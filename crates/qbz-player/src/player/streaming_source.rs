@@ -424,6 +424,16 @@ struct SharedBuffer {
     state: Mutex<BufferState>,
     ready: Condvar,
     wanted: Notify,
+    /// Set when nobody is going to listen to this stream again.
+    ///
+    /// A blocking read waits for bytes that a live download will eventually
+    /// supply — which is right while something is playing, and a trap once it
+    /// is not. A decoder thread abandoned by a stop that timed out would sit in
+    /// that wait for as long as the download took, holding the boxed source and
+    /// the whole track's buffer (120-220 MB at Hi-Res) for the life of the
+    /// process. Setting this turns the next read into a clean EOF, so the
+    /// decoder finishes, the thread exits and the memory goes back.
+    abandoned: std::sync::atomic::AtomicBool,
 }
 
 impl SharedBuffer {
@@ -435,6 +445,14 @@ impl SharedBuffer {
 
     /// Block until the buffer changes: data pushed, an error recorded, or
     /// the feeder reporting itself done.
+    /// Wait for the feeder to make progress.
+    ///
+    /// UNBOUNDED, deliberately: a reader that gave up after a timeout would
+    /// report a short read, and symphonia would take that for a corrupt stream.
+    /// The wait ends when bytes arrive, when the download completes or errors,
+    /// or when someone calls [`BufferedMediaSource::abandon`] — which is the
+    /// only way out for a reader nobody is listening to any more, and why that
+    /// method exists.
     fn wait<'a>(
         &'a self,
         guard: std::sync::MutexGuard<'a, BufferState>,
@@ -525,6 +543,7 @@ impl BufferedMediaSource {
             }),
             ready: Condvar::new(),
             wanted: Notify::new(),
+            abandoned: std::sync::atomic::AtomicBool::new(false),
         });
 
         let source = Self {
@@ -578,6 +597,7 @@ impl BufferedMediaSource {
         while state.contiguous_from(state.primary_offset) < self.config.initial_buffer_bytes as u64
             && !state.download_complete
             && state.download_error.is_none()
+            && !self.shared.abandoned.load(Ordering::SeqCst)
         {
             state = self.shared.wait(state)?;
         }
@@ -592,6 +612,20 @@ impl BufferedMediaSource {
     /// Check if the feeder is done and left nothing missing (full file in
     /// buffer). A range feeder only reports completion once every gap is
     /// filled, so this keeps meaning "the whole track is here".
+    /// Give up on this stream: wake every blocked reader and make the next
+    /// read report EOF.
+    ///
+    /// Called when the player drops a streaming source, so that any decoder
+    /// still holding a clone of it — including one on a thread a timed-out stop
+    /// had to abandon — finishes promptly instead of waiting out a download
+    /// nobody will hear.
+    pub fn abandon(&self) {
+        self.shared
+            .abandoned
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.shared.ready.notify_all();
+    }
+
     pub fn is_complete(&self) -> bool {
         if let Ok(state) = self.shared.state.lock() {
             state.download_complete && state.download_error.is_none()
@@ -796,6 +830,14 @@ impl Read for BufferedMediaSource {
             }
 
             if state.at_eof(read_pos) {
+                return Ok(0);
+            }
+
+            // Nobody is listening any more. Report EOF rather than waiting for
+            // a download whose audio will never be played; symphonia turns this
+            // into an `IoError`, the decode loop marks itself finished, and the
+            // thread unwinds instead of parking forever.
+            if self.shared.abandoned.load(Ordering::SeqCst) {
                 return Ok(0);
             }
 

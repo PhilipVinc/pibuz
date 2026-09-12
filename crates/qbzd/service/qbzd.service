@@ -17,5 +17,25 @@ Restart=on-failure
 RestartSec=10
 NoNewPrivileges=true
 
+# Let the ALSA writer thread ask for SCHED_FIFO. Without this rlimit the
+# request returns EPERM and qbzd carries on at normal priority — playback works
+# either way, it is just more exposed to a scheduling delay becoming a click on
+# a busy Pi. See crates/qbz-audio/src/rt.rs for why only that one thread is
+# promoted, and why the priority is deliberately low.
+#
+# 20 is a ceiling, not the value used: the daemon asks for
+# `audio.writer_rt_priority` (5 by default), well under the ~50 that kernel IRQ
+# threads run at, so a runaway writer cannot starve the USB bus the audio
+# leaves through. Setting `audio.writer_rt_priority 0` turns it off entirely.
+LimitRTPRIO=20
+#
+# NOT SUFFICIENT ON ITS OWN in a user unit. An rlimit can only be lowered, so
+# this is capped by the hard RLIMIT_RTPRIO the `systemd --user` manager
+# inherited — 0 on stock Raspberry Pi OS. To actually grant it, either add
+#   DefaultLimitRTPRIO=20
+# to /etc/systemd/user.conf and run `systemctl --user daemon-reexec`, or add the
+# user to the `audio` group with an `@audio - rtprio 20` line in
+# /etc/security/limits.d/. qbzd logs one line at startup saying which happened.
+
 [Install]
 WantedBy=default.target

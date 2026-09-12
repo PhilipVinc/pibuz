@@ -178,9 +178,50 @@ impl BufferingLatch {
             *guard = None;
             return None;
         }
+        // TRIPWIRE. The latch releases on the player's clock passing the offset
+        // the stream opened at, so a clock that is not measured from the start
+        // of the TRACK never releases it: the controller spins, its position
+        // frozen (the report suppresses position while buffering), and a track
+        // change goes unreported — all three at once, on a track that is
+        // audibly playing. That is not a hypothetical; it shipped, from a
+        // writer that reported frames-since-the-current-SOURCE-started after a
+        // seek rebuilt the engine around a source opened 166 s into the song.
+        //
+        // The signature is unmistakable and cheap to test for: we are on the
+        // right track, well past the grace, and the clock is sitting far BELOW
+        // the offset instead of climbing through it. Say so by name, once per
+        // load, because the symptom on its own points at the cloud or the
+        // controller and costs an evening.
+        if player_track_id == b.track_id
+            && b.since.elapsed() > STALLED_CLOCK_GRACE
+            && position_ms + STALLED_CLOCK_SLACK_MS < b.start_position_secs.saturating_mul(1000)
+        {
+            log::error!(
+                "[QConnect] track {} has been 'buffering' for {:?} with the player's clock at \
+                 {} ms, BELOW the {} ms this stream opened at. The clock is almost certainly \
+                 being reported relative to the current source rather than to the track, which \
+                 never satisfies the audible edge — the controller will spin with a frozen \
+                 position until the {:?} backstop fires.",
+                b.track_id,
+                b.since.elapsed(),
+                position_ms,
+                b.start_position_secs.saturating_mul(1000),
+                BUFFERING_MAX,
+            );
+        }
         Some((b.track_id, b.start_position_secs, b.duration_secs))
     }
 }
+
+/// How long a load may sit below its own start offset before the tripwire
+/// fires. Comfortably longer than a real load, which reaches the offset as soon
+/// as the first samples are audible.
+const STALLED_CLOCK_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How far below the offset counts as "not climbing towards it". A real load
+/// sits AT the offset (the player has not moved yet), so only a clock that has
+/// restarted from somewhere else lands here.
+const STALLED_CLOCK_SLACK_MS: u64 = 2_000;
 
 impl DaemonRendererEngine {
     pub fn new(
@@ -599,6 +640,39 @@ mod tests {
             "clock moved: audio is flowing"
         );
         assert!(latch.in_flight(9, 80_050).is_none(), "and it stays cleared");
+    }
+
+    /// The exact shape of the shipped bug, encoded so it cannot come back
+    /// silently: a seek to 2:46, and a clock that restarts from zero instead of
+    /// counting from the start of the track.
+    ///
+    /// The latch cannot FIX that — it is downstream of the clock, and its job
+    /// is to believe what the player tells it — so this asserts the two things
+    /// it can do: keep reporting the load (which is the honest reading of that
+    /// input), and hit the 90 s backstop rather than spinning forever.
+    #[test]
+    fn a_clock_that_restarts_after_a_seek_never_satisfies_the_audible_edge() {
+        let latch = BufferingLatch::default();
+        // The stream opened 166 seconds into the track.
+        latch.begin(9, 166, 372);
+
+        // A clock counting from the start of the SOURCE reports seconds since
+        // the seek — 0, 1, 2, 3 — and never passes 166 000 ms.
+        for since_seek_ms in [0_u64, 1_000, 2_000, 3_000, 60_000] {
+            assert!(
+                latch.in_flight(9, since_seek_ms).is_some(),
+                "a source-relative clock of {since_seek_ms} ms cannot release a latch armed at                  166 000 ms — this is the bug, and the fix belongs in the writer"
+            );
+        }
+
+        // A clock counting from the start of the TRACK passes it immediately,
+        // which is what the fix makes happen.
+        let latch = BufferingLatch::default();
+        latch.begin(9, 166, 372);
+        assert!(
+            latch.in_flight(9, 166_500).is_none(),
+            "a track-relative clock one half-second past the seek must release the latch"
+        );
     }
 
     #[test]

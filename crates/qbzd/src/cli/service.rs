@@ -156,6 +156,10 @@ fn systemd_user(t: &Target) -> String {
          Restart=on-failure\n\
          RestartSec=10\n\
          NoNewPrivileges=true\n\
+         # Lets the ALSA writer thread ask for SCHED_FIFO. Without it the\n\
+         # request returns EPERM and qbzd plays on at normal priority — see\n\
+         # `audio.writer_rt_priority`, which is what picks the actual value.\n\
+         LimitRTPRIO=20\n\
          \n\
          [Install]\n\
          WantedBy=default.target\n",
@@ -185,6 +189,10 @@ fn systemd_system(t: &Target) -> String {
          Restart=on-failure\n\
          RestartSec=10\n\
          NoNewPrivileges=true\n\
+         # Lets the ALSA writer thread ask for SCHED_FIFO. Without it the\n\
+         # request returns EPERM and qbzd plays on at normal priority — see\n\
+         # `audio.writer_rt_priority`, which is what picks the actual value.\n\
+         LimitRTPRIO=20\n\
          \n\
          [Install]\n\
          WantedBy=multi-user.target\n",
@@ -316,6 +324,16 @@ mod tests {
         // A user unit must NOT hardcode User=/XDG_RUNTIME_DIR (it's the session's).
         assert!(!u.contains("User="));
         assert!(!u.contains("XDG_RUNTIME_DIR"));
+    }
+
+    /// The rlimit is what makes `audio.writer_rt_priority` more than a log
+    /// line: without it the promotion returns EPERM on every host. It is one
+    /// easily-dropped line in a template nobody reads, so it is pinned here.
+    #[test]
+    fn both_systemd_units_let_the_writer_thread_ask_for_realtime() {
+        for tpl in [systemd_user(&t()), systemd_system(&t())] {
+            assert!(tpl.contains("LimitRTPRIO=20"), "missing rlimit:\n{tpl}");
+        }
     }
 
     #[test]

@@ -115,6 +115,19 @@ fn buffer_frames_for(sample_rate: u32) -> Frames {
     }
 }
 
+/// How many periods make up the ring.
+///
+/// The old code asked for `buffer/10`, which is a lot of periods: every one is
+/// an interrupt and a wakeup, and on a USB DAC the period also has to divide
+/// into whole USB frames. Four is the conventional figure for a playback-only
+/// renderer (it is what MPD and squeezelite land on) and it leaves the wakeup
+/// rate low enough that a Pi is not spending its scheduler budget on us.
+///
+/// The driver rounds this however it likes; [`granted_geometry`] is what the
+/// rest of the code believes.
+#[cfg(target_os = "linux")]
+const PERIODS_PER_BUFFER: Frames = 4;
+
 /// Log a PCM recovery and record it as a network-throttle underrun signal.
 ///
 /// Each call to ALSA's `pcm.recover()` that returns successfully indicates
@@ -167,6 +180,93 @@ fn recover_write_error(pcm: &PCM, errno: i32, suffix: &str) -> Result<(), String
     }
 }
 
+/// The ring and period length the driver actually granted.
+///
+/// `set_buffer_size_near` / `set_period_size_near` are requests, and drivers
+/// round them to whatever their DMA engine can do. Every number downstream —
+/// the start threshold, the writer's work quantum, the keep-alive depth — has
+/// to come from what was granted, not from what was asked for. The old log line
+/// printed the request and called it "Hardware configured", which is how a
+/// 185 ms write quantum against a 125 ms ring went unnoticed.
+#[cfg(target_os = "linux")]
+fn granted_geometry(hwp: &HwParams<'_>) -> Result<(Frames, Frames), String> {
+    let buffer_frames = hwp
+        .get_buffer_size()
+        .map_err(|e| format!("Failed to read back buffer size: {e}"))?;
+    let period_frames = hwp
+        .get_period_size()
+        .map_err(|e| format!("Failed to read back period size: {e}"))?;
+    if buffer_frames <= 0 || period_frames <= 0 {
+        return Err(format!(
+            "Driver reported a nonsensical geometry: buffer {buffer_frames}, period {period_frames}"
+        ));
+    }
+    Ok((buffer_frames, period_frames))
+}
+
+/// Install the software parameters. **This is the single most valuable change
+/// in this file**, so it is worth stating exactly what it does and does not do.
+///
+/// # What ALSA does without it
+///
+/// Nothing in this tree ever called `snd_pcm_sw_params`, so every stream ran on
+/// alsa-lib's defaults. They are not a mystery — `snd_pcm_sw_params_default()`
+/// in `src/pcm/pcm_params.c` sets them right after a successful `hw_params`:
+///
+/// ```text
+/// avail_min         = period_size
+/// start_threshold   = 1
+/// stop_threshold    = buffer_size
+/// silence_threshold = 0
+/// silence_size      = 0
+/// ```
+///
+/// `start_threshold = 1` is the problem: the device begins clocking the instant
+/// the FIRST frame is written, with the ring essentially empty. Everything after
+/// that is a race the writer has to win on every single period, with no cushion
+/// — and after an xrun recovery it starts the race again on a freshly emptied
+/// ring, which is how one dropout becomes a run of them.
+///
+/// # What we change, and what we deliberately do not
+///
+/// Only `start_threshold` actually changes behaviour; `avail_min` is set to the
+/// same value the default would have given, explicitly, so that a future reader
+/// does not have to go and look it up.
+///
+/// - `start_threshold = buffer_frames` — do not clock until the ring is full.
+///   Requires that something explicitly starts the stream when no more data is
+///   coming; see [`AlsaDirectStream::start_if_prepared`], which is not optional.
+/// - `stop_threshold` stays at `buffer_size`. Raising it to `boundary` would let
+///   the stream free-wheel over stale ring content on an underrun, and
+///   [`AlsaDirectStream::drain`] deliberately detects end-of-tail by watching for
+///   the XRun state, which free-wheeling would never reach.
+/// - `silence_threshold` / `silence_size` are left at 0. They only matter for a
+///   free-wheeling stream, which this is not — an underrun here halts the PCM
+///   rather than replaying anything.
+#[cfg(target_os = "linux")]
+fn configure_sw_params(
+    pcm: &PCM,
+    buffer_frames: Frames,
+    period_frames: Frames,
+    kind: &str,
+) -> Result<(), String> {
+    let swp = pcm
+        .sw_params_current()
+        .map_err(|e| format!("Failed to read current sw params: {e}"))?;
+    let was = swp.get_start_threshold().unwrap_or(-1);
+    swp.set_avail_min(period_frames)
+        .map_err(|e| format!("Failed to set avail_min: {e}"))?;
+    swp.set_start_threshold(buffer_frames)
+        .map_err(|e| format!("Failed to set start_threshold: {e}"))?;
+    pcm.sw_params(&swp)
+        .map_err(|e| format!("Failed to apply sw params: {e}"))?;
+    log::info!(
+        "[ALSA Direct] {kind} sw params: start_threshold {was} -> {buffer_frames} frames, \
+         avail_min {period_frames}, stop_threshold left at the ring length"
+    );
+    Ok(())
+}
+
 /// Fail closed when ALSA selected a different rate than requested (exclusive /
 /// bit-perfect paths must not silently nearest-neighbor).
 #[cfg(target_os = "linux")]
@@ -203,6 +303,24 @@ pub enum SampleLayout {
 }
 
 impl SampleLayout {
+    /// The layout for an ALSA format, or `None` for one this path cannot encode
+    /// (the DSD carriers, whose words are packed by `qbz-dsd` and written
+    /// verbatim).
+    ///
+    /// Linux-only because `alsa::Format` is; the enum itself stays portable so
+    /// the byte-order arithmetic can be tested anywhere.
+    #[cfg(target_os = "linux")]
+    pub fn for_format(format: Format) -> Option<Self> {
+        match format {
+            Format::FloatLE => Some(SampleLayout::F32Le),
+            Format::S32LE => Some(SampleLayout::S32Le),
+            Format::S24LE => Some(SampleLayout::S24Le),
+            Format::S243LE => Some(SampleLayout::S24Le3),
+            Format::S16LE => Some(SampleLayout::S16Le),
+            _ => None,
+        }
+    }
+
     /// Bytes one sample occupies on the wire.
     pub fn bytes_per_sample(self) -> usize {
         match self {
@@ -219,33 +337,55 @@ impl SampleLayout {
 /// its own recovery, which is how duplicated paths in this codebase have
 /// repeatedly drifted apart.
 pub fn encode_into(layout: SampleLayout, samples: &[f32], out: &mut Vec<u8>) {
-    out.reserve(samples.len() * layout.bytes_per_sample());
+    // APPENDS. Several callers reuse one hoisted buffer and `clear()` it
+    // themselves; the fade builds its ramp and pad into the same `Vec`. The
+    // base offset below is what makes that safe, and
+    // `encoding_appends_rather_than_replacing` is what stops the next rewrite
+    // from quietly turning it into a replace.
+    let bps = layout.bytes_per_sample();
+    let base = out.len();
+    // One sized allocation, then a flat write through fixed-width chunks. The
+    // per-sample `extend_from_slice` this replaces re-checked capacity and
+    // called into memcpy for every two-to-four bytes, on the one thread that
+    // must never fall behind.
+    out.resize(base + samples.len() * bps, 0);
+    let dst = &mut out[base..];
+
+    // `as_chunks_mut` rather than `chunks_exact_mut`: the width is a constant,
+    // so this hands back fixed-size arrays and the bounds check leaves the loop
+    // entirely. The remainder is always empty — `dst` was sized as a whole
+    // number of samples two lines up — and is ignored for that reason.
     match layout {
         SampleLayout::F32Le => {
-            for &s in samples {
-                out.extend_from_slice(&s.to_le_bytes());
+            let (words, _) = dst.as_chunks_mut::<4>();
+            for (word, &s) in words.iter_mut().zip(samples) {
+                *word = s.to_le_bytes();
             }
         }
         SampleLayout::S32Le => {
-            for &s in samples {
-                out.extend_from_slice(&f32_to_s32(s).to_le_bytes());
+            let (words, _) = dst.as_chunks_mut::<4>();
+            for (word, &s) in words.iter_mut().zip(samples) {
+                *word = f32_to_s32(s).to_le_bytes();
             }
         }
         SampleLayout::S24Le => {
-            for &s in samples {
-                out.extend_from_slice(&f32_to_s24(s).to_le_bytes());
+            let (words, _) = dst.as_chunks_mut::<4>();
+            for (word, &s) in words.iter_mut().zip(samples) {
+                *word = f32_to_s24(s).to_le_bytes();
             }
         }
         // The low three bytes of the little-endian word: value in 0..2, sign
         // carried in byte 2.
         SampleLayout::S24Le3 => {
-            for &s in samples {
-                out.extend_from_slice(&f32_to_s24(s).to_le_bytes()[..3]);
+            let (words, _) = dst.as_chunks_mut::<3>();
+            for (word, &s) in words.iter_mut().zip(samples) {
+                word.copy_from_slice(&f32_to_s24(s).to_le_bytes()[..3]);
             }
         }
         SampleLayout::S16Le => {
-            for &s in samples {
-                out.extend_from_slice(&f32_to_s16(s).to_le_bytes());
+            let (words, _) = dst.as_chunks_mut::<2>();
+            for (word, &s) in words.iter_mut().zip(samples) {
+                *word = f32_to_s16(s).to_le_bytes();
             }
         }
     }
@@ -336,6 +476,59 @@ pub const STOP_PAD_MS: u32 = 60;
 /// Frames in a silence pad of `pad_ms` at `sample_rate`.
 pub fn pad_frames(sample_rate: u32, pad_ms: u32) -> usize {
     ((u64::from(sample_rate) * u64::from(pad_ms)) / 1000) as usize
+}
+
+/// Milliseconds of ramp before the silence pad.
+///
+/// The pad alone was never enough. Landing on silence stops the clock from a
+/// settled state, but GETTING to that silence was itself a step: whatever the
+/// track's last sample happened to be, straight to zero, in one sample period.
+/// That is the same broadband click the pad exists to remove, moved 60 ms
+/// earlier — which is why "a pop after every song" survived the pad.
+///
+/// 10 ms is long enough that the ramp is inaudible as a fade and short enough
+/// that nobody hears the end of the track being shortened. It is the figure
+/// hardware mute circuits and every other renderer's fade-out use.
+pub const FADE_MS: u32 = 10;
+
+/// Fill `out` with `frames` of a raised-cosine ramp from `from` down to silence.
+///
+/// `from` is one frame (one sample per channel) — the last thing the device was
+/// given — and the ramp is applied to it, so the result starts exactly where the
+/// audio stopped and reaches exactly zero. Raised cosine rather than linear
+/// because its slope is zero at BOTH ends: a linear ramp removes the step in
+/// amplitude but leaves one in the first derivative, which is still a transient,
+/// just a quieter one.
+///
+/// Interleaved, `from.len()` samples per frame. A `from` of all zeros yields
+/// silence, which is the right answer and costs nothing to compute.
+pub fn fade_ramp_into(from: &[f32], frames: usize, out: &mut Vec<f32>) {
+    let channels = from.len();
+    if channels == 0 || frames == 0 {
+        return;
+    }
+    out.reserve(frames * channels);
+    if frames < 2 {
+        // Nowhere to ramp. Emitting the sample at full amplitude and then
+        // silence would be the step this function exists to remove, so a
+        // degenerate request goes straight to silence — quieter is always the
+        // safe direction for the last thing a DAC hears.
+        out.extend(std::iter::repeat_n(0.0, frames * channels));
+        return;
+    }
+    // Divided by `frames - 1`, not by `frames`, so BOTH endpoints are exact:
+    // gain is 1.0 on the first frame and 0.0 on the last. Dividing by `frames`
+    // leaves the ramp one step short of silence — a single LSB at 24-bit, which
+    // is inaudible but means the function does not do what its name says, and
+    // the next person to reuse it for a mute would inherit the residue.
+    let last_index = (frames - 1) as f32;
+    for f in 0..frames {
+        let phase = (f as f32) / last_index;
+        let gain = 0.5 * (1.0 + (std::f32::consts::PI * phase).cos());
+        for &sample in from {
+            out.push(sample * gain);
+        }
+    }
 }
 
 /// How many frames of silence to add to reach `target_frames` of queued audio.
@@ -429,6 +622,26 @@ pub struct AlsaDirectStream {
     sample_rate: u32,
     channels: u16,
     format: Format,
+    /// Ring and period length the driver actually granted, read back from the
+    /// applied `HwParams`. NOT what we asked for: `set_buffer_size_near` is a
+    /// request, and the writer sizes its work quantum from these.
+    buffer_frames: Frames,
+    period_frames: Frames,
+    /// True when ALSA's plug layer is rate-converting under us, i.e. this
+    /// stream is NOT bit-perfect. See [`Self::is_bit_perfect`].
+    resampled: bool,
+    /// True for the DoP and native-DSD constructors.
+    ///
+    /// Cannot be derived from `format`: a DoP stream is `S32LE`, exactly like a
+    /// PCM one, and the difference is what the words MEAN. Digital zero is
+    /// silence in PCM and is NOT silence in DoP, whose idle pattern carries
+    /// alternating 0x05/0xFA markers over 0x69 data — so every path that writes
+    /// zeros has to know which kind of stream it is holding.
+    dsd_carrier: bool,
+    /// The last frame handed to the device, kept so a stop can ramp down from
+    /// it instead of stepping to zero. `channels` long once anything has been
+    /// written. See [`Self::fade_out_and_pad`].
+    last_frame: Mutex<Vec<f32>>,
     device_id: String,
     /// ALSA control device holding the DAC's mixer, when it is not the one
     /// `device_id` names. Set after construction (see `set_mixer_device`)
@@ -555,78 +768,61 @@ impl AlsaDirectStream {
         let pcm = PCM::new(device_id, Direction::Playback, false)
             .map_err(|e| format!("Failed to open ALSA device '{}': {}", device_id, e))?;
 
-        // Set hardware parameters and auto-detect best format
-        let selected_format = {
-            let hwp =
-                HwParams::any(&pcm).map_err(|e| format!("Failed to get hardware params: {}", e))?;
-
-            // Set access type (interleaved)
-            hwp.set_access(Access::RWInterleaved)
-                .map_err(|e| format!("Failed to set access: {}", e))?;
-
-            // Try formats in order of preference for bit-perfect playback
-            // S24_3LE first: required by SMSL-class USB DACs (TAS1020B chip)
-            // Then descending bit-depth for quality
-            let format_priority = [
-                (Format::S243LE, "S24_3LE"), // 24-bit packed (SMSL, Topping, Fosi DACs)
-                (Format::S32LE, "S32LE"),    // 32-bit
-                (Format::S24LE, "S24LE"),    // 24-bit in 32-bit container
-                (Format::S16LE, "S16LE"),    // 16-bit
-                (Format::FloatLE, "Float32LE"), // Float (compatibility)
-            ];
-
-            let mut selected_format = None;
-            for (format, name) in &format_priority {
-                if hwp.set_format(*format).is_ok() {
-                    log::info!("[ALSA Direct] Selected format: {}", name);
-                    selected_format = Some(*format);
+        // Configure the hardware. Attempted twice at most: once with ALSA's
+        // rate conversion DISABLED, and — only if that cannot give us the
+        // track's exact rate — once with it enabled.
+        //
+        // # Why two attempts and not one
+        //
+        // `set_rate` is called with `ValueOr::Nearest`, so on a plug-layer PCM
+        // (`plughw:`, `default`, moOde's `_audioout`) it SUCCEEDS at whatever
+        // the slave can do and the plug layer quietly resamples. `set_rate_resample(false)`
+        // is what stops that, and it is the only way `ensure_exact_rate` means
+        // anything on such a device: read back through a plug chain, the rate
+        // is whatever we asked for, every time.
+        //
+        // But refusing to play is the wrong answer for a user whose output IS a
+        // plug device and always has been. So: fail closed on the QUALITY CLAIM
+        // (we know, and say, that the stream is not bit-perfect) and fail open
+        // on PLAYABILITY. The retry is keyed on `ensure_exact_rate`, not on
+        // `set_rate` — the latter essentially never fails, which is the whole
+        // problem.
+        let mut configured: Option<(Format, Frames, Frames, bool)> = None;
+        let mut first_failure: Option<String> = None;
+        for allow_resample in [false, true] {
+            match Self::configure_hw(&pcm, sample_rate, channels, allow_resample) {
+                Ok((format, buffer_frames, period_frames)) => {
+                    configured = Some((format, buffer_frames, period_frames, allow_resample));
                     break;
                 }
+                Err(e) => {
+                    if !allow_resample {
+                        first_failure = Some(e);
+                    } else {
+                        // Both attempts failed: report the strict one, which is
+                        // the informative error.
+                        return Err(first_failure.unwrap_or(e));
+                    }
+                }
             }
+        }
+        let (selected_format, buffer_frames, period_frames, resampled) =
+            configured.ok_or_else(|| "Failed to configure ALSA hardware parameters".to_string())?;
 
-            let format = selected_format.ok_or_else(|| {
-                "No supported audio format found (tried S24_3LE, S32LE, S24LE, S16LE, FloatLE)"
-                    .to_string()
-            })?;
-
-            // Set channels
-            hwp.set_channels(channels as u32)
-                .map_err(|e| format!("Failed to set channels: {}", e))?;
-
-            // Request the track rate. ValueOr::Nearest is still used so ALSA
-            // accepts the set; we fail closed below if hardware did not match.
-            hwp.set_rate(sample_rate, ValueOr::Nearest)
-                .map_err(|e| format!("Failed to set sample rate: {}", e))?;
-
-            // Buffer length: rate-derived by default, or whatever
-            // `audio.alsa_buffer_ms` asks for (see `buffer_frames_for`).
-            let buffer_size = buffer_frames_for(sample_rate);
-
-            hwp.set_buffer_size_near(buffer_size)
-                .map_err(|e| format!("Failed to set buffer size: {}", e))?;
-
-            // Set period size (1/10 of buffer)
-            hwp.set_period_size_near(buffer_size / 10, ValueOr::Nearest)
-                .map_err(|e| format!("Failed to set period size: {}", e))?;
-
-            // Apply hardware parameters
-            pcm.hw_params(&hwp)
-                .map_err(|e| format!("Failed to apply hardware params: {}", e))?;
-
-            ensure_exact_rate(&hwp, sample_rate, "exclusive PCM")?;
-
-            log::info!(
-                "[ALSA Direct] Hardware configured: {}Hz, {}ch, buffer: {} frames, format: {:?}",
-                sample_rate,
-                channels,
-                buffer_size,
-                format
+        if resampled {
+            log::warn!(
+                "[ALSA Direct] '{device_id}' cannot deliver {sample_rate} Hz without ALSA's rate \
+                 converter ({}). Playing anyway WITH resampling — this stream is NOT bit-perfect. \
+                 For bit-perfect output point audio.output_device at a hw: device.",
+                first_failure.as_deref().unwrap_or("reason unknown")
             );
+        }
 
-            format
-        };
+        configure_sw_params(&pcm, buffer_frames, period_frames, "exclusive PCM")?;
 
-        // Prepare device for playback
+        // Redundant in practice — `snd_pcm_hw_params()` prepares the stream
+        // itself — but harmless, and it keeps the state explicit at the one
+        // point where every constructor agrees on it.
         pcm.prepare()
             .map_err(|e| format!("Failed to prepare PCM: {}", e))?;
 
@@ -637,12 +833,95 @@ impl AlsaDirectStream {
             sample_rate,
             channels,
             format: selected_format,
+            buffer_frames,
+            period_frames,
+            resampled,
+            dsd_carrier: false,
+            last_frame: Mutex::new(Vec::new()),
             device_id: device_id.to_string(),
             mixer_device: None,
             // Last field: drops after `pcm` so the kernel-level exclusive
             // grip is released before the D-Bus bus name is freed.
             _reservation: reservation,
         })
+    }
+
+    /// One attempt at the PCM hardware configuration. Returns the chosen format
+    /// and the geometry the driver GRANTED.
+    ///
+    /// Split out of `new` so it can be run twice against a fresh `HwParams`:
+    /// once the params have been refined, the constraints cannot be relaxed
+    /// again, so retrying with a different `rate_resample` needs a new
+    /// container rather than a second `set_` on the old one.
+    fn configure_hw(
+        pcm: &PCM,
+        sample_rate: u32,
+        channels: u16,
+        allow_resample: bool,
+    ) -> Result<(Format, Frames, Frames), String> {
+        let hwp = HwParams::any(pcm).map_err(|e| format!("Failed to get hardware params: {e}"))?;
+
+        // Before anything else: a plug layer consulted after the rate is set
+        // has already decided to convert.
+        hwp.set_rate_resample(allow_resample)
+            .map_err(|e| format!("Failed to set rate_resample({allow_resample}): {e}"))?;
+
+        hwp.set_access(Access::RWInterleaved)
+            .map_err(|e| format!("Failed to set access: {e}"))?;
+
+        // Try formats in order of preference for bit-perfect playback.
+        // S24_3LE first: required by SMSL-class USB DACs (TAS1020B chip).
+        // Then descending bit-depth for quality.
+        let format_priority = [
+            (Format::S243LE, "S24_3LE"), // 24-bit packed (SMSL, Topping, Fosi DACs)
+            (Format::S32LE, "S32LE"),    // 32-bit
+            (Format::S24LE, "S24LE"),    // 24-bit in 32-bit container
+            (Format::S16LE, "S16LE"),    // 16-bit
+            (Format::FloatLE, "Float32LE"), // Float (compatibility)
+        ];
+
+        let mut selected_format = None;
+        for (format, name) in &format_priority {
+            if hwp.set_format(*format).is_ok() {
+                log::info!("[ALSA Direct] Selected format: {}", name);
+                selected_format = Some(*format);
+                break;
+            }
+        }
+        let format = selected_format.ok_or_else(|| {
+            "No supported audio format found (tried S24_3LE, S32LE, S24LE, S16LE, FloatLE)"
+                .to_string()
+        })?;
+
+        hwp.set_channels(u32::from(channels))
+            .map_err(|e| format!("Failed to set channels: {e}"))?;
+
+        // `ValueOr::Nearest` so ALSA accepts the set; `ensure_exact_rate` below
+        // is what fails us closed if the hardware landed somewhere else.
+        hwp.set_rate(sample_rate, ValueOr::Nearest)
+            .map_err(|e| format!("Failed to set sample rate: {e}"))?;
+
+        // Buffer length: rate-derived by default, or whatever
+        // `audio.alsa_buffer_ms` asks for (see `buffer_frames_for`).
+        let requested_buffer = buffer_frames_for(sample_rate);
+        hwp.set_buffer_size_near(requested_buffer)
+            .map_err(|e| format!("Failed to set buffer size: {e}"))?;
+        hwp.set_period_size_near(requested_buffer / PERIODS_PER_BUFFER, ValueOr::Nearest)
+            .map_err(|e| format!("Failed to set period size: {e}"))?;
+
+        pcm.hw_params(&hwp)
+            .map_err(|e| format!("Failed to apply hardware params: {e}"))?;
+
+        ensure_exact_rate(&hwp, sample_rate, "exclusive PCM")?;
+        let (buffer_frames, period_frames) = granted_geometry(&hwp)?;
+
+        log::info!(
+            "[ALSA Direct] Hardware configured: {sample_rate} Hz, {channels} ch, {format:?}, \
+             ring {buffer_frames} frames ({} ms), period {period_frames} frames (asked {requested_buffer})",
+            (buffer_frames.max(0) as u64 * 1000) / u64::from(sample_rate).max(1)
+        );
+
+        Ok((format, buffer_frames, period_frames))
     }
 
     /// Create an ALSA direct stream for DoP (DSD over PCM) delivery.
@@ -670,9 +949,14 @@ impl AlsaDirectStream {
         let pcm = PCM::new(device_id, Direction::Playback, false)
             .map_err(|e| format!("Failed to open ALSA device '{}': {}", device_id, e))?;
 
-        {
+        let (buffer_frames, period_frames) = {
             let hwp =
                 HwParams::any(&pcm).map_err(|e| format!("Failed to get hardware params: {}", e))?;
+            // A DoP carrier must reach the device bit-exactly: no plug-layer
+            // rate conversion, ever. Unlike the PCM path there is no fail-open
+            // retry — resampled DoP is not degraded DoP, it is noise.
+            hwp.set_rate_resample(false)
+                .map_err(|e| format!("Failed to disable rate conversion for DoP: {}", e))?;
             hwp.set_access(Access::RWInterleaved)
                 .map_err(|e| format!("Failed to set access: {}", e))?;
             hwp.set_format(Format::S32LE)
@@ -684,18 +968,23 @@ impl AlsaDirectStream {
             let buffer_size = buffer_frames_for(carrier_rate);
             hwp.set_buffer_size_near(buffer_size)
                 .map_err(|e| format!("Failed to set buffer size: {}", e))?;
-            hwp.set_period_size_near(buffer_size / 10, ValueOr::Nearest)
+            hwp.set_period_size_near(buffer_size / PERIODS_PER_BUFFER, ValueOr::Nearest)
                 .map_err(|e| format!("Failed to set period size: {}", e))?;
             pcm.hw_params(&hwp)
                 .map_err(|e| format!("Failed to apply hardware params: {}", e))?;
             ensure_exact_rate(&hwp, carrier_rate, "DoP carrier")?;
+            let geometry = granted_geometry(&hwp)?;
             log::info!(
-                "[ALSA Direct] DoP hardware configured: {}Hz, {}ch, S32_LE, buffer {} frames",
+                "[ALSA Direct] DoP hardware configured: {}Hz, {}ch, S32_LE, ring {} frames, period {}",
                 carrier_rate,
                 channels,
-                buffer_size
+                geometry.0,
+                geometry.1
             );
-        }
+            geometry
+        };
+
+        configure_sw_params(&pcm, buffer_frames, period_frames, "DoP carrier")?;
 
         pcm.prepare()
             .map_err(|e| format!("Failed to prepare PCM: {}", e))?;
@@ -707,6 +996,13 @@ impl AlsaDirectStream {
             sample_rate: carrier_rate,
             channels,
             format: Format::S32LE,
+            buffer_frames,
+            period_frames,
+            // A DoP carrier is S32 at an exact rate or it is nothing; there is
+            // no resampled fallback for it.
+            resampled: false,
+            dsd_carrier: true,
+            last_frame: Mutex::new(Vec::new()),
             device_id: device_id.to_string(),
             mixer_device: None,
             // Last field: drops after `pcm` (see field-order note on the struct).
@@ -748,6 +1044,10 @@ impl AlsaDirectStream {
         let selected = {
             let hwp =
                 HwParams::any(&pcm).map_err(|e| format!("Failed to get hardware params: {}", e))?;
+            // Native DSD is a bit stream carried in 32-bit words. There is no
+            // meaningful "resampled DSD"; refuse rather than convert.
+            hwp.set_rate_resample(false)
+                .map_err(|e| format!("Failed to disable rate conversion for native DSD: {}", e))?;
             hwp.set_access(Access::RWInterleaved)
                 .map_err(|e| format!("Failed to set access: {}", e))?;
             let mut selected = None;
@@ -767,19 +1067,24 @@ impl AlsaDirectStream {
             let buffer_size = buffer_frames_for(rate);
             hwp.set_buffer_size_near(buffer_size)
                 .map_err(|e| format!("Failed to set buffer size: {}", e))?;
-            hwp.set_period_size_near(buffer_size / 10, ValueOr::Nearest)
+            hwp.set_period_size_near(buffer_size / PERIODS_PER_BUFFER, ValueOr::Nearest)
                 .map_err(|e| format!("Failed to set period size: {}", e))?;
             pcm.hw_params(&hwp)
                 .map_err(|e| format!("Failed to apply hardware params: {}", e))?;
             ensure_exact_rate(&hwp, rate, "native DSD")?;
+            let (buffer_frames, period_frames) = granted_geometry(&hwp)?;
             log::info!(
-                "[ALSA Direct] Native DSD configured: {:?} @ {} Hz, {}ch",
+                "[ALSA Direct] Native DSD configured: {:?} @ {} Hz, {}ch, ring {} frames, period {}",
                 format,
                 rate,
-                channels
+                channels,
+                buffer_frames,
+                period_frames
             );
-            (format, le)
+            (format, le, buffer_frames, period_frames)
         };
+
+        configure_sw_params(&pcm, selected.2, selected.3, "native DSD")?;
 
         pcm.prepare()
             .map_err(|e| format!("Failed to prepare PCM: {}", e))?;
@@ -792,6 +1097,11 @@ impl AlsaDirectStream {
                 sample_rate: rate,
                 channels,
                 format: selected.0,
+                buffer_frames: selected.2,
+                period_frames: selected.3,
+                resampled: false,
+                dsd_carrier: true,
+                last_frame: Mutex::new(Vec::new()),
                 device_id: device_id.to_string(),
                 mixer_device: None,
                 // Last field: drops after `pcm` (see field-order note).
@@ -807,34 +1117,34 @@ impl AlsaDirectStream {
     /// DSD_U32 formats fail alsa-rs's checked-format i32 IO, so they use the
     /// unchecked accessor — sound because both layouts are exactly 32 bits
     /// per channel per frame, same as S32.
-    pub fn write_dop_i32(&self, samples: &[i32]) -> Result<(), String> {
-        let pcm = self.pcm.lock().unwrap();
-        let frames = samples.len() / self.channels as usize;
-        let io = if self.format == Format::S32LE {
-            pcm.io_i32()
-                .map_err(|e| format!("Failed to get PCM I/O: {}", e))?
-        } else {
-            unsafe { pcm.io_unchecked::<i32>() }
-        };
-        match io.writei(samples) {
-            Ok(written) => {
-                if written != frames {
-                    log::warn!(
-                        "[ALSA Direct] Partial DoP write: {} / {} frames",
-                        written,
-                        frames
-                    );
-                }
-                Ok(())
-            }
-            Err(e) => {
-                if let Err(msg) = recover_write_error(&pcm, e.errno(), "(DoP)") {
-                    Err(msg)
-                } else {
-                    Ok(())
-                }
-            }
+    pub fn write_dop_i32(&self, samples: &[i32], cancel: &AtomicBool) -> Result<usize, String> {
+        // Bounded, interruptible, and sharing the PCM path's write loop.
+        //
+        // This used to be a single blocking `writei` holding the PCM mutex for
+        // however long the device took — the exact shape that, on the PCM side,
+        // lost the audio thread for the life of the process when a card stopped
+        // draining: the writer sat inside the call, `stop()` could not get the
+        // mutex it needs, and the join waited forever. `write_bytes_interruptible`
+        // was written to escape that; the DSD path simply never got it.
+        //
+        // Byte-casting is sound for every format this is called with.
+        // `io_i32().writei()` writes each `i32`'s NATIVE representation, which
+        // is what `io_bytes()` writes too, and `frames_to_bytes` is
+        // format-aware — `snd_pcm_format_physical_width` is 32 bits per channel
+        // for `S32_LE` and for both `DSD_U32` layouts alike — so the frame
+        // arithmetic is identical. (It also drops the `io_unchecked` the DSD
+        // formats needed: `io_bytes` does no format verification, so there is
+        // nothing left to bypass.)
+        let (head, body, tail) = unsafe { samples.align_to::<u8>() };
+        // SAFETY-adjacent, but checked rather than assumed: `i32` has alignment
+        // 4 and `u8` alignment 1, so a `&[i32]` is always perfectly aligned for
+        // `u8` and `align_to` cannot split it. The assert pins that instead of
+        // trusting it.
+        debug_assert!(head.is_empty() && tail.is_empty());
+        if !head.is_empty() || !tail.is_empty() {
+            return Err("[ALSA Direct] DoP sample buffer is not byte-aligned".to_string());
         }
+        self.write_bytes_interruptible(body, cancel)
     }
 
     /// Write audio samples to ALSA (auto-converts from i16 based on detected format)
@@ -1003,22 +1313,26 @@ impl AlsaDirectStream {
     /// This is the primary write path for the f32 pipeline.
     ///
     /// Integer conversion is [`f32_to_s16`] / [`f32_to_s24`] / [`f32_to_s32`].
-    pub fn write_f32(&self, samples_f32: &[f32], cancel: &AtomicBool) -> Result<(), String> {
+    pub fn write_f32(&self, samples_f32: &[f32], cancel: &AtomicBool) -> Result<usize, String> {
         // Convert once, into the reusable byte buffer, then hand it to ONE
         // bounded write loop. Every format used to carry its own copy of the
         // write-and-recover dance; they are bytes by the time ALSA sees them,
         // and the PCM's own `bytes_to_frames` knows the frame size, so there is
         // no reason for four of them.
-        let layout = match self.format {
-            Format::FloatLE => SampleLayout::F32Le,
-            Format::S32LE => SampleLayout::S32Le,
-            Format::S24LE => SampleLayout::S24Le,
-            Format::S243LE => SampleLayout::S24Le3,
-            Format::S16LE => SampleLayout::S16Le,
-            other => {
-                return Err(format!("[ALSA Direct] unsupported format {other:?}"));
+        let layout = SampleLayout::for_format(self.format)
+            .ok_or_else(|| format!("[ALSA Direct] unsupported format {:?}", self.format))?;
+
+        // Remember where the signal was before handing it over, so a stop can
+        // ramp down from it rather than stepping to zero. Taken from the last
+        // WHOLE frame: a short tail that is not a whole frame is not what the
+        // device will end on.
+        let channels = usize::from(self.channels).max(1);
+        if samples_f32.len() >= channels {
+            if let Ok(mut last) = self.last_frame.lock() {
+                last.clear();
+                last.extend_from_slice(&samples_f32[samples_f32.len() - channels..]);
             }
-        };
+        }
 
         let mut scratch = self.scratch.lock().unwrap();
         let bytes = &mut scratch.bytes;
@@ -1026,6 +1340,91 @@ impl AlsaDirectStream {
         encode_into(layout, samples_f32, bytes);
 
         self.write_bytes_interruptible(bytes, cancel)
+    }
+
+    /// Frames currently queued inside ALSA, i.e. written but not yet heard.
+    ///
+    /// `0` rather than an error whenever the number would be meaningless — the
+    /// stream is not running, or `snd_pcm_delay` failed (it returns `-EPIPE`
+    /// after an xrun and `-EBADFD` once the PCM has been dropped). Callers use
+    /// this to turn "frames handed over" into "frames played", and a zero there
+    /// reads as "nothing outstanding", which is the safe direction: the
+    /// reported position can lag reality briefly, but never claims audio was
+    /// heard that was not.
+    pub fn delay_frames(&self) -> usize {
+        let Ok(pcm) = self.pcm.lock() else {
+            return 0;
+        };
+        if !matches!(
+            pcm.state(),
+            alsa::pcm::State::Running | alsa::pcm::State::Draining
+        ) {
+            return 0;
+        }
+        pcm.delay().map(|d| d.max(0) as usize).unwrap_or(0)
+    }
+
+    /// Start the stream if it is configured but not yet clocking.
+    ///
+    /// # Why this has to exist
+    ///
+    /// [`configure_sw_params`] sets `start_threshold` to the whole ring, so the
+    /// device waits for a full buffer before it begins. That is the point — it
+    /// is what stops playback beginning on an empty ring and racing from the
+    /// first period. But it means a stream that will never receive a full ring
+    /// never starts at all, and the failure mode is the worst kind: no sound,
+    /// no error, no log line.
+    ///
+    /// Every place where the producer knows no more data is coming, or that it
+    /// cannot supply a ring's worth in reasonable time, must call this:
+    ///
+    /// - the end of a track, before draining the tail,
+    /// - after a keep-alive silence top-up, whose depth is a FRACTION of the
+    ///   ring by design and so can never reach the threshold on its own,
+    /// - on resume, where a pause has left the PCM prepared and empty,
+    /// - the writer's prime deadline, for a source too slow to fill the ring.
+    ///
+    /// A no-op in every other state, so it is safe to call speculatively.
+    pub fn start_if_prepared(&self) -> Result<(), String> {
+        let pcm = self
+            .pcm
+            .lock()
+            .map_err(|_| "ALSA PCM mutex poisoned".to_string())?;
+        if !matches!(pcm.state(), alsa::pcm::State::Prepared) {
+            return Ok(());
+        }
+        match pcm.start() {
+            Ok(()) => {
+                log::debug!("[ALSA Direct] started a primed-but-idle stream explicitly");
+                Ok(())
+            }
+            // Racing the auto-start is fine: something else already started it.
+            Err(e) if matches!(pcm.state(), alsa::pcm::State::Running) => {
+                log::debug!(
+                    "[ALSA Direct] explicit start raced the auto-start ({e}); already running"
+                );
+                Ok(())
+            }
+            Err(e) => Err(format!("Failed to start PCM: {e}")),
+        }
+    }
+
+    /// The ring and period the driver granted, in frames.
+    pub fn buffer_frames(&self) -> usize {
+        self.buffer_frames.max(0) as usize
+    }
+
+    pub fn period_frames(&self) -> usize {
+        self.period_frames.max(0) as usize
+    }
+
+    /// False when ALSA's plug layer is rate-converting under this stream.
+    ///
+    /// Only ever false for a non-`hw:` output that could not deliver the
+    /// track's rate; see the two-attempt configuration in [`Self::new`]. The
+    /// renderer should not claim bit-perfect output when this is false.
+    pub fn is_bit_perfect(&self) -> bool {
+        !self.resampled
     }
 
     /// Top the ring up to `target_ms` of SILENCE, so the clock keeps running
@@ -1056,8 +1455,12 @@ impl AlsaDirectStream {
         if target_ms == 0 {
             return Ok(0);
         }
-        if matches!(self.format, Format::DSDU32BE | Format::DSDU32LE) {
-            // Belt and braces: DoP silence is not zeros.
+        // Keyed on the stream's ROLE, not its format. A DoP carrier is `S32LE`,
+        // indistinguishable from a PCM stream by format alone, and digital zero
+        // is not silence in DoP — it is a broken marker pattern, which a DAC
+        // locked in DSD renders as noise. The old check tested the format and
+        // so caught native DSD but missed every DoP stream.
+        if self.dsd_carrier {
             return Ok(0);
         }
 
@@ -1076,10 +1479,29 @@ impl AlsaDirectStream {
                 return Ok(0);
             }
             // `avail_update` can fail here in the ordinary course of things: a
-            // natural end leaves the pcm freshly prepared. Treat that as an
-            // empty ring rather than an error — the write below is what starts
-            // it, and a real error surfaces there.
-            let avail = pcm.avail_update().map(|f| f.max(0) as usize).unwrap_or(0);
+            // natural end leaves the pcm freshly prepared, and an underrun
+            // leaves it in XRun.
+            //
+            // The XRun case used to be fatal to the whole feature, silently.
+            // `unwrap_or(0)` made `avail` zero, so `held` came out as the whole
+            // ring, so `silence_frames_needed` returned 0 and this function
+            // returned `Ok(0)` — for the rest of the gap, and the rest of the
+            // stream. The keep-alive stopped writing at exactly the moment its
+            // job began, and the clock stopped, which is the click it exists to
+            // prevent. Recover first, then measure the recovered stream.
+            let avail = match pcm.avail_update() {
+                Ok(f) => f.max(0) as usize,
+                Err(e) => {
+                    if let Err(msg) = recover_write_error(&pcm, e.errno(), "(keep-alive)") {
+                        log::warn!("[ALSA Direct] keep-alive could not recover the pcm: {msg}");
+                        return Ok(0);
+                    }
+                    // A recovered stream is prepared and empty.
+                    pcm.avail_update()
+                        .map(|f| f.max(0) as usize)
+                        .unwrap_or(buffer_frames)
+                }
+            };
             let held = buffer_frames.saturating_sub(avail);
             // The ring's own length in ms is what the depth is resolved
             // against, so read it from the frames the device actually gave us
@@ -1096,12 +1518,20 @@ impl AlsaDirectStream {
             return Ok(0);
         }
 
-        let mut scratch = self.scratch.lock().unwrap();
-        let bytes = &mut scratch.bytes;
-        bytes.clear();
-        bytes.resize(frames * frame_bytes, 0);
-        self.write_bytes_interruptible(bytes, cancel)?;
-        Ok(frames)
+        let written = {
+            let mut scratch = self.scratch.lock().unwrap();
+            let bytes = &mut scratch.bytes;
+            bytes.clear();
+            bytes.resize(frames * frame_bytes, 0);
+            self.write_bytes_interruptible(bytes, cancel)?
+        };
+
+        // The depth this holds is a FRACTION of the ring, so it can never reach
+        // `start_threshold` on its own. Without this the keep-alive would queue
+        // silence against a stream that never starts clocking — the exact
+        // opposite of what it is for.
+        self.start_if_prepared()?;
+        Ok(written)
     }
 
     /// Write `data` to ALSA in bounded steps, releasing the PCM lock between
@@ -1119,14 +1549,32 @@ impl AlsaDirectStream {
     /// says it has (so `writei` cannot block), and when there is no space it
     /// waits at most `WAIT_MS` before letting go of the lock and re-checking
     /// `cancel`. The worst a stop can wait for the mutex is one `WAIT_MS`.
-    fn write_bytes_interruptible(&self, data: &[u8], cancel: &AtomicBool) -> Result<(), String> {
+    ///
+    /// # The return value is a contract, not a convenience
+    ///
+    /// Returns the number of FRAMES the device accepted, which is not always
+    /// every frame offered: a `cancel` mid-chunk returns early. The caller uses
+    /// this to advance its own idea of what has been handed over, so returning
+    /// `Ok(())` — as this used to — silently skipped whatever the cancel left
+    /// behind.
+    ///
+    /// # Underruns lose audio; they do not repeat it
+    ///
+    /// `offset` advances only on a successful `writei`, so the bytes a failed
+    /// call rejected are retried, which is continuing rather than replaying.
+    /// What an xrun DOES lose is the frames ALSA had already accepted and then
+    /// discarded — those stay counted here as accepted, because they were. The
+    /// audible result is a gap, never a stutter-with-repeat, and the position
+    /// derived from `handed - delay` jumps forward by exactly the lost amount,
+    /// which is the truth about where the track now is.
+    fn write_bytes_interruptible(&self, data: &[u8], cancel: &AtomicBool) -> Result<usize, String> {
         /// Long enough not to spin, short enough that a stop is never stuck
         /// behind it. The ALSA buffer is hundreds of ms, so this is well inside
         /// one refill.
         const WAIT_MS: u32 = 200;
 
         if data.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
 
         let (frame_bytes, buffer_frames) = {
@@ -1157,7 +1605,7 @@ impl AlsaDirectStream {
                     "[ALSA Direct] write cancelled with {} bytes left",
                     data.len() - offset
                 );
-                return Ok(());
+                return Ok(offset / frame_bytes);
             }
 
             let pcm = self.pcm.lock().unwrap();
@@ -1229,7 +1677,7 @@ impl AlsaDirectStream {
                 }
             }
         }
-        Ok(())
+        Ok(offset / frame_bytes)
     }
 
     /// Drain and stop playback
@@ -1240,10 +1688,21 @@ impl AlsaDirectStream {
         // sample the track ended on. Unless the track faded to zero, that step
         // is the pop heard after every song, at every sample rate.
         //
-        // Pad first, so the tail the DAC hears last is silence and the
-        // underrun happens on zeros. Skipped automatically when the stream is
-        // not running (see `pad_with_silence`).
-        self.pad_with_silence(STOP_PAD_MS);
+        // ORDER MATTERS, and it is not the obvious one.
+        //
+        // `fade_out_and_pad` does nothing unless the stream is RUNNING — which,
+        // with `start_threshold` set to the whole ring, a short track or a short
+        // tail is not: it is still Prepared, holding audio the device has not
+        // been told to play. Padding first would skip the ramp on exactly the
+        // tracks that end soonest after their last write, and then start a
+        // stream whose final sample is the raw track end.
+        //
+        // So: start the clock if it is waiting, THEN ramp down, THEN wait for
+        // the tail. `start_if_prepared` is a no-op on an already-running stream.
+        if let Err(e) = self.start_if_prepared() {
+            log::warn!("[ALSA Direct] could not start a prepared stream before draining: {e}");
+        }
+        self.fade_out_and_pad(FADE_MS, STOP_PAD_MS);
         log::info!("[ALSA Direct] Draining PCM");
         let pcm = self.pcm.lock().unwrap();
         // BOUNDED drain — a bare `snd_pcm_drain` blocks until every queued
@@ -1291,20 +1750,30 @@ impl AlsaDirectStream {
     }
 
     /// Stop PCM immediately (prepare for next playback)
-    /// Write `pad_ms` of digital silence, so a stop lands on zero.
+    /// Ramp the signal down to zero over `fade_ms`, then hold silence for
+    /// `pad_ms`, so the clock stops from a settled state AND gets there without
+    /// a step. See [`fade_ramp_into`] for why both halves are needed.
     ///
     /// Bounded by a deadline rather than by a cancel flag: this runs on the
     /// stop path, where every caller has already given up on the stream, and a
     /// device that has stopped draining must not be able to hold the stop open.
     /// A pad that does not make it out is not worth waiting for.
     #[cfg(target_os = "linux")]
-    fn pad_with_silence(&self, pad_ms: u32) {
-        if pad_ms == 0 {
+    fn fade_out_and_pad(&self, fade_ms: u32, pad_ms: u32) {
+        if fade_ms == 0 && pad_ms == 0 {
             return;
         }
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_millis(u64::from(pad_ms) * 2);
-        let (frame_bytes, frames) = {
+        // Digital zero is silence in PCM and noise in DoP, whose idle pattern
+        // carries markers. A DoP stream's own writer pads it correctly; this
+        // must not touch it. Checked on the stream's role, not its format —
+        // a DoP carrier IS `S32LE`.
+        if self.dsd_carrier {
+            return;
+        }
+
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(u64::from(fade_ms + pad_ms) * 2);
+        let frame_bytes = {
             let pcm = self.pcm.lock().unwrap();
             // Nothing to settle unless the clock is actually running.
             if !matches!(pcm.state(), alsa::pcm::State::Running) {
@@ -1314,16 +1783,37 @@ impl AlsaDirectStream {
             if fb <= 0 {
                 return;
             }
-            (fb as usize, pad_frames(self.sample_rate, pad_ms))
+            fb as usize
         };
+
+        let layout = match SampleLayout::for_format(self.format) {
+            Some(l) => l,
+            None => return,
+        };
+        let channels = usize::from(self.channels).max(1);
+        let last: Vec<f32> = self
+            .last_frame
+            .lock()
+            .ok()
+            .filter(|f| f.len() == channels)
+            .map(|f| f.clone())
+            .unwrap_or_else(|| vec![0.0; channels]);
 
         let mut scratch = match self.scratch.lock() {
             Ok(s) => s,
             Err(_) => return,
         };
+        // Ramp down from wherever the signal was, then hold silence. Built as
+        // f32 and encoded once, so it goes out in the device's own format.
+        let mut ramp: Vec<f32> = Vec::new();
+        fade_ramp_into(&last, pad_frames(self.sample_rate, fade_ms), &mut ramp);
+        ramp.resize(
+            ramp.len() + pad_frames(self.sample_rate, pad_ms) * channels,
+            0.0,
+        );
         let bytes = &mut scratch.bytes;
         bytes.clear();
-        bytes.resize(frames * frame_bytes, 0);
+        encode_into(layout, &ramp, bytes);
 
         let mut offset = 0usize;
         while offset < bytes.len() && std::time::Instant::now() < deadline {
@@ -1351,10 +1841,44 @@ impl AlsaDirectStream {
         }
     }
 
+    /// Discard whatever the device is still holding and make it ready again.
+    ///
+    /// The pause primitive. Deliberately does NOT ramp first, because a ramp
+    /// here could not be heard: the queue already holds up to a whole ring of
+    /// committed audio, a ramp written now would sit behind all of it, and the
+    /// drop below throws the lot away. Putting a ramp AHEAD of committed frames
+    /// needs `snd_pcm_rewind`, which alsa-rs 0.11 neither wraps nor exposes a
+    /// PCM handle for — so the honest thing is to make the pause immediate and
+    /// LOSSLESS (the writer hands the discarded frames back on resume) rather
+    /// than to advertise a fade that does not happen.
+    ///
+    /// What this does remove is the xrun. Today a pause simply stops writing:
+    /// the device plays out a ring's worth of audio nobody asked for and then
+    /// underruns, so every pause ends in a click.
+    pub fn discard_queued(&self) -> Result<(), String> {
+        let pcm = self
+            .pcm
+            .lock()
+            .map_err(|_| "ALSA PCM mutex poisoned".to_string())?;
+        // Same drop-then-prepare ritual as `stop`, and for the same reason:
+        // `prepare()` alone on a running stream is EBUSY on drivers that want
+        // an explicit drop first, and a failed prepare leaves the PCM in a
+        // limbo that the next write surfaces as unrecoverable EBADFD.
+        if let Err(e) = PCM::drop(&pcm) {
+            // libc::EBADFD — it was not running; nothing to discard.
+            const EBADFD: i32 = 77;
+            if e.errno() != EBADFD {
+                log::warn!("[ALSA Direct] drop on pause failed (continuing to prepare): {e}");
+            }
+        }
+        pcm.prepare()
+            .map_err(|e| format!("Failed to prepare PCM after pause: {e}"))
+    }
+
     pub fn stop(&self) -> Result<(), String> {
         // Land on silence before halting the clock, so the DAC is not left
         // holding whatever sample the track ended on. See `STOP_PAD_MS`.
-        self.pad_with_silence(STOP_PAD_MS);
+        self.fade_out_and_pad(FADE_MS, STOP_PAD_MS);
         log::info!("[ALSA Direct] Stopping PCM");
         let pcm = self.pcm.lock().unwrap();
         // Standard immediate-stop ritual: DROP (halt now, discard queued
@@ -1532,8 +2056,40 @@ impl AlsaDirectStream {
         &self,
         _samples: &[f32],
         _cancel: &std::sync::atomic::AtomicBool,
-    ) -> Result<(), String> {
+    ) -> Result<usize, String> {
         Err("ALSA Direct is only available on Linux".to_string())
+    }
+
+    pub fn write_dop_i32(
+        &self,
+        _samples: &[i32],
+        _cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<usize, String> {
+        Err("ALSA Direct is only available on Linux".to_string())
+    }
+
+    pub fn buffer_frames(&self) -> usize {
+        0
+    }
+
+    pub fn period_frames(&self) -> usize {
+        0
+    }
+
+    pub fn delay_frames(&self) -> usize {
+        0
+    }
+
+    pub fn is_bit_perfect(&self) -> bool {
+        false
+    }
+
+    pub fn start_if_prepared(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    pub fn discard_queued(&self) -> Result<(), String> {
+        Ok(())
     }
 
     pub fn write_silence_to_depth(
@@ -1884,6 +2440,91 @@ mod mixer_name_tests {
 
     /// Sizes and multi-sample runs: three samples must produce exactly three
     /// samples' worth of bytes, with nothing lost or padded.
+    /// `encode_into` APPENDS, and several callers rely on that — the fade
+    /// builds its ramp and then its silence pad into one buffer. A rewrite that
+    /// resized from 0 instead of from `out.len()` would pass every other test
+    /// in this module, because they all start from an empty `Vec`. This is the
+    /// one that would catch it.
+    #[test]
+    fn encoding_appends_rather_than_replacing() {
+        use super::{encode_into, SampleLayout};
+
+        let mut out: Vec<u8> = vec![0xAA, 0xBB, 0xCC];
+        encode_into(SampleLayout::S16Le, &[0.0, 1.0], &mut out);
+        assert_eq!(
+            &out[..3],
+            &[0xAA, 0xBB, 0xCC],
+            "pre-existing bytes were overwritten"
+        );
+        assert_eq!(out.len(), 3 + 2 * 2, "appended block is the wrong size");
+
+        // A second append lands after the first, not on top of it.
+        let after_first = out.len();
+        encode_into(SampleLayout::S16Le, &[0.0], &mut out);
+        assert_eq!(out.len(), after_first + 2);
+    }
+
+    /// The ramp is the whole point of the stop pad: a jump from the last sample
+    /// to zero is the same click the pad exists to remove.
+    #[test]
+    fn the_fade_starts_where_the_audio_stopped_and_reaches_exact_silence() {
+        use super::fade_ramp_into;
+
+        let last = [0.8f32, -0.6];
+        let frames = 64;
+        let mut out = Vec::new();
+        fade_ramp_into(&last, frames, &mut out);
+        assert_eq!(out.len(), frames * last.len());
+
+        // Starts exactly on the last frame: no step into the ramp.
+        assert_eq!(out[0], 0.8);
+        assert_eq!(out[1], -0.6);
+
+        // Monotone towards zero on each channel, and the magnitude never grows.
+        for ch in 0..last.len() {
+            let mut previous = f32::MAX;
+            for f in 0..frames {
+                let magnitude = out[f * last.len() + ch].abs();
+                assert!(
+                    magnitude <= previous + f32::EPSILON,
+                    "channel {ch} grew at frame {f}"
+                );
+                previous = magnitude;
+            }
+        }
+
+        // And it gets all the way there: the final frame is EXACTLY silence,
+        // not one LSB short of it, so the pad that follows is continuous.
+        let tail = &out[out.len() - last.len()..];
+        for &sample in tail {
+            assert_eq!(sample, 0.0, "ramp ended at {sample}, not silence");
+        }
+
+        // A single-frame ramp is degenerate but must still be silence rather
+        // than a full-amplitude sample: it is the last thing the DAC hears.
+        let mut one = Vec::new();
+        fade_ramp_into(&last, 1, &mut one);
+        assert_eq!(one, vec![0.0, 0.0]);
+    }
+
+    /// A silent stream fades to silence rather than to a division by zero, and
+    /// a degenerate request produces nothing rather than panicking. Both reach
+    /// this from the stop path, where a panic is silence with no recovery.
+    #[test]
+    fn a_degenerate_fade_is_empty_rather_than_a_panic() {
+        use super::fade_ramp_into;
+
+        let mut out = Vec::new();
+        fade_ramp_into(&[], 32, &mut out);
+        assert!(out.is_empty(), "no channels means no ramp");
+
+        fade_ramp_into(&[0.5, 0.5], 0, &mut out);
+        assert!(out.is_empty(), "no frames means no ramp");
+
+        fade_ramp_into(&[0.0, 0.0], 8, &mut out);
+        assert_eq!(out, vec![0.0; 16], "silence fades to silence");
+    }
+
     #[test]
     fn encoding_is_dense_and_correctly_sized() {
         use super::{encode_into, SampleLayout};

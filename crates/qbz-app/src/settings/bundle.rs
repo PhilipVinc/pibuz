@@ -752,6 +752,8 @@ fn plan_audio(
                     | "volume_curve"
                     | "alsa_buffer_ms"
                     | "dac_keepalive_ms"
+                    | "pcm_ring_ms"
+                    | "writer_rt_priority"
                     | "cache_to_disk"
                     | "dsd_mode"
             )
@@ -959,6 +961,21 @@ fn plan_audio_machine(
     // about a stopped clock, not which device is attached.
     if let Some(v) = map.get("dac_keepalive_ms") {
         applied_line(plan, "audio.dac_keepalive_ms", v, "");
+    }
+
+    // pcm_ring_ms — depth of the decoded-audio ring. Portable for the same
+    // reason as alsa_buffer_ms: it describes how much slack this host's network
+    // and storage need, not which DAC is plugged into it. `auto` on the far end
+    // simply re-derives from that box's own memory profile.
+    if let Some(v) = map.get("pcm_ring_ms") {
+        applied_line(plan, "audio.pcm_ring_ms", v, "");
+    }
+
+    // writer_rt_priority — whether the ALSA writer thread asks for SCHED_FIFO.
+    // Portable: it is a statement about how contended this host's CPU is, and
+    // the request degrades to a log line wherever the rlimit is absent.
+    if let Some(v) = map.get("writer_rt_priority") {
+        applied_line(plan, "audio.writer_rt_priority", v, "");
     }
 
     // cache_to_disk — whether the L2 cache is written at all. A host preference

@@ -9,6 +9,10 @@ repository.workspace = true
 [dependencies]
 qbz-models = { path = "../qbz-models" }
 qbz-audio = { path = "../qbz-audio" }
+
+# Lock-free SPSC ring for the decoder -> ALSA-writer handoff. Same crate and
+# same idiom the JACK feeder already uses in qbz-audio; see player/playback_engine.rs.
+ringbuf = "0.4"
 qbz-qobuz = { path = "../qbz-qobuz" }
 qbz-cmaf = { path = "../qbz-cmaf" }
 qbz-dsd = { path = "../qbz-dsd" }

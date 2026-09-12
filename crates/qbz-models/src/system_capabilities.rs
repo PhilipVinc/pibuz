@@ -53,6 +53,24 @@ pub struct MemoryProfile {
     /// Whether this host may prefetch the NEXT track at all — i.e. whether
     /// gapless is possible here. See [`GAPLESS_MIN_TOTAL_KB`].
     pub allow_gapless_prefetch: bool,
+    /// Seconds of DECODED audio to hold between the decoder and the DAC.
+    ///
+    /// This is the renderer's entire tolerance for a stall — a WiFi dropout, an
+    /// SD-card seek, a slow FLAC frame. Anything longer than this is an audible
+    /// click, so the number is the reliability budget, not a tuning knob.
+    ///
+    /// It is cheap where it matters. The ring holds interleaved `f32`, so a
+    /// second costs `rate * channels * 4` bytes: 353 KB at 44.1 kHz stereo and
+    /// 1.5 MB at 192 kHz. Six seconds of Hi-Res is ~9 MB, against the ~120-220 MB
+    /// the same track already occupies as compressed bytes — a rounding error on
+    /// a board that can play Hi-Res at all.
+    ///
+    /// Two seconds on a small board rather than six for the same reason
+    /// `allow_hires_prefetch` is false there: a 512 MB Pi has no 9 MB to spare,
+    /// and two seconds still covers every stall short of a genuine network
+    /// outage. Reference points: squeezelite's output buffer is ~10 s of CD
+    /// audio, MPD's decoded-chunk pipe a few seconds.
+    pub pcm_ring_seconds: u8,
 }
 
 /// Least RAM a host needs before it may hold a second whole track.
@@ -119,6 +137,10 @@ pub fn l1_cache_bytes_for_total_kb(mem_total_kb: u64) -> usize {
         .min(L1_CACHE_MAX_BYTES)
 }
 
+/// Decoded-audio ring depth per class. See [`MemoryProfile::pcm_ring_seconds`].
+const PCM_RING_SECONDS_NORMAL: u8 = 6;
+const PCM_RING_SECONDS_LOW_MEMORY: u8 = 2;
+
 impl MemoryProfile {
     /// Derive the profile from a total-memory figure (KB).
     fn from_total_kb(mem_total_kb: u64) -> Self {
@@ -142,6 +164,7 @@ impl MemoryProfile {
                 allow_hires_prefetch: true,
                 audio_cache_l1_max_bytes: l1_cache_bytes_for_total_kb(mem_total_kb),
                 allow_gapless_prefetch: mem_total_kb >= GAPLESS_MIN_TOTAL_KB,
+                pcm_ring_seconds: PCM_RING_SECONDS_NORMAL,
             }
         } else {
             Self {
@@ -153,6 +176,7 @@ impl MemoryProfile {
                 allow_hires_prefetch: false,
                 audio_cache_l1_max_bytes: l1_cache_bytes_for_total_kb(mem_total_kb),
                 allow_gapless_prefetch: mem_total_kb >= GAPLESS_MIN_TOTAL_KB,
+                pcm_ring_seconds: PCM_RING_SECONDS_LOW_MEMORY,
             }
         }
     }
@@ -282,6 +306,35 @@ pub fn memory_profile() -> &'static MemoryProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ring is the stall budget, so the small board must still get a real
+    /// one — and the big board must not get so much that the allocation itself
+    /// becomes the memory problem.
+    #[test]
+    fn the_decoded_ring_is_sized_by_class_and_stays_cheap() {
+        let pi3a = MemoryProfile::from_total_kb(439 * 1024);
+        let pi5 = MemoryProfile::from_total_kb(4 * 1024 * 1024);
+        assert_eq!(pi3a.class, MemoryClass::LowMemory);
+        assert_eq!(pi5.class, MemoryClass::Normal);
+        assert!(
+            pi3a.pcm_ring_seconds >= 2,
+            "a small board still needs a cushion"
+        );
+        assert!(pi3a.pcm_ring_seconds < pi5.pcm_ring_seconds);
+
+        // The worst case the ring is ever asked to hold: 24/192 stereo f32.
+        let bytes = |secs: u8| usize::from(secs) * 192_000 * 2 * 4;
+        assert!(
+            bytes(pi3a.pcm_ring_seconds) <= 4 * 1024 * 1024,
+            "LowMemory ring is {} bytes at 192 kHz",
+            bytes(pi3a.pcm_ring_seconds)
+        );
+        assert!(
+            bytes(pi5.pcm_ring_seconds) <= 16 * 1024 * 1024,
+            "Normal ring is {} bytes at 192 kHz",
+            bytes(pi5.pcm_ring_seconds)
+        );
+    }
 
     #[test]
     fn parse_meminfo_total_kb_extracts_value() {

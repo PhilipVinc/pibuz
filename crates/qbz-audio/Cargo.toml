@@ -47,6 +47,9 @@ ringbuf = "0.4"
 [target.'cfg(target_os = "linux")'.dependencies]
 # ALSA for direct hardware access (bit-perfect)
 alsa = "0.11"
+# pthread_setschedparam, for putting the ALSA writer thread on SCHED_FIFO.
+# See src/rt.rs for why that thread and no other.
+libc = "0.2"
 # alsa-sys: direct FFI for snd_lib_error_set_handler (custom error routing).
 # Kept in lockstep with alsa (0.11 -> alsa-sys 0.4); a single alsa-sys is
 # required because of the `links = "alsa"` constraint shared with cpal.

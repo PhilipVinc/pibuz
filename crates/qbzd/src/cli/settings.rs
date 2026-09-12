@@ -87,6 +87,12 @@ const KEY_TABLE: &[(&str, ApplyClass)] = &[
     // Read by the writer thread on every idle turn, so a change takes effect
     // at the next gap without touching the stream.
     ("audio.dac_keepalive_ms", ApplyClass::None),
+    // Sized when the decoder ring is built, i.e. when a stream opens: Reinit so
+    // it applies to the next track rather than the next daemon start.
+    ("audio.pcm_ring_ms", ApplyClass::Reinit),
+    // The promotion happens as the writer thread starts, and the value is read
+    // once when the player does: next daemon start.
+    ("audio.writer_rt_priority", ApplyClass::None),
     ("audio.limit_quality_to_device", ApplyClass::Reload),
     ("audio.allow_quality_fallback", ApplyClass::Reload),
     ("audio.quality_fallback_behavior", ApplyClass::Reload),
@@ -321,6 +327,51 @@ fn parse_alsa_buffer_ms(v: &str) -> Result<u16, String> {
     Ok(n)
 }
 
+/// `auto` (or `0`) takes the host memory profile's figure; anything else is the
+/// decoded-ring depth in ms, 250-30000.
+///
+/// The floor is 250 ms because a ring thinner than the hardware ring it feeds
+/// is not a cushion at all. The ceiling is 30 s because past that the ring stops
+/// being a jitter budget and starts being a second copy of the track.
+fn parse_pcm_ring_ms(v: &str) -> Result<u32, String> {
+    let v = v.trim();
+    if v.eq_ignore_ascii_case("auto") {
+        return Ok(0);
+    }
+    let n: u32 = v
+        .parse()
+        .map_err(|_| format!("invalid ring depth '{v}' — expected 'auto' or 250-30000 (ms)"))?;
+    if n != 0 && !(250..=30_000).contains(&n) {
+        return Err(format!(
+            "ring depth {n} ms out of range — expected 'auto' or 250-30000"
+        ));
+    }
+    Ok(n)
+}
+
+/// `off` (or `0`) leaves the writer thread at ordinary priority; anything else
+/// is its `SCHED_FIFO` priority, 1-20.
+///
+/// Capped at 20 to match `LimitRTPRIO=` in the shipped units, and because
+/// nothing is gained above it: the writer only needs to outrank `SCHED_OTHER`,
+/// and must NOT outrank the kernel IRQ threads (conventionally 50) servicing
+/// the USB bus the audio leaves through.
+fn parse_writer_rt_priority(v: &str) -> Result<u8, String> {
+    let v = v.trim();
+    if v.eq_ignore_ascii_case("off") {
+        return Ok(0);
+    }
+    let n: u8 = v
+        .parse()
+        .map_err(|_| format!("invalid priority '{v}' — expected 'off' or 1-20"))?;
+    if n > 20 {
+        return Err(format!(
+            "priority {n} out of range — expected 'off' or 1-20"
+        ));
+    }
+    Ok(n)
+}
+
 /// `off` (or `0`) disables the DAC keep-alive; anything else is the depth of
 /// silence to hold during a gap, 10-500 ms.
 ///
@@ -484,6 +535,20 @@ fn read_all(roots: &ProfileRoots) -> Result<Vec<(&'static str, String)>, String>
                     "off".to_string()
                 } else {
                     audio.dac_keepalive_ms.to_string()
+                }
+            }
+            "audio.pcm_ring_ms" => {
+                if audio.pcm_ring_ms == 0 {
+                    "auto".to_string()
+                } else {
+                    audio.pcm_ring_ms.to_string()
+                }
+            }
+            "audio.writer_rt_priority" => {
+                if audio.writer_rt_priority == 0 {
+                    "off".to_string()
+                } else {
+                    audio.writer_rt_priority.to_string()
                 }
             }
             "audio.limit_quality_to_device" => render_bool(audio.limit_quality_to_device),
@@ -674,6 +739,20 @@ pub(crate) fn write_one(
             open_audio(roots)
                 .map_err(SetError::Io)?
                 .set_dac_keepalive_ms(v)
+                .map_err(SetError::Io)?
+        }
+        "audio.pcm_ring_ms" => {
+            let v = parse_pcm_ring_ms(raw).map_err(SetError::Usage)?;
+            open_audio(roots)
+                .map_err(SetError::Io)?
+                .set_pcm_ring_ms(v)
+                .map_err(SetError::Io)?
+        }
+        "audio.writer_rt_priority" => {
+            let v = parse_writer_rt_priority(raw).map_err(SetError::Usage)?;
+            open_audio(roots)
+                .map_err(SetError::Io)?
+                .set_writer_rt_priority(v)
                 .map_err(SetError::Io)?
         }
         "audio.cache_to_disk" => {
@@ -1612,6 +1691,59 @@ mod tests {
         assert_eq!(values["playback.autoplay"], "track_only");
         assert_eq!(values["qconnect.device_name"], "Kitchen");
         assert_eq!(values["qconnect.startup_mode"], "on");
+        cleanup(&roots);
+    }
+
+    #[test]
+    fn the_decoded_ring_round_trips_and_refuses_a_depth_thinner_than_the_hardware_ring() {
+        let roots = scratch_roots("pcm_ring");
+        // Auto is the default and shows as a word, not a zero: the number it
+        // resolves to is the host's, not the user's.
+        let values: std::collections::HashMap<_, _> =
+            read_all(&roots).unwrap().into_iter().collect();
+        assert_eq!(values["audio.pcm_ring_ms"], "auto");
+
+        write_one(&roots, "audio.pcm_ring_ms", "4000").expect("set depth");
+        let values: std::collections::HashMap<_, _> =
+            read_all(&roots).unwrap().into_iter().collect();
+        assert_eq!(values["audio.pcm_ring_ms"], "4000");
+
+        write_one(&roots, "audio.pcm_ring_ms", "auto").expect("back to auto");
+        let values: std::collections::HashMap<_, _> =
+            read_all(&roots).unwrap().into_iter().collect();
+        assert_eq!(values["audio.pcm_ring_ms"], "auto");
+
+        // Thinner than the ALSA ring it feeds is not a cushion; 30 s of decoded
+        // audio is a second copy of the track, not a jitter budget.
+        assert!(write_one(&roots, "audio.pcm_ring_ms", "100").is_err());
+        assert!(write_one(&roots, "audio.pcm_ring_ms", "60000").is_err());
+        assert!(write_one(&roots, "audio.pcm_ring_ms", "lots").is_err());
+        cleanup(&roots);
+    }
+
+    #[test]
+    fn the_writer_priority_round_trips_and_stays_under_the_irq_threads() {
+        let roots = scratch_roots("rt_priority");
+        // On by default — it degrades to a log line where the rlimit is absent,
+        // so there is nothing to protect a host from.
+        let values: std::collections::HashMap<_, _> =
+            read_all(&roots).unwrap().into_iter().collect();
+        assert_eq!(values["audio.writer_rt_priority"], "5");
+
+        write_one(&roots, "audio.writer_rt_priority", "off").expect("turn it off");
+        let values: std::collections::HashMap<_, _> =
+            read_all(&roots).unwrap().into_iter().collect();
+        assert_eq!(values["audio.writer_rt_priority"], "off");
+
+        write_one(&roots, "audio.writer_rt_priority", "10").expect("set priority");
+        let values: std::collections::HashMap<_, _> =
+            read_all(&roots).unwrap().into_iter().collect();
+        assert_eq!(values["audio.writer_rt_priority"], "10");
+
+        // Above the shipped LimitRTPRIO, and on a path towards outranking the
+        // kernel IRQ threads the audio itself depends on.
+        assert!(write_one(&roots, "audio.writer_rt_priority", "50").is_err());
+        assert!(write_one(&roots, "audio.writer_rt_priority", "yes").is_err());
         cleanup(&roots);
     }
 

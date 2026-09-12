@@ -59,11 +59,12 @@ docker run --rm \
   -v "$MOUNT_ROOT:/work" \
   -v qbzd-cargo-registry:/usr/local/cargo/registry \
   -v qbzd-target-aarch64:/target \
-  -w "/work/$REL/crates" \
+  -w "/work/$REL" \
   "$IMAGE" \
   bash -lc '
     set -e
-    # The mount trap: an unshared host path shows up as an empty directory.
+    # The mount trap: an unshared host path shows up as an empty directory,
+    # not as an error, so a build can "succeed" against no source at all.
     test -f Cargo.toml || { echo "no Cargo.toml at $PWD — colima is not sharing this checkout"; exit 1; }
     CARGO_TARGET_DIR=/target QBZD_BUILD_ID="$QBZD_BUILD_ID" cargo build --release -p qbzd
     mkdir -p "/work/'"$REL"'/dist"

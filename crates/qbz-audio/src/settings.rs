@@ -89,6 +89,32 @@ pub struct AudioSettings {
     /// whatever silence is queued is latency the next track waits behind.
     #[serde(default)]
     pub dac_keepalive_ms: u16,
+    /// Milliseconds of DECODED audio to keep buffered ahead of the DAC; `0`
+    /// (the default) takes the host's memory profile figure.
+    ///
+    /// Distinct from [`Self::alsa_buffer_ms`], and the more important of the
+    /// two. That one sizes the hardware ring the DAC drains; this one sizes the
+    /// ring the DECODER fills, which is what stands between a network stall and
+    /// a click. Before it existed the hardware ring was the only cushion, and a
+    /// WiFi hiccup longer than 125 ms at CD rate was audible.
+    ///
+    /// Clamped to 250-30000 ms, and never allowed below three times the ALSA
+    /// ring (the writer would deadlock against a hardware queue deeper than its
+    /// own supply). Costs `rate * channels * 4` bytes per second: 353 KB/s at
+    /// 44.1 kHz stereo, 1.5 MB/s at 192 kHz.
+    #[serde(default)]
+    pub pcm_ring_ms: u32,
+    /// `SCHED_FIFO` priority for the ALSA writer thread; `0` disables the
+    /// promotion and leaves it at ordinary priority.
+    ///
+    /// Needs `LimitRTPRIO=` in the service unit (both generated units set 20).
+    /// Without it the request returns `EPERM`, which is logged once and
+    /// otherwise harmless — playback is unaffected, just more exposed to a
+    /// scheduling delay becoming a click on a busy Pi.
+    ///
+    /// Clamped to 0-20. See `qbz_audio::rt` for why the default is as low as 5.
+    #[serde(default = "default_writer_rt_priority")]
+    pub writer_rt_priority: u8,
     /// Write cached tracks to the L2 disk cache.
     ///
     /// False keeps caching in memory only: gapless still works (the next track
@@ -166,6 +192,14 @@ fn default_cache_to_disk() -> bool {
     true
 }
 
+/// On by default. The promotion needs an rlimit the service unit grants, and
+/// degrades to a single info line where it is absent, so defaulting it on costs
+/// nothing on a host that cannot use it and is the right answer on every host
+/// that can. See [`crate::rt`].
+fn default_writer_rt_priority() -> u8 {
+    crate::rt::DEFAULT_WRITER_RT_PRIORITY
+}
+
 fn default_volume_curve() -> String {
     crate::volume_curve::VolumeCurve::Perceptual
         .as_key()
@@ -201,6 +235,8 @@ impl Default for AudioSettings {
             volume_curve: default_volume_curve(),
             alsa_buffer_ms: 0,   // 0 = derive from the sample rate
             dac_keepalive_ms: 0, // 0 = off, like shairport-sync and MPD default it
+            pcm_ring_ms: 0,      // 0 = take the host memory profile's figure
+            writer_rt_priority: default_writer_rt_priority(),
             cache_to_disk: default_cache_to_disk(),
             limit_quality_to_device: false, // Opt-in. Off since 1.1.9 (#45); wired to the read-only probe in #638 fix 3
             device_max_sample_rate: None,   // Set when device is selected
@@ -349,6 +385,14 @@ impl AudioSettingsStore {
             "ALTER TABLE audio_settings ADD COLUMN dac_keepalive_ms INTEGER DEFAULT 0",
             [],
         );
+        let _ = conn.execute(
+            "ALTER TABLE audio_settings ADD COLUMN pcm_ring_ms INTEGER DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE audio_settings ADD COLUMN writer_rt_priority INTEGER DEFAULT 5",
+            [],
+        );
 
         // Seed the single settings row on first run with the OOTB default backend
         // ("System"). INSERT OR IGNORE is a one-time seed: it only fires when the
@@ -414,7 +458,7 @@ impl AudioSettingsStore {
     pub fn get_settings(&self) -> Result<AudioSettings, String> {
         self.conn
             .query_row(
-                "SELECT output_device, exclusive_mode, dac_passthrough, preferred_sample_rate, backend_type, alsa_plugin, alsa_hardware_volume, stream_first_track, stream_buffer_seconds, streaming_only, limit_quality_to_device, device_max_sample_rate, normalization_enabled, normalization_target_lufs, gapless_enabled, device_sample_rate_limits, pw_force_bitperfect, sync_audio_on_startup, quality_fallback_behavior, skip_sink_switch, allow_quality_fallback, reserve_dac_while_running, dsd_mode, memory_cache_mb, alsa_mixer_device, volume_curve, alsa_buffer_ms, cache_to_disk, dac_keepalive_ms FROM audio_settings WHERE id = 1",
+                "SELECT output_device, exclusive_mode, dac_passthrough, preferred_sample_rate, backend_type, alsa_plugin, alsa_hardware_volume, stream_first_track, stream_buffer_seconds, streaming_only, limit_quality_to_device, device_max_sample_rate, normalization_enabled, normalization_target_lufs, gapless_enabled, device_sample_rate_limits, pw_force_bitperfect, sync_audio_on_startup, quality_fallback_behavior, skip_sink_switch, allow_quality_fallback, reserve_dac_while_running, dsd_mode, memory_cache_mb, alsa_mixer_device, volume_curve, alsa_buffer_ms, cache_to_disk, dac_keepalive_ms, pcm_ring_ms, writer_rt_priority FROM audio_settings WHERE id = 1",
                 [],
                 |row| {
                     // Parse backend_type from JSON string
@@ -473,6 +517,10 @@ impl AudioSettingsStore {
                         alsa_buffer_ms: row.get::<_, Option<i64>>(26)?.unwrap_or(0) as u16,
                         cache_to_disk: row.get::<_, Option<i64>>(27)?.unwrap_or(1) != 0,
                         dac_keepalive_ms: row.get::<_, Option<i64>>(28)?.unwrap_or(0) as u16,
+                        pcm_ring_ms: row.get::<_, Option<i64>>(29)?.unwrap_or(0) as u32,
+                        writer_rt_priority: row.get::<_, Option<i64>>(30)?.unwrap_or_else(
+                            || i64::from(default_writer_rt_priority()),
+                        ) as u8,
                     })
                 },
             )
@@ -626,6 +674,32 @@ impl AudioSettingsStore {
                 params![ms],
             )
             .map_err(|e| format!("Failed to set ALSA buffer ms: {}", e))?;
+        Ok(())
+    }
+
+    /// Set the decoded-audio ring depth in ms; `0` restores the host memory
+    /// profile's figure. Read when a stream opens, so it applies to the next
+    /// track.
+    pub fn set_pcm_ring_ms(&self, ms: u32) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE audio_settings SET pcm_ring_ms = ?1 WHERE id = 1",
+                params![ms as i64],
+            )
+            .map_err(|e| format!("Failed to set PCM ring ms: {}", e))?;
+        Ok(())
+    }
+
+    /// Set the ALSA writer thread's `SCHED_FIFO` priority; `0` turns the
+    /// promotion off. Read once when the player starts, so it takes effect on
+    /// the next daemon start.
+    pub fn set_writer_rt_priority(&self, priority: u8) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE audio_settings SET writer_rt_priority = ?1 WHERE id = 1",
+                params![priority as i64],
+            )
+            .map_err(|e| format!("Failed to set writer RT priority: {}", e))?;
         Ok(())
     }
 
@@ -930,7 +1004,9 @@ impl AudioSettingsStore {
                     volume_curve = ?24,
                     alsa_buffer_ms = ?25,
                     cache_to_disk = ?26,
-                    dac_keepalive_ms = ?27
+                    dac_keepalive_ms = ?27,
+                    pcm_ring_ms = ?28,
+                    writer_rt_priority = ?29
                 WHERE id = 1",
                 params![
                     defaults.output_device,
@@ -960,6 +1036,8 @@ impl AudioSettingsStore {
                     defaults.alsa_buffer_ms as i64,
                     defaults.cache_to_disk as i64,
                     defaults.dac_keepalive_ms as i64,
+                    defaults.pcm_ring_ms as i64,
+                    defaults.writer_rt_priority as i64,
                 ],
             )
             .map_err(|e| format!("Failed to reset audio settings: {}", e))?;

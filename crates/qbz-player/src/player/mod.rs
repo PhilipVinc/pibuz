@@ -228,6 +228,28 @@ fn cpal_device_name(device: &rodio::cpal::Device) -> Option<String> {
         .map(|description| description.name().to_string())
 }
 
+/// Milliseconds since the first call, from a MONOTONIC clock.
+///
+/// Not `SystemTime`. A Raspberry Pi has no battery-backed clock, so it boots
+/// somewhere in 1970 and jumps to the real date the moment NTP answers —
+/// seconds or years, whenever the network comes up. Playback that started
+/// before that step had its position anchored to the old epoch, and the jump
+/// went straight into the reported position: the Qobuz app showing a track
+/// minutes or decades in, and every duration-based decision downstream
+/// (`pos >= dur` arms the gapless transition) firing on nonsense.
+///
+/// `Instant` cannot be stepped, so the anchor cannot move.
+fn monotonic_millis() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    // 1 ms floor so a stamp taken immediately is never mistaken for the
+    // "no anchor" sentinel of 0.
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis()
+        .max(1) as u64
+}
+
 fn decode_with_symphonia(data: &TrackBytes) -> Result<AudioSpecs, String> {
     let source = Box::new(CursorMediaSource::new(data.clone())) as Box<dyn MediaSource>;
     let mss = MediaSourceStream::new(source, Default::default());
@@ -530,6 +552,24 @@ fn should_arm_prefetch(
         && !ready_flag
         && next_track_id == 0
         && current_stream_complete
+}
+
+/// Drop the player's handle on a streaming source, telling any reader still
+/// holding a clone of it to give up.
+///
+/// The clone that matters belongs to a decoder thread a timed-out stop had to
+/// abandon. `BufferedMediaSource::read` waits on a condvar with no timeout —
+/// correctly, since a reader that gave up early would hand symphonia a short
+/// read and be taken for a corrupt stream — so such a thread would otherwise
+/// sit there for as long as the download ran, holding the boxed source and the
+/// whole track's buffer: 120-220 MB at Hi-Res, for the life of the process.
+///
+/// Clearing the slot alone does not do it. The `Arc` is shared, so the last
+/// reference is the wedged thread's, and nothing wakes it.
+fn release_streaming_source(slot: &mut Option<Arc<BufferedMediaSource>>) {
+    if let Some(source) = slot.take() {
+        source.abandon();
+    }
 }
 
 fn begin_new_track(
@@ -1236,7 +1276,12 @@ pub struct SharedState {
     /// `normalization_gain`; integer-percent storage quantized the volume
     /// to 1% on every re-apply)
     volume: Arc<AtomicU32>,
-    /// Playback start time (Unix timestamp millis when started/resumed)
+    /// When playback started or resumed, in MONOTONIC milliseconds since
+    /// process start (see [`monotonic_millis`]); `0` means "no anchor".
+    ///
+    /// Deliberately not a Unix timestamp, which is what this used to be: a Pi
+    /// has no battery-backed clock, and the NTP step that lands seconds after
+    /// boot would walk straight into the reported position.
     playback_start_millis: Arc<AtomicU64>,
     /// Position when playback was started/resumed (in seconds)
     position_at_start: Arc<AtomicU64>,
@@ -1511,10 +1556,7 @@ impl SharedState {
             return self.position.load(Ordering::SeqCst);
         }
 
-        let now_millis = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let now_millis = monotonic_millis();
 
         let elapsed_secs = (now_millis.saturating_sub(start_millis)) / 1000;
         let position_at_start = self.position_at_start.load(Ordering::SeqCst);
@@ -1545,12 +1587,7 @@ impl SharedState {
             return self.position.load(Ordering::SeqCst).saturating_mul(1000);
         }
 
-        let now_millis = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
-        let elapsed_ms = now_millis.saturating_sub(start_millis);
+        let elapsed_ms = monotonic_millis().saturating_sub(start_millis);
         let position_at_start_ms = self
             .position_at_start
             .load(Ordering::SeqCst)
@@ -1565,14 +1602,31 @@ impl SharedState {
 
     /// Mark playback as started/resumed at current position
     fn start_playback_timer(&self, position: u64) {
-        let now_millis = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
         self.playback_start_millis
-            .store(now_millis, Ordering::SeqCst);
+            .store(monotonic_millis(), Ordering::SeqCst);
         self.position_at_start.store(position, Ordering::SeqCst);
+    }
+
+    /// Re-anchor the interpolating timer onto a position the AUDIO clock
+    /// reports, without disturbing anything else.
+    ///
+    /// Called from the position monitor on every tick for backends that can
+    /// tell us what the DAC has actually converted. Between ticks
+    /// `current_position` keeps interpolating, so the reported position stays
+    /// smooth; each tick pulls it back onto the truth. That is the standard
+    /// renderer arrangement — the hardware owns the clock, the wall clock only
+    /// fills in the gaps — and it fixes two things at once: the reported
+    /// position no longer leads the sound by a whole ALSA ring, and it no
+    /// longer drifts against the DAC's own crystal.
+    fn sync_to_audio_clock(&self, position_secs: u64) {
+        if !self.is_playing.load(Ordering::SeqCst) {
+            return;
+        }
+        self.position.store(position_secs, Ordering::SeqCst);
+        self.playback_start_millis
+            .store(monotonic_millis(), Ordering::SeqCst);
+        self.position_at_start
+            .store(position_secs, Ordering::SeqCst);
     }
 
     /// Mark playback as paused, saving current position
@@ -2260,7 +2314,7 @@ impl Player {
                                     *current_audio_file = Some(path.clone());
                                 }
                             }
-                            *current_streaming_source = None; // Clear streaming source for non-streaming playback
+                            release_streaming_source(current_streaming_source); // Clear streaming source for non-streaming playback
                             thread_state.set_loaded_audio(true);
 
                             // Create PlaybackEngine from StreamType
@@ -2424,7 +2478,7 @@ impl Player {
                                 &analyzer_tx,
                                 &analyzer_enabled,
                             );
-                            if let Err(e) = engine.append(source) {
+                            if let Err(e) = engine.append(source, 0) {
                                 log::error!("Failed to append source to engine: {}", e);
                                 return;
                             }
@@ -2635,7 +2689,7 @@ impl Player {
                                         // streaming source was already stored at
                                         // command-accept, and a Resume that finds it
                                         // would replay a track that never started.
-                                        *current_streaming_source = None;
+                                        release_streaming_source(current_streaming_source);
                                         *current_audio_data = None;
                                         *current_audio_file = None;
                                         thread_state.set_loaded_audio(false);
@@ -2678,7 +2732,7 @@ impl Player {
                                         // later Resume replay the completed download
                                         // with duration still 0, pinning the bar at
                                         // 0:00 forever (#508/#592).
-                                        *current_streaming_source = None;
+                                        release_streaming_source(current_streaming_source);
                                         *current_audio_data = None;
                                         *current_audio_file = None;
                                         thread_state.set_loaded_audio(false);
@@ -2722,7 +2776,7 @@ impl Player {
                                     }
                                     Err(e) => {
                                         log::error!("Failed to create engine for streaming: {}", e);
-                                        *current_streaming_source = None;
+                                        release_streaming_source(current_streaming_source);
                                         *current_audio_data = None;
                                         *current_audio_file = None;
                                         thread_state.set_loaded_audio(false);
@@ -2856,7 +2910,7 @@ impl Player {
                                             .to_string()
                                     }
                                 };
-                                *current_streaming_source = None;
+                                release_streaming_source(current_streaming_source);
                                 *current_audio_data = None;
                                 *current_audio_file = None;
                                 thread_state.set_loaded_audio(false);
@@ -2890,7 +2944,7 @@ impl Player {
                                             "Failed to create incremental streaming source: {}",
                                             e
                                         );
-                                        *current_streaming_source = None;
+                                        release_streaming_source(current_streaming_source);
                                         *current_audio_data = None;
                                         *current_audio_file = None;
                                         thread_state.set_loaded_audio(false);
@@ -2971,7 +3025,7 @@ impl Player {
                                 }
                                 if let Some(err) = source.download_error() {
                                     log::error!("Resume: feeder failed after the seek: {}", err);
-                                    *current_streaming_source = None;
+                                    release_streaming_source(current_streaming_source);
                                     *current_audio_data = None;
                                     *current_audio_file = None;
                                     thread_state.set_loaded_audio(false);
@@ -3081,7 +3135,7 @@ impl Player {
                                 &analyzer_tx,
                                 &analyzer_enabled,
                             );
-                            if let Err(e) = engine.append(source_to_play) {
+                            if let Err(e) = engine.append(source_to_play, start_position_secs) {
                                 log::error!("Failed to append streaming source to engine: {}", e);
                                 return;
                             }
@@ -3178,7 +3232,7 @@ impl Player {
                                 *current_track_channels = Some(2);
                                 *current_audio_data = None;
                                 *current_audio_file = None;
-                                *current_streaming_source = None;
+                                release_streaming_source(current_streaming_source);
 
                                 let mut engine = PlaybackEngine::new_alsa_dop(stream, false);
                                 if let Err(e) = engine.append_dop(Box::new(DsdErrorReport::new(
@@ -3297,7 +3351,7 @@ impl Player {
                                 *current_track_channels = Some(2);
                                 *current_audio_data = None;
                                 *current_audio_file = None;
-                                *current_streaming_source = None;
+                                release_streaming_source(current_streaming_source);
 
                                 let mut engine = PlaybackEngine::new_alsa_dop(stream, true);
                                 if let Err(e) = engine.append_dop(Box::new(DsdErrorReport::new(
@@ -3714,7 +3768,7 @@ impl Player {
                                     &analyzer_tx,
                                     &analyzer_enabled,
                                 );
-                                if let Err(e) = engine.append(skipped_source) {
+                                if let Err(e) = engine.append(skipped_source, resume_pos) {
                                     log::error!("Failed to append source for resume: {}", e);
                                     return;
                                 }
@@ -3740,7 +3794,7 @@ impl Player {
                             }
                             *current_audio_data = None;
                             *current_audio_file = None;
-                            *current_streaming_source = None;
+                            release_streaming_source(current_streaming_source);
                             *current_normalization_gain = None;
                             *current_gain_atomic = None;
                             *gapless_pending = None;
@@ -4137,7 +4191,7 @@ impl Player {
                                 &analyzer_tx,
                                 &analyzer_enabled,
                             );
-                            if let Err(e) = engine.append(skipped_source) {
+                            if let Err(e) = engine.append(skipped_source, position_secs) {
                                 seek_abort(
                                     &thread_state,
                                     &format!("append source for seek failed: {e}"),
@@ -4393,7 +4447,7 @@ impl Player {
                             // holds its current source (NOT empty), so a
                             // paused session is never resumed by this.
                             let engine_was_empty = engine.empty();
-                            if let Err(e) = engine.append(source) {
+                            if let Err(e) = engine.append(source, 0) {
                                 log::error!(
                                     "Gapless: failed to append track {} to engine: {}",
                                     track_id,
@@ -4507,9 +4561,24 @@ impl Player {
                                     }
                                 }
                                 if clear_streaming_source {
-                                    current_streaming_source = None;
+                                    release_streaming_source(&mut current_streaming_source);
                                 }
 
+                                // Pull the reported position back onto the
+                                // audio clock before reading it. On ALSA Direct
+                                // the engine knows what the DAC has actually
+                                // converted; the interpolating timer only fills
+                                // in between these ticks. Without this the
+                                // position runs a whole hardware ring ahead of
+                                // the sound — a full second on the buffer a Pi
+                                // is told to use — and drifts against the DAC's
+                                // crystal on top.
+                                if let Some(audio_secs) = current_engine
+                                    .as_ref()
+                                    .and_then(|engine| engine.position_secs())
+                                {
+                                    thread_state.sync_to_audio_clock(audio_secs);
+                                }
                                 let pos = thread_state.current_position();
                                 let dur = thread_state.duration.load(Ordering::SeqCst);
 
@@ -4643,7 +4712,7 @@ impl Player {
                                     // Dropping it frees a finished Hi-Res track on a host where
                                     // promotion was skipped, and leaves the next PlayNext an
                                     // empty slot rather than a stale one.
-                                    current_streaming_source = None;
+                                    release_streaming_source(&mut current_streaming_source);
                                 }
 
                                 // Gapless readiness: signal the frontend that it
@@ -4887,6 +4956,30 @@ impl Player {
             );
         }
         qbz_audio::alsa_direct::set_dac_keepalive_ms(u32::from(audio_settings.dac_keepalive_ms));
+
+        // Depth of the DECODED ring — the buffer between the decoder and the
+        // DAC, and the renderer's whole tolerance for a network or disk stall.
+        // Distinct from the ALSA buffer above, which is only the hardware ring.
+        // `0` means the host's memory profile picks it.
+        if audio_settings.pcm_ring_ms > 0 {
+            log::info!(
+                "[Player] decoded ring: {} ms (audio.pcm_ring_ms)",
+                audio_settings.pcm_ring_ms
+            );
+        } else {
+            log::info!(
+                "[Player] decoded ring: {} s (from the {:?} memory profile)",
+                qbz_models::system_capabilities::memory_profile().pcm_ring_seconds,
+                qbz_models::system_capabilities::memory_profile().class,
+            );
+        }
+        playback_engine::set_pcm_ring_ms(audio_settings.pcm_ring_ms);
+
+        // Whether the ALSA writer thread asks for SCHED_FIFO. Safe only because
+        // that thread no longer decodes or waits on the network — see
+        // `qbz_audio::rt`. Read once here; the promotion happens as the thread
+        // starts.
+        qbz_audio::rt::set_writer_rt_priority(audio_settings.writer_rt_priority);
 
         // How a volume percentage becomes an amplitude multiplier. Read once
         // here: the curve is a property of the host's configuration, and every
@@ -6787,27 +6880,83 @@ mod tests {
         state.is_playing.store(true, Ordering::SeqCst);
         assert_eq!(state.current_position_ms(), 12_000);
 
-        // Playing with anchors: position_at_start*1000 + wall-clock elapsed ms.
-        let now_ms = std::time::SystemTime::now()
+        // Playing with anchors: position_at_start*1000 + elapsed ms.
+        //
+        // The elapsed time is MEASURED rather than faked by back-dating the
+        // anchor, because the anchor is now monotonic process-relative time
+        // (see `monotonic_millis`) — in a fresh test process that is only a few
+        // milliseconds, so subtracting a second and a half from it saturates to
+        // the `0` "no anchor" sentinel and the derivation never runs.
+        const ELAPSED_MS: u64 = 80;
+        state
+            .playback_start_millis
+            .store(super::monotonic_millis(), Ordering::SeqCst);
+        state.position_at_start.store(10, Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(ELAPSED_MS));
+        let pos = state.current_position_ms();
+        // The window is deliberately loose at BOTH ends. `monotonic_millis`
+        // truncates to whole milliseconds, so an anchor taken at X.9 ms and
+        // read 80 ms later reports 79 — a one-millisecond flake if the lower
+        // bound is the sleep itself. The upper end absorbs a loaded CI box.
+        assert!(
+            (10_000 + ELAPSED_MS / 2..=10_000 + ELAPSED_MS * 5).contains(&pos),
+            "expected ~{}ms, got {pos}",
+            10_000 + ELAPSED_MS
+        );
+
+        // Clamped to duration*1000 (same rule current_position applies).
+        state.position_at_start.store(301, Ordering::SeqCst);
+        assert_eq!(state.current_position_ms(), 300_000);
+    }
+
+    /// The reason the anchor is monotonic at all.
+    ///
+    /// A Raspberry Pi has no battery-backed clock: it boots in 1970 and jumps
+    /// to the real date whenever NTP first answers, which is seconds to minutes
+    /// after boot and can be a step of decades. With the anchor held as a Unix
+    /// timestamp, playback that started before that step had its position
+    /// computed against the old epoch, and the jump landed directly in the
+    /// reported position — and in `pos >= dur`, which is one of the two
+    /// triggers that arm a gapless transition.
+    ///
+    /// `Instant` cannot be stepped, so this is now structurally impossible.
+    /// The test pins the property by checking that the two clocks are not
+    /// interchangeable: if someone swaps `monotonic_millis` back for a
+    /// wall-clock read, an epoch-sized anchor stops being nonsense and this
+    /// fails.
+    #[test]
+    fn the_position_anchor_is_immune_to_a_clock_step() {
+        use std::sync::atomic::Ordering;
+
+        let state = super::SharedState::new();
+        state.duration.store(300, Ordering::SeqCst);
+        state.is_playing.store(true, Ordering::SeqCst);
+        state.position.store(0, Ordering::SeqCst);
+        state.position_at_start.store(0, Ordering::SeqCst);
+
+        // An anchor taken from the correct clock reads back as ~0 elapsed.
+        state
+            .playback_start_millis
+            .store(super::monotonic_millis(), Ordering::SeqCst);
+        assert!(
+            state.current_position() <= 1,
+            "a fresh monotonic anchor should read as no elapsed time"
+        );
+
+        // A Unix-epoch anchor is not a monotonic one, and never can be: the
+        // derived elapsed time saturates to zero rather than becoming decades.
+        let epoch_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
         state
             .playback_start_millis
-            .store(now_ms - 1_500, Ordering::SeqCst);
-        state.position_at_start.store(10, Ordering::SeqCst);
-        let pos = state.current_position_ms();
-        assert!(
-            (11_450..=11_900).contains(&pos),
-            "expected ~11500ms, got {pos}"
+            .store(epoch_ms, Ordering::SeqCst);
+        assert_eq!(
+            state.current_position(),
+            0,
+            "a wall-clock anchor must not be readable as elapsed monotonic time"
         );
-
-        // Clamped to duration*1000 (same rule current_position applies).
-        state
-            .playback_start_millis
-            .store(now_ms - 10_000, Ordering::SeqCst);
-        state.position_at_start.store(299, Ordering::SeqCst);
-        assert_eq!(state.current_position_ms(), 300_000);
     }
 
     #[test]

@@ -6,11 +6,25 @@
 //! - Loudness analysis and normalization
 //! - Diagnostic tools
 //!
-//! # CRITICAL: This code is IMMUTABLE
+//! # What must not change by accident
 //!
-//! The audio backend system was carefully designed for bit-perfect playback.
-//! Do NOT modify the logic in these files without understanding the full
-//! architecture. See `qbz-nix-docs/AUDIO_BACKENDS.md` for details.
+//! (This header used to read "This code is IMMUTABLE" and point at
+//! `qbz-nix-docs/AUDIO_BACKENDS.md`. That file is not in this tree — it went
+//! with the desktop UI — and the code below has been rewritten many times
+//! since. It was a stale marker of exactly the kind CLAUDE.md warns about, so
+//! here are the invariants it was trying to protect, stated where they can be
+//! checked.)
+//!
+//! - **The bit-perfect path does not touch the samples.** On the ALSA-direct
+//!   path the only permitted operations between the decoder and the device are
+//!   the format conversion in [`alsa_direct::encode_into`] and an explicit
+//!   software volume at unity. No resampling, no dither, no mixing.
+//! - **Full scale is 2^(N-1), never 2^(N-1) − 1**, so a bit-depth change is an
+//!   exact shift. See the doc comment on [`alsa_direct::f32_to_s16`].
+//! - **The output follows the track's rate**; a format change rebuilds the
+//!   stream rather than resampling into the open one.
+//! - **Only one thread may be real-time, and it may not block.** See
+//!   [`rt`] for what that costs and why.
 //!
 //! # Architecture
 //!
@@ -33,6 +47,7 @@ pub mod alsa_direct;
 pub mod alsa_error_handler;
 pub mod analysis;
 pub mod analyzer_tap;
+pub mod audio_out;
 pub mod backend;
 pub mod coreaudio_direct;
 pub mod dac_capabilities;
@@ -49,11 +64,14 @@ pub mod loudness_analyzer;
 pub mod loudness_cache;
 pub mod network_throttle;
 pub mod output_sinks;
+pub mod pcm_ring;
 #[cfg(target_os = "linux")]
 pub mod pipewire_backend;
 #[cfg(target_os = "linux")]
 pub mod pulse_backend;
+pub mod rt;
 pub mod settings;
+pub mod virtual_out;
 pub mod visualizer;
 pub mod volume_curve;
 
@@ -66,6 +84,7 @@ pub use alsa_backend::{
 pub use alsa_direct::AlsaDirectStream;
 pub use analysis::SpectralAnalyzer;
 pub use analyzer_tap::{AnalyzerMessage, AnalyzerTap};
+pub use audio_out::AudioOut;
 pub use backend::{
     AlsaDirectError, AlsaPlugin, AudioBackend, AudioBackendType, AudioDevice, BackendConfig,
     BackendManager, BackendResult, BitPerfectMode,
@@ -86,7 +105,10 @@ pub use loudness::{calculate_gain_factor, db_to_linear, extract_replaygain, Repl
 pub use loudness_analyzer::LoudnessAnalyzer;
 pub use loudness_cache::LoudnessCache;
 pub use output_sinks::{list_output_sinks, OutputSinkInfo};
+pub use pcm_ring::{ring_capacity_frames, Boundary, BoundaryKind, RingLink};
+pub use rt::{promote_writer_thread_and_log, set_writer_rt_priority, RtOutcome};
 pub use settings::AudioSettings;
+pub use virtual_out::VirtualAudioOut;
 pub use visualizer::{RingBuffer, TappedSource, VisualizerTap};
 
 /// Stub: returns the ID unchanged on non-Linux (no ALSA normalization needed).
