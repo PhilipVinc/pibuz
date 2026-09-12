@@ -43,7 +43,7 @@ use tokio::task::JoinHandle;
 
 use crate::adapter::DaemonAdapter;
 use crate::paths::ProfileRoots;
-use crate::state::{AuthState, DaemonShared};
+use crate::state::DaemonShared;
 
 use self::engine::DaemonRendererEngine;
 use self::session::{bootstrap_remote_presence, DaemonSessionLoopHost};
@@ -450,20 +450,19 @@ impl DaemonQconnectService {
         }
     }
 
-    /// Wait until the daemon is Ready (logged in + API initialized), then attempt
-    /// `connect()` with the bounded [2s, 5s, 15s, 30s] retry schedule. Each
-    /// `connect()` re-resolves the transport config internally, so a transient
-    /// credential/network failure can clear on a later attempt.
+    /// Wait until the API client is up, then attempt `connect()` with the
+    /// bounded [2s, 5s, 15s, 30s] retry schedule. Each `connect()` re-resolves
+    /// the transport config internally, so a transient network failure can
+    /// clear on a later attempt.
+    ///
+    /// The wait used to require a logged-in ACCOUNT as well. With the account
+    /// path gone that condition could never hold, so this task slept forever
+    /// and auto-connect only ever happened as a side effect of a pairing
+    /// handoff. `is_api_initialized` is the real precondition: it means the
+    /// bundle tokens were extracted, which is what `/qws/createToken`
+    /// discovery needs.
     async fn connect_on_ready(self: Arc<Self>) {
-        loop {
-            let logged_in = self
-                .shared
-                .lock()
-                .map(|s| s.auth == AuthState::LoggedIn)
-                .unwrap_or(false);
-            if logged_in && self.runtime.core().is_api_initialized().await {
-                break;
-            }
+        while !self.runtime.core().is_api_initialized().await {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
 

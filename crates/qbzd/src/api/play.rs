@@ -16,7 +16,7 @@
 // {"artist_id": N} | {"url": "https://open.qobuz.com/..."}, plus optional
 // {"index": N} (0-based start position within the resolved list). A URL wins
 // over the id fields and is resolved to one of the id kinds first. Errors:
-// 409 needs_auth, 400 bad_request (no selector / bad URL), 404 not_found
+// 400 bad_request (no selector / bad URL), 404 not_found
 // (unknown id / empty resolution), 503 audio_unavailable (start failed).
 use std::io::Cursor;
 
@@ -26,8 +26,6 @@ use tiny_http::Response;
 use qbz_models::{QueueTrack, Track};
 use qbz_qobuz::link_resolver::{resolve_link, ResolvedLink};
 
-use crate::state::AuthState;
-
 use super::queue::track_to_queue_track;
 use super::{err_json, json, ApiState};
 
@@ -36,10 +34,6 @@ use super::{err_json, json, ApiState};
 const ARTIST_TOP_LIMIT: u32 = 50;
 
 pub fn play(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
-    if let Some(resp) = auth_gate(state) {
-        return resp;
-    }
-
     let selector = match parse_selector(body) {
         Ok(s) => s,
         Err((message, hint)) => return err_json(400, "bad_request", &message, &hint),
@@ -243,26 +237,6 @@ fn summary(qt: &QueueTrack) -> Value {
         "artist": qt.artist,
         "album": qt.album,
     })
-}
-
-/// 409 `needs_auth` — play needs a live Qobuz session (materialization calls
-/// the client). Self-contained per-file helper (this crate's convention).
-fn auth_gate(state: &ApiState) -> Option<Response<Cursor<Vec<u8>>>> {
-    let needs_auth = state
-        .shared
-        .lock()
-        .map(|s| s.auth == AuthState::NeedsAuth)
-        .unwrap_or(false);
-    if needs_auth {
-        Some(err_json(
-            409,
-            "needs_auth",
-            "not logged in to Qobuz",
-            "run: qbzd login",
-        ))
-    } else {
-        None
-    }
 }
 
 #[cfg(test)]

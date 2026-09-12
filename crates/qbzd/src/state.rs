@@ -10,19 +10,8 @@ pub struct LatchedErrors {
     pub transport: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AuthState {
-    NeedsAuth,
-    Restoring,
-    LoggedIn,
-} // 01 §6.2 machine
-
 pub struct DaemonShared {
     // one Arc<Mutex<...>> shared by driver + API
-    pub auth: AuthState,
-    pub user_id: Option<u64>,
-    pub subscription: Option<String>,
     pub last_errors: LatchedErrors,
     pub driver_last_tick: Option<std::time::Instant>,
     pub muted: bool,
@@ -30,13 +19,6 @@ pub struct DaemonShared {
     pub started_at: std::time::Instant,
     pub startup_warnings: u32,
     pub qconnect: QconnectStatus,
-    /// T11 (`POST /api/settings/reload`, 02 §3.3.17): a fingerprint of the
-    /// credential-file token currently applied to the live session, so reload
-    /// can tell "new token on disk" (re-login) from "same token, unrelated
-    /// nudge" (no-op) without keeping a second copy of the secret in memory.
-    /// `None` whenever the daemon is not LoggedIn against a known token
-    /// (cleared alongside every `set_needs_auth`).
-    pub credential_fingerprint: Option<u64>,
     /// Coarse network-reachability signal for `/api/status`'s `network.online`
     /// (01 §9.3). Latched ONLY from real network-class outcomes — never active
     /// probing: false on an auth-retry/credential-reload network-class failure
@@ -142,31 +124,11 @@ mod tests {
     }
 
     #[test]
-    fn auth_state_serializes_to_contract_strings() {
-        // 02-cli-and-api.md §3.3.3: auth.state ∈ logged_in|needs_auth|restoring
-        assert_eq!(
-            serde_json::to_string(&AuthState::NeedsAuth).unwrap(),
-            "\"needs_auth\""
-        );
-        assert_eq!(
-            serde_json::to_string(&AuthState::Restoring).unwrap(),
-            "\"restoring\""
-        );
-        assert_eq!(
-            serde_json::to_string(&AuthState::LoggedIn).unwrap(),
-            "\"logged_in\""
-        );
-    }
-
-    #[test]
     fn daemon_shared_holds_the_fields_the_status_route_needs() {
         // Construction smoke test: DaemonShared has no derive (Instant isn't
         // Serialize) so this is the only compile-time guard that the field
         // set/types stay what api::status::assemble expects.
         let shared = DaemonShared {
-            auth: AuthState::LoggedIn,
-            user_id: Some(1234567),
-            subscription: Some("studio".into()),
             last_errors: LatchedErrors::default(),
             driver_last_tick: None,
             muted: false,
@@ -174,12 +136,10 @@ mod tests {
             started_at: std::time::Instant::now(),
             startup_warnings: 0,
             qconnect: QconnectStatus::default(),
-            credential_fingerprint: None,
             network_online: std::sync::atomic::AtomicBool::new(true),
             bus: None,
         };
-        assert_eq!(shared.auth, AuthState::LoggedIn);
-        assert_eq!(shared.user_id, Some(1234567));
+        assert!(shared.network_online());
     }
 
     #[test]
@@ -188,9 +148,6 @@ mod tests {
         // it false, a real success flips it back true — the exact two
         // transitions every call site above drives. Defaults true.
         let shared = DaemonShared {
-            auth: AuthState::Restoring,
-            user_id: None,
-            subscription: None,
             last_errors: LatchedErrors::default(),
             driver_last_tick: None,
             muted: false,
@@ -198,7 +155,6 @@ mod tests {
             started_at: std::time::Instant::now(),
             startup_warnings: 0,
             qconnect: QconnectStatus::default(),
-            credential_fingerprint: None,
             network_online: std::sync::atomic::AtomicBool::new(true),
             bus: None,
         };

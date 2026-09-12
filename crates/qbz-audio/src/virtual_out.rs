@@ -484,13 +484,22 @@ mod tests {
 
     #[test]
     fn silence_tops_up_to_the_depth_and_is_counted_separately() {
-        let out = VirtualAudioOut::new(44_100, 2, 1_000, 100.0);
+        // REAL time (speed 1.0) deliberately. `write_silence_to_depth` starts
+        // the clock, so under a 100x clock the microseconds between the two
+        // calls below drain a visible number of frames and the second top-up
+        // is no longer zero — which is the harness being right, not wrong.
+        let out = VirtualAudioOut::new(44_100, 2, 1_000, 1.0);
         let written = out.write_silence_to_depth(100, &cancel()).unwrap();
         assert!(written > 0);
         assert_eq!(out.silence_frames_written(), written as u64);
-        // A second top-up at the same depth adds nothing.
+        // A second top-up at the same depth writes at most the sliver that
+        // drained in between — never another depth's worth.
         let again = out.write_silence_to_depth(100, &cancel()).unwrap();
-        assert_eq!(again, 0, "the depth is a ceiling, not a target to refill");
+        assert!(
+            again * 10 < written,
+            "a second top-up wrote {again} of {written} frames — the depth is a ceiling, \
+             not a target to refill from scratch"
+        );
     }
 
     #[test]

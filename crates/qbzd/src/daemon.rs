@@ -1,6 +1,5 @@
 // crates/qbzd/src/daemon.rs — the `qbzd run` boot sequence (01-architecture.md
-// §8.1, NORMATIVE order), the NeedsAuth-stays-up state machine (§6.2) and the
-// graceful shutdown (§8.2). Later tasks splice into the numbered steps: the
+// §8.1, NORMATIVE order) and the graceful shutdown (§8.2). Later tasks splice into the numbered steps: the
 // playback driver (T4) at step 10, the HTTP server (T6) at step 11, QConnect
 // (T9/T10) at step 12. Until they land the daemon boots a playable core and
 // parks on signals — API-less but fully diagnosable in-process.
@@ -9,7 +8,6 @@ use std::sync::{Arc, Mutex};
 use qbz_app::playback_driver::{self, DriverDeps};
 use qbz_app::settings::daemon_prefs;
 use qbz_app::shell::AppRuntime;
-use qbz_core::CoreError;
 use qbz_models::CoreEvent;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
@@ -18,7 +16,7 @@ use crate::adapter::DaemonAdapter;
 use crate::config::QbzdConfig;
 use crate::lock::{InstanceLock, LockError};
 use crate::paths::ProfileRoots;
-use crate::state::{AuthState, DaemonShared, LatchedErrors, QconnectStatus};
+use crate::state::{DaemonShared, LatchedErrors, QconnectStatus};
 
 /// The composed runtime handoff produced by [`boot`] and consumed by later
 /// tasks: T4 spawns the playback driver on `runtime` + `shared`, T6 serves
@@ -339,7 +337,6 @@ async fn boot(
     //    Connect handoff supplies its own `jwt_api` streaming credential
     //    (see qconnect/pairing.rs), so there is nothing on disk to restore
     //    and nothing to retry — the renderer simply waits to be cast to.
-    set_needs_auth(&shared, None);
     let auth_retry = None;
 
     Ok(BootedRuntime {
@@ -448,14 +445,10 @@ fn spawn_queue_persist(
     })
 }
 
-/// Fresh shared state. Starts in `Restoring` — credential restore drives the
-/// terminal transition to `LoggedIn` or `NeedsAuth` (§6.2 diagram).
+/// Fresh shared state.
 fn new_shared(cfg: &QbzdConfig) -> Arc<Mutex<DaemonShared>> {
     let _ = cfg; // reserved: premute/mpris defaults wire in with later tasks.
     Arc::new(Mutex::new(DaemonShared {
-        auth: AuthState::Restoring,
-        user_id: None,
-        subscription: None,
         last_errors: LatchedErrors::default(),
         driver_last_tick: None,
         muted: false,
@@ -463,32 +456,10 @@ fn new_shared(cfg: &QbzdConfig) -> Arc<Mutex<DaemonShared>> {
         started_at: std::time::Instant::now(),
         startup_warnings: 0,
         qconnect: QconnectStatus::default(),
-        credential_fingerprint: None,
         network_online: std::sync::atomic::AtomicBool::new(true),
         // Attached by daemon::run right after boot (the bus outlives boot).
         bus: None,
     }))
-}
-
-/// Enter NeedsAuth. `err = None` = no saved credentials at all (the common
-/// first-run case); `Some(e)` = an explicit auth rejection just cleared the
-/// token. Either way the daemon STAYS UP (§6.2) and names the fix.
-pub(crate) fn set_needs_auth(shared: &Arc<Mutex<DaemonShared>>, err: Option<CoreError>) {
-    if let Ok(mut s) = shared.lock() {
-        s.auth = AuthState::NeedsAuth;
-        s.user_id = None;
-        s.subscription = None;
-        // T11: NeedsAuth has no applied token by definition.
-        s.credential_fingerprint = None;
-    }
-    match err {
-        None => log::info!("Not logged in — run 'qbzd setup' (or 'qbzd login')"),
-        Some(e) => {
-            log::warn!(
-                "Qobuz rejected the saved session ({e}) — run 'qbzd login' to re-authenticate"
-            )
-        }
-    }
 }
 
 /// Resolve `[server] bind:port` to a `SocketAddr` (01 §10.1). A malformed value
@@ -574,8 +545,7 @@ async fn wait_for_signal() {
 // what changed: audio (routing-critical -> `Player::reinit_device`, the rest ->
 // `Player::reload_settings`), the daemon's own streaming-quality cell (the
 // driver's background auto-advance), the QConnect KV (device-name cache +
-// connect/disconnect reconciliation), and finally the credential file (absent
-// -> NeedsAuth; new -> session restore). Never re-reads `qbzd.toml` (§3.1.2 —
+// connect/disconnect reconciliation). Never re-reads `qbzd.toml` (§3.1.2 —
 // process config is boot-only). Response = the post-reload `/api/status` body,
 // composed by the caller — zero new shapes (03-setup-tui.md §4.3: the
 // reinit/reload narrative is composed CLIENT-side from the CLI's own copy of
@@ -689,13 +659,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn no_credentials_enters_needs_auth() {
+    fn fresh_shared_state_has_no_latched_errors() {
         let shared = new_shared(&QbzdConfig::default());
-        set_needs_auth(&shared, None);
         let s = shared.lock().unwrap();
-        assert_eq!(s.auth, AuthState::NeedsAuth);
-        assert!(s.user_id.is_none());
         assert!(s.last_errors.auth.is_none());
+        assert!(s.last_errors.stream.is_none());
+        assert!(s.last_errors.transport.is_none());
     }
 
     // ======================= T11: settings/reload =======================

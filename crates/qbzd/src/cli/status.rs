@@ -4,7 +4,7 @@
 // runs the version-skew check (§1.6, from the /api/status payload — it carries
 // `version` + `api_version`, so it needs no /api/info fallback) and, on the
 // daemon box, the linger check (§1.4). Exit codes come from the frozen table
-// (§1.3): 0 healthy · 3 unreachable · 4 needs_auth · 5 device unopenable.
+// (§1.3): 0 healthy · 3 unreachable · 5 device unopenable.
 use serde_json::Value;
 
 use crate::cli::client::ApiClient;
@@ -31,7 +31,7 @@ pub async fn ping(host: Option<String>, json: bool, roots: &ProfileRoots) -> i32
 }
 
 /// `qbzd status` — THE diagnostic. Human composite block; `--json` raw payload.
-/// Exit 0 healthy · 3 unreachable · 4 needs_auth · 5 device unopenable.
+/// Exit 0 healthy · 3 unreachable · 5 device unopenable.
 pub async fn status(host: Option<String>, json: bool, roots: &ProfileRoots) -> i32 {
     let client = ApiClient::new(host, roots);
     let payload = match client.get("/api/status").await {
@@ -75,13 +75,13 @@ pub async fn status(host: Option<String>, json: bool, roots: &ProfileRoots) -> i
     exit_from_state(&payload)
 }
 
-/// 4 needs_auth · 5 configured device not present · else 0 (§1.3). Auth gates
-/// before device: a login is the more common fix.
+/// 5 configured device not present · else 0.
+///
+/// Exit 4 (`needs_auth`) is gone with the account path. It fired whenever the
+/// daemon had no Qobuz login — which, for a renderer that gets its credentials
+/// from a Connect handoff, is ALWAYS. A healthy Pi sitting ready to be cast to
+/// was reporting itself as failed to every script and monitor that checked it.
 fn exit_from_state(p: &Value) -> i32 {
-    let auth = str_at(p, &["auth", "state"]);
-    if auth == "needs_auth" {
-        return 4;
-    }
     let configured = p
         .pointer("/audio/configured_device")
         .map(|v| !v.is_null())
@@ -107,7 +107,6 @@ fn render(p: &Value, host: &str) -> String {
     out.push_str(&format!(
         "μqbzd {version} · api v{api} · up {uptime} · {host} · data {data_root}\n"
     ));
-    out.push_str(&format!("auth      : {}\n", render_auth(p)));
     out.push_str(&format!("audio     : {}\n", render_audio(p)));
     out.push_str(&format!("playback  : {}\n", render_playback(p)));
     out.push_str(&format!("qconnect  : {}\n", render_qconnect(p)));
@@ -124,22 +123,6 @@ fn render(p: &Value, host: &str) -> String {
     ));
     out.push_str(&format!("last error: {}\n", render_last_error(p)));
     out
-}
-
-fn render_auth(p: &Value) -> String {
-    match str_at(p, &["auth", "state"]).as_str() {
-        "logged_in" => {
-            let user = p.pointer("/auth/user_id").and_then(|v| v.as_u64());
-            let sub = p.pointer("/auth/subscription").and_then(|v| v.as_str());
-            match (user, sub) {
-                (Some(u), Some(s)) => format!("logged in (user {u}, {s})"),
-                (Some(u), None) => format!("logged in (user {u})"),
-                _ => "logged in".to_string(),
-            }
-        }
-        "restoring" => "restoring session…".to_string(),
-        _ => "not logged in".to_string(),
-    }
 }
 
 fn render_audio(p: &Value) -> String {
@@ -347,11 +330,10 @@ fn fmt_uptime(secs: u64) -> String {
 mod tests {
     use super::*;
 
-    fn logged_in_payload() -> Value {
+    fn healthy_payload() -> Value {
         serde_json::json!({
             "version": "2.1.0", "api_version": 1, "uptime_secs": 259_200,
             "data_root": "/home/pi/.local/share/qbzd", "driver_tick_age_ms": 210,
-            "auth": {"state": "logged_in", "user_id": 1234567, "subscription": "studio"},
             "audio": {"backend": "alsa", "configured_device": "hw:CARD=D30,DEV=0",
                       "device_present": true, "device_open": true,
                       "bit_perfect": "DirectHardware", "sample_rate": 192000, "bit_depth": 24},
@@ -367,23 +349,30 @@ mod tests {
 
     #[test]
     fn healthy_status_exits_zero() {
-        assert_eq!(exit_from_state(&logged_in_payload()), 0);
+        assert_eq!(exit_from_state(&healthy_payload()), 0);
     }
 
     #[test]
-    fn needs_auth_exits_four() {
-        let mut p = logged_in_payload();
-        p["auth"]["state"] = serde_json::json!("needs_auth");
-        assert_eq!(exit_from_state(&p), 4);
+    fn a_renderer_that_has_not_been_cast_to_is_still_healthy() {
+        // The regression this replaced: `exit_from_state` returned 4 whenever
+        // the daemon had no Qobuz account. A renderer gets its credentials
+        // from a Connect handoff, so that was every healthy Pi, every time —
+        // `qbzd status` reported failure to every script that checked it.
+        let p = healthy_payload();
+        assert!(
+            p.get("auth").is_none(),
+            "there is no account state any more"
+        );
+        assert_eq!(exit_from_state(&p), 0);
     }
 
     #[test]
     fn configured_but_absent_device_exits_five() {
-        let mut p = logged_in_payload();
+        let mut p = healthy_payload();
         p["audio"]["device_present"] = serde_json::json!(false);
         assert_eq!(exit_from_state(&p), 5);
         // system default (no configured device) never trips exit 5.
-        let mut sysdef = logged_in_payload();
+        let mut sysdef = healthy_payload();
         sysdef["audio"]["configured_device"] = serde_json::Value::Null;
         sysdef["audio"]["device_present"] = serde_json::json!(false);
         assert_eq!(exit_from_state(&sysdef), 0);
@@ -391,14 +380,14 @@ mod tests {
 
     #[test]
     fn render_covers_the_composite_block() {
-        let block = render(&logged_in_payload(), "127.0.0.1:8182");
+        let block = render(&healthy_payload(), "127.0.0.1:8182");
         assert!(
             block.contains("μqbzd 2.1.0 · api v1 · up 3d 0h · 127.0.0.1:8182"),
             "{block}"
         );
         assert!(
-            block.contains("auth      : logged in (user 1234567, studio)"),
-            "{block}"
+            !block.contains("auth"),
+            "the block must not carry an account line — there is no account: {block}"
         );
         assert!(block.contains("alsa hw:CARD=D30,DEV=0 · present · bit-perfect: DirectHardware · 192000 Hz / 24-bit"), "{block}");
         assert!(
@@ -416,7 +405,7 @@ mod tests {
 
     #[test]
     fn stopped_playback_renders_queue_only() {
-        let mut p = logged_in_payload();
+        let mut p = healthy_payload();
         p["playback"]["state"] = serde_json::json!("stopped");
         let line = render_playback(&p);
         assert_eq!(line, "stopped · queue 14");

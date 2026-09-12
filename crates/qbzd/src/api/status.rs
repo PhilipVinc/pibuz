@@ -9,7 +9,7 @@ use std::io::Cursor;
 use serde::Serialize;
 use tiny_http::Response;
 
-use crate::state::{AuthState, LatchedErrors, QconnectStatus};
+use crate::state::{LatchedErrors, QconnectStatus};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StatusDoc {
@@ -18,19 +18,11 @@ pub struct StatusDoc {
     pub uptime_secs: u64,
     pub data_root: String,
     pub driver_tick_age_ms: Option<u64>,
-    pub auth: AuthStatus,
     pub audio: AudioStatus,
     pub playback: PlaybackStatus,
     pub qconnect: QconnectStatus,
     pub network: NetworkStatus,
     pub last_errors: LatchedErrors,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct AuthStatus {
-    pub state: AuthState,
-    pub user_id: Option<u64>,
-    pub subscription: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -95,7 +87,7 @@ pub fn info(state: &super::ApiState) -> Response<Cursor<Vec<u8>>> {
 }
 
 /// `GET /api/status` (02 §3.3.3) — the composite daemon status. ALWAYS 200;
-/// the CLI maps degradation (needs_auth, missing device) to exit codes.
+/// the CLI maps degradation (a missing device) to exit codes.
 pub fn status(state: &super::ApiState) -> Response<Cursor<Vec<u8>>> {
     let doc = assemble_live(state);
     let mut value = serde_json::to_value(&doc).unwrap_or_else(|_| serde_json::json!({}));
@@ -108,7 +100,7 @@ pub fn status(state: &super::ApiState) -> Response<Cursor<Vec<u8>>> {
     super::json(200, value)
 }
 
-/// Compose [`StatusDoc`] from live sources: `DaemonShared` (auth/qconnect/latched
+/// Compose [`StatusDoc`] from live sources: `DaemonShared` (qconnect/latched
 /// errors/tick age), the Player's sync getters via `get_playback_event`, the
 /// queue via an async core call (`block_on` on the daemon runtime — this is a
 /// plain serving thread, never a tokio worker, so no panic), and the audio
@@ -116,21 +108,9 @@ pub fn status(state: &super::ApiState) -> Response<Cursor<Vec<u8>>> {
 fn assemble_live(state: &super::ApiState) -> StatusDoc {
     // 1. snapshot DaemonShared, then DROP the guard before any block_on so the
     //    mutex is never held across an await point.
-    let (
-        auth,
-        user_id,
-        subscription,
-        last_errors,
-        qconnect,
-        tick_age,
-        muted,
-        uptime,
-        network_online,
-    ) = match state.shared.lock() {
+    let (last_errors, qconnect, tick_age, muted, uptime, network_online) = match state.shared.lock()
+    {
         Ok(s) => (
-            s.auth,
-            s.user_id,
-            s.subscription.clone(),
             s.last_errors.clone(),
             s.qconnect.clone(),
             s.driver_last_tick.map(|t| t.elapsed().as_millis() as u64),
@@ -139,9 +119,6 @@ fn assemble_live(state: &super::ApiState) -> StatusDoc {
             s.network_online(),
         ),
         Err(_) => (
-            AuthState::Restoring,
-            None,
-            None,
             LatchedErrors::default(),
             QconnectStatus::default(),
             None,
@@ -196,11 +173,6 @@ fn assemble_live(state: &super::ApiState) -> StatusDoc {
         uptime_secs: uptime,
         data_root: state.roots.data.display().to_string(),
         driver_tick_age_ms: tick_age,
-        auth: AuthStatus {
-            state: auth,
-            user_id,
-            subscription,
-        },
         audio: AudioStatus {
             backend,
             configured_device,
@@ -297,20 +269,15 @@ fn cached_device_names(state: &super::ApiState) -> Vec<String> {
 mod tests {
     use super::*;
 
-    /// A NeedsAuth [`StatusDoc`] built directly (no live runtime), matching the
-    /// 02 §3.3.3 NeedsAuth fragment — the serde-shape contract these tests pin.
-    fn needs_auth_doc() -> StatusDoc {
+    /// An idle [`StatusDoc`] built directly (no live runtime) — the serde-shape
+    /// contract these tests pin.
+    fn idle_doc() -> StatusDoc {
         StatusDoc {
             version: "2.1.0".into(),
             api_version: crate::API_VERSION,
             uptime_secs: 261_360,
             data_root: "/home/pi/.local/share/qbzd".into(),
             driver_tick_age_ms: Some(210),
-            auth: AuthStatus {
-                state: AuthState::NeedsAuth,
-                user_id: None,
-                subscription: None,
-            },
             audio: AudioStatus {
                 backend: Some("alsa".into()),
                 configured_device: None,
@@ -345,7 +312,7 @@ mod tests {
     #[test]
     fn status_doc_mirrors_the_top_level_contract_keys() {
         // 02-cli-and-api.md §3.3.3 top-level keys, exactly.
-        let json = serde_json::to_value(needs_auth_doc()).unwrap();
+        let json = serde_json::to_value(idle_doc()).unwrap();
         let obj = json.as_object().unwrap();
         for key in [
             "version",
@@ -353,7 +320,6 @@ mod tests {
             "uptime_secs",
             "data_root",
             "driver_tick_age_ms",
-            "auth",
             "audio",
             "playback",
             "qconnect",
@@ -365,18 +331,16 @@ mod tests {
     }
 
     #[test]
-    fn needs_auth_fragment_matches_spec_example() {
-        // 02 §3.3.3 NeedsAuth example fragment + auth.state serde string.
-        let doc = needs_auth_doc();
-        assert_eq!(doc.auth.state, AuthState::NeedsAuth);
-        assert!(doc.auth.user_id.is_none());
-        assert!(doc.auth.subscription.is_none());
+    fn a_latched_auth_error_is_still_reported() {
+        // `last_errors.auth` is the error CHANNEL, not the account state
+        // machine that went with the login path: a QConnect handoff whose
+        // `jwt_api` is rejected still latches here, and `/api/status` is the
+        // only place it surfaces.
+        let doc = idle_doc();
         assert_eq!(
             doc.last_errors.auth.as_deref(),
             Some("token rejected by Qobuz (401) — cleared")
         );
-        let json = serde_json::to_value(&doc.auth).unwrap();
-        assert_eq!(json["state"], "needs_auth");
     }
 
     #[test]
@@ -384,7 +348,7 @@ mod tests {
         // Pins the `status()` pointer-overwrite: `to_value(&doc)` widens the
         // f32 `playback.volume` via `Number::from_f32`; the fix must land
         // `0.8` on the wire, never `0.800000011920929`.
-        let mut doc = needs_auth_doc();
+        let mut doc = idle_doc();
         doc.playback.volume = 0.8f32;
         let mut value = serde_json::to_value(&doc).unwrap();
         if let Some(vol) = value.pointer_mut("/playback/volume") {
@@ -398,7 +362,7 @@ mod tests {
     #[test]
     fn audio_block_serializes_the_documented_keys() {
         // 02 §3.3.3 audio object — the shape the live assembler fills.
-        let json = serde_json::to_value(needs_auth_doc()).unwrap();
+        let json = serde_json::to_value(idle_doc()).unwrap();
         let audio = json["audio"].as_object().unwrap();
         for key in [
             "backend",

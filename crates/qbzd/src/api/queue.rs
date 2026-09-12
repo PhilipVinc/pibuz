@@ -9,12 +9,6 @@
 // speaks 0-based exclusively, straight from `QueueState.current_index`
 // (`crates/qbz-models/src/playback.rs:94-103`) with no shift.
 //
-// 409 needs_auth is gated per-route by the §3.3.14-16 Errors columns, same
-// discipline as api/playback.rs's header comment: `add` gates (needs a
-// session to resolve tracks via `core.get_track`); `list`/`remove`/`clear`
-// carry no needs_auth in their Errors column and act on whatever queue state
-// already exists regardless of auth.
-//
 // Server-side materialization (brief, non-negotiable): `add` NEVER accepts a
 // client-built `QueueTrack`. It resolves each `track_id` via `core.get_track`
 // (the Qobuz catalog `Track`) and maps it to a `QueueTrack` with
@@ -38,8 +32,6 @@ use serde_json::Value;
 use tiny_http::Response;
 
 use qbz_models::{QueueTrack, RepeatMode, Track};
-
-use crate::state::AuthState;
 
 use super::{err_json, json, ApiState};
 
@@ -95,17 +87,13 @@ pub fn list(state: &ApiState, query: &str) -> Response<Cursor<Vec<u8>>> {
 }
 
 /// `POST /api/queue/add` (02 §3.3.14). Body `{"track_ids": [...], "position":
-/// "end"|"next"}` (`position` default `"end"`). Errors: 409 `needs_auth`,
+/// "end"|"next"}` (`position` default `"end"`). Errors:
 /// 404 `not_found` (any unresolvable id — resolution stops at the first
 /// failure, nothing partially added), 400 `bad_request` (malformed
 /// `track_ids` element or unknown `position` literal — both parses are
 /// STRICT and run before any core call, so a rejected body never partially
 /// mutates the queue).
 pub fn add(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
-    if let Some(resp) = auth_gate(state) {
-        return resp;
-    }
-
     let track_ids = match parse_track_ids(body) {
         Ok(ids) => ids,
         Err((message, hint)) => return err_json(400, "bad_request", &message, &hint),
@@ -287,9 +275,6 @@ pub fn reorder(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
 /// spawn-and-ack (see `playback::advance`) so a slow fetch can't starve the
 /// single-threaded API — failures latch into `last_errors.stream`.
 pub fn jump(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
-    if let Some(resp) = auth_gate(state) {
-        return resp;
-    }
     let index = match body.get("index").and_then(|v| v.as_u64()) {
         Some(n) => n as usize,
         None => {
@@ -381,29 +366,6 @@ pub fn stop_after(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
 }
 
 // ============================ internals ============================
-
-/// 409 `needs_auth` — only `add` gates (§3.3.14's Errors column; `list`/
-/// `remove`/`clear` carry no needs_auth entry and act on whatever queue
-/// already exists). Mirrors `playback::auth_gate` exactly; kept local per
-/// this file's self-contained-helpers convention (see api/status.rs's own
-/// `bitperfect_label`/`backend_label`).
-fn auth_gate(state: &ApiState) -> Option<Response<Cursor<Vec<u8>>>> {
-    let needs_auth = state
-        .shared
-        .lock()
-        .map(|s| s.auth == AuthState::NeedsAuth)
-        .unwrap_or(false);
-    if needs_auth {
-        Some(err_json(
-            409,
-            "needs_auth",
-            "not logged in to Qobuz",
-            "run: qbzd login",
-        ))
-    } else {
-        None
-    }
-}
 
 /// Strict `track_ids` parse — ANY non-u64 element is a 400 naming the
 /// offending (0-based JSON array) position. The previous `filter_map` parse

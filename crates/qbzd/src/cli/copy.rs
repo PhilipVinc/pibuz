@@ -19,23 +19,6 @@ pub fn daemon_down(host: &str) -> String {
     )
 }
 
-/// Daemon up but not logged in — exit 4 (02 §1.4). The down-vs-unhealthy
-/// distinction: the daemon answered, the Qobuz session is what's missing.
-/// Rendered by `CliError::NeedsAuth`'s `Display` — hit whenever `now`/`play`/
-/// `toggle`/`next`/`prev` get a 409 `needs_auth` from a daemon nothing has cast
-/// to yet; `status` renders the composite block instead.
-///
-/// This used to advise `qbzd login`. There is no login any more — the renderer
-/// gets its credentials from a Qobuz Connect handoff — so a message naming a
-/// command that does not exist is worse than no message. Say what the state
-/// actually is and what resolves it.
-pub fn daemon_up_needs_auth() -> String {
-    "error: nothing is playing — this renderer has not been cast to yet
-  → open Qobuz on your phone or desktop, start a track, and pick this device
-    from the output/devices menu"
-        .to_string()
-}
-
 /// Linger-off warning (02 §1.4; NOT an error) — printed by `qbzd status` on the
 /// daemon box when `loginctl show-user $USER -p Linger` reports `Linger=no`.
 pub fn linger_off(user: &str) -> String {

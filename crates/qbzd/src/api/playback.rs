@@ -1,14 +1,12 @@
 // crates/qbzd/src/api/playback.rs — routes 4-12 (02-cli-and-api.md §3.3.4-12):
 // GET /api/now-playing + the 8 POST /api/playback/* transport routes.
 //
-// 409 needs_auth (01-architecture.md §6.2) is gated per-route by reading the
-// per-route Errors column in 02 §3.3, not blanket-applied: `/api/now-playing`
-// gates unconditionally (§3.3.4); `play`/`toggle` gate ONLY the cold-start
-// branch (§3.3.5-8 "cold-start needs a session"); `next`/`previous` gate
-// unconditionally before running the advance ritual (§3.3.9-10); `pause`/
-// `stop`/`seek`/`volume` never cold-start and are NOT listed with needs_auth
-// in their own Errors columns (§3.3.11-12), so they act on whatever is
-// already loaded regardless of auth state.
+// There is no auth gate. These routes used to answer 409 `needs_auth` off the
+// account state machine; this daemon has no account path, so that state was
+// permanently "not logged in" and the gate answered 409 to every transport
+// call on a renderer that was playing perfectly. A cast session carries its
+// own `jwt_api` (qconnect/pairing.rs), and a route that genuinely cannot
+// resolve a stream fails at the core call with the reason.
 //
 // DSD-direct guard: `Player::is_dsd_direct_active()` (qbz-player/src/player/
 // mod.rs:4893, "True while a DoP stream is active (volume fixed, seek
@@ -31,8 +29,6 @@ use std::sync::Arc;
 use serde_json::Value;
 use tiny_http::Response;
 
-use crate::state::AuthState;
-
 use super::{canon_volume, err_json, json, ApiState};
 
 /// `GET /api/now-playing` (02 §3.3.4). `playback` is the serialized
@@ -45,10 +41,6 @@ use super::{canon_volume, err_json, json, ApiState};
 /// no queue count because nothing needs one while a track is loaded).
 /// `track` is the current `QueueTrack`, or `null` when nothing is loaded.
 pub fn now_playing(state: &ApiState) -> Response<Cursor<Vec<u8>>> {
-    if let Some(resp) = auth_gate(state) {
-        return resp;
-    }
-
     let player = state.runtime.core().player();
     let mut ev = player.get_playback_event();
     let queue = state.rt.block_on(state.runtime.core().get_queue_state());
@@ -375,9 +367,7 @@ fn apply_mute(state: &ApiState, live: f32, arg: &str) -> Response<Cursor<Vec<u8>
     )
 }
 
-/// `next`/`previous` (02 §3.3.9-10): gate on NeedsAuth BEFORE running the
-/// ritual (unconditional per those two rows' Errors column, unlike
-/// play/toggle's cold-start-only gate), then SPAWN
+/// `next`/`previous` (02 §3.3.9-10): SPAWN
 /// `qbz_app::playback_driver::advance_and_play` — the FULL ritual (skip-walk →
 /// play → prefetch → persist), never a bare cursor move (02 §2.2 trap).
 ///
@@ -389,9 +379,6 @@ fn apply_mute(state: &ApiState, live: f32, arg: &str) -> Response<Cursor<Vec<u8>
 /// The landing track is no longer reported synchronously — follow it via
 /// `qbzd now` / SSE.
 fn advance(state: &ApiState, forward: bool) -> Response<Cursor<Vec<u8>>> {
-    if let Some(resp) = auth_gate(state) {
-        return resp;
-    }
     let quality = resolve_quality(state);
     let runtime = std::sync::Arc::clone(&state.runtime);
     let shared = Arc::clone(&state.shared);
@@ -411,22 +398,19 @@ fn advance(state: &ApiState, forward: bool) -> Response<Cursor<Vec<u8>>> {
     )
 }
 
-/// `play`/`toggle`'s cold-start branch: gate on NeedsAuth, resolve the
+/// `play`/`toggle`'s cold-start branch: resolve the
 /// current queue track, then SPAWN resolve+play+persist — the same ritual
 /// tail `advance_and_play` runs, minus the cursor-move (we're playing the
 /// CURRENT track, not advancing to a new one) and the gapless prefetch (the
 /// running driver's tick-based `ArmGapless` picks that up on a later tick
 /// once playback is underway).
 ///
-/// Spawn-and-ack (see `advance`): the gates (auth, empty queue) stay
-/// synchronous so their documented errors are immediate; the network-bound
+/// Spawn-and-ack (see `advance`): the empty-queue gate stays
+/// synchronous so its documented error is immediate; the network-bound
 /// load leg runs on the tokio runtime and latches failures into
 /// `last_errors.stream` instead of a 5xx. Ok(()) means "load queued" — the
 /// callers answer `{"state": "loading"}`.
 fn cold_start(state: &ApiState) -> Result<(), Response<Cursor<Vec<u8>>>> {
-    if let Some(resp) = auth_gate(state) {
-        return Err(resp);
-    }
     let queue = state.rt.block_on(state.runtime.core().get_queue_state());
     let Some(track) = queue.current_track else {
         // No documented error code fits "empty queue" exactly; audio_unavailable
@@ -467,25 +451,6 @@ fn cold_start(state: &ApiState) -> Result<(), Response<Cursor<Vec<u8>>>> {
 pub(crate) fn resolve_quality(state: &ApiState) -> qbz_models::Quality {
     let prefs = qbz_app::settings::daemon_prefs::load_at(&state.roots.data);
     qbz_app::playback_driver::quality_from_key(&prefs.streaming_quality)
-}
-
-/// 409 `needs_auth` (01 §6.2 / 02 §3.1.3 example envelope, verbatim).
-fn auth_gate(state: &ApiState) -> Option<Response<Cursor<Vec<u8>>>> {
-    let needs_auth = state
-        .shared
-        .lock()
-        .map(|s| s.auth == AuthState::NeedsAuth)
-        .unwrap_or(false);
-    if needs_auth {
-        Some(err_json(
-            409,
-            "needs_auth",
-            "not logged in to Qobuz",
-            "run: qbzd login",
-        ))
-    } else {
-        None
-    }
 }
 
 /// A generic runtime failure, exit 1 (02 §1.3's catch-all) — e.g. the

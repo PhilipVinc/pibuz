@@ -145,22 +145,21 @@ grep -q 'unknown key: acceptance_script_marker' "$LOGFILE" \
   || fail "boot did not warn about the unrecognized qbzd.toml key -- see $LOGFILE"
 
 echo "== status answers 'why is it silent' in one call (02 section 3.3.3) =="
-# This scratch daemon never logs in, so status is expected to report
-# auth.state=needs_auth and the CLI exits 4 (02 section 1.3: "status exits
-# nonzero on degraded state") -- that is the down-vs-unhealthy distinction
-# working correctly, not a script failure, so capture rc separately from
-# `set -e` and assert the SPECIFIC expected code rather than just >/dev/null.
+# A renderer that has not been cast to is HEALTHY: it has no account by
+# design, its credentials arrive with a Qobuz Connect handoff. This used to
+# assert exit 4 (needs_auth) here, which meant every idle Pi reported itself
+# as failed to every script that checked it.
 set +e
 status_json=$(qbzd status --json)
-rc_status_needs_auth=$?
+rc_status=$?
 set -e
-[ "$rc_status_needs_auth" -eq 4 ] || fail "status --json on an unauthenticated daemon != 4 (got $rc_status_needs_auth)"
+[ "$rc_status" -eq 0 ] || fail "status --json on an idle renderer != 0 (got $rc_status)"
 echo "$status_json" | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
-for k in ('auth', 'audio', 'playback', 'qconnect', 'network', 'last_errors', 'driver_tick_age_ms'):
+for k in ('audio', 'playback', 'qconnect', 'network', 'last_errors', 'driver_tick_age_ms'):
     assert k in d, f'missing status key: {k}'
-assert d['auth']['state'] == 'needs_auth', d['auth']
+assert 'auth' not in d, 'there is no account state any more'
 "
 
 echo "== ping/info shape (02 section 3.3.1 / 3.3.2) =="

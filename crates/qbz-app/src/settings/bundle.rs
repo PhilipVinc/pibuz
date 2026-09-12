@@ -1118,7 +1118,7 @@ fn plan_integrations(
         if !uid_will_exist {
             plan.skipped.push(skip_line(
                 &full,
-                "no user on this daemon yet — run qbzd login first, or import with --include-auth",
+                "scrobbler settings need a per-user store this daemon does not have",
             ));
             continue;
         }

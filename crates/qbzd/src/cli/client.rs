@@ -20,8 +20,6 @@ pub enum CliError {
     /// exit 3 — connect refused / timeout on the target (carries `host` for the
     /// §1.4 daemon-down copy).
     Unreachable(String),
-    /// exit 4 — daemon in NeedsAuth; a Qobuz session is required.
-    NeedsAuth,
     /// exit 5 — audio/device error (device unopenable, volume/seek fixed in DSD).
     Device(String),
     /// exit 6 — unknown id / index out of range.
@@ -37,7 +35,6 @@ impl CliError {
         match self {
             CliError::Runtime(_) | CliError::ApiSkew { .. } => 1,
             CliError::Unreachable(_) => 3,
-            CliError::NeedsAuth => 4,
             CliError::Device(_) => 5,
             CliError::NotFound(_) => 6,
         }
@@ -49,7 +46,6 @@ impl std::fmt::Display for CliError {
         use crate::cli::copy;
         match self {
             CliError::Unreachable(host) => write!(f, "{}", copy::daemon_down(host)),
-            CliError::NeedsAuth => write!(f, "{}", copy::daemon_up_needs_auth()),
             // `error_from_envelope` pre-builds the two DSD-specific codes into
             // the full verbatim §1.4 copy (already "error: ..." prefixed); a
             // plain device message from the server gets the generic prefix.
@@ -253,7 +249,6 @@ fn error_from_envelope(v: &Value) -> CliError {
         .unwrap_or("daemon returned an error")
         .to_string();
     match code {
-        "needs_auth" => CliError::NeedsAuth,
         "not_found" => CliError::NotFound(message),
         // §1.4's verbatim DSD blocks are frozen client-side copy, not the
         // server's short envelope message — swap them in so `qbzd seek`/
@@ -273,7 +268,6 @@ mod tests {
     fn exit_codes_match_the_frozen_table() {
         // 02-cli-and-api.md §1.3.
         assert_eq!(CliError::Unreachable("x".into()).exit_code(), 3);
-        assert_eq!(CliError::NeedsAuth.exit_code(), 4);
         assert_eq!(CliError::Device("x".into()).exit_code(), 5);
         assert_eq!(CliError::NotFound("x".into()).exit_code(), 6);
         assert_eq!(CliError::ApiSkew { daemon: 2, cli: 1 }.exit_code(), 1);
@@ -282,8 +276,6 @@ mod tests {
 
     #[test]
     fn error_envelope_maps_code_to_exit() {
-        let needs = serde_json::json!({"error": {"code": "needs_auth", "message": "no"}});
-        assert_eq!(error_from_envelope(&needs).exit_code(), 4);
         let nf = serde_json::json!({"error": {"code": "not_found", "message": "no"}});
         assert_eq!(error_from_envelope(&nf).exit_code(), 6);
         let dev = serde_json::json!({"error": {"code": "volume_fixed_dsd", "message": "no"}});
