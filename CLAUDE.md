@@ -13,9 +13,16 @@ artifacts in `target/`. Plain `cargo build` / `cargo test` from the root work.
 (It was not always so — the manifest used to live in `crates/`, so older commit
 messages and comments may mention `--manifest-path crates/Cargo.toml`.)
 
-The workspace is `qbzd` plus **exactly** its dependency closure — 23 crates, the
+The workspace is `qbzd` plus **exactly** its dependency closure — 20 crates, the
 set `cargo tree -p qbzd` resolves. If you find yourself adding a workspace member,
 check whether `qbzd` really needs it.
+
+It was 23 until the desktop-era code came out: `qbz-offline-cache`, `qbz-library`
+and `qbz-secrets` were the offline-download tier, reachable only through three
+`qbz-core` methods whose `offline:` argument every call site in the tree passed
+`None` to. Linked, never used. If a feature here looks orphaned, check whether
+anything actually calls it before assuming it is load-bearing — a lot of this
+tree is a desktop app that was never fully unwound.
 
 ## Commands
 
@@ -29,7 +36,7 @@ cargo build --release -p qbzd
 
 ## Tests and lints: the suite is GREEN, keep it that way
 
-`./scripts/cargo-test.sh` passes clean — 47 suites, 0 failures — on macOS and
+`./scripts/cargo-test.sh` passes clean — 997 tests, 0 failures — on macOS and
 linux/arm64. `cargo clippy --workspace --all-targets -- -D warnings` is clean on
 both too, and CI enforces fmt + clippy + tests. **A failure is a regression.**
 
@@ -38,6 +45,33 @@ both too, and CI enforces fmt + clippy + tests. **A failure is a regression.**
 Linux too — nothing installed the rustls `CryptoProvider` outside `qbzd`'s
 `main`, so any test building a reqwest client panicked. The ninth asserted XDG
 paths on a platform that does not use them. All fixed.)
+
+## The audio behaviour tests
+
+`crates/qbz-player/src/player/playback_engine.rs` → `mod engine_behaviour_tests`
+runs the REAL decoder thread, writer thread and ring against
+`qbz_audio::VirtualAudioOut` — a software DAC that clocks at `rate x speed`,
+models `start_threshold`, counts underruns and can tape every frame handed over.
+The whole suite is ~0.25 s: `cargo test -p qbz-player engine_behaviour`.
+
+**Every bug found on hardware gets a case there BEFORE it is fixed.** A suite
+nobody adds to is dead weight; the discipline is the point. It has already earned
+it — it caught an end-of-stream bug on its first run that hardware testing had
+only half-revealed.
+
+Do NOT reach for ALSA's `null` PCM instead. Measured: it takes 3 s of audio in
+2 ms and reports no delay, so every timing-dependent path degenerates.
+
+Two traps in the harness itself:
+- Sample `underruns()` MID-TRACK. The end of a tail runs the ring dry and counts
+  as one, exactly as real ALSA reaches XRun there — `drain` relies on that.
+- Use `snapshot()` for anything asserting `played + queued == written`. Reading
+  `frames_played()` and `delay_frames()` separately is a race.
+
+What it cannot test at all: clicks, real xruns, the stop ramp, `start_threshold`
+against a real driver, RT scheduling, whether moOde's `_audioout` really passes
+through. Green here means the state machine is right, not that the Pi sounds
+right.
 
 ## Formatting and lints
 
