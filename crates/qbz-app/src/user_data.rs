@@ -135,14 +135,6 @@ impl UserDataPaths {
         contents.trim().parse::<u64>().ok()
     }
 
-    /// Clear the last user_id file, called on explicit logout.
-    pub fn clear_last_user_id() {
-        if let Ok(path) = Self::last_user_id_path() {
-            let _ = std::fs::remove_file(&path);
-            log::info!("Cleared last_user_id file");
-        }
-    }
-
     fn last_user_id_path() -> Result<PathBuf, String> {
         let dir = Self::global_data_dir()?;
         Ok(dir.join("last_user_id"))

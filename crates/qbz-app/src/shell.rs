@@ -241,18 +241,6 @@ impl<A: FrontendAdapter + Send + Sync + 'static> AppRuntime<A> {
         }
     }
 
-    /// Activate an offline-only session using the last known user.
-    ///
-    /// Falls back to user id `0` (an empty profile) when no previous session
-    /// was recorded. Does not re-persist the last-user marker.
-    pub async fn activate_offline(&self) -> Result<(), String> {
-        let user_id = UserDataPaths::load_last_user_id().unwrap_or(0);
-        self.user_paths.set_user(user_id);
-        let data_dir = self.user_paths.user_data_dir()?;
-        let cache_dir = self.user_paths.user_cache_dir()?;
-        self.activate_at(user_id, &data_dir, &cache_dir).await
-    }
-
     /// Deactivate the current session.
     ///
     /// Drops the open per-user stores (closing their database connections),

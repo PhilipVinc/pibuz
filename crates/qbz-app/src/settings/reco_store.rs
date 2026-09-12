@@ -1100,10 +1100,6 @@ fn merge_unique_preserve_order<T: Eq + std::hash::Hash + Clone>(
 
 pub type RecoStoreState = Arc<Mutex<Option<RecoStore>>>;
 
-pub fn create_empty_reco_store_state() -> RecoStoreState {
-    Arc::new(Mutex::new(None))
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
