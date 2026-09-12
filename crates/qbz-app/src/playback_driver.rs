@@ -450,10 +450,7 @@ pub async fn run_driver<A: FrontendAdapter + Send + Sync + 'static>(
                     // big, and if so write it to the card in one blocking fsync'd
                     // burst and drop the copy: a 195 MB `Arc` clone plus 11-15 s
                     // of a pinned card, which underran ALSA audibly.
-                    match core
-                        .fetch_for_gapless_resolved(*id, quality, None, None)
-                        .await
-                    {
+                    match core.fetch_for_gapless_resolved(*id, quality).await {
                         Some(qbz_player::TrackAudio::File(path)) => {
                             if let Err(e) = player.play_next_file(path, *id) {
                                 log::warn!("[qbzd] driver: gapless from disk failed: {e}");
@@ -595,8 +592,7 @@ pub async fn advance_and_play<A: FrontendAdapter + Send + Sync + 'static>(
         return Ok(None);
     };
     let track_id = track.id;
-    core.play_track_resolved(track_id, quality, None, None, 0)
-        .await?;
+    core.play_track_resolved(track_id, quality, 0).await?;
     // Warm the successors so the next transition can be gapless (best-effort).
     prefetch_successors(runtime, quality).await;
     // Persist the session (queue + current + position) so a restart resumes.

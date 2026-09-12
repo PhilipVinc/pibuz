@@ -45,9 +45,6 @@ pub enum ApiError {
     #[error("Temporarily backing off after repeated 403s ({0}s remaining)")]
     ForbiddenCircuitOpen(u64),
 
-    #[error("Offline mode is active - Qobuz services are disabled")]
-    OfflineMode,
-
     #[error("Network error: {0}")]
     NetworkError(#[from] reqwest::Error),
 

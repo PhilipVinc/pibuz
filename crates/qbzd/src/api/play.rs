@@ -106,7 +106,7 @@ pub(crate) fn start_resolved(
     state.rt.spawn(async move {
         let played = runtime
             .core()
-            .play_track_resolved(start_track_id, quality, None, None, 0)
+            .play_track_resolved(start_track_id, quality, 0)
             .await;
         if let Err(err) = played {
             log::error!("[api] play start of {start_track_id} failed: {err}");

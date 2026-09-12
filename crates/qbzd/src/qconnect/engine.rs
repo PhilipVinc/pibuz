@@ -281,7 +281,7 @@ impl DaemonRendererEngine {
         start_position_secs: u64,
     ) -> Result<(), String> {
         self.core()
-            .play_track_resolved(track_id, quality, None, None, start_position_secs)
+            .play_track_resolved(track_id, quality, start_position_secs)
             .await
             .map_err(|err| format!("CMAF fallback for remote track {track_id}: {err}"))?;
         self.core().sync_current_to_id(track_id).await;

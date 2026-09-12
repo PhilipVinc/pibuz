@@ -14,7 +14,7 @@
 //!
 //! The Last.fm offline queue does NOT live here: it is the `scrobble_queue`
 //! table in the shared per-user `offline_settings.db`
-//! ([`crate::offline_mode::store::OfflineModeStore`]) — same rows Tauri queues
+//! (the desktop app's offline-mode store) — same rows Tauri queues
 //! into and flushes from. The ListenBrainz offline queue is the
 //! `ListenBrainzCache.listen_queue` (qbz-integrations).
 //!

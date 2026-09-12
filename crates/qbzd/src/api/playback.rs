@@ -446,7 +446,7 @@ fn cold_start(state: &ApiState) -> Result<(), Response<Cursor<Vec<u8>>>> {
     state.rt.spawn(async move {
         let played = runtime
             .core()
-            .play_track_resolved(track_id, quality, None, None, 0)
+            .play_track_resolved(track_id, quality, 0)
             .await;
         if let Err(err) = played {
             log::error!("[api] cold-start play of {track_id} failed: {err}");

@@ -319,7 +319,7 @@ pub fn jump(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
     state.rt.spawn(async move {
         if let Err(err) = runtime
             .core()
-            .play_track_resolved(track_id, quality, None, None, 0)
+            .play_track_resolved(track_id, quality, 0)
             .await
         {
             log::error!("[api] queue jump play of {track_id} failed: {err}");

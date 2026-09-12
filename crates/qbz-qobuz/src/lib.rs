@@ -39,7 +39,6 @@ pub mod error;
 pub mod forbidden_breaker;
 pub mod link_resolver;
 pub mod lyrics;
-pub mod offline_gate;
 pub mod performers;
 pub mod purchases;
 pub mod retry;

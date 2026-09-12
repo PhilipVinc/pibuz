@@ -10,7 +10,7 @@
 //!
 //! - Every purchase service request routes through `self.http()?` (the in-tree
 //!   offline choke point) instead of the raw `self.http` the Tauri build uses.
-//!   Purchases therefore fail fast offline (`ApiError::OfflineMode`), consistent
+//!   Purchases therefore fail fast without a connection, consistent
 //!   with the rest of `qbz-qobuz`. The Tauri build had no shared offline gate.
 //! - The CDN cross-feature gate (`CDN_STREAMING_ACTIVE`) is `src-tauri`-only; it
 //!   guarded `download_audio` against concurrent streaming-vs-download CDN rate

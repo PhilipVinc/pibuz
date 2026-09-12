@@ -54,7 +54,6 @@
 
 pub mod core;
 pub mod error;
-pub mod offline_resolve;
 /// Host memory profiling. Lives in `qbz-models` so `qbz-player` (which
 /// `qbz-core` depends on) can size its caches from it too; re-exported here
 /// because callers know it by this path.

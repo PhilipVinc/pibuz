@@ -1621,12 +1621,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "glob"
-version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
-
-[[package]]
 name = "hashbrown"
 version = "0.14.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2337,32 +2331,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lofty"
-version = "0.23.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d0c107dba5af049cf1c36b646fc1ba0cd2705f40d766d2c4c64f1b797c5fbed"
-dependencies = [
- "byteorder",
- "data-encoding",
- "flate2",
- "lofty_attr",
- "log",
- "ogg_pager",
- "paste",
-]
-
-[[package]]
-name = "lofty_attr"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "458ace39169e4b83c4f77ae3d42d5d1d11c422feef590219a97c973d3b524557"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
 name = "log"
 version = "0.4.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2809,15 +2777,6 @@ dependencies = [
  "libc",
  "objc2",
  "objc2-core-foundation",
-]
-
-[[package]]
-name = "ogg_pager"
-version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d6d1ca8364b84e0cf725eed06b1460c44671e6c0fb28765f5262de3ece07fdc"
-dependencies = [
- "byteorder",
 ]
 
 [[package]]
@@ -3340,7 +3299,6 @@ dependencies = [
  "qbz-audio",
  "qbz-integrations",
  "qbz-models",
- "qbz-offline-cache",
  "qbz-player",
  "qbz-qobuz",
  "qbz-radio",
@@ -3395,25 +3353,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "qbz-library"
-version = "2.1.0"
-dependencies = [
- "dirs 6.0.0",
- "glob",
- "image",
- "lofty",
- "log",
- "qbz-dsd",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "uuid 1.22.0",
- "walkdir",
-]
-
-[[package]]
 name = "qbz-log"
 version = "2.1.0"
 dependencies = [
@@ -3454,27 +3393,6 @@ dependencies = [
  "thiserror 2.0.18",
  "url",
  "urlencoding",
-]
-
-[[package]]
-name = "qbz-offline-cache"
-version = "2.1.0"
-dependencies = [
- "dirs 6.0.0",
- "futures-util",
- "lofty",
- "log",
- "qbz-cmaf",
- "qbz-library",
- "qbz-models",
- "qbz-qobuz",
- "qbz-secrets",
- "reqwest",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
 ]
 
 [[package]]
@@ -3548,23 +3466,6 @@ dependencies = [
  "rusqlite",
  "serde",
  "tokio",
-]
-
-[[package]]
-name = "qbz-secrets"
-version = "2.1.0"
-dependencies = [
- "aes-gcm",
- "base64",
- "hkdf",
- "keyring",
- "log",
- "rand 0.9.3",
- "serde",
- "sha2 0.10.9",
- "tempfile",
- "thiserror 2.0.18",
- "uuid 1.22.0",
 ]
 
 [[package]]
