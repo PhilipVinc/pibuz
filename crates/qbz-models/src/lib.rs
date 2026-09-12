@@ -32,7 +32,6 @@
 pub mod error;
 pub mod events;
 pub mod lenient;
-pub mod mixtape;
 pub mod playback;
 pub mod purchase_serde;
 pub mod source;

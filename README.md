@@ -1,39 +1,21 @@
-# μqbzd — headless Qobuz Connect daemon
+# μ-qbz-d — headless Qobuz Connect daemon
 
 **μqbzd started life as a fork of [QBZ](https://github.com/vicrodh/qbz), and has since
-diverged into a headless-only project.** See [Where this came from](#where-this-came-from)
-— QBZ is where nearly all of this code was written, and it is very much alive; if you want
-a desktop Qobuz player, go there, not here.
+diverged into a headless-only project optimized for low power devices like Raspberry Pis.** See [Where this came from](#where-this-came-from)
 
-> **The name.** **μ** reads three ways, all of them true: *micro*, because what's left is
-> a ~25 MB binary where the desktop build wanted ~30 GB of RAM to link; **無** *mu*,
-> *nothing* — this is the one with no interface; and plain *mu*sic. Written `muqbzd`
-> wherever ASCII is required (the repo, the tag names, anything you have to type). The
-> binary is still `qbzd`, so every existing unit file, hook and `qbzd ...` command keeps
-> working.
-
-`qbzd` is a standalone ~25 MB binary that turns any Linux box — a Raspberry Pi, a NAS, the
+The binary is `qbzd`, a standalone ~25 MB binary that turns any Linux box — a Raspberry Pi, a NAS, or the 
 living-room mini-PC — into a bit-perfect **Qobuz Connect endpoint** that appears in the
 official Qobuz apps like a hardware streamer.
 
 - Daemon + full CLI + terminal setup wizard (TUI) in one binary
-- Browser-based login that works over SSH; one-file settings hand-off from desktop QBZ
 - HiFi wizard with copyable audio-stack config blocks (clipboard works over SSH)
 - MPRIS out of the box, live JSON events (`qbzd watch`), service files for systemd/OpenRC/runit
 - Event hooks: `qbzd settings set hooks.script /path/to/script` runs your script on
   playback/session events with `QBZ_*` environment variables — push integration for
   audio-box distros (moOde, Volumio, DIY setups), no polling required
 - Local pairing (no login required): the daemon advertises itself on the LAN like a
-  hardware streamer, so ANY Qobuz account in the household can cast to it from the
-  official app — the app hands the device its own session tokens on selection
-  (last cast wins, exactly like a Spotify Connect box). A logged-in account is
-  optional: when present the daemon streams with its own account, otherwise it
-  streams with the token the casting app handed over. Toggle with
-  `qbzd settings set qconnect.pairing on|off` (port: `qconnect.pairing_port`, default 8183);
-  both apply on the next daemon start
+  hardware streamer, so ANY Qobuz account in the household can cast to it from the official app.
 
-Upstream's manual still applies:
-**[Headless Daemon (qbzd) — Wiki](https://github.com/vicrodh/qbz/wiki/Headless-Daemon)**
 
 ## Where this came from
 
@@ -63,7 +45,6 @@ want the application; μqbzd only makes sense if you want a headless box.
 
 - This application uses the Qobuz API but is not certified by Qobuz.
 - Qobuz is a trademark of Qobuz. QBZ is not affiliated with, endorsed by, or certified by Qobuz.
-- **Offline cache** is a temporary playback store for listening without an internet connection while you have a valid subscription. If your subscription becomes invalid, QBZ will remove all cached content after 3 days.
 - Qobuz Terms of Service: https://www.qobuz.com/us-en/legal/terms
 
 ## Building
