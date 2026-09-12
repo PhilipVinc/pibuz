@@ -1179,10 +1179,6 @@ pub fn export(roots: &ProfileRoots, file: Option<String>, from: &str, include_au
             eprintln!("{}", crate::cli::copy::bundle_no_desktop_profile());
             return 1;
         }
-        Err(bundle::BundleError::TokenDecryptFailed) => {
-            eprintln!("{}", crate::cli::copy::bundle_token_decrypt_failed());
-            return 1;
-        }
         Err(e) => {
             eprintln!("error: {e}");
             return 1;

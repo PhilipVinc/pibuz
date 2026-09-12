@@ -22,12 +22,17 @@ pub fn daemon_down(host: &str) -> String {
 /// Daemon up but not logged in — exit 4 (02 §1.4). The down-vs-unhealthy
 /// distinction: the daemon answered, the Qobuz session is what's missing.
 /// Rendered by `CliError::NeedsAuth`'s `Display` — hit whenever `now`/`play`/
-/// `toggle`/`next`/`prev` get a 409 `needs_auth` from a NeedsAuth daemon;
-/// `status` renders the composite block instead.
+/// `toggle`/`next`/`prev` get a 409 `needs_auth` from a daemon nothing has cast
+/// to yet; `status` renders the composite block instead.
+///
+/// This used to advise `qbzd login`. There is no login any more — the renderer
+/// gets its credentials from a Qobuz Connect handoff — so a message naming a
+/// command that does not exist is worse than no message. Say what the state
+/// actually is and what resolves it.
 pub fn daemon_up_needs_auth() -> String {
-    "error: daemon is running but not logged in to Qobuz
-  → log in:           qbzd login
-  → have a bundle?    qbzd settings import qbz-settings-20260714.qbzb --include-auth"
+    "error: nothing is playing — this renderer has not been cast to yet
+  → open Qobuz on your phone or desktop, start a track, and pick this device
+    from the output/devices menu"
         .to_string()
 }
 
@@ -150,17 +155,6 @@ pub fn bundle_no_desktop_profile() -> String {
     "error: no desktop profile found at ~/.local/share/qbz
   is desktop QBZ installed on this box? To export this daemon's settings instead:
   qbzd settings export            (daemon profile is the default)"
-        .to_string()
-}
-
-/// IV1 desktop-token decryption failure on `--from desktop --include-auth`
-/// (04 §4.1, verbatim) — the portal secret is bound to the desktop session.
-pub fn bundle_token_decrypt_failed() -> String {
-    "error: could not decrypt the desktop Qobuz token
-  the desktop token is protected with a session key only available inside your
-  desktop session
-  → run this command from a terminal inside your desktop session, or
-  → skip --include-auth and log the daemon in directly:  qbzd login"
         .to_string()
 }
 
