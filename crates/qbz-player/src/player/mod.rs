@@ -45,7 +45,6 @@ use qbz_audio::{
     calculate_gain_factor, db_to_linear, extract_replaygain, AnalyzerMessage, AnalyzerTap,
     AudioBackendType, AudioDiagnostic, AudioSettings, BackendConfig, BackendManager,
     BitPerfectMode, DiagnosticSource, DynamicAmplify, LoudnessAnalyzer, LoudnessCache,
-    TappedSource, VisualizerTap,
 };
 use qbz_cache::TrackBytes;
 use qbz_models::{AssetOrigin, ExternalStreamAsset, Quality, StreamQualityInfo};
@@ -1674,9 +1673,6 @@ pub struct Player {
     pub state: SharedState,
     /// Audio settings (exclusive mode, DAC passthrough, etc.)
     audio_settings: Arc<Mutex<AudioSettings>>,
-    /// Visualizer tap for audio sample capture (optional)
-    #[allow(dead_code)]
-    visualizer_tap: Option<VisualizerTap>,
     /// Bit-depth diagnostic capture (always available, zero-cost when idle)
     pub diagnostic: AudioDiagnostic,
     /// Two-level playback cache (L1 memory + optional L2 disk). A track is
@@ -1686,18 +1682,16 @@ pub struct Player {
 
 impl Default for Player {
     fn default() -> Self {
-        Self::new(None, AudioSettings::default(), None, AudioDiagnostic::new())
+        Self::new(None, AudioSettings::default(), AudioDiagnostic::new())
     }
 }
 
 impl Player {
     /// Create a new player with an optional specific output device and audio settings
     /// If device_name is None, uses the system default device
-    /// visualizer_tap is optional - if provided, audio samples are captured for visualization
     pub fn new(
         device_name: Option<String>,
         audio_settings: AudioSettings,
-        visualizer_tap: Option<VisualizerTap>,
         diagnostic: AudioDiagnostic,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<AudioCommand>();
@@ -1713,8 +1707,7 @@ impl Player {
         let settings = Arc::new(Mutex::new(audio_settings.clone()));
         let thread_settings = settings.clone();
 
-        // Clone visualizer tap and diagnostic for audio thread
-        let thread_viz_tap = visualizer_tap.clone();
+        // Clone the diagnostic for the audio thread
         let thread_diagnostic = diagnostic.clone();
 
         // Spawn dedicated audio thread
@@ -1735,7 +1728,7 @@ impl Player {
             let _analyzer_handle = LoudnessAnalyzer::spawn(analyzer_rx, loudness_cache.clone());
             let analyzer_enabled = Arc::new(AtomicBool::new(false));
 
-            // Helper to wrap source with visualizer tap, normalization, and diagnostic capture
+            // Helper to wrap a source with diagnostic capture and normalization
             // Pipeline order (normalization ON):
             //   Diagnostic (raw) → AnalyzerTap → DynamicAmplify → Visualizer
             // Pipeline order (normalization OFF — bit-perfect):
@@ -1773,16 +1766,7 @@ impl Player {
                         source
                     };
 
-                // Visualizer tap (outermost)
-                if let Some(ref tap) = thread_viz_tap {
-                    Box::new(TappedSource::new(
-                        source,
-                        tap.ring_buffer.clone(),
-                        tap.enabled.clone(),
-                    ))
-                } else {
-                    source
-                }
+                source
             };
 
             // Get the audio host
@@ -2470,7 +2454,7 @@ impl Player {
                             *current_gain_atomic = gain_atomic.clone();
                             thread_state.set_normalization_gain(normalization);
 
-                            // Wrap source with diagnostic, normalization, and visualizer
+                            // Wrap source with diagnostic capture and normalization
                             let source = wrap_source(
                                 source,
                                 normalization,
@@ -3127,7 +3111,7 @@ impl Player {
                                 );
                             }
 
-                            // Wrap source with diagnostic, normalization, and visualizer
+                            // Wrap source with diagnostic capture and normalization
                             let source_to_play = wrap_source(
                                 source_to_play,
                                 normalization,
@@ -3759,7 +3743,7 @@ impl Player {
                                         }
                                     };
 
-                                // Wrap source with diagnostic, normalization, and visualizer
+                                // Wrap source with diagnostic capture and normalization
                                 // Reuse the gain + atomic from the original Play
                                 let skipped_source = wrap_source(
                                     skipped_source,
@@ -4182,7 +4166,7 @@ impl Player {
                             // Send Reset to analyzer (seek invalidates accumulated samples)
                             let _ = analyzer_tx.try_send(AnalyzerMessage::Reset);
 
-                            // Wrap source with diagnostic, normalization, and visualizer
+                            // Wrap source with diagnostic capture and normalization
                             // Reuse the gain + atomic from the current track
                             let skipped_source = wrap_source(
                                 skipped_source,
@@ -4423,7 +4407,7 @@ impl Player {
                                     (None, None)
                                 };
 
-                            // Wrap source with normalization/visualizer pipeline
+                            // Wrap source with the normalization pipeline
                             let source = wrap_source(
                                 source,
                                 normalization,
@@ -5039,7 +5023,6 @@ impl Player {
             tx,
             state,
             audio_settings: settings,
-            visualizer_tap,
             diagnostic,
             audio_cache,
         }

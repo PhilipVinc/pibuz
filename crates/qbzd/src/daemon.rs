@@ -325,8 +325,7 @@ async fn boot(
         adapter,
         settings.output_device.clone(),
         settings,
-        None,
-    )); // shell.rs:64
+    ));
 
     // Offline-tolerant (§8.1-8): a network failure here still leaves a locally
     // usable core; a missing DAC is likewise non-fatal (Player starts deviceless

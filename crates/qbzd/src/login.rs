@@ -398,8 +398,7 @@ fn gen_nonce() -> String {
 /// default audio settings (no store is opened — login never touches audio),
 /// then `init()` to extract the Qobuz bundle tokens the sign-in calls need.
 async fn build_login_runtime() -> Result<AppRuntime<NoOpAdapter>, LoginError> {
-    let runtime =
-        AppRuntime::with_audio_settings(NoOpAdapter, None, AudioSettings::default(), None);
+    let runtime = AppRuntime::with_audio_settings(NoOpAdapter, None, AudioSettings::default());
     if let Err(e) = runtime.init().await {
         return Err(LoginError::Failed(format!(
             "could not reach Qobuz to start login: {e}\n  → check your connection and retry"

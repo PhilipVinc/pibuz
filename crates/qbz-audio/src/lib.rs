@@ -45,7 +45,6 @@ pub mod alsa_backend;
 pub mod alsa_direct;
 #[cfg(target_os = "linux")]
 pub mod alsa_error_handler;
-pub mod analysis;
 pub mod analyzer_tap;
 pub mod audio_out;
 pub mod backend;
@@ -72,7 +71,6 @@ pub mod pulse_backend;
 pub mod rt;
 pub mod settings;
 pub mod virtual_out;
-pub mod visualizer;
 pub mod volume_curve;
 
 // Re-export commonly used types
@@ -82,7 +80,6 @@ pub use alsa_backend::{
     resolve_stable_to_current_hw,
 };
 pub use alsa_direct::AlsaDirectStream;
-pub use analysis::SpectralAnalyzer;
 pub use analyzer_tap::{AnalyzerMessage, AnalyzerTap};
 pub use audio_out::AudioOut;
 pub use backend::{
@@ -109,7 +106,6 @@ pub use pcm_ring::{ring_capacity_frames, Boundary, BoundaryKind, RingLink};
 pub use rt::{promote_writer_thread_and_log, set_writer_rt_priority, RtOutcome};
 pub use settings::AudioSettings;
 pub use virtual_out::VirtualAudioOut;
-pub use visualizer::{RingBuffer, TappedSource, VisualizerTap};
 
 /// Stub: returns the ID unchanged on non-Linux (no ALSA normalization needed).
 #[cfg(not(target_os = "linux"))]

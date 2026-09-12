@@ -9,9 +9,14 @@
 //! seamlessly without interrupting the PCM stream.
 
 use qbz_audio::pcm_ring::{BoundaryKind, RingLink};
+use qbz_audio::AudioOut;
+// The PCM engine takes `dyn AudioOut`; only the Linux-only DoP variant still
+// names the concrete stream. Gated rather than removed: a macOS build reports
+// it unused, and deleting it there is the exact trap CLAUDE.md records.
+#[cfg(target_os = "linux")]
+use qbz_audio::AlsaDirectStream;
 #[cfg(target_os = "linux")]
 use qbz_audio::JackStream;
-use qbz_audio::{AlsaDirectStream, AudioOut};
 use ringbuf::traits::{Consumer, Producer, Split};
 use ringbuf::{HeapCons, HeapProd, HeapRb};
 use rodio::{mixer::Mixer, Player as RodioPlayer, Source};

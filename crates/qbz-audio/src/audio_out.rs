@@ -171,7 +171,12 @@ impl AudioOut for crate::AlsaDirectStream {
     fn stop(&self) -> Result<(), String> {
         crate::AlsaDirectStream::stop(self)
     }
-    fn set_hardware_volume(&self, volume: f32) -> Result<(), String> {
-        crate::AlsaDirectStream::set_hardware_volume(self, volume)
+    fn set_hardware_volume(&self, _volume: f32) -> Result<(), String> {
+        // NOT a delegation. The non-Linux stub has no inherent
+        // `set_hardware_volume`, so `AlsaDirectStream::set_hardware_volume`
+        // resolves straight back to this trait method — which is an infinite
+        // recursion, i.e. a stack overflow the moment anything sets the volume
+        // on a developer's machine. Answer directly instead.
+        Err("ALSA Direct is only available on Linux".to_string())
     }
 }
