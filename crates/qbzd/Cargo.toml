@@ -30,7 +30,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { workspace = true }
 dirs = "6"
-rand = { workspace = true }
 log = { workspace = true }
 async-trait = { workspace = true }
 # QConnect glue copies (T9) — mirror the desktop copies' direct imports
@@ -42,8 +41,6 @@ tiny_http = "0.12"           # pairing.rs / api HTTP listener
 mdns-sd = "0.11"             # pairing.rs mDNS advertisement
 toml = "0.9"                 # in lock transitively
 libc = "0.2"                 # flock
-urlencoding = "2"            # OAuth redirect_url encode + callback decode (in lock via qbz)
-open = "5"                   # system-browser launch for `qbzd login` (in lock via qbz)
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 # T13 setup TUI. ratatui 0.30 (NEVER 0.29 — 0.29 pins unicode-width "=0.2.0",
