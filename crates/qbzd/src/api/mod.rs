@@ -14,18 +14,9 @@
 // The two-call split — `bind` at boot step 5 (stateless, so the foreign-occupant
 // diagnosis runs BEFORE the stores/runtime exist), `serve` at boot step 11 — is
 // what keeps the 01-architecture.md §8.1 boot order honest.
-pub mod artwork;
-pub mod browse;
-pub mod discover;
-pub mod fav;
-pub mod lyrics;
 pub mod play;
 pub mod playback;
-pub mod playlist;
 pub mod queue;
-pub mod radio;
-pub mod reco;
-pub mod search;
 pub mod settings;
 pub mod sse;
 pub mod status;
@@ -352,56 +343,9 @@ fn route(state: &ApiState, req: &mut Request) -> Response<Cursor<Vec<u8>>> {
             let body = read_json_body(req);
             playback::repeat(state, &body)
         }
-        ("GET", "/api/search") => search::search(state, &query),
         ("POST", "/api/play") => {
             let body = read_json_body(req);
             play::play(state, &body)
-        }
-        ("GET", "/api/album") => browse::album(state, &query),
-        ("GET", "/api/artist") => browse::artist(state, &query),
-        ("GET", "/api/similar") => browse::similar(state, &query),
-        ("GET", "/api/suggest") => browse::suggest(state, &query),
-        ("GET", "/api/discover") => discover::discover(state, &query),
-        ("GET", "/api/lyrics") => lyrics::lyrics(state, &query),
-        ("GET", "/api/artwork/current") => artwork::current(state),
-        ("POST", "/api/radio") => {
-            let body = read_json_body(req);
-            radio::radio(state, &body)
-        }
-        ("POST", "/api/reco/playlist") => {
-            let body = read_json_body(req);
-            reco::playlist(state, &body)
-        }
-        ("GET", "/api/favorites") => fav::list(state, &query),
-        ("POST", "/api/favorites/add") => {
-            let body = read_json_body(req);
-            fav::add(state, &body)
-        }
-        ("POST", "/api/favorites/remove") => {
-            let body = read_json_body(req);
-            fav::remove(state, &body)
-        }
-        ("GET", "/api/playlists") => playlist::list(state),
-        ("GET", "/api/playlist") => playlist::show(state, &query),
-        ("POST", "/api/playlist/create") => {
-            let body = read_json_body(req);
-            playlist::create(state, &body)
-        }
-        ("POST", "/api/playlist/update") => {
-            let body = read_json_body(req);
-            playlist::update(state, &body)
-        }
-        ("POST", "/api/playlist/delete") => {
-            let body = read_json_body(req);
-            playlist::delete(state, &body)
-        }
-        ("POST", "/api/playlist/tracks/add") => {
-            let body = read_json_body(req);
-            playlist::tracks_add(state, &body)
-        }
-        ("POST", "/api/playlist/tracks/remove") => {
-            let body = read_json_body(req);
-            playlist::tracks_remove(state, &body)
         }
         ("GET", "/api/queue") => queue::list(state, &query),
         ("POST", "/api/queue/add") => {

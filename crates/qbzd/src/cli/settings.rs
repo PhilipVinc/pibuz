@@ -928,17 +928,17 @@ pub(crate) fn write_one(
 /// `[server] token` the same way `cli/client.rs::resolve_token` does for the
 /// local target, so a token-protected daemon still gets nudged.
 fn nudge(roots: &ProfileRoots) -> bool {
-    let host = crate::login::nudge_host(roots);
+    let host = crate::daemon_nudge::nudge_host(roots);
     let token = local_token(roots);
-    crate::login::nudge_reload(&host, token.as_deref())
+    crate::daemon_nudge::nudge_reload(&host, token.as_deref())
 }
 
 /// Three-state variant of [`nudge`] for `settings import`, which must
 /// distinguish daemon-down from reload-refused (04 §5.3 step 7).
-fn nudge_outcome(roots: &ProfileRoots) -> crate::login::NudgeOutcome {
-    let host = crate::login::nudge_host(roots);
+fn nudge_outcome(roots: &ProfileRoots) -> crate::daemon_nudge::NudgeOutcome {
+    let host = crate::daemon_nudge::nudge_host(roots);
     let token = local_token(roots);
-    crate::login::nudge_reload_outcome(&host, token.as_deref())
+    crate::daemon_nudge::nudge_reload_outcome(&host, token.as_deref())
 }
 
 fn local_token(roots: &ProfileRoots) -> Option<String> {
@@ -1296,33 +1296,10 @@ pub async fn import(
         }
     }
 
-    // Step 5: validate secrets BEFORE any write (rejected → exit 4, nothing done).
-    let mut validated_uid: Option<u64> = None;
-    let mut auth_note: Option<String> = None;
-    if let Some(token) = plan.auth_token.clone() {
-        match crate::login::validate_token(&token).await {
-            Ok(session) => {
-                validated_uid = Some(session.user_id);
-                let mut note = format!(
-                    "Qobuz token validated — logged in as user {}",
-                    session.user_id
-                );
-                if let Some(bid) = plan.bundle_user_id {
-                    if bid != session.user_id {
-                        note.push_str(&format!(
-                            "\n  note: bundle user_id {bid} differs from the validated login {}",
-                            session.user_id
-                        ));
-                    }
-                }
-                auth_note = Some(note);
-            }
-            Err(_) => {
-                eprintln!("{}", crate::cli::copy::bundle_token_rejected());
-                return 4;
-            }
-        }
-    }
+    // Step 5 (auth) is gone with the account path: a bundle can no longer carry
+    // a Qobuz token, so there is nothing to validate before writing.
+    let validated_uid: Option<u64> = None;
+    let auth_note: Option<String> = None;
 
     // Dry-run stops after step 5 (04 §5.1): same summary, writes nothing.
     if dry_run {
@@ -1356,10 +1333,10 @@ pub async fn import(
 /// changed) to the `done:` reload phrase, an optional stderr error, and the
 /// exit code. Split from IO so the §5.3-step-7 contract is unit-testable.
 fn reload_disposition(
-    outcome: crate::login::NudgeOutcome,
+    outcome: crate::daemon_nudge::NudgeOutcome,
     routing_critical: bool,
 ) -> (String, Option<String>, i32) {
-    use crate::login::NudgeOutcome::*;
+    use crate::daemon_nudge::NudgeOutcome::*;
     match outcome {
         Reloaded => {
             // §5.3 step 7 honesty rule: a routing-critical change re-inits the
@@ -1890,7 +1867,7 @@ mod tests {
 
     #[test]
     fn reload_disposition_maps_the_three_outcomes() {
-        use crate::login::NudgeOutcome::*;
+        use crate::daemon_nudge::NudgeOutcome::*;
 
         let (line, err, code) = reload_disposition(Reloaded, false);
         assert_eq!(line, "daemon reloaded (was running)");

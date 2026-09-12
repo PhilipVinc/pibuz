@@ -32,28 +32,24 @@ pub const BREADCRUMB_ROOT: &str = "Setup";
 /// so a trailing `*` fits the 14-col sidebar; Account/Import/Wizard are never
 /// dirty. Seven since FB4 added the HiFi Wizard (owner-sanctioned cap break over
 /// the old six-screen D7 cap).
-pub const SIDEBAR_LABELS: [&str; 8] = [
-    "Account",
+pub const SIDEBAR_LABELS: [&str; 6] = [
     "Audio",
     "Playback",
     "QConnect",
     "Network",
     "Import/Exp",
     "Wizard",
-    "Scrobbler",
 ];
 
 /// Left-nav labels, WIDE tier (≥ 100 cols → the 28-col sidebar, FB5). The extra
 /// room lets `Import / Export` spell itself out; everything else is already whole.
-pub const SIDEBAR_LABELS_WIDE: [&str; 8] = [
-    "Account",
+pub const SIDEBAR_LABELS_WIDE: [&str; 6] = [
     "Audio",
     "Playback",
     "QConnect",
     "Network",
     "Import / Export",
     "Wizard",
-    "Scrobbler",
 ];
 
 /// A terse, static one-line summary shown dim UNDER each name in the wide sidebar
@@ -113,43 +109,11 @@ pub const DIRTY_HINT: &str = "s save · d discard · Esc stay";
 
 pub const FOOTER_UNREACHABLE: &str = "daemon: not reachable";
 pub const FOOTER_RUNNING: &str = "daemon: running";
-pub const FOOTER_NEEDS_AUTH: &str = "not signed in";
 /// Appended to a save result when the daemon is down (03 §2.3, error-voice).
 pub const APPLIES_ON_START: &str =
     "changes apply when the daemon starts — systemctl --user status qbzd";
 
 // ============================ Account (§3.1) ============================
-
-pub const ACCOUNT_TITLE: &str = "Account";
-/// In-screen section box title (distinct from the screen title in the frame).
-pub const ACCOUNT_SECTION: &str = "SIGN-IN";
-pub const ACCOUNT_STATUS: &str = "Status";
-pub const ACCOUNT_NOT_LOGGED_IN: &str = "not logged in";
-/// Offline + daemon-down: a credential file exists but was never validated —
-/// NEVER fabricate an email/name (§3.1 rules).
-pub const ACCOUNT_CRED_PRESENT: &str = "credential file present (not validated)";
-pub const ACCOUNT_LOGIN_BROWSER: &str = "Log in with browser";
-pub const ACCOUNT_PASTE_TOKEN: &str = "Paste token";
-pub const ACCOUNT_LOGOUT: &str = "Log out";
-
-pub fn account_logged_in(email: &str) -> String {
-    format!("logged in as {email}")
-}
-pub fn account_logged_in_plan(email: &str, plan: &str) -> String {
-    format!("logged in as {email} ({plan})")
-}
-
-pub const ACCOUNT_LOGOUT_CONFIRM_TITLE: &str = "Log out";
-pub const ACCOUNT_LOGOUT_CONFIRM_BODY: &str =
-    "Clear the Qobuz credentials on this box? If the daemon is running it will\nstop playback and wait for a new login.";
-pub const CONFIRM_YN: &str = "y confirm · Esc cancel";
-
-pub const ACCOUNT_VALIDATING: &str = "validating token with Qobuz…";
-
-/// Suspend-and-run divergence banner (see report): the browser flow runs on the
-/// plain terminal. Shown briefly before the alt-screen is left.
-pub const ACCOUNT_BROWSER_HANDOFF: &str =
-    "Starting browser login on the terminal below. Follow the printed URL;\nthe TUI resumes when login finishes or times out.";
 
 // ============================ Audio (§3.2) ============================
 
@@ -439,14 +403,3 @@ pub const WIZ_ABANDON_BODY: &str = "Your selections and generated config will be
 pub const WIZ_ABANDON_HINT: &str = "y quit · Esc stay";
 
 // ============================ Scrobbler (CONSOLE ext) ============================
-
-pub const SCROBBLER_TITLE: &str = "Scrobbler";
-pub const HELP_SCROBBLER: &str =
-    "L connect Last.fm · B connect ListenBrainz · Tab nav · Esc nav · q quit";
-// Alt-screen handoffs — printed on the plain terminal before the CLI auth flow
-// runs (same methodology as the Account browser login).
-pub const SCROBBLE_LASTFM_HANDOFF: &str =
-    "Connecting Last.fm — a browser authorize step follows below.\n";
-pub const SCROBBLE_LISTENBRAINZ_HANDOFF: &str =
-    "Connecting ListenBrainz — paste your user token below.\n";
-pub const SCROBBLE_RETURN_HINT: &str = "\nPress Enter to return to setup…";

@@ -92,17 +92,6 @@ impl DaemonShared {
     }
 }
 
-/// A non-reversible-in-practice fingerprint of a credential token (SipHash via
-/// the stdlib default hasher) — used ONLY to detect "the file changed", never
-/// to reconstruct the token. Keeps `DaemonShared` from holding a second live
-/// copy of the secret alongside the credential file + the Qobuz client.
-pub fn token_fingerprint(token: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    token.hash(&mut hasher);
-    hasher.finish()
-}
-
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct QconnectStatus {
     pub enabled: bool,
@@ -220,14 +209,5 @@ mod tests {
 
         shared.set_network_online(true);
         assert!(shared.network_online(), "set true -> reads back true");
-    }
-
-    #[test]
-    fn token_fingerprint_is_stable_and_distinguishes_tokens() {
-        let a = token_fingerprint("token-a");
-        let a_again = token_fingerprint("token-a");
-        let b = token_fingerprint("token-b");
-        assert_eq!(a, a_again);
-        assert_ne!(a, b);
     }
 }

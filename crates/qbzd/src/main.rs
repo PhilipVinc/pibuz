@@ -5,14 +5,13 @@ mod api;
 mod cli;
 mod config;
 mod daemon;
+mod daemon_nudge;
 mod events_bridge;
 mod hooks;
 mod lock;
-mod login;
 mod mpris;
 mod paths;
 mod qconnect;
-mod scrobble_engine;
 mod state;
 mod tui;
 
@@ -45,16 +44,6 @@ struct Cli {
 enum Cmd {
     /// Run the daemon in the foreground (systemd ExecStart)
     Run,
-    /// Log in to Qobuz (one-shot browser listener; --paste; --token)
-    Login {
-        #[arg(long)]
-        callback_host: Option<String>,
-        #[arg(long)]
-        paste: bool,
-        #[arg(long)]
-        token: Option<String>,
-    },
-    Logout,
     /// Interactive configurator (six screens)
     Setup,
     /// Composite daemon diagnostic
@@ -76,100 +65,6 @@ enum Cmd {
         #[arg(long)]
         raw: bool,
     },
-    /// Search Qobuz — top hits with ids (--ids pipes into `queue add -`)
-    Search {
-        query: String,
-        #[arg(long = "type", default_value = "all")]
-        kind: String,
-        #[arg(long, default_value_t = 20)]
-        limit: u32,
-        #[arg(long, default_value_t = 0)]
-        offset: u32,
-        #[arg(long)]
-        ids: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Album page — tracklist with ids
-    Album {
-        id: String,
-        #[arg(long)]
-        suggest: bool,
-        #[arg(long)]
-        ids: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Artist page (default), --top tracks, or --albums grid
-    Artist {
-        id: u64,
-        #[arg(long)]
-        top: bool,
-        #[arg(long)]
-        albums: bool,
-        #[arg(long, default_value_t = 20)]
-        limit: u32,
-        #[arg(long)]
-        ids: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Similar artists or albums: artist:ID | album:ID
-    Similar {
-        selector: String,
-        #[arg(long, default_value_t = 20)]
-        limit: u32,
-        #[arg(long)]
-        ids: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// For-You suggestions — seeds from the queue, or --seed <ID,ID>|-
-    Suggest {
-        #[arg(long)]
-        seed: Option<String>,
-        #[arg(long, default_value_t = 20)]
-        limit: u32,
-        #[arg(long)]
-        ids: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Discover rails: index | most-streamed | new-releases | press-awards |
-    /// qobuzissims | album-of-the-week | ideal-discography | playlists | tags |
-    /// release-watch (replicate Discover; no recommendations)
-    Discover {
-        section: Option<String>,
-        #[arg(long)]
-        genre: Option<String>,
-        #[arg(long)]
-        tag: Option<String>,
-        #[arg(long = "release-type")]
-        release_type: Option<String>,
-        #[arg(long = "type")]
-        kind: Option<String>,
-        #[arg(long, default_value_t = 20)]
-        limit: u32,
-        #[arg(long)]
-        ids: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Recommendations: playlist <ID> (Suggested Songs — no history needed)
-    Reco {
-        #[command(subcommand)]
-        cmd: RecoCmd,
-    },
-    /// Favorites: list | add | remove
-    Fav {
-        #[command(subcommand)]
-        cmd: FavCmd,
-    },
-    /// Playlists: list | show
-    Playlist {
-        #[command(subcommand)]
-        cmd: PlaylistCmd,
-    },
     /// Shuffle: on | off | toggle (bare = toggle)
     Shuffle {
         mode: Option<String>,
@@ -177,27 +72,6 @@ enum Cmd {
     /// Repeat: off | all | one
     Repeat {
         mode: String,
-    },
-    /// Seed-and-go radio: artist:ID | track:ID | album:ID
-    Radio {
-        seed: String,
-    },
-    /// Lyrics for a track (bare = current); --synced adds [mm:ss.cc] timestamps
-    Lyrics {
-        track_id: Option<u64>,
-        #[arg(long)]
-        synced: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Current-track cover art — prints the URL, or --save PATH downloads it
-    Art {
-        #[arg(long)]
-        save: Option<String>,
-    },
-    /// Resolve a Qobuz URL to a kind:ID token (pure, no daemon)
-    Resolve {
-        url: String,
     },
     /// Resume (bare) or play content: album:ID | track:ID | artist:ID | playlist:ID | URL
     Play {
@@ -233,11 +107,6 @@ enum Cmd {
     Qconnect {
         #[command(subcommand)]
         cmd: QconnectCmd,
-    },
-    /// Scrobbling: login (Last.fm / ListenBrainz) · status · enable · disable
-    Scrobble {
-        #[command(subcommand)]
-        cmd: ScrobbleCmd,
     },
     Config {
         #[command(subcommand)]
@@ -510,43 +379,6 @@ async fn main() {
                 }
             }
         }
-        Cmd::Login {
-            callback_host,
-            paste,
-            token,
-        } => {
-            let roots = login_roots();
-            let result = if let Some(tok) = token {
-                login::login_with_token_arg(&roots, &tok).await
-            } else if paste {
-                login::login_paste(&roots).await
-            } else {
-                login::login_browser(&roots, callback_host).await
-            };
-            match result {
-                Ok(session) => {
-                    println!("{}", cli::copy::login_success(&session));
-                    0
-                }
-                Err(e) => {
-                    eprintln!("{e}");
-                    1
-                }
-            }
-        }
-        Cmd::Logout => {
-            let roots = login_roots();
-            match login::logout(&roots) {
-                Ok(daemon_nudged) => {
-                    println!("{}", cli::copy::logout_success(daemon_nudged));
-                    0
-                }
-                Err(e) => {
-                    eprintln!("{e}");
-                    1
-                }
-            }
-        }
         Cmd::Status { json } => {
             // The CLI reads only local qbzd.toml (for the opt-in token); the
             // config root is always at its XDG default.
@@ -565,133 +397,6 @@ async fn main() {
             let roots = paths::ProfileRoots::resolve(None, None);
             cli::watch::watch(cli.host, raw, &roots).await
         }
-        Cmd::Search {
-            query,
-            kind,
-            limit,
-            offset,
-            ids,
-            json,
-        } => {
-            let roots = paths::ProfileRoots::resolve(None, None);
-            cli::search::search(cli.host, query, kind, limit, offset, ids, json, &roots).await
-        }
-        Cmd::Album {
-            id,
-            suggest,
-            ids,
-            json,
-        } => {
-            let roots = paths::ProfileRoots::resolve(None, None);
-            cli::browse::album(cli.host, id, suggest, ids, json, &roots).await
-        }
-        Cmd::Artist {
-            id,
-            top,
-            albums,
-            limit,
-            ids,
-            json,
-        } => {
-            let roots = paths::ProfileRoots::resolve(None, None);
-            cli::browse::artist(cli.host, id, top, albums, limit, ids, json, &roots).await
-        }
-        Cmd::Similar {
-            selector,
-            limit,
-            ids,
-            json,
-        } => {
-            let roots = paths::ProfileRoots::resolve(None, None);
-            cli::browse::similar(cli.host, selector, limit, ids, json, &roots).await
-        }
-        Cmd::Suggest {
-            seed,
-            limit,
-            ids,
-            json,
-        } => {
-            let roots = paths::ProfileRoots::resolve(None, None);
-            cli::browse::suggest(cli.host, seed, limit, ids, json, &roots).await
-        }
-        Cmd::Discover {
-            section,
-            genre,
-            tag,
-            release_type,
-            kind,
-            limit,
-            ids,
-            json,
-        } => {
-            let roots = paths::ProfileRoots::resolve(None, None);
-            cli::discover::discover(
-                cli.host,
-                section,
-                genre,
-                tag,
-                release_type,
-                kind,
-                limit,
-                ids,
-                json,
-                &roots,
-            )
-            .await
-        }
-        Cmd::Reco { cmd } => {
-            let roots = paths::ProfileRoots::resolve(None, None);
-            match cmd {
-                RecoCmd::Playlist {
-                    id,
-                    limit,
-                    ids,
-                    json,
-                } => cli::reco::playlist(cli.host, id, limit, ids, json, &roots).await,
-            }
-        }
-        Cmd::Fav { cmd } => {
-            let roots = paths::ProfileRoots::resolve(None, None);
-            match cmd {
-                FavCmd::List { kind, ids, json } => {
-                    cli::fav::list(cli.host, kind, ids, json, &roots).await
-                }
-                FavCmd::Add {
-                    fav_type,
-                    id,
-                    current,
-                } => cli::fav::add(cli.host, fav_type, id, current, &roots).await,
-                FavCmd::Remove { fav_type, id } => {
-                    cli::fav::remove(cli.host, fav_type, id, &roots).await
-                }
-            }
-        }
-        Cmd::Playlist { cmd } => {
-            let roots = paths::ProfileRoots::resolve(None, None);
-            match cmd {
-                PlaylistCmd::List { json } => cli::playlist::list(cli.host, json, &roots).await,
-                PlaylistCmd::Show { id, ids, json } => {
-                    cli::playlist::show(cli.host, id, ids, json, &roots).await
-                }
-                PlaylistCmd::Create { name, desc, public } => {
-                    cli::playlist::create(cli.host, name, desc, public, &roots).await
-                }
-                PlaylistCmd::Edit {
-                    id,
-                    name,
-                    desc,
-                    public,
-                    private,
-                } => cli::playlist::edit(cli.host, id, name, desc, public, private, &roots).await,
-                PlaylistCmd::Rm { id, yes } => cli::playlist::rm(cli.host, id, yes, &roots).await,
-                PlaylistCmd::Add { id, track_ids } => {
-                    cli::playlist::add(cli.host, id, track_ids, &roots).await
-                }
-                PlaylistCmd::Remove { id, track_ids } => {
-                    cli::playlist::remove(cli.host, id, track_ids, &roots).await
-                }
-            }
-        }
         Cmd::Shuffle { mode } => {
             let roots = paths::ProfileRoots::resolve(None, None);
             cli::mode::shuffle(cli.host, mode, &roots).await
@@ -700,23 +405,6 @@ async fn main() {
             let roots = paths::ProfileRoots::resolve(None, None);
             cli::mode::repeat(cli.host, mode, &roots).await
         }
-        Cmd::Radio { seed } => {
-            let roots = paths::ProfileRoots::resolve(None, None);
-            cli::radio::radio(cli.host, seed, &roots).await
-        }
-        Cmd::Lyrics {
-            track_id,
-            synced,
-            json,
-        } => {
-            let roots = paths::ProfileRoots::resolve(None, None);
-            cli::lyrics::lyrics(cli.host, track_id, synced, json, &roots).await
-        }
-        Cmd::Art { save } => {
-            let roots = paths::ProfileRoots::resolve(None, None);
-            cli::art::art(cli.host, save, &roots).await
-        }
-        Cmd::Resolve { url } => cli::resolve::resolve(url),
         Cmd::Play { content } => {
             let roots = paths::ProfileRoots::resolve(None, None);
             cli::play::play(cli.host, content, &roots).await
@@ -798,24 +486,6 @@ async fn main() {
                 QconnectCmd::Enable => cli::settings::qconnect_enable(&roots),
                 QconnectCmd::Disable => cli::settings::qconnect_disable(&roots),
                 QconnectCmd::Name { name } => cli::settings::qconnect_name(&roots, &name),
-            }
-        }
-        Cmd::Scrobble { cmd } => {
-            let roots = login_roots();
-            match cmd {
-                ScrobbleCmd::Login { cmd } => match cmd {
-                    ScrobbleLoginCmd::Lastfm => cli::scrobble::login_lastfm(cli.host, &roots).await,
-                    ScrobbleLoginCmd::Listenbrainz { token } => {
-                        cli::scrobble::login_listenbrainz(cli.host, token, &roots).await
-                    }
-                },
-                ScrobbleCmd::Status => cli::scrobble::status(&roots),
-                ScrobbleCmd::Disable { provider } => {
-                    cli::scrobble::set_enabled(cli.host, provider, false, &roots).await
-                }
-                ScrobbleCmd::Enable { provider } => {
-                    cli::scrobble::set_enabled(cli.host, provider, true, &roots).await
-                }
             }
         }
         Cmd::Config { cmd } => {

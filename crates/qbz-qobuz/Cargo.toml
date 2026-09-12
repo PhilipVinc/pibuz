@@ -44,7 +44,6 @@ anyhow = { workspace = true }
 [dev-dependencies]
 # Used only by examples/lyrics_probe.rs (read-only live probe of the lyrics
 # endpoint): loads the saved OAuth token / credentials for login.
-qbz-credentials = { path = "../qbz-credentials" }
 
 # Tests construct a QobuzClient, which builds a reqwest client. The workspace
 # pins reqwest's `rustls-tls-webpki-roots-no-provider`, so a process-level

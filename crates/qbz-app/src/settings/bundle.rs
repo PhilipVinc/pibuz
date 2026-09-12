@@ -25,7 +25,6 @@ use qbz_audio::AudioBackendType;
 
 use crate::settings::daemon_prefs;
 use crate::settings::playback::{PlaybackPreferences, PlaybackPreferencesStore};
-use crate::settings::scrobblers::ScrobblerSettingsStore;
 
 /// The bundle schema version this importer implements and this exporter writes
 /// (04 §1). Hard-gated on import (`plan` step 2, §5.6). v1 is the floor.
@@ -286,7 +285,7 @@ impl Bundle {
 /// GLOBAL desktop stores (the ONLY legal desktop-path access); `--from daemon`
 /// reads the daemon roots. Domains the source cannot provide are ABSENT, never
 /// empty objects (§2.9).
-pub fn export(source: ExportSource, opts: &ExportOptions) -> Result<Bundle, BundleError> {
+pub fn export(source: ExportSource, _opts: &ExportOptions) -> Result<Bundle, BundleError> {
     let (paths, profile) = match &source {
         ExportSource::Desktop => (desktop_paths(), "desktop"),
         ExportSource::Daemon(p) => (
@@ -338,12 +337,7 @@ pub fn export(source: ExportSource, opts: &ExportOptions) -> Result<Bundle, Bund
         ExportSource::Daemon(_) => read_last_user_id(&paths.data_root),
     };
     match uid {
-        Some(uid) => {
-            if let Some(scrob) = read_scrobblers(&paths.data_root, uid, opts.include_auth) {
-                let mut integrations = Map::new();
-                integrations.insert("scrobblers".into(), scrob);
-                domains.insert("integrations".into(), Value::Object(integrations));
-            }
+        Some(_uid) => {
             if let Some(folders) = read_library_folders(&paths.data_root) {
                 domains.insert("library_folders".into(), folders);
             }
@@ -353,19 +347,6 @@ pub fn export(source: ExportSource, opts: &ExportOptions) -> Result<Bundle, Bund
                 "[bundle] no last_user_id under this profile — per-user domains \
                  (integrations, library_folders) omitted"
             );
-        }
-    }
-
-    // auth — SECRET, opt-in (§2.7). Export-side half of the double gate.
-    if opts.include_auth {
-        let token = load_decrypted_token(&source, &paths)?;
-        if let Some(token) = token {
-            let mut auth = Map::new();
-            auth.insert("user_auth_token".into(), Value::String(token));
-            if let Some(uid) = uid {
-                auth.insert("user_id".into(), Value::Number(uid.into()));
-            }
-            domains.insert("auth".into(), Value::Object(auth));
         }
     }
 
@@ -469,11 +450,19 @@ fn build_plan(
 /// check passed (validate-all-then-apply). Pure setter writes — re-running is
 /// safe and idempotent (§5.3 step 6). `validated_uid` is the authoritative uid
 /// from the validated login (§5.7); when absent, the daemon's own
+/// Test-only since the account path went: nothing in the import writes a
+/// `last_user_id` any more, but the fixtures still need to plant one.
+#[cfg(test)]
+fn write_last_user_id(data_root: &Path, uid: u64) -> Result<(), String> {
+    std::fs::create_dir_all(data_root).map_err(|e| e.to_string())?;
+    std::fs::write(data_root.join("last_user_id"), uid.to_string()).map_err(|e| e.to_string())
+}
+
 /// `last_user_id` is consulted for per-user writes.
 pub fn apply(
     plan: &ImportPlan,
     target: &ProfilePaths,
-    validated_uid: Option<u64>,
+    _validated_uid: Option<u64>,
 ) -> Result<ImportReport, BundleError> {
     let mut report = ImportReport {
         applied: plan.applied.len(),
@@ -481,19 +470,6 @@ pub fn apply(
         skipped: plan.skipped.len(),
         per_domain: Vec::new(),
     };
-
-    let uid = validated_uid.or_else(|| read_last_user_id(&target.data_root));
-
-    // auth first: persist token + last_user_id + ensure users/<uid>/ (§5.7).
-    if let (Some(token), Some(uid)) = (&plan.auth_token, validated_uid) {
-        match persist_auth(target, token, uid) {
-            Ok(()) => report.per_domain.push(("auth".into(), Ok(()))),
-            Err(e) => {
-                report.per_domain.push(("auth".into(), Err(e.clone())));
-                return Err(BundleError::Io(e));
-            }
-        }
-    }
 
     // group writes by store so each store opens once.
     let mut audio_writes: Vec<(&str, &Value)> = Vec::new();
@@ -548,23 +524,6 @@ pub fn apply(
             return Err(BundleError::Io(r.unwrap_err()));
         }
     }
-    if !scrobbler_writes.is_empty() {
-        match uid {
-            Some(uid) => {
-                let r = apply_scrobbler_writes(&target.data_root, uid, &scrobbler_writes);
-                let failed = r.is_err();
-                report.per_domain.push(("integrations".into(), r.clone()));
-                if failed {
-                    return Err(BundleError::Io(r.unwrap_err()));
-                }
-            }
-            None => report.per_domain.push((
-                "integrations".into(),
-                Err("no user on this daemon — skipped".into()),
-            )),
-        }
-    }
-
     Ok(report)
 }
 
@@ -1313,58 +1272,6 @@ fn apply_qconnect_writes(data_root: &Path, writes: &[(&str, &Value)]) -> Result<
     Ok(())
 }
 
-fn apply_scrobbler_writes(
-    data_root: &Path,
-    uid: u64,
-    writes: &[(&str, &Value)],
-) -> Result<(), String> {
-    let dir = data_root.join(format!("users/{uid}"));
-    let store = ScrobblerSettingsStore::new_at(&dir)?;
-    let mut current = store.get_settings()?;
-    for (key, value) in writes {
-        match *key {
-            "enabled" => store.set_enabled(as_bool(value))?,
-            "lastfm_enabled" => store.set_lastfm_enabled(as_bool(value))?,
-            "lastfm_username" => {
-                current.lastfm_username = value.as_str().unwrap_or("").to_string();
-                store.set_lastfm_session(&current.lastfm_session_key, &current.lastfm_username)?;
-            }
-            "lastfm_session_key" => {
-                current.lastfm_session_key = value.as_str().unwrap_or("").to_string();
-                store.set_lastfm_session(&current.lastfm_session_key, &current.lastfm_username)?;
-            }
-            "listenbrainz_enabled" => store.set_listenbrainz_enabled(as_bool(value))?,
-            "listenbrainz_username" => {
-                current.listenbrainz_username = value.as_str().unwrap_or("").to_string();
-                store.set_listenbrainz_token(
-                    &current.listenbrainz_token,
-                    &current.listenbrainz_username,
-                )?;
-            }
-            "listenbrainz_token" => {
-                current.listenbrainz_token = value.as_str().unwrap_or("").to_string();
-                store.set_listenbrainz_token(
-                    &current.listenbrainz_token,
-                    &current.listenbrainz_username,
-                )?;
-            }
-            other => log::warn!("[bundle] apply: unhandled scrobbler key {other}"),
-        }
-    }
-    Ok(())
-}
-
-fn persist_auth(target: &ProfilePaths, token: &str, uid: u64) -> Result<(), String> {
-    qbz_credentials::save_oauth_token_at(&target.config_root, token)?;
-    // last_user_id under the DAEMON root (NEVER the desktop global path — the
-    // daemon must not touch ~/.local/share/qbz; 04 §5.7 cites the desktop fn
-    // only for the flat-file format).
-    write_last_user_id(&target.data_root, uid)?;
-    std::fs::create_dir_all(target.data_root.join(format!("users/{uid}")))
-        .map_err(|e| e.to_string())?;
-    Ok(())
-}
-
 fn as_bool(v: &Value) -> bool {
     v.as_bool().unwrap_or(false)
 }
@@ -1394,41 +1301,6 @@ fn read_playback_prefs(data_root: &Path) -> Option<PlaybackPreferences> {
 
 fn playback_to_json(p: &PlaybackPreferences) -> Value {
     serde_json::to_value(p).unwrap_or(Value::Null)
-}
-
-fn read_scrobblers(data_root: &Path, uid: u64, include_auth: bool) -> Option<Value> {
-    let dir = data_root.join(format!("users/{uid}"));
-    if !dir.join("scrobbler_settings.db").exists() {
-        return None;
-    }
-    let store = ScrobblerSettingsStore::new_at(&dir).ok()?;
-    let s = store.get_settings().ok()?;
-    let mut obj = Map::new();
-    obj.insert("enabled".into(), Value::Bool(s.enabled));
-    obj.insert("lastfm_enabled".into(), Value::Bool(s.lastfm_enabled));
-    obj.insert("lastfm_username".into(), Value::String(s.lastfm_username));
-    obj.insert(
-        "listenbrainz_enabled".into(),
-        Value::Bool(s.listenbrainz_enabled),
-    );
-    obj.insert(
-        "listenbrainz_username".into(),
-        Value::String(s.listenbrainz_username),
-    );
-    // Secrets only with --include-auth; otherwise empty (§2.5).
-    let lastfm_key = if include_auth {
-        s.lastfm_session_key
-    } else {
-        String::new()
-    };
-    let lb_token = if include_auth {
-        s.listenbrainz_token
-    } else {
-        String::new()
-    };
-    obj.insert("lastfm_session_key".into(), Value::String(lastfm_key));
-    obj.insert("listenbrainz_token".into(), Value::String(lb_token));
-    Some(Value::Object(obj))
 }
 
 fn read_library_folders(data_root: &Path) -> Option<Value> {
@@ -1538,44 +1410,6 @@ fn read_last_user_id(data_root: &Path) -> Option<u64> {
         .trim()
         .parse::<u64>()
         .ok()
-}
-
-fn write_last_user_id(data_root: &Path, uid: u64) -> Result<(), String> {
-    std::fs::create_dir_all(data_root).map_err(|e| e.to_string())?;
-    std::fs::write(data_root.join("last_user_id"), uid.to_string()).map_err(|e| e.to_string())
-}
-
-// ---- decrypted token load (export --include-auth) ----
-fn load_decrypted_token(
-    source: &ExportSource,
-    paths: &ProfilePaths,
-) -> Result<Option<String>, BundleError> {
-    match source {
-        ExportSource::Desktop => match qbz_credentials::load_oauth_token() {
-            Ok(Some(t)) => Ok(Some(t)),
-            Ok(None) => {
-                // Distinguish "no token" from "present but undecryptable" (IV1:
-                // the portal secret is bound to the desktop session, §4.1).
-                if paths.config_root.join(".qbz-oauth-token").exists() {
-                    Err(BundleError::TokenDecryptFailed)
-                } else {
-                    Ok(None)
-                }
-            }
-            Err(_) => {
-                if paths.config_root.join(".qbz-oauth-token").exists() {
-                    Err(BundleError::TokenDecryptFailed)
-                } else {
-                    Ok(None)
-                }
-            }
-        },
-        ExportSource::Daemon(_) => match qbz_credentials::load_oauth_token_at(&paths.config_root) {
-            Ok(Some(t)) => Ok(Some(t)),
-            Ok(None) => Ok(None),
-            Err(e) => Err(BundleError::Io(e)),
-        },
-    }
 }
 
 // ---- desktop paths + misc ----

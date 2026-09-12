@@ -9,7 +9,7 @@
 // T11's `write_one`, import/export through the T12 bundle engine, auth through
 // the T5 login engine. The TUI adds no persistence of its own (03 §6).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 
 use serde_json::{json, Value};
@@ -25,17 +25,14 @@ use qbz_audio::{AudioBackendType, AudioDevice, BackendManager, NegotiatedRate};
 
 use crate::cli::client::{ApiClient, CliError};
 use crate::config::QbzdConfig;
-use crate::login;
 use crate::paths::ProfileRoots;
 use crate::qconnect::transport as qconnect_kv;
 
-use super::screens::account::{AccountState, AuthSnapshot};
 use super::screens::audio::AudioState;
 use super::screens::bundle::{BundleState, PendingImport};
 use super::screens::network::{self as network_screen, NetworkState};
 use super::screens::playback::PlaybackState;
 use super::screens::qconnect::QConnectState;
-use super::screens::scrobbler::ScrobblerState;
 use super::screens::wizard::WizardState;
 use super::strings as s;
 use super::theme;
@@ -53,29 +50,25 @@ use ratatui::Frame;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
-    Account,
     Audio,
     Playback,
     QConnect,
     Network,
     Bundle,
     Wizard,
-    Scrobbler,
 }
 
-/// Eight sections. The original D7 six-screen cap was broken deliberately for
-/// FB4's HiFi Wizard, and again for the CONSOLE ext's Scrobbler (Last.fm /
-/// ListenBrainz auth) — both owner-sanctioned. Scrobbler is appended LAST so no
-/// existing section index (or number-key jump) shifts.
-pub const SCREENS: [Screen; 8] = [
-    Screen::Account,
+/// Six sections. Was eight until the account path was removed: this daemon has
+/// no Qobuz login and no scrobbling, so the Account and Scrobbler sections went
+/// with them. What remains is what `qbzd setup` is now for — configuring the
+/// audio device and the renderer.
+pub const SCREENS: [Screen; 6] = [
     Screen::Audio,
     Screen::Playback,
     Screen::QConnect,
     Screen::Network,
     Screen::Bundle,
     Screen::Wizard,
-    Screen::Scrobbler,
 ];
 
 // Sidebar width is now responsive (FB5): `widgets::sidebar_width(term_width)` —
@@ -90,26 +83,6 @@ pub enum Focus {
     Content,
 }
 
-/// Construct the path to the OAuth token file in the config root.
-fn cred_file_path(config_root: &Path) -> PathBuf {
-    config_root.join(".qbz-oauth-token")
-}
-
-/// Determine the startup focus (03 §2.2, re-shelled for FB3). The landing
-/// SECTION is always Account (there is no menu to land on any more); only the
-/// focus differs:
-/// - No credential file → focus the CONTENT (Account is ready to log in).
-/// - Credential file present → focus the NAV (the operator picks where to go).
-///
-/// The decision is based on credential-file presence, not live daemon auth state.
-fn initial_focus(cred_file_present: bool) -> Focus {
-    if cred_file_present {
-        Focus::Nav
-    } else {
-        Focus::Content
-    }
-}
-
 /// The 0-based index of a section in `SCREENS` (sidebar row / number key).
 fn section_index(screen: Screen) -> usize {
     SCREENS.iter().position(|s| *s == screen).unwrap_or(0)
@@ -118,14 +91,12 @@ fn section_index(screen: Screen) -> usize {
 /// The full section title for the breadcrumb (the sidebar uses short labels).
 fn section_title(screen: Screen) -> &'static str {
     match screen {
-        Screen::Account => s::ACCOUNT_TITLE,
         Screen::Audio => s::AUDIO_TITLE,
         Screen::Playback => s::PLAYBACK_TITLE,
         Screen::QConnect => s::QCONNECT_TITLE,
         Screen::Network => s::NETWORK_TITLE,
         Screen::Bundle => s::BUNDLE_TITLE,
         Screen::Wizard => s::WIZARD_TITLE,
-        Screen::Scrobbler => s::SCROBBLER_TITLE,
     }
 }
 
@@ -218,9 +189,6 @@ pub enum ScreenAction {
     Save,
     Back,
     RefreshDevices,
-    LoginBrowser,
-    LoginToken(String),
-    Logout,
     ImportPlan(String),
     ImportApply,
     Export {
@@ -240,12 +208,6 @@ pub enum ScreenAction {
     WizardTestPoll,
     /// Esc mid-wizard — open the confirm-abandon modal.
     WizardAbandon,
-    // ---- Scrobbler (CONSOLE ext) ----
-    /// Suspend the alt-screen and run the Last.fm connect flow on the plain
-    /// terminal (same methodology as the browser login).
-    ScrobbleConnectLastfm,
-    /// Suspend the alt-screen and run the ListenBrainz token connect flow.
-    ScrobbleConnectListenbrainz,
 }
 
 /// Read-only context passed to every screen's `draw` (the live status body for
@@ -257,13 +219,6 @@ pub struct DrawCtx<'a> {
 /// What the event loop must do after handling a key (terminal-control cases).
 pub enum LoopCmd {
     None,
-    /// Suspend the alt-screen and run the T5 browser-login engine on the plain
-    /// terminal, then resume (see the task report for this deliberate divergence).
-    BrowserLogin,
-    /// Suspend the alt-screen and run the Last.fm scrobbler connect flow.
-    ScrobbleLastfm,
-    /// Suspend the alt-screen and run the ListenBrainz scrobbler connect flow.
-    ScrobbleListenbrainz,
 }
 
 // ============================ worker messages ============================
@@ -276,7 +231,6 @@ pub enum Msg {
         reachable: bool,
         success: bool,
     },
-    TokenLogin(Result<(String, Option<String>), String>),
     ImportPlanned(Result<Box<PendingImport>, String>),
     ImportApplied {
         lines: Vec<String>,
@@ -302,14 +256,12 @@ pub enum Msg {
 // shortage of.
 #[allow(clippy::large_enum_variant)]
 enum Active {
-    Account(AccountState),
     Audio(AudioState),
     Playback(PlaybackState),
     QConnect(QConnectState),
     Network(NetworkState),
     Bundle(BundleState),
     Wizard(WizardState),
-    Scrobbler(ScrobblerState),
 }
 
 enum Overlay {
@@ -356,7 +308,6 @@ pub struct App {
 
     status: Option<Value>,
     reachable: bool,
-    auth: AuthSnapshot,
 
     overlay: Overlay,
     busy: Option<String>,
@@ -375,24 +326,23 @@ impl App {
             handle,
             tx,
             rx,
-            active: Active::Account(AccountState::new(AuthSnapshot::default())),
-            active_section: Screen::Account,
+            active: Active::Audio(AudioState::new(&AudioSettings::default())),
+            active_section: Screen::Audio,
             nav_cursor: 0,
             focus: Focus::Nav,
             status: None,
             reachable: false,
-            auth: AuthSnapshot::default(),
             overlay: Overlay::None,
             busy: None,
             busy_tick: 0,
             should_quit: false,
             leave_after_save: None,
         };
-        // Landing (FB3): always the Account section; focus depends on whether a
-        // credential file exists (first-run → content, ready to log in).
-        let cred_file_exists = cred_file_path(&roots.config).exists();
-        app.enter_screen(Screen::Account);
-        app.focus = initial_focus(cred_file_exists);
+        // Landing: the Audio section. This used to be Account, which no longer
+        // exists — `qbzd setup` is now an audio/device configurator, and the
+        // output device is the first thing anyone needs to set.
+        app.enter_screen(Screen::Audio);
+        app.focus = Focus::Content;
         app
     }
 
@@ -410,42 +360,6 @@ impl App {
         let body = self.handle.block_on(fetch_status(roots));
         self.reachable = body.is_some();
         self.status = body;
-        self.auth = self.derive_auth();
-    }
-
-    /// Resolve auth from live status (daemon up) or credential-file presence
-    /// (daemon down) — NEVER fabricating a name offline (§3.1).
-    fn derive_auth(&self) -> AuthSnapshot {
-        if self.reachable {
-            if let Some(st) = &self.status {
-                let state = st
-                    .pointer("/auth/state")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                if state == "logged_in" {
-                    let id = st.pointer("/auth/user_id").and_then(Value::as_u64);
-                    let plan = st
-                        .pointer("/auth/subscription")
-                        .and_then(Value::as_str)
-                        .map(str::to_string);
-                    return AuthSnapshot {
-                        logged_in: true,
-                        email: id.map(|i| format!("user {i}")),
-                        plan,
-                        cred_file_present: true,
-                    };
-                }
-                return AuthSnapshot::default();
-            }
-        }
-        // Offline: only report credential-file presence.
-        let cred = self.roots.config.join(".qbz-oauth-token").exists();
-        AuthSnapshot {
-            logged_in: false,
-            email: None,
-            plan: None,
-            cred_file_present: cred,
-        }
     }
 
     // -------------------------- navigation --------------------------
@@ -458,7 +372,6 @@ impl App {
         self.active_section = screen;
         self.nav_cursor = section_index(screen);
         self.active = match screen {
-            Screen::Account => Active::Account(AccountState::new(self.auth.clone())),
             Screen::Audio => {
                 let audio = load_audio(&self.roots);
                 let mut st = AudioState::new(&audio);
@@ -497,7 +410,6 @@ impl App {
             }
             Screen::Bundle => Active::Bundle(BundleState::new(desktop_profile_present())),
             Screen::Wizard => Active::Wizard(WizardState::new()),
-            Screen::Scrobbler => Active::Scrobbler(ScrobblerState::new(&self.roots)),
         };
     }
 
@@ -566,14 +478,12 @@ impl App {
 
     fn active_is_editing(&self) -> bool {
         match &self.active {
-            Active::Account(s) => s.is_editing(),
             Active::Audio(s) => s.is_editing(),
             Active::Playback(s) => s.is_editing(),
             Active::QConnect(s) => s.is_editing(),
             Active::Network(s) => s.is_editing(),
             Active::Bundle(s) => s.is_editing(),
             Active::Wizard(s) => s.is_editing(),
-            Active::Scrobbler(s) => s.is_editing(),
         }
     }
 
@@ -581,14 +491,12 @@ impl App {
     /// The Wizard uses it for the current STEP name (`Wizard › <step>`).
     fn active_editing_label(&self) -> Option<&'static str> {
         match &self.active {
-            Active::Account(s) => s.editing_label(),
             Active::Audio(s) => s.editing_label(),
             Active::Playback(s) => s.editing_label(),
             Active::QConnect(s) => s.editing_label(),
             Active::Network(s) => s.editing_label(),
             Active::Bundle(s) => s.editing_label(),
             Active::Wizard(s) => s.editing_label(),
-            Active::Scrobbler(s) => s.editing_label(),
         }
     }
 
@@ -698,14 +606,12 @@ impl App {
 
     fn dispatch_screen_key(&mut self, key: KeyEvent) -> ScreenAction {
         match &mut self.active {
-            Active::Account(s) => s.handle_key(key),
             Active::Audio(s) => s.handle_key(key),
             Active::Playback(s) => s.handle_key(key),
             Active::QConnect(s) => s.handle_key(key),
             Active::Network(s) => s.handle_key(key),
             Active::Bundle(s) => s.handle_key(key),
             Active::Wizard(s) => s.handle_key(key),
-            Active::Scrobbler(s) => s.handle_key(key),
         }
     }
 
@@ -727,15 +633,6 @@ impl App {
                     let backend = s.backend();
                     self.spawn_devices(backend);
                 }
-                LoopCmd::None
-            }
-            ScreenAction::LoginBrowser => LoopCmd::BrowserLogin,
-            ScreenAction::LoginToken(token) => {
-                self.spawn_token_login(token);
-                LoopCmd::None
-            }
-            ScreenAction::Logout => {
-                self.do_logout();
                 LoopCmd::None
             }
             ScreenAction::ImportPlan(path) => {
@@ -774,8 +671,6 @@ impl App {
                 self.overlay = Overlay::ConfirmAbandon;
                 LoopCmd::None
             }
-            ScreenAction::ScrobbleConnectLastfm => LoopCmd::ScrobbleLastfm,
-            ScreenAction::ScrobbleConnectListenbrainz => LoopCmd::ScrobbleListenbrainz,
         }
     }
 
@@ -849,45 +744,6 @@ impl App {
         self.handle.spawn_blocking(move || {
             let _ = tx.send(Msg::Devices(enumerate_devices(backend)));
         });
-    }
-
-    fn spawn_token_login(&mut self, token: String) {
-        self.busy = Some(s::ACCOUNT_VALIDATING.to_string());
-        let roots = self.roots.clone();
-        let tx = self.tx.clone();
-        self.handle.spawn(async move {
-            let res = login::login_with_token_arg(&roots, &token)
-                .await
-                .map(|session| (session.email, Some(session.subscription_label)))
-                .map_err(|e| e.to_string());
-            let _ = tx.send(Msg::TokenLogin(res));
-        });
-    }
-
-    fn do_logout(&mut self) {
-        match login::logout(&self.roots) {
-            Ok(_) => {
-                self.auth = AuthSnapshot {
-                    logged_in: false,
-                    email: None,
-                    plan: None,
-                    cred_file_present: false,
-                };
-                if let Active::Account(s) = &mut self.active {
-                    s.set_auth(self.auth.clone());
-                }
-                self.overlay = Overlay::Result {
-                    title: s::ACCOUNT_TITLE.to_string(),
-                    lines: vec!["logged out".to_string()],
-                };
-            }
-            Err(e) => {
-                self.overlay = Overlay::Result {
-                    title: s::ACCOUNT_TITLE.to_string(),
-                    lines: vec![e.to_string()],
-                };
-            }
-        }
     }
 
     fn spawn_import_plan(&mut self, path: String) {
@@ -1056,32 +912,6 @@ impl App {
                     self.leave_after_save = None;
                 }
             }
-            Msg::TokenLogin(result) => {
-                self.busy = None;
-                match result {
-                    Ok((email, plan)) => {
-                        self.auth = AuthSnapshot {
-                            logged_in: true,
-                            email: Some(email.clone()),
-                            plan: plan.clone(),
-                            cred_file_present: true,
-                        };
-                        if let Active::Account(st) = &mut self.active {
-                            st.set_auth(self.auth.clone());
-                        }
-                        self.overlay = Overlay::Result {
-                            title: s::ACCOUNT_TITLE.to_string(),
-                            lines: vec![s::account_logged_in(&email)],
-                        };
-                    }
-                    Err(e) => {
-                        self.overlay = Overlay::Result {
-                            title: s::ACCOUNT_TITLE.to_string(),
-                            lines: e.lines().map(str::to_string).collect(),
-                        };
-                    }
-                }
-            }
             Msg::ImportPlanned(result) => {
                 self.busy = None;
                 match result {
@@ -1111,8 +941,6 @@ impl App {
                 if let Active::Bundle(s) = &mut self.active {
                     s.clear_pending();
                 }
-                // A bundle may have logged us in — refresh auth.
-                self.auth = self.derive_auth();
                 self.overlay = Overlay::Result {
                     title: s::BUNDLE_TITLE.to_string(),
                     lines,
@@ -1157,45 +985,6 @@ impl App {
                     w.set_test_result(requested, negotiated, note);
                 }
             }
-        }
-    }
-
-    /// Called by the loop after it runs the suspended browser-login engine.
-    pub fn after_browser_login(&mut self, result: Result<(String, Option<String>), String>) {
-        match result {
-            Ok((email, plan)) => {
-                self.auth = AuthSnapshot {
-                    logged_in: true,
-                    email: Some(email.clone()),
-                    plan: plan.clone(),
-                    cred_file_present: true,
-                };
-                if let Active::Account(st) = &mut self.active {
-                    st.set_auth(self.auth.clone());
-                }
-                self.overlay = Overlay::Result {
-                    title: s::ACCOUNT_TITLE.to_string(),
-                    lines: vec![s::account_logged_in(&email)],
-                };
-            }
-            Err(e) => {
-                self.overlay = Overlay::Result {
-                    title: s::ACCOUNT_TITLE.to_string(),
-                    lines: e.lines().map(str::to_string).collect(),
-                };
-            }
-        }
-    }
-
-    pub fn roots(&self) -> &ProfileRoots {
-        &self.roots
-    }
-
-    /// Reload the Scrobbler screen's settings snapshot after a connect flow ran
-    /// on the suspended plain terminal (the CLI auth wrote the store directly).
-    pub fn refresh_scrobbler(&mut self) {
-        if matches!(self.active_section, Screen::Scrobbler) {
-            self.active = Active::Scrobbler(ScrobblerState::new(&self.roots));
         }
     }
 
@@ -1250,14 +1039,12 @@ impl App {
             status: self.status.as_ref(),
         };
         match &self.active {
-            Active::Account(sc) => sc.draw(f, inner, &ctx),
             Active::Audio(sc) => sc.draw(f, inner, &ctx),
             Active::Playback(sc) => sc.draw(f, inner, &ctx),
             Active::QConnect(sc) => sc.draw(f, inner, &ctx),
             Active::Network(sc) => sc.draw(f, inner, &ctx),
             Active::Bundle(sc) => sc.draw(f, inner, &ctx),
             Active::Wizard(sc) => sc.draw(f, inner, &ctx),
-            Active::Scrobbler(sc) => sc.draw(f, inner, &ctx),
         }
 
         self.draw_footer(f, rows[3]);
@@ -1408,7 +1195,7 @@ impl App {
     /// alone — every state spells itself out.
     fn draw_footer(&self, f: &mut Frame, area: Rect) {
         let playing = self.status.as_ref().and_then(playing_extra);
-        let (text, style) = footer_state(self.reachable, self.auth.logged_in, playing);
+        let (text, style) = footer_state(self.reachable, playing);
         f.render_widget(Paragraph::new(Line::from(Span::styled(text, style))), area);
     }
 
@@ -1424,7 +1211,6 @@ impl App {
                     }
                 }
                 Active::Wizard(sc) => sc.help_text(),
-                Active::Scrobbler(_) => s::HELP_SCROBBLER,
                 _ => {
                     if self.active_is_dirty() {
                         s::HELP_CONTENT_DIRTY
@@ -1597,21 +1383,7 @@ async fn apply_import(
         }
     };
 
-    // Validate the auth token BEFORE any write (§3.6 step 5).
-    let mut uid = None;
-    if let Some(token) = plan.auth_token.clone() {
-        match login::validate_token(&token).await {
-            Ok(session) => uid = Some(session.user_id),
-            Err(_) => {
-                return Msg::ImportApplied {
-                    lines: vec!["the Qobuz token in this bundle was rejected".to_string()],
-                    status: None,
-                    reachable: false,
-                }
-            }
-        }
-    }
-
+    let uid: Option<u64> = None;
     if let Err(e) = bundle::apply(&plan, &target, uid) {
         return Msg::ImportApplied {
             lines: vec![format!("import only partially applied: {e}")],
@@ -1712,18 +1484,9 @@ fn build_live(bundle: &Bundle) -> (LiveSystem, AudioBackendType, Vec<AudioDevice
 ///   (a deliberate FB2 addition over the base footer: an operator-visible
 ///   needs-auth cue, owner veto at the smoke);
 /// - running + signed in → ok, with the optional `playing …` tail.
-fn footer_state(
-    reachable: bool,
-    logged_in: bool,
-    playing: Option<String>,
-) -> (String, ratatui::style::Style) {
+fn footer_state(reachable: bool, playing: Option<String>) -> (String, ratatui::style::Style) {
     if !reachable {
         (format!(" {}", s::FOOTER_UNREACHABLE), theme::dim())
-    } else if !logged_in {
-        (
-            format!(" {} · {}", s::FOOTER_RUNNING, s::FOOTER_NEEDS_AUTH),
-            theme::warn(),
-        )
     } else {
         let text = match playing {
             Some(e) => format!(" {} · {e}", s::FOOTER_RUNNING),
@@ -1777,20 +1540,6 @@ mod tests {
     use ratatui::Terminal;
 
     // ---- landing (FB3): always Account; focus depends on the credential file ----
-
-    #[test]
-    fn first_run_lands_focus_on_content() {
-        // No credential file → the operator should be able to log in immediately,
-        // so the CONTENT (Account) owns focus.
-        assert_eq!(initial_focus(false), Focus::Content);
-    }
-
-    #[test]
-    fn returning_user_lands_focus_on_nav() {
-        // A credential file exists → land with the NAV focused so the operator
-        // picks where to go (the section is still Account underneath).
-        assert_eq!(initial_focus(true), Focus::Nav);
-    }
 
     // ---- breadcrumb composition (max 2 levels) ----
 
@@ -1921,7 +1670,6 @@ mod tests {
             .build()
             .unwrap();
         let active = match section {
-            Screen::Account => Active::Account(AccountState::new(AuthSnapshot::default())),
             Screen::Audio => Active::Audio(AudioState::new(&AudioSettings::default())),
             Screen::Playback => Active::Playback(PlaybackState::new(
                 "hires_plus",
@@ -1935,11 +1683,6 @@ mod tests {
             }
             Screen::Bundle => Active::Bundle(BundleState::new(false)),
             Screen::Wizard => Active::Wizard(WizardState::new()),
-            Screen::Scrobbler => Active::Scrobbler(ScrobblerState::new(&ProfileRoots {
-                config: PathBuf::from("/nonexistent"),
-                data: PathBuf::from("/nonexistent"),
-                cache: PathBuf::from("/nonexistent"),
-            })),
         };
         App {
             roots: ProfileRoots {
@@ -1956,7 +1699,6 @@ mod tests {
             focus,
             status: None,
             reachable: false,
-            auth: AuthSnapshot::default(),
             overlay: Overlay::None,
             busy: None,
             busy_tick: 0,
@@ -1995,7 +1737,9 @@ mod tests {
                     "80x24 must not trip the resize guard for {screen:?}"
                 );
                 // The sidebar and version chrome are present.
-                assert!(out.contains("Account"), "sidebar missing for {screen:?}");
+                // "Audio" rather than "Account": the Account section went with
+                // the login path, and Audio is now the first sidebar row.
+                assert!(out.contains("Audio"), "sidebar missing for {screen:?}");
                 let version = format!("qbzd {}", env!("CARGO_PKG_VERSION"));
                 assert!(
                     out.contains(&version),
@@ -2054,26 +1798,19 @@ mod tests {
         assert!(widgets::sidebar_width(120) >= 2 * widgets::sidebar_width(80));
     }
 
+    /// The footer now has two states, not three: the "needs auth" cue went with
+    /// the account path.
     #[test]
-    fn footer_state_maps_the_three_daemon_states() {
-        // Unreachable → dim, regardless of auth.
-        let (text, style) = footer_state(false, true, None);
+    fn footer_state_maps_the_two_daemon_states() {
+        let (text, style) = footer_state(false, None);
         assert_eq!(text, format!(" {}", s::FOOTER_UNREACHABLE));
         assert_eq!(style, theme::dim());
 
-        // Reachable but not signed in → warn, names the missing auth.
-        let (text, style) = footer_state(true, false, None);
-        assert_eq!(
-            text,
-            format!(" {} · {}", s::FOOTER_RUNNING, s::FOOTER_NEEDS_AUTH)
-        );
-        assert_eq!(style, theme::warn());
-
-        // Running + signed in → ok, with and without the playing tail.
-        let (text, style) = footer_state(true, true, None);
+        let (text, style) = footer_state(true, None);
         assert_eq!(text, format!(" {}", s::FOOTER_RUNNING));
         assert_eq!(style, theme::ok());
-        let (text, _) = footer_state(true, true, Some("playing 96000 Hz / 24 bit".into()));
+
+        let (text, _) = footer_state(true, Some("playing 96000 Hz / 24 bit".into()));
         assert_eq!(
             text,
             format!(" {} · playing 96000 Hz / 24 bit", s::FOOTER_RUNNING)

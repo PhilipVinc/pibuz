@@ -10,7 +10,7 @@ use qbz_app::playback_driver::{self, DriverDeps};
 use qbz_app::settings::daemon_prefs;
 use qbz_app::shell::AppRuntime;
 use qbz_core::CoreError;
-use qbz_models::{CoreEvent, UserSession};
+use qbz_models::CoreEvent;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
@@ -130,13 +130,6 @@ pub async fn run(roots: ProfileRoots, cfg: QbzdConfig, warns: Vec<String>) -> Re
     //      clone, so it is aborted+joined ahead of `drop(booted)` (#521 ordering).
     let queue_persist = spawn_queue_persist(booted.runtime.clone(), booted.bus.subscribe());
 
-    // 10c. Scrobble-on-play (CONSOLE): a CoreEvent-bus subscriber that sends
-    //      "now playing" on TrackStarted and scrobbles once past the Last.fm
-    //      threshold, to whichever of Last.fm / ListenBrainz is connected +
-    //      enabled in the scrobbler store. Holds NO Arc<AppRuntime>, so it sits
-    //      outside the #521/§8.2 ordering — aborted for a clean shutdown below.
-    let scrobbler = crate::scrobble_engine::spawn(roots.clone(), booted.bus.subscribe());
-
     // 10c½. Events bridge: translate the driver's transition edges into the
     //       playback CoreEvents the bus consumers above (and SSE, and the event
     //       hook below) are written for — TrackStarted / PlaybackStateChanged /
@@ -250,9 +243,6 @@ pub async fn run(roots: ProfileRoots, cfg: QbzdConfig, warns: Vec<String>) -> Re
     // `Arc<AppRuntime>` clone alive past `drop(booted)` (#521 ordering).
     queue_persist.abort();
     let _ = queue_persist.await;
-    // Stop the scrobble-on-play subscriber (holds no Arc<AppRuntime>; order-free).
-    scrobbler.abort();
-    let _ = scrobbler.await;
     // Stop the events bridge BEFORE `drop(booted)`: it upgrades its Weak to a
     // strong Arc<AppRuntime> for the span of each wake (#521 ordering).
     events_bridge.abort();
@@ -340,67 +330,17 @@ async fn boot(
     // writes; vectors are built on demand from MusicBrainz + Qobuz, so this
     // needs no listening history. Best-effort: a failed open leaves
     // `generate_playlist_suggestions` working un-cached (artist_vectors = None).
-    if let Ok(store) = qbz_reco::ArtistVectorStore::open_at(&roots.data) {
-        runtime.core().set_artist_vectors(store).await;
-    }
-
     let shared = new_shared(cfg);
     if let Ok(mut s) = shared.lock() {
         s.startup_warnings = warn_count as u32;
     }
 
-    // 8. credential restore per the §6.2 taxonomy (mirrors qbz/src/auth.rs:
-    //    215-230): clear the token ONLY on explicit auth rejection; KEEP it on
-    //    every network-class failure (clearing on transient errors is the
-    //    documented boot-token-loss bug class).
-    let auth_retry = match qbz_credentials::load_oauth_token_at(&roots.config)? {
-        None => {
-            set_needs_auth(&shared, None);
-            // `None` covers both "no token saved" and "token saved but this
-            // process cannot decrypt it" — the decrypt failure is swallowed by
-            // design so a broken file can never abort boot. Tell them apart
-            // here, or `status` reports "not logged in / last error: none" and
-            // the real cause stays buried in the log.
-            if qbz_credentials::oauth_token_file_present_at(&roots.config) {
-                latch_undecryptable_token(&shared);
-            }
-            None
-        }
-        Some(token) => {
-            // Register before the token can reach any log line (§6.3).
-            qbz_log::register_secret(token.clone());
-            match runtime.core().login_with_token(&token).await {
-                Ok(session) => {
-                    restore_activate(&runtime, &shared, roots, session, &token).await?;
-                    // 9½. session restore (queue/position) PAUSED: the daemon's
-                    //     session store IS its queue persistence, so a restart
-                    //     comes back with the queue armed but not auto-playing.
-                    playback_driver::restore_session_paused(runtime.as_ref()).await;
-                    None
-                }
-                Err(e) if is_auth_rejection(&e) => {
-                    qbz_credentials::clear_oauth_token_at(&roots.config)?;
-                    latch_auth_error(&shared, &e);
-                    set_needs_auth(&shared, Some(e));
-                    None
-                }
-                Err(e) => {
-                    // network-class: KEEP token, stay Restoring, retry w/ backoff.
-                    log::warn!("session restore deferred (network-class): {e}");
-                    // 01 §9.3: a real network-class outcome — latch `network.online`
-                    // false so `/api/status` reflects it until a retry succeeds.
-                    if let Ok(s) = shared.lock() {
-                        s.set_network_online(false);
-                    }
-                    Some(spawn_auth_retry(
-                        runtime.clone(),
-                        shared.clone(),
-                        roots.clone(),
-                    ))
-                }
-            }
-        }
-    };
+    // 8. No credential restore: this daemon has no account path. A Qobuz
+    //    Connect handoff supplies its own `jwt_api` streaming credential
+    //    (see qconnect/pairing.rs), so there is nothing on disk to restore
+    //    and nothing to retry — the renderer simply waits to be cast to.
+    set_needs_auth(&shared, None);
+    let auth_retry = None;
 
     Ok(BootedRuntime {
         runtime,
@@ -508,42 +448,6 @@ fn spawn_queue_persist(
     })
 }
 
-/// Activate the per-user session against DAEMON paths (§8.1-9): inject the
-/// session into the core, then `activate_at` the runtime with per-user daemon
-/// data/cache directories — never the desktop `UserDataPaths`.
-pub(crate) async fn restore_activate(
-    runtime: &Arc<AppRuntime<DaemonAdapter>>,
-    shared: &Arc<Mutex<DaemonShared>>,
-    roots: &ProfileRoots,
-    session: UserSession,
-    token: &str,
-) -> Result<(), String> {
-    runtime
-        .core()
-        .set_session(session.clone())
-        .await
-        .map_err(|e| e.to_string())?;
-    runtime
-        .activate_at(
-            session.user_id,
-            &roots.data.join(format!("users/{}", session.user_id)),
-            &roots.cache.join(format!("users/{}", session.user_id)),
-        )
-        .await?;
-    set_logged_in(shared, &session);
-    // T11: remember which token this activation applied so a later
-    // `POST /api/settings/reload` can tell "same token" from "new token" and
-    // skip a redundant re-login on every unrelated settings nudge.
-    if let Ok(mut s) = shared.lock() {
-        s.credential_fingerprint = Some(crate::state::token_fingerprint(token));
-        // 01 §9.3: a real login/restore success (boot, background auth-retry,
-        // or a reload's credential re-validation — every caller of this fn)
-        // means the network is reachable — latch `network.online` back true.
-        s.set_network_online(true);
-    }
-    Ok(())
-}
-
 /// Fresh shared state. Starts in `Restoring` — credential restore drives the
 /// terminal transition to `LoggedIn` or `NeedsAuth` (§6.2 diagram).
 fn new_shared(cfg: &QbzdConfig) -> Arc<Mutex<DaemonShared>> {
@@ -585,124 +489,6 @@ pub(crate) fn set_needs_auth(shared: &Arc<Mutex<DaemonShared>>, err: Option<Core
             )
         }
     }
-}
-
-/// Enter LoggedIn (Ready). Records the user id + subscription label for
-/// `/api/status` (T6). The auth token itself is never stored here — it is a
-/// registered secret and lives only in the credential file.
-fn set_logged_in(shared: &Arc<Mutex<DaemonShared>>, session: &UserSession) {
-    if let Ok(mut s) = shared.lock() {
-        s.auth = AuthState::LoggedIn;
-        s.user_id = Some(session.user_id);
-        s.subscription = Some(session.subscription_label.clone());
-    }
-    log::info!(
-        "Logged in (user {}, subscription '{}')",
-        session.user_id,
-        session.subscription_label
-    );
-}
-
-/// Latch the "saved token is present but undecryptable" case. Reachable when a
-/// token was written under a key this process cannot derive — e.g. a login that
-/// ran in a graphical session against a build that still mixed the XDG portal
-/// secret in, now read by an init-started daemon with no session bus. The
-/// credential store migrates that token itself where it can (a daemon that CAN
-/// reach the portal rewrites it portal-free); when it cannot, the only exit is a
-/// fresh login, so say exactly that instead of a bare "not logged in".
-pub(crate) fn latch_undecryptable_token(shared: &Arc<Mutex<DaemonShared>>) {
-    if let Ok(mut s) = shared.lock() {
-        s.last_errors.auth = Some(
-            "the saved token could not be decrypted by this daemon — run 'qbzd login' to re-authenticate".into(),
-        );
-    }
-    log::warn!("saved token present but undecryptable — run 'qbzd login' to re-authenticate");
-}
-
-/// Latch an auth error so a `status` call remains diagnosable after the fact
-/// (§9.4 — drain-once channels alone cannot answer "why did the music stop?").
-pub(crate) fn latch_auth_error(shared: &Arc<Mutex<DaemonShared>>, e: &CoreError) {
-    if let Ok(mut s) = shared.lock() {
-        s.last_errors.auth = Some(format!("token rejected by Qobuz — cleared ({e})"));
-    }
-}
-
-/// True ONLY for an explicit auth rejection from Qobuz — a 401 on the token
-/// login (`AuthenticationError`) or an ineligible-account verdict. Network
-/// failures, offline gate, 5xx, rate limiting and parse errors all return false
-/// so the saved token is KEPT (mirrors crates/qbz/src/auth.rs:215-230; the
-/// taxonomy — not the variant list — is the normative part).
-pub(crate) fn is_auth_rejection(error: &CoreError) -> bool {
-    matches!(
-        error,
-        CoreError::Api(
-            qbz_qobuz::ApiError::AuthenticationError(_) | qbz_qobuz::ApiError::IneligibleUser
-        )
-    )
-}
-
-/// Background retry for a network-class restore failure (§6.2: stay in the
-/// authenticating state, KEEP the token, retry with backoff). On success the
-/// session activates; on a now-explicit auth rejection the token is cleared and
-/// the daemon drops to NeedsAuth; if the whole schedule sees only network-class
-/// failures the token is KEPT and the daemon surfaces NeedsAuth so it stays
-/// diagnosable and a later `qbzd login` / settings reload can retry.
-fn spawn_auth_retry(
-    runtime: Arc<AppRuntime<DaemonAdapter>>,
-    shared: Arc<Mutex<DaemonShared>>,
-    roots: ProfileRoots,
-) -> JoinHandle<()> {
-    const SCHEDULE_SECS: [u64; 4] = [2, 5, 15, 30];
-    tokio::spawn(async move {
-        let token = match qbz_credentials::load_oauth_token_at(&roots.config) {
-            Ok(Some(t)) => t,
-            _ => return, // token vanished (concurrent logout) — nothing to retry.
-        };
-        for (i, delay) in SCHEDULE_SECS.iter().enumerate() {
-            tokio::time::sleep(std::time::Duration::from_secs(*delay)).await;
-            log::info!("session restore retry {}/{}", i + 1, SCHEDULE_SECS.len());
-            match runtime.core().login_with_token(&token).await {
-                Ok(session) => {
-                    if let Err(e) =
-                        restore_activate(&runtime, &shared, &roots, session, &token).await
-                    {
-                        log::warn!("session activation after retry failed: {e}");
-                    }
-                    return;
-                }
-                Err(e) if is_auth_rejection(&e) => {
-                    let _ = qbz_credentials::clear_oauth_token_at(&roots.config);
-                    latch_auth_error(&shared, &e);
-                    set_needs_auth(&shared, Some(e));
-                    return;
-                }
-                Err(e) => {
-                    log::warn!(
-                        "session restore retry {} failed (network-class): {e}",
-                        i + 1
-                    );
-                    // 01 §9.3: latch `network.online` false on every real
-                    // network-class outcome, not just the first.
-                    if let Ok(s) = shared.lock() {
-                        s.set_network_online(false);
-                    }
-                }
-            }
-        }
-        // Schedule exhausted with only network-class failures: KEEP the token,
-        // surface NeedsAuth, latch the reason for `qbzd status`.
-        if let Ok(mut s) = shared.lock() {
-            s.auth = AuthState::NeedsAuth;
-            s.set_network_online(false);
-            s.last_errors.auth = Some(
-                "could not reach Qobuz to restore the saved session — token kept, retry with 'qbzd login' or 'qbzd settings reload'".into(),
-            );
-        }
-        log::warn!(
-            "session restore gave up after {} network-class attempts — token KEPT",
-            SCHEDULE_SECS.len()
-        );
-    })
 }
 
 /// Resolve `[server] bind:port` to a `SocketAddr` (01 §10.1). A malformed value
@@ -802,13 +588,6 @@ async fn wait_for_signal() {
 pub(crate) async fn reload(state: &crate::api::ApiState) {
     reload_audio(state);
     reload_quality(state);
-    reload_credentials(
-        &state.runtime,
-        &state.shared,
-        &state.roots,
-        state.qconnect_control.get(),
-    )
-    .await;
     reload_qconnect(state).await;
 }
 
@@ -905,133 +684,9 @@ pub(crate) async fn reload_qconnect(state: &crate::api::ApiState) {
     }
 }
 
-/// What the freshly-read credential file implies for the live session — pure
-/// decision, unit-tested with no IO/network; [`reload_credentials`] just
-/// executes whichever variant this returns.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum CredentialAction {
-    /// The file matches what's already applied (or both are absent/NeedsAuth
-    /// already) — no network call, no state churn on an unrelated nudge.
-    NoOp,
-    /// The file is now empty but the daemon thinks it's logged in — tear the
-    /// session down (mirrors what `qbzd logout` does to a running daemon,
-    /// 02 §2.2: "QConnect session torn down, playback stopped").
-    EnterNeedsAuth,
-    /// A token is on disk that is not the one currently applied (fresh login
-    /// out of NeedsAuth, a retry while Restoring, or an account switch) —
-    /// validate and activate it.
-    Apply(String),
-}
-
-pub(crate) fn decide_credential_action(
-    current_auth: AuthState,
-    current_fingerprint: Option<u64>,
-    file_token: Option<String>,
-) -> CredentialAction {
-    match file_token {
-        None => {
-            if current_auth == AuthState::NeedsAuth {
-                CredentialAction::NoOp
-            } else {
-                CredentialAction::EnterNeedsAuth
-            }
-        }
-        Some(token) => {
-            let fp = crate::state::token_fingerprint(&token);
-            if current_auth == AuthState::LoggedIn && current_fingerprint == Some(fp) {
-                CredentialAction::NoOp
-            } else {
-                CredentialAction::Apply(token)
-            }
-        }
-    }
-}
-
-/// Re-read the credential file and reconcile the live session against it (02
-/// §3.3.17: "absent → NeedsAuth transition; new → session restore"; taxonomy
-/// shared with boot, §6.2). `qconnect` is `None` only in the brief boot window
-/// before step 12 populates the cell — the teardown branch just skips the
-/// QConnect disconnect then (there is no session for it to hold yet).
-pub(crate) async fn reload_credentials(
-    runtime: &Arc<AppRuntime<DaemonAdapter>>,
-    shared: &Arc<Mutex<DaemonShared>>,
-    roots: &ProfileRoots,
-    qconnect: Option<&crate::qconnect::QconnectControl>,
-) {
-    let file_token = match qbz_credentials::load_oauth_token_at(&roots.config) {
-        Ok(t) => t,
-        Err(e) => {
-            log::warn!("[reload] could not read the credential file: {e}");
-            return;
-        }
-    };
-    let (current_auth, current_fp) = match shared.lock() {
-        Ok(s) => (s.auth, s.credential_fingerprint),
-        Err(_) => return,
-    };
-
-    match decide_credential_action(current_auth, current_fp, file_token) {
-        CredentialAction::NoOp => {}
-        CredentialAction::EnterNeedsAuth => {
-            log::info!("[reload] credential file cleared — tearing the session down (NeedsAuth)");
-            if let Some(qc) = qconnect {
-                let _ = qc.disconnect().await;
-            }
-            let _ = runtime.core().stop();
-            let _ = runtime.core().logout().await;
-            let _ = runtime.deactivate().await;
-            set_needs_auth(shared, None);
-        }
-        CredentialAction::Apply(token) => {
-            qbz_log::register_secret(token.clone());
-            match runtime.core().login_with_token(&token).await {
-                Ok(session) => {
-                    match restore_activate(runtime, shared, roots, session, &token).await {
-                        Ok(()) => {
-                            playback_driver::restore_session_paused(runtime.as_ref()).await;
-                        }
-                        Err(e) => log::warn!("[reload] session activation failed: {e}"),
-                    }
-                }
-                Err(e) if is_auth_rejection(&e) => {
-                    let _ = qbz_credentials::clear_oauth_token_at(&roots.config);
-                    latch_auth_error(shared, &e);
-                    set_needs_auth(shared, Some(e));
-                }
-                Err(e) => {
-                    log::warn!("[reload] session restore deferred (network-class): {e}");
-                    // 01 §9.3: real network-class outcome — latch it false.
-                    if let Ok(s) = shared.lock() {
-                        s.set_network_online(false);
-                    }
-                }
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn is_auth_rejection_matches_only_explicit_rejections() {
-        // Explicit rejections → clear the token.
-        assert!(is_auth_rejection(&CoreError::Api(
-            qbz_qobuz::ApiError::AuthenticationError("401".into())
-        )));
-        assert!(is_auth_rejection(&CoreError::Api(
-            qbz_qobuz::ApiError::IneligibleUser
-        )));
-        // Network-class / other → KEEP the token (the boot-token-loss guard).
-        assert!(!is_auth_rejection(&CoreError::Api(
-            qbz_qobuz::ApiError::ServerError(503)
-        )));
-        assert!(!is_auth_rejection(&CoreError::Api(
-            qbz_qobuz::ApiError::RateLimited(30)
-        )));
-        assert!(!is_auth_rejection(&CoreError::NotInitialized));
-    }
 
     #[test]
     fn no_credentials_enters_needs_auth() {
@@ -1043,100 +698,7 @@ mod tests {
         assert!(s.last_errors.auth.is_none());
     }
 
-    #[test]
-    fn explicit_rejection_latches_and_needs_auth() {
-        let shared = new_shared(&QbzdConfig::default());
-        let err = CoreError::Api(qbz_qobuz::ApiError::AuthenticationError("401".into()));
-        latch_auth_error(&shared, &err);
-        set_needs_auth(&shared, Some(err));
-        let s = shared.lock().unwrap();
-        assert_eq!(s.auth, AuthState::NeedsAuth);
-        assert!(s.last_errors.auth.is_some());
-    }
-
-    #[test]
-    fn logged_in_records_user_and_subscription() {
-        let shared = new_shared(&QbzdConfig::default());
-        let session = UserSession {
-            user_auth_token: "secret".into(),
-            user_id: 1234567,
-            email: "a@b.c".into(),
-            display_name: "Tester".into(),
-            subscription_label: "studio".into(),
-            subscription_valid_until: None,
-            country_code: None,
-            language_code: None,
-        };
-        set_logged_in(&shared, &session);
-        let s = shared.lock().unwrap();
-        assert_eq!(s.auth, AuthState::LoggedIn);
-        assert_eq!(s.user_id, Some(1234567));
-        assert_eq!(s.subscription.as_deref(), Some("studio"));
-    }
-
     // ======================= T11: settings/reload =======================
-
-    #[test]
-    fn credential_action_noop_when_absent_and_already_needs_auth() {
-        assert_eq!(
-            decide_credential_action(AuthState::NeedsAuth, None, None),
-            CredentialAction::NoOp
-        );
-    }
-
-    #[test]
-    fn credential_action_enters_needs_auth_when_file_cleared_while_logged_in() {
-        // The `qbzd logout` case: file now absent, daemon still thinks it's
-        // LoggedIn (or mid-Restoring) — must tear down.
-        let fp = crate::state::token_fingerprint("old-token");
-        assert_eq!(
-            decide_credential_action(AuthState::LoggedIn, Some(fp), None),
-            CredentialAction::EnterNeedsAuth
-        );
-        assert_eq!(
-            decide_credential_action(AuthState::Restoring, None, None),
-            CredentialAction::EnterNeedsAuth
-        );
-    }
-
-    #[test]
-    fn credential_action_noop_when_token_unchanged_and_logged_in() {
-        let fp = crate::state::token_fingerprint("same-token");
-        assert_eq!(
-            decide_credential_action(AuthState::LoggedIn, Some(fp), Some("same-token".into())),
-            CredentialAction::NoOp
-        );
-    }
-
-    #[test]
-    fn credential_action_applies_new_token_out_of_needs_auth() {
-        assert_eq!(
-            decide_credential_action(AuthState::NeedsAuth, None, Some("fresh-token".into())),
-            CredentialAction::Apply("fresh-token".into())
-        );
-    }
-
-    #[test]
-    fn credential_action_applies_changed_token_while_already_logged_in() {
-        // Account-switch / re-login case: fingerprint differs even though the
-        // daemon is already LoggedIn.
-        let old_fp = crate::state::token_fingerprint("old-token");
-        assert_eq!(
-            decide_credential_action(AuthState::LoggedIn, Some(old_fp), Some("new-token".into())),
-            CredentialAction::Apply("new-token".into())
-        );
-    }
-
-    #[test]
-    fn credential_action_applies_when_fingerprint_missing_even_if_marked_logged_in() {
-        // Defensive: a LoggedIn state with no recorded fingerprint (should not
-        // happen post-T11, but a stale/older state) must not be treated as a
-        // match — never silently skip a real token on disk.
-        assert_eq!(
-            decide_credential_action(AuthState::LoggedIn, None, Some("token".into())),
-            CredentialAction::Apply("token".into())
-        );
-    }
 
     fn base_audio_settings() -> qbz_audio::settings::AudioSettings {
         qbz_audio::settings::AudioSettings::default()

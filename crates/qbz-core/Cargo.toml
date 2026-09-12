@@ -11,9 +11,6 @@ qbz-models = { path = "../qbz-models" }
 qbz-audio = { path = "../qbz-audio" }
 qbz-player = { path = "../qbz-player" }
 qbz-qobuz = { path = "../qbz-qobuz" }
-qbz-radio = { path = "../qbz-radio" }
-qbz-integrations = { path = "../qbz-integrations" }
-qbz-reco = { path = "../qbz-reco" }
 
 # Async
 tokio = { workspace = true }
