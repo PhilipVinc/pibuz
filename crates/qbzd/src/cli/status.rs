@@ -52,7 +52,12 @@ pub async fn status(host: Option<String>, json: bool, roots: &ProfileRoots) -> i
         eprintln!("{}", copy::api_version_skew(daemon_api, crate::API_VERSION));
         return 1;
     }
-    let cli_ver = env!("CARGO_PKG_VERSION");
+    // `crate::VERSION`, NOT `CARGO_PKG_VERSION`: the daemon reports the
+    // former (the release workflow stamps the tag through `QBZD_BUILD_ID`,
+    // and a local Pi build stamps a `2.1.0.local-<sha>`). Comparing against
+    // the bare Cargo version made every stamped build warn that it was skewed
+    // against ITSELF — same binary, same process even, two different strings.
+    let cli_ver = crate::VERSION;
     if let Some(daemon_ver) = payload.get("version").and_then(|v| v.as_str()) {
         if !daemon_ver.is_empty() && daemon_ver != cli_ver {
             eprintln!("{}", copy::version_skew(daemon_ver, cli_ver));

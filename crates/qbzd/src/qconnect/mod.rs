@@ -450,20 +450,40 @@ impl DaemonQconnectService {
         }
     }
 
-    /// Wait until the API client is up, then attempt `connect()` with the
-    /// bounded [2s, 5s, 15s, 30s] retry schedule. Each `connect()` re-resolves
-    /// the transport config internally, so a transient network failure can
-    /// clear on a later attempt.
+    /// Wait until the API client is up and a usable credential exists, then
+    /// attempt `connect()` with the bounded [2s, 5s, 15s, 30s] retry schedule.
+    /// Each `connect()` re-resolves the transport config internally, so a
+    /// transient network failure can clear on a later attempt.
     ///
-    /// The wait used to require a logged-in ACCOUNT as well. With the account
-    /// path gone that condition could never hold, so this task slept forever
-    /// and auto-connect only ever happened as a side effect of a pairing
-    /// handoff. `is_api_initialized` is the real precondition: it means the
-    /// bundle tokens were extracted, which is what `/qws/createToken`
-    /// discovery needs.
+    /// The wait used to require a logged-in ACCOUNT. With the account path gone
+    /// that could never hold, so this task slept forever and auto-connect only
+    /// ever happened as a side effect of a pairing handoff.
+    ///
+    /// Simply dropping the condition is wrong in the other direction. Without a
+    /// credential `connect()` falls through to `/qws/createToken` discovery,
+    /// which is account-bound and answers "requires authenticated user" — five
+    /// times, at WARN, on every boot of a perfectly healthy renderer, flapping
+    /// the lifecycle Off → Connecting → Off five times on the way. moOde's
+    /// renderer script watches those transitions. So gate on there being
+    /// something to connect WITH: a live handed-over pairing token, or an
+    /// explicit endpoint from the environment. A renderer that has not been
+    /// cast to has neither, and the right behaviour there is to sit quietly on
+    /// the pairing listener and wait.
     async fn connect_on_ready(self: Arc<Self>) {
         while !self.runtime.core().is_api_initialized().await {
             tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        let paired = pairing::valid_ws_tokens(&self.pairing_store).is_some();
+        let explicit_endpoint = std::env::var("QBZ_QCONNECT_WS_ENDPOINT")
+            .ok()
+            .is_some_and(|v| !v.trim().is_empty());
+        if !paired && !explicit_endpoint {
+            log::info!(
+                "[QConnect] auto-connect: no handed-over credential yet — \
+                 waiting on the pairing listener to be cast to"
+            );
+            return;
         }
 
         let schedule: [u64; 4] = [2_000, 5_000, 15_000, 30_000];
