@@ -92,6 +92,50 @@ against a real driver, RT scheduling, whether moOde's `_audioout` really passes
 through. Green here means the state machine is right, not that the Pi sounds
 right.
 
+## The controller-sync tests
+
+`crates/qconnect-app/src/controller_harness.rs` puts a scripted phone in a test.
+A `VirtualController` expands gestures (`tap_pause`, `drag_seek`,
+`push_queue_and_play`) into the exact inbound frames the cloud sends for them; a
+`FakeCloud` relays them, folds the renderer's reports into the screen it would
+push back, and ECHOES each state report at the renderer the way the real cloud
+does; a `ControllerView` models the screen, where `Buffering` is a spinner and
+`total_ms: None` is a blanked progress bar. Under it runs the real `QconnectApp`,
+the real `qconnect_app::renderer` orchestration, and a `FakeEngine` that MODELS
+the player rather than canning answers. Cases live in `controller_sync_tests.rs`;
+the suite is 0.01 s: `cargo test -p qconnect-app controller_sync`.
+
+**Same discipline as the audio tests: a bug seen on a phone gets a case here
+BEFORE it is fixed.** Assert against the SCREEN, not against protocol fields —
+the screen is what was wrong every time. The shared invariants in
+`assert_invariants` (the progress display never blanks, the echo never reaches
+the player, the cursor names the audible track, one gesture is not a report
+storm) are checked by every case, so a rule added for one bug catches the next
+one for free.
+
+Three traps, each of which silently walked the happy path until a mutation
+exposed it:
+- **Call `let_the_load_windows_expire()`** unless the case is about those
+  windows. The 5 s load-dedup and 1.5 s handoff-echo windows both hang off one
+  wall-clock `Instant`, so a microsecond-long test sits inside BOTH: every pause
+  is swallowed as a peer echo and every load is deduped away.
+- **`make_the_audio_thread_lag()`** for anything about a load in flight. By
+  default the fake adopts a track the instant the stream opens; the real audio
+  thread adopts it only once it has samples, and several guards exist ONLY for
+  that gap.
+- The fake's queue must hold the REAL tracks. `align_queue_cursor` looks the
+  target up in it, so placeholder ids send it down the "not in queue" fallback
+  every time and hide every cursor bug behind harness noise.
+
+What it cannot reach: the daemon's own report loop (`qbzd::qconnect::report`),
+which is where `buffer_state` is decided and where the periodic position reports
+come from — so spinner LIFETIMES are out of scope. It is monomorphic on
+`NativeWsTransport` + `AppRuntime` (`DaemonQconnectApp`, `DaemonEventSink`,
+`DaemonRendererEngine`); making those generic over transport and engine is what
+would let this harness mount the daemon's own sink instead of a copy of its
+shape. The daemon-side volume policy (`VolumeMode::Locked`) is in the same
+position: its arithmetic is unit-tested, its behaviour is not reachable here.
+
 ## Formatting and lints
 
 Run `cargo fmt --all`; the tree is rustfmt-clean and CI checks it. (Older
