@@ -3,7 +3,12 @@
 Notable changes per release. Versions are plain semver; releases are `vX.Y.Z`
 tags on `main`.
 
-## Unreleased
+## 2.3.1 — unreleased
+
+Bounded streaming. Verified on a 905 MB Pi 3B against a live Qobuz Connect
+session: the held buffer stays at 2.9 MB where it used to grow to the whole
+track, RSS while playing 24/96 went from ~125 MB to ~40 MB, and the download
+is paced at the track's own byte-rate instead of the link's.
 
 ### Changed
 
@@ -39,6 +44,15 @@ tags on `main`.
 - The HTTP client used a *total* request timeout, which a rate-matched
   download would have hit on every track over five minutes; it now times out
   on stalls instead.
+- **Seeking on a bounded stream works.** A seek rebuilds the decoder, which
+  re-probes the container from byte 0 — a region the window has long since
+  discarded. The pinned header is now readable by decoders rather than only by
+  metadata accessors, and a reader may re-request any region the window threw
+  away, with the feeder staying up to serve it instead of exiting once the file
+  has been walked.
+- **Gapless is no longer refused for the whole track.** A third gate was keyed
+  on the download being complete, which a bounded window makes false until the
+  very end; the prefetch ran, succeeded, and was discarded at every hand-off.
 
 ## 2.3.0 — 2026-09-13
 

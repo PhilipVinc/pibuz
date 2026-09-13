@@ -2851,7 +2851,7 @@ dependencies = [
 
 [[package]]
 name = "qbz-app"
-version = "2.3.0"
+version = "2.3.1"
 dependencies = [
  "chrono",
  "dirs 6.0.0",
@@ -2872,7 +2872,7 @@ dependencies = [
 
 [[package]]
 name = "qbz-audio"
-version = "2.3.0"
+version = "2.3.1"
 dependencies = [
  "alsa",
  "alsa-sys",
@@ -2900,7 +2900,7 @@ dependencies = [
 
 [[package]]
 name = "qbz-cache"
-version = "2.3.0"
+version = "2.3.1"
 dependencies = [
  "dirs 6.0.0",
  "filetime",
@@ -2910,7 +2910,7 @@ dependencies = [
 
 [[package]]
 name = "qbz-cmaf"
-version = "2.3.0"
+version = "2.3.1"
 dependencies = [
  "aes",
  "base64",
@@ -2925,7 +2925,7 @@ dependencies = [
 
 [[package]]
 name = "qbz-core"
-version = "2.3.0"
+version = "2.3.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2942,7 +2942,7 @@ dependencies = [
 
 [[package]]
 name = "qbz-log"
-version = "2.3.0"
+version = "2.3.1"
 dependencies = [
  "chrono",
  "dirs 5.0.1",
@@ -2953,7 +2953,7 @@ dependencies = [
 
 [[package]]
 name = "qbz-media-controls"
-version = "2.3.0"
+version = "2.3.1"
 dependencies = [
  "async-channel",
  "log",
@@ -2964,7 +2964,7 @@ dependencies = [
 
 [[package]]
 name = "qbz-models"
-version = "2.3.0"
+version = "2.3.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2978,7 +2978,7 @@ dependencies = [
 
 [[package]]
 name = "qbz-player"
-version = "2.3.0"
+version = "2.3.1"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -3001,7 +3001,7 @@ dependencies = [
 
 [[package]]
 name = "qbz-qobuz"
-version = "2.3.0"
+version = "2.3.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -3024,7 +3024,7 @@ dependencies = [
 
 [[package]]
 name = "qbzd"
-version = "2.3.0"
+version = "2.3.1"
 dependencies = [
  "async-trait",
  "clap",
@@ -3060,7 +3060,7 @@ dependencies = [
 
 [[package]]
 name = "qconnect-app"
-version = "2.3.0"
+version = "2.3.1"
 dependencies = [
  "async-trait",
  "log",
@@ -3079,7 +3079,7 @@ dependencies = [
 
 [[package]]
 name = "qconnect-core"
-version = "2.3.0"
+version = "2.3.1"
 dependencies = [
  "qbz-models",
  "serde",
@@ -3088,7 +3088,7 @@ dependencies = [
 
 [[package]]
 name = "qconnect-protocol"
-version = "2.3.0"
+version = "2.3.1"
 dependencies = [
  "log",
  "prost",
@@ -3101,7 +3101,7 @@ dependencies = [
 
 [[package]]
 name = "qconnect-transport-ws"
-version = "2.3.0"
+version = "2.3.1"
 dependencies = [
  "async-trait",
  "futures-util",
