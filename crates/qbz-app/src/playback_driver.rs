@@ -158,6 +158,32 @@ pub struct QueueSnapshot {
 /// `(index, track_id)` of the first `playable == true` entry within `max_walk`
 /// steps, or `None` when none is found inside the bound (never walks forever).
 /// Mirrors `playback.rs::advance_to_playable`'s `MAX_OFFLINE_SKIPS` cap.
+/// Whether a gapless successor that has finished downloading is still the one
+/// to queue.
+///
+/// The fetch is asynchronous and the listener is not. Pressing *next* while a
+/// successor is in flight leaves the completed download describing a future
+/// that no longer exists — and queueing it anyway makes the player walk
+/// BACKWARDS through the queue. Observed on hardware:
+///
+/// ```text
+/// 20:39:58  Gapless: this track is buffered — fetching the next one
+/// 20:40:02  SetState current_track=74936706        (the listener skipped)
+/// 20:40:07  [GAPLESS] Track 34812125 downloaded for gapless -> queued
+/// 20:44:09  ALSA Direct gapless transition: 74936706 -> 34812125
+/// ```
+///
+/// 34812125 sits BEFORE 74936706 in the queue: it had already been played and
+/// skipped past, and four minutes later it played again. The controller also
+/// showed the wrong track for a moment on every skip, which is the same
+/// staleness surfacing through the renderer report.
+///
+/// Clearing `gapless_pending` when a new track starts is not enough, because
+/// the fetch that produces the next one is still in flight and lands after.
+pub fn gapless_fetch_still_wanted(armed_against: u64, now_playing: u64) -> bool {
+    armed_against != 0 && armed_against == now_playing
+}
+
 pub fn next_playable(upcoming: &[(u64, bool)], max_walk: usize) -> Option<(usize, u64)> {
     for (i, &(id, playable)) in upcoming.iter().enumerate() {
         if i >= max_walk {
@@ -443,6 +469,10 @@ pub async fn run_driver<A: FrontendAdapter + Send + Sync + 'static>(
                 }
                 DriverAction::ArmGapless(id) => {
                     let quality = (deps.quality)();
+                    // Which track this successor was chosen for. Checked again
+                    // after the download, because the download is async and the
+                    // user is not.
+                    let armed_against = ev.track_id;
                     // Where the bytes live is decided during the download now,
                     // from the size the CMAF segment table gives up front — so
                     // there is nothing left to arrange here. This used to
@@ -450,7 +480,19 @@ pub async fn run_driver<A: FrontendAdapter + Send + Sync + 'static>(
                     // big, and if so write it to the card in one blocking fsync'd
                     // burst and drop the copy: a 195 MB `Arc` clone plus 11-15 s
                     // of a pinned card, which underran ALSA audibly.
-                    match core.fetch_for_gapless_resolved(*id, quality).await {
+                    let fetched = core.fetch_for_gapless_resolved(*id, quality).await;
+                    let now_playing = player.get_playback_event().track_id;
+                    if fetched.is_some() && !gapless_fetch_still_wanted(armed_against, now_playing)
+                    {
+                        // Stale. Queueing it would play a track the listener
+                        // has already moved past — see the function's docs.
+                        log::info!(
+                            "[qbzd] driver: dropping the gapless fetch of {id} — it was armed \
+                             while {armed_against} played and the player is now on {now_playing}"
+                        );
+                        continue;
+                    }
+                    match fetched {
                         Some(qbz_player::TrackAudio::File(path)) => {
                             if let Err(e) = player.play_next_file(path, *id) {
                                 log::warn!("[qbzd] driver: gapless from disk failed: {e}");
@@ -788,6 +830,38 @@ fn from_persisted(t: PersistedQueueTrack) -> QueueTrack {
 
 #[cfg(test)]
 mod tests {
+
+    /// THE SKIP BUG, from the Pi's own log.
+    ///
+    /// The queue ran ... 1399713(5), 34812125(6), 74936706(7) ... A successor
+    /// was armed for 34812125 while 1399713 played; the listener then skipped
+    /// twice, so by the time that download finished the player was on
+    /// 74936706. Queueing it anyway sent the player BACKWARDS — four minutes
+    /// later it transitioned 74936706 -> 34812125, a track already heard and
+    /// skipped past.
+    #[test]
+    fn a_successor_armed_for_a_track_we_have_skipped_is_dropped() {
+        // Armed while 1399713 was playing, finished while 74936706 is.
+        assert!(
+            !gapless_fetch_still_wanted(1399713, 74936706),
+            "a fetch that outlived its track must not be queued"
+        );
+    }
+
+    /// The ordinary case must survive the guard: nothing skipped, so the
+    /// successor is still wanted and gapless still works.
+    #[test]
+    fn a_successor_armed_for_the_track_still_playing_is_kept() {
+        assert!(gapless_fetch_still_wanted(34812125, 34812125));
+    }
+
+    /// Stopped, or no track: nothing to be the successor of.
+    #[test]
+    fn a_successor_is_dropped_when_nothing_is_playing() {
+        assert!(!gapless_fetch_still_wanted(0, 0));
+        assert!(!gapless_fetch_still_wanted(34812125, 0));
+    }
+
     use super::*;
 
     /// Minimal `PlaybackEvent` builder: the four fields the driver reasons about
