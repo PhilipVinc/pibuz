@@ -73,17 +73,6 @@ pub enum QbzError {
 }
 
 impl QbzError {
-    /// Check if this error is recoverable (user can retry or fix)
-    pub fn is_recoverable(&self) -> bool {
-        matches!(
-            self,
-            QbzError::NetworkError(_)
-                | QbzError::NotAuthenticated
-                | QbzError::StreamUnavailable(_)
-                | QbzError::Cancelled
-        )
-    }
-
     /// Get an error code for frontend handling
     pub fn code(&self) -> &'static str {
         match self {

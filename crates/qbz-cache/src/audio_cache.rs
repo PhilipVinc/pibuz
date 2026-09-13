@@ -93,11 +93,6 @@ impl AudioCache {
         }
     }
 
-    /// Set the playback cache for disk spillover
-    pub fn set_playback_cache(&mut self, cache: Arc<PlaybackCache>) {
-        self.playback_cache = Some(cache);
-    }
-
     /// Get the playback cache reference
     pub fn get_playback_cache(&self) -> Option<&Arc<PlaybackCache>> {
         self.playback_cache.as_ref()
@@ -318,7 +313,9 @@ impl AudioCache {
         }
     }
 
-    /// Get cache statistics
+    /// Cache statistics, read by this crate's own tests to assert eviction and
+    /// sizing. No production caller — the tests ARE the reason it exists, and
+    /// deleting it would mean deleting the coverage with it.
     pub fn stats(&self) -> CacheStats {
         let state = self.state.lock().unwrap();
         CacheStats {

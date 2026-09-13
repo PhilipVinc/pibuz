@@ -454,7 +454,8 @@ impl PlaybackCache {
         log::info!("Playback cache cleared");
     }
 
-    /// Get cache statistics
+    /// Cache statistics, read by this crate's own tests (see `stats` in
+    /// audio_cache.rs for why it stays).
     pub fn stats(&self) -> PlaybackCacheStats {
         let state = self.state.lock().unwrap();
         PlaybackCacheStats {
