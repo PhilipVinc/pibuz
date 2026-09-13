@@ -211,42 +211,6 @@ pub fn probe_streaminfo(bytes: &[u8]) -> Option<AudioParams> {
     }
 }
 
-/// Where the bytes for an external/cast track were resolved from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum AssetOrigin {
-    Network,
-    Cache,
-    Offline,
-}
-
-/// A fully-materialized audio asset to hand to an external renderer
-/// (Chromecast / DLNA) through the local media server. Carries the raw bytes
-/// VERBATIM (no transcode), the MIME to advertise, and the quality actually
-/// resolved so the UI can display it. Casting bypasses the local audio
-/// backend, so this is the only place the delivered quality is known.
-#[derive(Clone)]
-pub struct ExternalStreamAsset {
-    pub bytes: Vec<u8>,
-    pub content_type: String,
-    pub quality: StreamQualityInfo,
-    /// Track duration in seconds, when known by the resolver.
-    pub duration_secs: Option<f64>,
-    pub origin: AssetOrigin,
-}
-
-impl std::fmt::Debug for ExternalStreamAsset {
-    // Don't dump the whole byte vec into logs.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ExternalStreamAsset")
-            .field("bytes", &format_args!("{} bytes", self.bytes.len()))
-            .field("content_type", &self.content_type)
-            .field("quality", &self.quality)
-            .field("duration_secs", &self.duration_secs)
-            .field("origin", &self.origin)
-            .finish()
-    }
-}
-
 // ============ CMAF Stream Types ============
 
 /// Response from POST /api.json/0.2/session/start

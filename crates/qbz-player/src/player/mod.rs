@@ -47,7 +47,7 @@ use qbz_audio::{
     BitPerfectMode, DiagnosticSource, DynamicAmplify, LoudnessAnalyzer, LoudnessCache,
 };
 use qbz_cache::TrackBytes;
-use qbz_models::{AssetOrigin, ExternalStreamAsset, Quality, StreamQualityInfo};
+use qbz_models::Quality;
 use qbz_qobuz::QobuzClient;
 
 /// Commands sent to the audio thread
@@ -1385,6 +1385,12 @@ impl SharedState {
         }
     }
 
+    /// Whether the current stream has recorded an error.
+    ///
+    /// Read only by the `DsdErrorReport` tests. Kept because those cover real
+    /// behaviour — an io error surfacing at stream end vs a clean EOF — and
+    /// this is the field's accessor; dropping it to satisfy a dead-code sweep
+    /// would mean deleting the coverage, which is the wrong trade.
     pub fn has_stream_error(&self) -> bool {
         self.stream_error.load(Ordering::SeqCst)
     }
@@ -5437,81 +5443,6 @@ impl Player {
         self.audio_cache.contains(track_id)
     }
 
-    /// Should a track of `bytes` be handed to the gapless path as a FILE rather
-    /// than kept in memory?
-    ///
-    /// Yes exactly when two of them will not fit in the L1 budget — the playing
-    /// track and the prefetched next one is the pair the cache exists to hold,
-    /// and when it cannot hold both, holding them anyway is what took a 1 GB Pi
-    /// into swap.
-    ///
-    /// This used to key on the host's MEMORY CLASS instead, which was wrong in
-    /// both directions: a 22 MB CD track on a 1 GB player paid 1.8 s of
-    /// `sync_all` to the SD card for a detour it did not need (and missed its
-    /// gapless hand-off by 0.85 s doing it), while a 220 MB Hi-Res track on a
-    /// 4 GB player skipped the detour and pinned a pair against the budget.
-    pub fn should_hand_over_as_file(&self, bytes: usize) -> bool {
-        spill_to_disk(bytes, self.audio_cache.budget_bytes())
-    }
-
-    /// Drop every cached audio byte (L1 memory + L2 disk). Called when the
-    /// streaming-quality preference changes so the new tier takes effect on the
-    /// next play/cast instead of on the next cache miss — the cache is keyed by
-    /// track id alone and carries no quality dimension.
-    pub fn clear_audio_cache(&self) {
-        self.audio_cache.clear();
-    }
-
-    /// The L2 cache file holding `track_id`, when the prefetch left one there.
-    ///
-    /// For the gapless hand-off: with a file in hand the caller can use
-    /// [`Self::play_next_file`] and skip the resident copy entirely.
-    pub fn cached_track_file(&self, track_id: u64) -> Option<std::path::PathBuf> {
-        self.audio_cache
-            .get_playback_cache()?
-            .path_if_present(track_id)
-    }
-
-    /// Put `bytes` on disk and return the file, so a caller can hand the track
-    /// over as a path instead of keeping it resident.
-    ///
-    /// The L2 cache is normally written only as SPILL when L1 evicts something,
-    /// and L1 refuses a track larger than its budget outright — so on the very
-    /// host that needs this, a 217 MB Hi-Res track never reaches disk on its
-    /// own and there is no file to hand over. Writing it here is what makes the
-    /// disk hand-off possible at all.
-    ///
-    /// Returns `None` when there is no L2 cache configured, or the write did not
-    /// produce a readable file; the caller then keeps the in-memory path.
-    pub fn stage_track_on_disk(&self, track_id: u64, bytes: &[u8]) -> Option<std::path::PathBuf> {
-        let cache = self.audio_cache.get_playback_cache()?;
-        if let Some(existing) = cache.path_if_present(track_id) {
-            return Some(existing);
-        }
-        cache.insert(track_id, bytes);
-        let path = cache.path_if_present(track_id);
-        match &path {
-            Some(p) => log::info!(
-                "Staged track {} on disk for a gapless hand-off ({} bytes -> {})",
-                track_id,
-                bytes.len(),
-                p.display()
-            ),
-            None => log::warn!("Could not stage track {track_id} on disk; keeping it in memory"),
-        }
-        path
-    }
-
-    /// Drop `track_id` from the L1 memory cache, unconditionally.
-    ///
-    /// Distinct from [`Self::release_finished_track`], which is about a track
-    /// that has finished PLAYING and only fires on a memory-constrained host.
-    /// This one is for bytes we have decided to read from disk instead: keeping
-    /// the L1 copy would defeat the point.
-    pub fn drop_cached_track(&self, track_id: u64) -> bool {
-        self.audio_cache.release(track_id)
-    }
-
     /// A track just finished playing — free its bytes early, but only where the
     /// memory actually matters.
     ///
@@ -5650,121 +5581,6 @@ impl Player {
             },
             Err(e) => {
                 log::warn!("[GAPLESS] No stream URL for {track_id}: {e}");
-                None
-            }
-        }
-    }
-
-    /// Resolve a fully-materialized audio asset for an EXTERNAL renderer
-    /// (Chromecast / DLNA), carrying the bytes verbatim plus the MIME and the
-    /// quality. Used by the Cast path through the local media server.
-    ///
-    /// Cache-first (P1, matches the fast Tauri cast path + consumes the gapless
-    /// prefetch): L1 in-memory -> L2 on-disk playback cache (both decrypted
-    /// FLAC) -> network. A prefetched/replayed track is served instantly; only a
-    /// cold track pays the CMAF download. On a cache hit the delivered quality is
-    /// not known here (no metadata stored with the bytes) — the caller derives
-    /// the quality label from the track's catalog metadata; the network path
-    /// returns the precise resolved tier.
-    pub async fn fetch_for_external_stream(
-        &self,
-        client: &QobuzClient,
-        track_id: u64,
-        quality: Quality,
-    ) -> Option<ExternalStreamAsset> {
-        // L1: in-memory cache (warmed by the gapless prefetch / a prior play).
-        if let Some(cached) = self.audio_cache.get(track_id) {
-            log::info!(
-                "[CAST-FETCH] Track {track_id} from MEMORY cache ({} bytes)",
-                cached.size_bytes
-            );
-            return Some(ExternalStreamAsset {
-                bytes: cached.data.to_vec(),
-                content_type: "audio/flac".to_string(),
-                quality: StreamQualityInfo::from_raw(0, None, None),
-                duration_secs: None,
-                origin: AssetOrigin::Cache,
-            });
-        }
-        // L2: on-disk plain-FLAC playback cache; warm L1 on the way out.
-        if let Some(playback_cache) = self.audio_cache.get_playback_cache() {
-            if let Some(audio_data) = playback_cache.get(track_id) {
-                log::info!(
-                    "[CAST-FETCH] Track {track_id} from DISK cache ({} bytes)",
-                    audio_data.len()
-                );
-                self.audio_cache.insert(track_id, audio_data.as_slice());
-                return Some(ExternalStreamAsset {
-                    bytes: audio_data,
-                    content_type: "audio/flac".to_string(),
-                    quality: StreamQualityInfo::from_raw(0, None, None),
-                    duration_secs: None,
-                    origin: AssetOrigin::Cache,
-                });
-            }
-        }
-
-        // Cold: CMAF full download (Akamai CDN) -> decrypted FLAC.
-        match qbz_qobuz::cmaf::download_full_with_quality(client, track_id, quality).await {
-            Ok((bytes, q)) => {
-                log::info!(
-                    "[CAST-FETCH] Track {track_id} via CMAF: {} bytes, format_id={}, {:?} kHz/{:?}-bit",
-                    bytes.len(),
-                    q.format_id,
-                    q.sampling_rate_khz,
-                    q.bit_depth
-                );
-                // Warm L1 so a subsequent local replay skips the network.
-                self.audio_cache.insert(track_id, bytes.as_slice());
-                return Some(ExternalStreamAsset {
-                    bytes,
-                    content_type: "audio/flac".to_string(),
-                    quality: q,
-                    duration_secs: None,
-                    origin: AssetOrigin::Network,
-                });
-            }
-            Err(e) => {
-                log::warn!("[CAST-FETCH] CMAF failed for track {track_id}: {e}, trying legacy");
-            }
-        }
-
-        // Fallback: legacy stream URL + plain HTTP download. Quality and MIME
-        // come from the resolved StreamUrl (which carries the granted tier).
-        match client.get_stream_url_with_fallback(track_id, quality).await {
-            Ok(stream_url) => {
-                let content_type =
-                    external_content_type(&stream_url.mime_type, stream_url.format_id);
-                let q = StreamQualityInfo::from_raw(
-                    stream_url.format_id,
-                    Some(stream_url.sampling_rate),
-                    stream_url.bit_depth,
-                );
-                match self.download_audio(&stream_url.url).await {
-                    Ok(bytes) => {
-                        log::info!(
-                            "[CAST-FETCH] Track {track_id} via legacy: {} bytes, format_id={}, ct={}",
-                            bytes.len(),
-                            q.format_id,
-                            content_type
-                        );
-                        self.audio_cache.insert(track_id, bytes.as_slice());
-                        Some(ExternalStreamAsset {
-                            bytes,
-                            content_type,
-                            quality: q,
-                            duration_secs: None,
-                            origin: AssetOrigin::Network,
-                        })
-                    }
-                    Err(e) => {
-                        log::warn!("[CAST-FETCH] Legacy download failed for {track_id}: {e}");
-                        None
-                    }
-                }
-            }
-            Err(e) => {
-                log::warn!("[CAST-FETCH] No stream URL for {track_id}: {e}");
                 None
             }
         }
@@ -6695,27 +6511,9 @@ impl<S: qbz_dsd::DsdWordSource> Iterator for DsdErrorReport<S> {
     }
 }
 
-/// Pick the MIME to advertise to an external renderer for a legacy stream-URL
-/// download. Prefer the server-provided `mime_type`; when it is empty (Qobuz
-/// can return `""`), fall back by format id so the renderer is never handed an
-/// empty content type (which some Chromecast/DLNA renderers reject).
-pub fn external_content_type(mime: &str, format_id: u32) -> String {
-    let trimmed = mime.trim();
-    if !trimmed.is_empty() {
-        return trimmed.to_string();
-    }
-    match qbz_models::Quality::from_id(format_id) {
-        Some(qbz_models::Quality::Mp3) => "audio/mpeg".to_string(),
-        // Lossless / HiRes / UltraHiRes are FLAC over the file/url path.
-        Some(_) => "audio/flac".to_string(),
-        None => "audio/flac".to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::compute_needs_new_stream;
-    use super::external_content_type;
     use super::{DsdErrorReport, SharedState};
 
     struct FakeDsdSource {
@@ -6940,24 +6738,6 @@ mod tests {
             0,
             "a wall-clock anchor must not be readable as elapsed monotonic time"
         );
-    }
-
-    #[test]
-    fn external_content_type_prefers_server_mime() {
-        assert_eq!(external_content_type("audio/flac", 7), "audio/flac");
-        assert_eq!(external_content_type("audio/mpeg", 5), "audio/mpeg");
-        // Whitespace-only is treated as empty.
-        assert_eq!(external_content_type("  ", 6), "audio/flac");
-    }
-
-    #[test]
-    fn external_content_type_falls_back_by_format_id() {
-        // Empty MIME (Qobuz can return "") -> derive from format id.
-        assert_eq!(external_content_type("", 5), "audio/mpeg"); // Mp3
-        assert_eq!(external_content_type("", 6), "audio/flac"); // Lossless
-        assert_eq!(external_content_type("", 7), "audio/flac"); // HiRes
-        assert_eq!(external_content_type("", 27), "audio/flac"); // UltraHiRes
-        assert_eq!(external_content_type("", 999), "audio/flac"); // unknown -> flac
     }
 
     #[test]

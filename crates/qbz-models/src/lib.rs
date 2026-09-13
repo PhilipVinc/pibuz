@@ -56,7 +56,6 @@ pub use types::{
     ArtistAlbums,
     ArtistBiography,
     // Artist page types
-    AssetOrigin,
     AudioParams,
     // Discover types
     DiscoverAlbum,
@@ -64,7 +63,6 @@ pub use types::{
     DiscoverAlbumImage,
     DiscoverArtist,
     DiscoverAudioInfo,
-    ExternalStreamAsset,
     Favorites,
     Genre,
     Goody,

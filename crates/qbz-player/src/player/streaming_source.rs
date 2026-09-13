@@ -64,24 +64,19 @@ impl Default for StreamingConfig {
 }
 
 impl StreamingConfig {
-    /// Create config from buffer seconds and approximate bitrate
+    /// Buffer sized from a duration in seconds.
     ///
     /// For Hi-Res FLAC at 192kHz/24bit stereo, bitrate is roughly 9.2 Mbps
     /// We estimate ~1MB per second as a conservative approximation
+    ///
+    /// Reached only from the local-file DSD path, which has no caller of its
+    /// own — so the dead-code lint calls this dead too, transitively. It stays
+    /// as long as that path does.
     pub fn from_seconds(seconds: u8) -> Self {
         // Minimum 256KB to ensure format detection works
         let bytes = ((seconds as usize) * 1024 * 1024).max(256 * 1024);
         Self {
             initial_buffer_bytes: bytes,
-            max_buffer_bytes: 100 * 1024 * 1024,
-        }
-    }
-
-    /// Create a minimal config for fastest startup
-    /// Uses smallest buffer that still allows format detection (~256KB)
-    pub fn fast_start() -> Self {
-        Self {
-            initial_buffer_bytes: 256 * 1024,
             max_buffer_bytes: 100 * 1024 * 1024,
         }
     }
@@ -583,30 +578,6 @@ impl BufferedMediaSource {
             .lock()
             .map(|state| state.seek_mode == StreamSeekMode::RangeRequests)
             .unwrap_or(false)
-    }
-
-    /// Wait until initial buffer is filled or download completes.
-    ///
-    /// This should be called before passing the source to the decoder,
-    /// to ensure enough data is available for format detection.
-    ///
-    /// Returns error if download fails before initial buffer is filled.
-    pub fn wait_for_initial_buffer(&self) -> IoResult<()> {
-        let mut state = self.shared.lock()?;
-
-        while state.contiguous_from(state.primary_offset) < self.config.initial_buffer_bytes as u64
-            && !state.download_complete
-            && state.download_error.is_none()
-            && !self.shared.abandoned.load(Ordering::SeqCst)
-        {
-            state = self.shared.wait(state)?;
-        }
-
-        if let Some(ref err) = state.download_error {
-            return Err(IoError::other(err.clone()));
-        }
-
-        Ok(())
     }
 
     /// Check if the feeder is done and left nothing missing (full file in
@@ -1128,8 +1099,6 @@ pub struct IncrementalStreamingSource {
     /// decoded packet, cleared on the next successful decode — so each
     /// episode records exactly one underrun with the network throttle.
     stalled: bool,
-    /// Reference to the buffered source (for cache retrieval after playback)
-    buffered_source: Arc<BufferedMediaSource>,
 }
 
 impl IncrementalStreamingSource {
@@ -1192,7 +1161,6 @@ impl IncrementalStreamingSource {
             finished: false,
             packets_decoded: 0,
             stalled: false,
-            buffered_source,
         })
     }
 
@@ -1204,11 +1172,6 @@ impl IncrementalStreamingSource {
     /// Get the number of channels
     pub fn get_channels(&self) -> u16 {
         self.channels
-    }
-
-    /// Get reference to the buffered source for cache retrieval
-    pub fn buffered_source(&self) -> &Arc<BufferedMediaSource> {
-        &self.buffered_source
     }
 
     /// Seek the decoder to the given time using Symphonia's native seek.

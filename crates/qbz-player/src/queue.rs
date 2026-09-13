@@ -388,9 +388,9 @@ impl QueueManager {
     /// positions through `shuffle_order`. Peels positions off the tail inward so
     /// the surviving positions never shift under it. Returns the count removed.
     ///
-    /// This is the wired "Remove all after" queue action. (`remove_after`, below,
-    /// truncates by absolute `tracks` index and is NOT play-order-aware under
-    /// shuffle — it is kept only for its existing unit coverage.)
+    /// This is the "Remove all after" queue action. A second, absolute-index
+    /// version used to sit below it, not play-order-aware under shuffle and
+    /// kept (its own comment said so) only for its unit coverage. It is gone.
     pub fn remove_upcoming_after(&self, upcoming_index: usize) -> usize {
         let mut upcoming_len = {
             let state = self.state.lock().unwrap();
@@ -408,50 +408,6 @@ impl QueueManager {
             upcoming_len -= 1;
         }
         removed
-    }
-
-    /// Remove all tracks at indices greater than `index`. The track at
-    /// `index` is preserved. Returns the number of tracks removed.
-    /// If the marker referenced a track in the removed range, the marker
-    /// is cleared. No-op (returns 0) if `index` is the last position or
-    /// out of bounds.
-    pub fn remove_after(&self, index: usize) -> usize {
-        let mut state = self.state.lock().unwrap();
-
-        if index + 1 >= state.tracks.len() {
-            return 0;
-        }
-
-        let cutoff = index + 1;
-        let removed_ids: Vec<u64> = state.tracks[cutoff..].iter().map(|t| t.id).collect();
-        let removed_count = removed_ids.len();
-
-        // Drop the tail of `tracks`.
-        state.tracks.truncate(cutoff);
-
-        // If shuffle is active, also drop indices >= cutoff from shuffle_order
-        // (preserve relative order of surviving indices).
-        if state.shuffle {
-            state.shuffle_order.retain(|&i| i < cutoff);
-            // shuffle_position remains valid since we only dropped tracks AFTER
-            // the current playing one (precondition: index >= current_index in
-            // the typical UI flow; defensive clamp below handles edge cases).
-            if state.shuffle_position >= state.shuffle_order.len() {
-                state.shuffle_position = state.shuffle_order.len().saturating_sub(1);
-            }
-        }
-
-        // Drop history entries pointing past the cutoff.
-        state.history.retain(|&i| i < cutoff);
-
-        // Invalidate marker if it pointed into the removed range.
-        if let Some(marker_id) = state.stop_after_track_id {
-            if removed_ids.contains(&marker_id) {
-                state.stop_after_track_id = None;
-            }
-        }
-
-        removed_count
     }
 
     /// Move a track from one position to another
@@ -554,43 +510,6 @@ impl QueueManager {
         state
             .current_index
             .and_then(|idx| state.tracks.get(idx).cloned())
-    }
-
-    /// Get next track without advancing
-    pub fn peek_next(&self) -> Option<QueueTrack> {
-        let state = self.state.lock().unwrap();
-        if state.tracks.is_empty() {
-            return None;
-        }
-
-        if state.repeat == RepeatMode::One {
-            return state
-                .current_index
-                .and_then(|idx| state.tracks.get(idx).cloned());
-        }
-
-        let next_idx = if state.shuffle {
-            let next_pos = state.shuffle_position + 1;
-            if next_pos < state.shuffle_order.len() {
-                Some(state.shuffle_order[next_pos])
-            } else if state.repeat == RepeatMode::All {
-                state.shuffle_order.first().copied()
-            } else {
-                None
-            }
-        } else {
-            let curr_idx = state.current_index.unwrap_or(0);
-            let next_idx = curr_idx + 1;
-            if next_idx < state.tracks.len() {
-                Some(next_idx)
-            } else if state.repeat == RepeatMode::All {
-                Some(0)
-            } else {
-                None
-            }
-        };
-
-        next_idx.and_then(|idx| state.tracks.get(idx).cloned())
     }
 
     /// Get multiple upcoming tracks without advancing
@@ -885,11 +804,6 @@ impl QueueManager {
     /// Set repeat mode
     pub fn set_repeat(&self, mode: RepeatMode) {
         self.state.lock().unwrap().repeat = mode;
-    }
-
-    /// Get repeat mode
-    pub fn get_repeat(&self) -> RepeatMode {
-        self.state.lock().unwrap().repeat
     }
 
     /// Set the "stop after" marker on a specific track ID. Replaces any
@@ -2072,84 +1986,6 @@ mod tests {
     }
 
     #[test]
-    fn test_remove_after_returns_count() {
-        let queue = QueueManager::new();
-        for id in [101, 102, 103, 104, 105] {
-            queue.add_track(create_test_track(id));
-        }
-
-        let removed = queue.remove_after(1);
-
-        assert_eq!(removed, 3, "should remove indices 2, 3, 4");
-        let state = queue.get_state();
-        assert_eq!(state.total_tracks, 2);
-    }
-
-    #[test]
-    fn test_remove_after_on_last_index_is_noop() {
-        let queue = QueueManager::new();
-        for id in [101, 102, 103] {
-            queue.add_track(create_test_track(id));
-        }
-
-        let removed = queue.remove_after(2);
-
-        assert_eq!(removed, 0);
-        assert_eq!(queue.get_state().total_tracks, 3);
-    }
-
-    #[test]
-    fn test_remove_after_with_index_out_of_bounds_is_noop() {
-        let queue = QueueManager::new();
-        queue.add_track(create_test_track(101));
-        queue.add_track(create_test_track(102));
-
-        let removed = queue.remove_after(99);
-
-        assert_eq!(removed, 0);
-        assert_eq!(queue.get_state().total_tracks, 2);
-    }
-
-    #[test]
-    fn test_remove_after_invalidates_marker_when_in_removed_range() {
-        let queue = QueueManager::new();
-        for id in [101, 102, 103, 104] {
-            queue.add_track(create_test_track(id));
-        }
-        queue.set_stop_after(103);
-
-        queue.remove_after(1); // removes 103, 104
-
-        assert_eq!(queue.get_stop_after(), None);
-    }
-
-    #[test]
-    fn test_remove_after_keeps_marker_when_before_range() {
-        let queue = QueueManager::new();
-        for id in [101, 102, 103, 104] {
-            queue.add_track(create_test_track(id));
-        }
-        queue.set_stop_after(101);
-
-        queue.remove_after(2); // removes 104 only (index 3)
-
-        assert_eq!(queue.get_stop_after(), Some(101));
-    }
-
-    #[test]
-    fn test_remove_after_keeps_marker_when_at_pivot_index() {
-        let queue = QueueManager::new();
-        for id in [101, 102, 103, 104] {
-            queue.add_track(create_test_track(id));
-        }
-        queue.set_stop_after(102);
-
-        queue.remove_after(1); // removes indices 2, 3 — track 102 (at index 1) stays
-
-        assert_eq!(queue.get_stop_after(), Some(102));
-    }
-
-    #[test]
     fn test_remove_upcoming_after_linear() {
         let queue = QueueManager::new();
         // 101 playing, upcoming = [102, 103, 104, 105].
@@ -2224,6 +2060,33 @@ mod tests {
         queue.remove_upcoming_after(1);
 
         assert_eq!(queue.get_stop_after(), None);
+    }
+
+    /// The marker must survive a removal that does not reach it. These two
+    /// cases used to be covered against `remove_after`, an absolute-index
+    /// truncation that was not play-order-aware and had no caller — its own
+    /// comment admitted it was kept only for these tests. The coverage moves
+    /// here, onto the function the queue action actually calls.
+    #[test]
+    fn test_remove_upcoming_after_keeps_marker_before_the_pivot() {
+        let queue = QueueManager::new();
+        queue.set_queue((101..=105).map(create_test_track).collect(), Some(0));
+        queue.set_stop_after(102); // upcoming position 0 — ahead of the pivot
+
+        queue.remove_upcoming_after(1); // drops upcoming 2,3 (104, 105)
+
+        assert_eq!(queue.get_stop_after(), Some(102));
+    }
+
+    #[test]
+    fn test_remove_upcoming_after_keeps_marker_at_the_pivot() {
+        let queue = QueueManager::new();
+        queue.set_queue((101..=105).map(create_test_track).collect(), Some(0));
+        queue.set_stop_after(103); // upcoming position 1 — the pivot itself, kept
+
+        queue.remove_upcoming_after(1);
+
+        assert_eq!(queue.get_stop_after(), Some(103));
     }
 
     #[test]
