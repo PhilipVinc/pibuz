@@ -416,6 +416,20 @@ fn cached_quality_below_requested(data: &TrackBytes, requested: Quality) -> bool
     quality_below_requested(meta.sample_rate, meta.bit_depth.unwrap_or(16), requested)
 }
 
+/// Whether the copy already on disk can serve a request for `requested`.
+///
+/// The L2 half of the cache ladder, split out because this is the level the
+/// quality bug actually lived at: the decision was right in isolation and
+/// still refused every file, and nothing exercised the path that reads one.
+///
+/// Note the `unwrap_or(false)`: a head we cannot parse is treated as unusable
+/// and re-fetched, which is the safe direction but is also silent.
+pub(crate) fn l2_copy_is_usable(path: &std::path::Path, requested: Quality) -> bool {
+    read_head(path, HEAD_BYTES)
+        .map(|head| !cached_quality_below_requested(&head, requested))
+        .unwrap_or(false)
+}
+
 /// The decision behind [`cached_quality_below_requested`], without the parse.
 ///
 /// Separate so it can be tested: the parse returns `false` on ANY error, so a
@@ -4819,9 +4833,7 @@ impl Player {
             .and_then(|l2| l2.path_if_present(track_id))
         {
             // Same quality gate as the L1 hit above, from the header alone.
-            let head_ok = read_head(&path, HEAD_BYTES)
-                .map(|head| !cached_quality_below_requested(&head, quality))
-                .unwrap_or(false);
+            let head_ok = l2_copy_is_usable(&path, quality);
             if head_ok {
                 if !self.is_current_play(gen) {
                     log::info!("Player: L2-hit play for track {track_id} superseded (gen {gen})");
@@ -6402,8 +6414,22 @@ mod spill_rule_tests {
 
 #[cfg(test)]
 mod cached_quality_tests {
-    use super::quality_below_requested;
+    use super::{l2_copy_is_usable, quality_below_requested};
     use qbz_models::Quality;
+
+    /// Real FLAC files, encoded by ffmpeg, 8 KB each.
+    ///
+    /// Synthesising one by hand does not work: symphonia's probe reads past
+    /// STREAMINFO into the first audio frame and returns "end of stream"
+    /// without it. Two earlier versions of this test built headers by hand,
+    /// and because the quality gate returns its `Err` default of `false` on any
+    /// parse failure, they passed while proving nothing. The guard assertion
+    /// below exists so that cannot happen again quietly.
+    fn fixture(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata")
+            .join(name)
+    }
 
     /// THE CACHE BUG. Most hi-res masters are 24/96, and a tier is a ceiling
     /// rather than a promise, so demanding >96 kHz for Hi-Res+ rejected the
@@ -6440,6 +6466,53 @@ mod cached_quality_tests {
     #[test]
     fn any_flac_satisfies_lossless() {
         assert!(!quality_below_requested(44_100, 16, Quality::Lossless));
+    }
+
+    // ---- the same question one level up, against real files on disk --------
+    //
+    // The decision above was right in isolation and still refused every file,
+    // because nothing exercised the path that reads one. These do.
+
+    #[test]
+    fn a_24_96_file_on_disk_is_usable_for_hi_res_plus() {
+        let path = fixture("hires-24-96.flac");
+
+        // If the fixture does not parse, the gate returns its `Err` default of
+        // "usable" and the assertion below proves nothing. This is not
+        // hypothetical: two earlier drafts of this test hand-built a FLAC
+        // header, symphonia rejected it, and every assertion passed.
+        let bytes: qbz_cache::TrackBytes = std::fs::read(&path).expect("fixture").as_slice().into();
+        let meta = super::extract_audio_metadata_full(&bytes).expect("fixture must parse");
+        assert_eq!(meta.sample_rate, 96_000);
+        assert_eq!(meta.bit_depth, Some(24));
+
+        assert!(
+            l2_copy_is_usable(&path, Quality::UltraHiRes),
+            "a 24/96 copy is the best Qobuz has for most hi-res tracks — refusing it \
+             means the disk cache is never used at all"
+        );
+        assert!(l2_copy_is_usable(&path, Quality::HiRes));
+    }
+
+    #[test]
+    fn a_16_44_file_on_disk_is_not_usable_for_hi_res() {
+        let path = fixture("lossless-16-44.flac");
+        let bytes: qbz_cache::TrackBytes = std::fs::read(&path).expect("fixture").as_slice().into();
+        let meta = super::extract_audio_metadata_full(&bytes).expect("fixture must parse");
+        assert_eq!(meta.bit_depth, Some(16));
+
+        assert!(!l2_copy_is_usable(&path, Quality::UltraHiRes));
+        assert!(!l2_copy_is_usable(&path, Quality::HiRes));
+        assert!(l2_copy_is_usable(&path, Quality::Lossless));
+    }
+
+    /// A file that is not there is not usable — the `unwrap_or(false)` arm.
+    #[test]
+    fn a_missing_file_is_not_usable() {
+        assert!(!l2_copy_is_usable(
+            &fixture("definitely-not-here.flac"),
+            Quality::Lossless
+        ));
     }
 }
 

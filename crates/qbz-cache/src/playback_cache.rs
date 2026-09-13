@@ -70,6 +70,31 @@ impl PlaybackCache {
         // Scan existing files to rebuild state
         cache.rebuild_state();
 
+        // Then bring it back under the cap.
+        //
+        // `rebuild_state` adopts whatever is on the card and reports the total;
+        // it never used to act on it. Eviction only ran from `begin_write` and
+        // `insert`, so a cache that was over budget at startup — because the
+        // cap was lowered, because a `.part` completed after the last eviction,
+        // or because the daemon was killed mid-write — stayed over budget until
+        // the next track happened to be written. Observed on the Pi at 862 MB
+        // against an 800 MB cap, across a restart, with no write due.
+        //
+        // That matters more than the arithmetic suggests: the cap is what keeps
+        // the cache off the rest of a 15 GB SD card that also holds the OS.
+        let over = {
+            let state = cache.state.lock().unwrap();
+            state.current_size.saturating_sub(max_size_bytes)
+        };
+        if over > 0 {
+            log::info!(
+                "Playback cache is {} MB over its {} MB cap on startup — evicting",
+                over / (1024 * 1024),
+                max_size_bytes / (1024 * 1024)
+            );
+            cache.evict_if_needed(0);
+        }
+
         log::info!(
             "Playback cache initialized at {:?} (max {} MB)",
             cache.cache_dir,
@@ -488,6 +513,51 @@ mod tests {
     /// a shared directory makes `insert_leaves_no_partial_file` — which scans
     /// the whole directory — fail on another test's in-flight `.part`.
     static TEMP_DIR_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// A cache that starts over its cap must come back under it, without
+    /// waiting for a write to trigger eviction.
+    ///
+    /// `rebuild_state` adopted whatever was on the card and only reported the
+    /// total; eviction ran solely from `begin_write`/`insert`. So a cache that
+    /// was over budget at startup — cap lowered, a `.part` completed after the
+    /// last eviction, the daemon killed mid-write — stayed over budget
+    /// indefinitely. Measured on the Pi at 862 MB against an 800 MB cap, held
+    /// across a restart with no write due.
+    #[test]
+    fn a_cache_over_its_cap_at_startup_is_trimmed() {
+        let seq = TEMP_DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir =
+            std::env::temp_dir().join(format!("qbz-l2-startup-{}-{}", std::process::id(), seq));
+        std::fs::create_dir_all(&dir).expect("make dir");
+
+        // Four 1 KB tracks on the card, against a cap that fits two.
+        for id in 1u64..=4 {
+            std::fs::write(dir.join(format!("{id}.audio")), vec![0u8; 1024]).expect("seed");
+        }
+
+        let cache = PlaybackCache::with_path(dir.clone(), 2048).expect("open");
+        let stats = cache.stats();
+        assert!(
+            stats.current_size_bytes <= 2048,
+            "cache holds {} bytes against a 2048 byte cap — startup did not evict",
+            stats.current_size_bytes
+        );
+
+        // And the eviction is real: the files are gone, not just the index.
+        let on_disk: u64 = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "audio"))
+            .filter_map(|e| e.metadata().ok())
+            .map(|m| m.len())
+            .sum();
+        assert!(
+            on_disk <= 2048,
+            "{on_disk} bytes still on the card after startup eviction"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn temp_cache(max_bytes: u64) -> (PlaybackCache, PathBuf) {
         let dir = std::env::temp_dir().join(format!(
