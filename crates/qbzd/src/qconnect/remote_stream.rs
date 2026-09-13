@@ -407,6 +407,10 @@ pub async fn download_and_stream_remote_track(
         .map_err(|err| format!("create remote streaming client: {err}"))?;
 
     let mut tee = DiskTee::open(disk_cache, track_id, content_length);
+    // Set once the whole file has been walked, so the completion work (publish
+    // the staged file, disarm the fail-guard) happens exactly once even though
+    // the feeder stays up afterwards to serve seeks.
+    let mut completed = false;
     let mut plan = writer.initial_plan();
     let mut bytes_received = 0u64;
     let start_time = Instant::now();
@@ -647,15 +651,40 @@ pub async fn download_and_stream_remote_track(
 
         match writer.next_plan() {
             Some(next) => plan = next,
-            // Nothing left to fetch, or no reader left to fetch it for.
-            None => break 'plans,
+            // Nothing left to FETCH — but not necessarily nothing left to
+            // SERVE. The window keeps only a sliding piece of the file, so a
+            // reader that jumps backwards into a discarded region still needs
+            // this feeder alive to re-fetch it. Finish the completion work
+            // once, then park until someone asks or the last reader goes.
+            None => {
+                if !completed {
+                    completed = true;
+                    guard.armed = false;
+                    // The `.part` is renamed into place only after the last
+                    // chunk is written and synced.
+                    if let Some(t) = tee.take() {
+                        t.finish();
+                    }
+                    log::info!(
+                        "[{}/STREAMING] Track {} complete: {:.2} MB fetched in {:.1}s — staying up to serve seeks",
+                        log_tag,
+                        track_id,
+                        bytes_received as f64 / (1024.0 * 1024.0),
+                        start_time.elapsed().as_secs_f64()
+                    );
+                }
+                match writer.wait_for_request().await {
+                    Some(next) => {
+                        plan = next;
+                        continue 'plans;
+                    }
+                    None => break 'plans,
+                }
+            }
         }
     }
 
     guard.armed = false;
-    // Publish before signalling completion is irrelevant to correctness, but
-    // doing it here means the `.part` is only ever renamed into place after
-    // the last chunk has been written and synced.
     if let Some(t) = tee.take() {
         t.finish();
     }

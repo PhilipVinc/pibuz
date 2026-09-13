@@ -420,12 +420,24 @@ impl BufferState {
     /// Should the feeder be asked to re-open at `pos`, or are those bytes
     /// close enough behind the download head to be worth waiting for?
     fn should_request(&self, pos: u64) -> bool {
-        if self.seek_mode != StreamSeekMode::RangeRequests || self.download_complete {
+        if self.seek_mode != StreamSeekMode::RangeRequests {
             return false;
         }
         if self.pending_request.is_some() {
             // A restart is already in flight; a second would only cancel it.
             return false;
+        }
+        if self.total_size.is_some_and(|total| pos >= total) {
+            return false; // past the end is EOF, not something to fetch
+        }
+        if self.download_complete {
+            // Completion used to end the conversation: the feeder had walked
+            // the whole file, so anything unbuffered had to be a torn-down
+            // buffer. A window makes that false — the feeder walked the whole
+            // file and the buffer kept only a sliding piece of it, so a
+            // reader jumping back into a discarded region needs it fetched
+            // again. The feeder stays parked for exactly this.
+            return self.segment_at(pos).is_none();
         }
         let inbound =
             pos >= self.range_start && pos <= self.write_pos.saturating_add(FORWARD_WAIT_BYTES);
@@ -1023,6 +1035,25 @@ impl Read for BufferedMediaSource {
                 return Ok(to_read);
             }
 
+            // The pinned header, once the window has trimmed its run away.
+            //
+            // Every decoder build starts by probing from byte 0 — a seek
+            // rebuilds the engine and re-probes — so without this a trimmed
+            // stream fails with "probe reach EOF at 0 bytes" and the seek is
+            // aborted. Observed on the Pi: one forward seek left playback
+            // stopped with the controller spinning. Keeping the bytes was not
+            // enough; they have to be READABLE, and readers only ever looked
+            // at `segments`.
+            if read_pos < state.header.len() as u64 {
+                let from = read_pos as usize;
+                let to_read = buf.len().min(state.header.len() - from);
+                buf[..to_read].copy_from_slice(&state.header[from..from + to_read]);
+                let next = read_pos + to_read as u64;
+                self.read_pos.store(next, Ordering::SeqCst);
+                state.reader_positions.insert(self.reader_id, next);
+                return Ok(to_read);
+            }
+
             if state.at_eof(read_pos) {
                 return Ok(0);
             }
@@ -1035,10 +1066,10 @@ impl Read for BufferedMediaSource {
                 return Ok(0);
             }
 
-            if state.download_complete {
-                // A hole no feeder will ever fill: completion is only
-                // reported once nothing is missing, so the buffer must have
-                // been torn down under us.
+            if state.download_complete && !state.should_request(read_pos) {
+                // Nothing is coming and we are not allowed to ask: either the
+                // feeder cannot serve ranges at all, or the buffer was torn
+                // down under us.
                 return Err(IoError::new(
                     ErrorKind::UnexpectedEof,
                     format!("stream byte {read_pos} is not buffered and the feeder has stopped"),
@@ -1269,6 +1300,37 @@ impl BufferWriter {
                 }
                 if !state.should_park() {
                     return;
+                }
+            }
+            notified.await;
+        }
+    }
+
+    /// Park until a reader asks for a range, and hand back the plan.
+    ///
+    /// `None` when there is nobody left to serve, which is the feeder's cue to
+    /// exit. Everything else is a request to honour.
+    ///
+    /// A windowed buffer needs this. The feeder used to exit the moment
+    /// `next_plan` said there was nothing left to fetch, on the reasoning that
+    /// a whole file had been walked and so every byte was held. The window
+    /// keeps only a sliding piece of that file, so a reader jumping backwards
+    /// into a discarded region has to be able to ask for it — and an exited
+    /// feeder cannot answer.
+    pub async fn wait_for_request(&self) -> Option<FetchPlan> {
+        loop {
+            // Registered before the check so a request that lands in between
+            // is held as a permit rather than lost.
+            let notified = self.shared.wanted.notified();
+            {
+                let mut state = self.shared.state.lock().ok()?;
+                if state.readers == 0 || state.download_error.is_some() {
+                    return None;
+                }
+                if let Some(offset) = state.pending_request.take() {
+                    state.begin(offset);
+                    state.download_complete = false;
+                    return Some(FetchPlan { offset, end: None });
                 }
             }
             notified.await;
@@ -2774,6 +2836,69 @@ mod buffer_behaviour_tests {
             TOTAL - 256 * KB as u64,
             "the rest of the track is still readable after a pause"
         );
+    }
+
+    /// THE PI BUG. A decoder rebuilt after a seek probes from byte 0, and byte
+    /// 0 has long since been trimmed.
+    ///
+    /// Every seek tears down the engine and builds a new decoder, which means
+    /// symphonia probes the container from the start of the file again. With a
+    /// windowed buffer that region is gone, and on the Pi this produced:
+    ///
+    ///   ERROR symphonia_core::probe probe reach EOF at 0 bytes.
+    ///   ERROR Audio thread: seek aborted: ... no suitable format reader found
+    ///
+    /// — playback stopped and the controller spun until the 90 s backstop.
+    /// The unit tests were green: none of them trimmed and then read from the
+    /// head, because none of them let the feeder run far enough ahead to trim.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_header_is_readable_after_the_window_has_moved_past_it() {
+        const TOTAL: u64 = 8 * MB as u64;
+        let log = Arc::new(FeedLog::default());
+        let cfg = StreamingConfig {
+            initial_buffer_bytes: 32 * KB,
+            window_bytes: 512 * KB,
+        };
+        let (source, writer) = BufferedMediaSource::new_seekable(cfg, Some(TOTAL));
+        let source = Arc::new(source);
+        let mut reader = source.create_reader();
+
+        let feeder = tokio::spawn(feed(writer, TOTAL, 32 * KB, None, log.clone()));
+
+        // Walk far enough that the trim has certainly dropped byte 0: past the
+        // header pin plus the look-behind slack.
+        let walked = (HEADER_PIN_BYTES + SEEK_LOOKBEHIND_BYTES + MB as u64) as usize;
+        let source_for_probe = source.clone();
+        let probe = tokio::task::spawn_blocking(move || {
+            let mut buf = vec![0u8; 64 * KB];
+            let mut done = 0usize;
+            while done < walked {
+                let n = reader.read(&mut buf).expect("walk forward");
+                assert!(n > 0, "stream ended early at {done}");
+                done += n;
+            }
+
+            // A fresh reader, exactly as a rebuilt decoder makes: it starts at
+            // byte 0 and must find the container header there.
+            let mut probe = source_for_probe.create_reader();
+            let mut head = vec![0u8; 4096];
+            probe
+                .read_exact(&mut head)
+                .expect("a rebuilt decoder must be able to probe from byte 0");
+            for (i, got) in head.iter().enumerate() {
+                assert_eq!(*got, byte_at(i as u64), "wrong header byte at {i}");
+            }
+        });
+
+        // Bounded, because the failure mode is a HANG, not an error: a read of
+        // a trimmed region with no way to re-request it waits on the condvar
+        // for bytes that are never coming. A hung CI job is a worse regression
+        // signal than a failed assertion.
+        tokio::time::timeout(Duration::from_secs(10), probe)
+            .await
+            .expect("probing from byte 0 blocked — the header is not readable")
+            .expect("reader thread");
+        feeder.abort();
     }
 
     /// A forward seek past the download head re-opens the body there rather
