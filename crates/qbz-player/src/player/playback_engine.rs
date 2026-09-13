@@ -1763,6 +1763,38 @@ mod engine_behaviour_tests {
         engine.stop();
     }
 
+    /// The position must never be observed BELOW the offset it was appended
+    /// at — not merely "reaches it eventually".
+    ///
+    /// That distinction is the whole contract as far as the QConnect buffering
+    /// latch is concerned: it releases when the clock passes where the stream
+    /// opened, so a clock that starts at zero and climbs reads as "still
+    /// loading" for as long as the climb takes, and the controller spins.
+    /// Observed on the Pi as `clock at 15217 ms, BELOW the 51000 ms this
+    /// stream opened at`.
+    #[test]
+    fn a_seeked_source_is_never_reported_below_its_offset() {
+        const SEEK_TO: u64 = 166;
+        let out = device();
+        let mut engine = PlaybackEngine::new_alsa_direct(out.clone(), false);
+        engine.append(tone(3.0, 0.25), SEEK_TO).expect("append");
+
+        assert!(wait_for("playback to start", || out.frames_played() > 0));
+        // Sample repeatedly across the start of playback: a clock that began at
+        // zero would be caught here even though it later climbs past SEEK_TO.
+        for _ in 0..50 {
+            if let Some(p) = engine.position_secs() {
+                assert!(
+                    p >= SEEK_TO,
+                    "position {p}s is below the {SEEK_TO}s offset — the clock is \
+                     source-relative, and the controller will spin until it catches up"
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        engine.stop();
+    }
+
     /// A track played from the start reports from zero, not from some offset
     /// left over from whatever the engine did last.
     #[test]

@@ -62,6 +62,19 @@ enum AudioCommand {
         duration_secs: u64,
         sample_rate: u32,
         channels: u16,
+        /// Where in the TRACK this playback begins.
+        ///
+        /// Without it the engine was always appended at 0 and the caller
+        /// applied the offset afterwards with a separate `seek`. Between those
+        /// two steps the reported clock was source-relative — it counted from
+        /// the start of playback rather than from the point in the track — so a
+        /// load at 0:51 reported 0:15 after fifteen seconds, which is BELOW
+        /// where the stream opened. The QConnect buffering latch reads that as
+        /// "not arrived yet" and the controller spins until the backstop.
+        ///
+        /// `PlayStreaming` has always carried it. This is the same value, for
+        /// the path that plays already-resident bytes or a cached file.
+        start_position_secs: u64,
     },
     /// Play from streaming source (BufferedMediaSource)
     /// The download task should already be running and pushing to the source
@@ -2028,6 +2041,7 @@ impl Player {
                     match command {
                         AudioCommand::Play {
                             audio,
+                            start_position_secs,
                             track_id,
                             duration_secs,
                             sample_rate,
@@ -2518,7 +2532,9 @@ impl Player {
                                 &analyzer_tx,
                                 &analyzer_enabled,
                             );
-                            if let Err(e) = engine.append(source, 0) {
+                            // The offset the caller asked for, not 0. See
+                            // `AudioCommand::Play::start_position_secs`.
+                            if let Err(e) = engine.append(source, start_position_secs) {
                                 log::error!("Failed to append source to engine: {}", e);
                                 return;
                             }
@@ -4857,14 +4873,12 @@ impl Player {
                     cached.size_bytes
                 );
                 // Use apply_play_data so we do not bump generation again.
-                let r = self.apply_play_data(cached.data, track_id);
-                // Cached tracks play from in-memory data (no streaming resume
-                // offset); honor a session-resume position with a best-effort
-                // seek once playback has been handed to the audio thread.
-                if r.is_ok() && start_position_secs > 0 && self.is_current_play(gen) {
-                    let _ = self.seek(start_position_secs);
-                }
-                return Some(r);
+                // Start AT the offset rather than from zero and seeking after.
+                // The seek-after left the reported clock source-relative until
+                // it landed, which the QConnect latch reads as "not arrived" —
+                // and it decoded from the top of the track to throw the result
+                // away.
+                return Some(self.apply_play_data(cached.data, track_id, start_position_secs));
             }
         }
 
@@ -4899,16 +4913,14 @@ impl Player {
                     log::info!("Player: L2-hit play for track {track_id} superseded (gen {gen})");
                     return Some(Ok(()));
                 }
-                match self.apply_play_file(&path, track_id) {
+                match self.apply_play_file(&path, track_id, start_position_secs) {
                     Ok(()) => {
                         log::info!(
-                            "[CACHE HIT] Track {} — playing from the disk cache ({})",
+                            "[CACHE HIT] Track {} — playing from the disk cache ({}), from {}s",
                             track_id,
-                            path.display()
+                            path.display(),
+                            start_position_secs
                         );
-                        if start_position_secs > 0 && self.is_current_play(gen) {
-                            let _ = self.seek(start_position_secs);
-                        }
                         return Some(Ok(()));
                     }
                     // A file we cannot decode is not a reason to fail the play:
@@ -5204,12 +5216,9 @@ impl Player {
             self.audio_cache.insert(track_id, audio_data.clone());
         }
 
-        // Send to audio thread (do not re-bump generation)
-        let r = self.apply_play_data(audio_data, track_id);
-        if r.is_ok() && start_position_secs > 0 && self.is_current_play(gen) {
-            let _ = self.seek(start_position_secs);
-        }
-        r
+        // Send to audio thread (do not re-bump generation), starting AT the
+        // requested offset rather than from zero and seeking after.
+        self.apply_play_data(audio_data, track_id, start_position_secs)
     }
 
     /// Download a track fully into the L1/L2 cache **without** starting
@@ -5757,7 +5766,7 @@ impl Player {
     /// cache are passed through without a copy.
     pub fn play_data(&self, data: impl Into<TrackBytes>, track_id: u64) -> Result<(), String> {
         let _gen = self.begin_play();
-        self.apply_play_data(data, track_id)
+        self.apply_play_data(data, track_id, 0)
     }
 
     /// Send `Play` without bumping generation (used by `play_track` after
@@ -5769,7 +5778,12 @@ impl Player {
     /// is probed here — through the very decoder that will play it — so a file
     /// we cannot read fails before the engine is torn down, leaving the caller
     /// free to fall back to the network.
-    fn apply_play_file(&self, path: &std::path::Path, track_id: u64) -> Result<(), String> {
+    fn apply_play_file(
+        &self,
+        path: &std::path::Path,
+        track_id: u64,
+        start_position_secs: u64,
+    ) -> Result<(), String> {
         let probe = decode_file_with_fallback(path)?;
         let sample_rate: u32 = probe.sample_rate().into();
         let channels: u16 = probe.channels().into();
@@ -5795,6 +5809,7 @@ impl Player {
             .send(AudioCommand::Play {
                 audio: TrackAudio::File(path.to_path_buf()),
                 track_id,
+                start_position_secs,
                 duration_secs: 0, // Will be determined by decoder
                 sample_rate,
                 channels,
@@ -5805,7 +5820,12 @@ impl Player {
         Ok(())
     }
 
-    fn apply_play_data(&self, data: impl Into<TrackBytes>, track_id: u64) -> Result<(), String> {
+    fn apply_play_data(
+        &self,
+        data: impl Into<TrackBytes>,
+        track_id: u64,
+        start_position_secs: u64,
+    ) -> Result<(), String> {
         let data: TrackBytes = data.into();
         log::info!(
             "Player: Playing {} bytes of audio data for track {}",
@@ -5835,6 +5855,7 @@ impl Player {
             .send(AudioCommand::Play {
                 audio: TrackAudio::Memory(data),
                 track_id,
+                start_position_secs,
                 duration_secs: 0, // Will be determined by decoder
                 sample_rate,
                 channels,

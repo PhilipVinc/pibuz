@@ -1156,6 +1156,32 @@ impl AlsaDirectStream {
         if !matches!(pcm.state(), alsa::pcm::State::Prepared) {
             return Ok(());
         }
+
+        // Nothing queued, nothing to start.
+        //
+        // This exists to start a stream holding LESS than `start_threshold`,
+        // which is the whole ring — so the device would otherwise sit prepared
+        // forever on the last few frames of a track. Holding NONE is a
+        // different thing: `snd_pcm_start` on an empty buffer is an immediate
+        // underrun, and the driver says so with EPIPE.
+        //
+        // Seen on the Pi as four `Broken pipe (32)` warnings in a row, right
+        // after a 5 s cold-offset seek had starved the writer. Nothing was
+        // wrong that needed fixing — there was simply no audio yet — but it
+        // was logged as a failure each time, in exactly the log someone reads
+        // when hunting an audible artifact.
+        // libc::EPIPE — the "Broken pipe (32)" an underrun reports.
+        const EPIPE: i32 = 32;
+        // A failed `avail_update` reads as "the whole ring is free", so the
+        // guard below declines to start — which is the safe direction: the
+        // writer starts it on its next chunk either way.
+        let queued = self
+            .buffer_frames
+            .saturating_sub(pcm.avail_update().unwrap_or_default());
+        if queued <= 0 {
+            return Ok(());
+        }
+
         match pcm.start() {
             Ok(()) => {
                 log::debug!("[ALSA Direct] started a primed-but-idle stream explicitly");
@@ -1166,6 +1192,13 @@ impl AlsaDirectStream {
                 log::debug!(
                     "[ALSA Direct] explicit start raced the auto-start ({e}); already running"
                 );
+                Ok(())
+            }
+            // It underran between the check and the call. The writer's own
+            // recovery prepares the device on its next write; there is nothing
+            // for this path to do and nothing worth warning about.
+            Err(e) if e.errno() == EPIPE => {
+                log::debug!("[ALSA Direct] idle start found the device underrun ({e}); leaving it to the writer");
                 Ok(())
             }
             Err(e) => Err(format!("Failed to start PCM: {e}")),
