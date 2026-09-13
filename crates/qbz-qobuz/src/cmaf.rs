@@ -1137,4 +1137,180 @@ mod segment_assembly_tests {
         }
         assert_ne!(forward, reversed);
     }
+
+    /// Bytes of the QBZ init UUID box (`qbz_cmaf::parser::QBZ_INIT_UUID`,
+    /// private there for the same reason as its segment twin).
+    const INIT_UUID: [u8; 16] = [
+        0xc7, 0xc7, 0x5d, 0xf0, 0xfd, 0xd9, 0x51, 0xe9, 0x8f, 0xc2, 0x29, 0x71, 0xe4, 0xac, 0xf8,
+        0xd2,
+    ];
+
+    /// Build an init segment whose table declares `entries` as
+    /// `(byte_len, sample_count)`, wrapped exactly as the parser expects.
+    fn init_segment(entries: &[(u32, u32)]) -> Vec<u8> {
+        let mut flac = Vec::new();
+        flac.extend_from_slice(b"fLaC");
+        flac.extend_from_slice(&[0x00, 0x00, 0x00, 0x22]); // STREAMINFO, 34 bytes
+        flac.extend_from_slice(&[0x11u8; 34]);
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&[0u8; 4]); // version/padding
+        payload.extend_from_slice(&1u32.to_be_bytes()); // track_id
+        payload.extend_from_slice(&2u32.to_be_bytes()); // file_id
+        payload.extend_from_slice(&96_000u32.to_be_bytes()); // sample_rate
+        payload.push(24); // bits_per_sample
+        payload.extend_from_slice(&[2, 0, 0]); // channels + padding
+        payload.extend_from_slice(&[0u8; 6]); // total_samples_count
+        payload.extend_from_slice(&(flac.len() as u16).to_be_bytes());
+        payload.extend_from_slice(&flac);
+        payload.push(4); // key_id_len
+        payload.extend_from_slice(&[0xEEu8; 4]); // key_id
+        payload.extend_from_slice(&(entries.len() as u16).to_be_bytes());
+        for (byte_len, sample_count) in entries {
+            payload.extend_from_slice(&byte_len.to_be_bytes());
+            payload.extend_from_slice(&sample_count.to_be_bytes());
+        }
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&((8 + 16 + payload.len()) as u32).to_be_bytes());
+        out.extend_from_slice(b"uuid");
+        out.extend_from_slice(&INIT_UUID);
+        out.extend_from_slice(&payload);
+        out
+    }
+
+    /// A reproducible pseudo-random source. No dev-dependency, and the seed is
+    /// in every failure message, so a broken case can be replayed.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0 >> 11
+        }
+        fn in_range(&mut self, lo: usize, hi: usize) -> usize {
+            lo + (self.next() as usize) % (hi - lo + 1)
+        }
+    }
+
+    /// Generate one synthetic track: the segments, and the `(byte_len,
+    /// sample_count)` table an honest packager would have written for them.
+    ///
+    /// `byte_len` here is the segment's `mdat` payload size, which is the claim
+    /// under test — see the round trip below.
+    fn synthetic_track(seed: u64, n_segments: usize) -> (Vec<Vec<u8>>, Vec<(u32, u32)>) {
+        let mut rng = Lcg(seed);
+        let mut segments = Vec::with_capacity(n_segments);
+        let mut table = Vec::with_capacity(n_segments);
+        for _ in 0..n_segments {
+            let n_frames = rng.in_range(1, 6);
+            let frames: Vec<(Vec<u8>, bool)> = (0..n_frames)
+                .map(|_| {
+                    let len = rng.in_range(1, 300);
+                    let fill = (rng.next() & 0xFF) as u8;
+                    (vec![fill; len], rng.next().is_multiple_of(2))
+                })
+                .collect();
+            // A tail beyond the last frame entry is unencrypted audio the
+            // assembler must still emit; zero is the common case.
+            let trailing = if rng.next().is_multiple_of(3) {
+                rng.in_range(1, 40)
+            } else {
+                0
+            };
+            let mdat_payload: usize = frames.iter().map(|(f, _)| f.len()).sum::<usize>() + trailing;
+            segments.push(segment(&frames, trailing));
+            table.push((mdat_payload as u32, (n_frames * 4096) as u32));
+        }
+        (segments, table)
+    }
+
+    /// THE CLAIM the range-seekable CMAF path rests on, pinned as an invariant
+    /// of our own code: a segment assembles to EXACTLY the byte count its table
+    /// entry declares, so prefix sums over the table are assembled-stream
+    /// offsets rather than an estimate of them.
+    ///
+    /// Proving it here and not only on hardware matters because the table is a
+    /// remote input: this test says what our assembler does with it, so a
+    /// change on either side — a parser tweak, a new box in the segment, a
+    /// Qobuz-side redefinition caught by the feeder's run-time check — has a
+    /// fixed reference to fail against.
+    #[test]
+    fn a_segment_assembles_to_exactly_its_declared_byte_len() {
+        for seed in 0..64u64 {
+            let (segments, table) = synthetic_track(seed, 7);
+            let key = [0x5Au8; 16];
+            for (i, (seg, (byte_len, _))) in segments.iter().zip(&table).enumerate() {
+                let mut out = Vec::new();
+                decrypt_segment_into(seg, i + 1, &key, &mut out).expect("decrypt");
+                assert_eq!(
+                    out.len() as u32,
+                    *byte_len,
+                    "seed {seed} segment {} assembled to {} bytes, table said {byte_len}",
+                    i + 1,
+                    out.len()
+                );
+            }
+        }
+    }
+
+    /// The whole round trip, through the real parser: build an init segment,
+    /// parse it back, and check that [`qbz_cmaf::SegmentMap`] places every
+    /// segment at the offset its bytes actually occupy in the assembled FLAC.
+    ///
+    /// This is the map the feeder seeks with. If it is off by so much as a
+    /// byte, a seek serves audio attributed to the wrong offsets — which
+    /// decodes as noise rather than failing.
+    #[test]
+    fn the_segment_map_places_every_segment_where_its_bytes_land() {
+        for seed in 100..132u64 {
+            let n = 9;
+            let (segments, table) = synthetic_track(seed, n);
+            let init = init_segment(&table);
+            let info = qbz_cmaf::parse_init_segment(&init).expect("parse init");
+            assert_eq!(info.flac_header.len(), 42);
+            assert_eq!(info.segment_table.len(), n);
+
+            let map = qbz_cmaf::SegmentMap::new(info.flac_header.len(), &info.segment_table);
+            let key = [0x5Au8; 16];
+
+            let mut assembled = info.flac_header.clone();
+            for (i, seg) in segments.iter().enumerate() {
+                let start = assembled.len() as u64;
+                assert_eq!(
+                    map.segment_start(i + 1),
+                    Some(start),
+                    "seed {seed}: segment {} starts at {start}, map said {:?}",
+                    i + 1,
+                    map.segment_start(i + 1)
+                );
+                decrypt_segment_into(seg, i + 1, &key, &mut assembled).expect("decrypt");
+                assert_eq!(
+                    map.segment_len(i + 1),
+                    Some(assembled.len() as u64 - start),
+                    "seed {seed}: segment {} length disagrees with the table",
+                    i + 1
+                );
+            }
+
+            assert_eq!(
+                map.total_len(),
+                assembled.len() as u64,
+                "seed {seed}: the table's total is not the assembled size"
+            );
+
+            // And the reverse direction: every assembled byte resolves to the
+            // segment that carries it, which is what a seek asks of the map.
+            for offset in (map.header_len()..map.total_len()).step_by(7) {
+                let seg = map.segment_at(offset).expect("audio offset");
+                let resume = map.resume_at(offset);
+                assert_eq!(resume.first_segment, seg);
+                assert!(!resume.with_header);
+                assert!(resume.body_offset <= offset);
+                assert_eq!(map.segment_start(seg), Some(resume.body_offset));
+            }
+        }
+    }
 }
