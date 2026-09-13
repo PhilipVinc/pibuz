@@ -75,7 +75,7 @@ async fn pause_and_play_never_blank_the_progress_display() {
         "the report tick should have published a track length"
     );
 
-    harness.leave_handoff_echo_window();
+    harness.let_the_load_windows_expire();
     harness.controller().tap_pause().await;
     harness.controller().tap_play().await;
 
@@ -105,7 +105,7 @@ async fn a_state_only_pause_does_not_rewind_to_an_earlier_track() {
     harness.report_tick().await;
 
     let before = harness.engine_calls().len();
-    harness.leave_handoff_echo_window();
+    harness.let_the_load_windows_expire();
     harness.controller().tap_pause().await;
 
     let after: Vec<_> = harness.engine_calls().into_iter().skip(before).collect();
@@ -137,7 +137,7 @@ async fn a_pause_inside_the_handoff_window_is_ignored_as_a_peer_echo() {
     harness.become_active_renderer().await;
     harness.controller().push_queue_and_play(&TRACKS, 0).await;
 
-    // No `leave_handoff_echo_window` — the load just happened.
+    // No `let_the_load_windows_expire` — the load just happened.
     harness.controller().tap_pause().await;
 
     assert!(
@@ -151,7 +151,7 @@ async fn a_pause_inside_the_handoff_window_is_ignored_as_a_peer_echo() {
     );
 
     // And the very same gesture IS obeyed once the window has passed.
-    harness.leave_handoff_echo_window();
+    harness.let_the_load_windows_expire();
     harness.controller().tap_pause().await;
     assert!(harness.engine_calls().contains(&EngineCall::Pause));
     assert!(!harness.engine().snapshot().is_playing);
@@ -200,7 +200,7 @@ async fn the_clouds_echo_of_our_own_report_reaches_neither_wire_nor_player() {
     harness.controller().push_queue_and_play(&TRACKS, 0).await;
     harness.advance_playback(5_000);
     harness.report_tick().await;
-    harness.leave_handoff_echo_window();
+    harness.let_the_load_windows_expire();
     harness.controller().tap_pause().await;
 
     for step in harness.timeline() {
@@ -313,7 +313,7 @@ async fn a_pause_during_a_gapless_advance_does_not_drag_playback_backwards() {
     harness.advance_playback(3_000);
 
     let before = harness.engine_calls().len();
-    harness.leave_handoff_echo_window();
+    harness.let_the_load_windows_expire();
     harness.controller().tap_pause().await;
 
     let after: Vec<_> = harness.engine_calls().into_iter().skip(before).collect();
@@ -349,7 +349,7 @@ async fn a_pause_during_a_gapless_advance_does_not_jump_to_the_previous_tracks_p
     // The player rolls into the next track on its own.
     harness.advance_gaplessly_to(102);
 
-    harness.leave_handoff_echo_window();
+    harness.let_the_load_windows_expire();
     harness.controller().tap_pause().await;
 
     assert!(
@@ -383,7 +383,7 @@ async fn reports_quote_the_queue_version_the_cloud_last_announced() {
     let announced = harness.queue_snapshot().await.version;
     harness.advance_playback(4_000);
     harness.report_tick().await;
-    harness.leave_handoff_echo_window();
+    harness.let_the_load_windows_expire();
     harness.controller().tap_pause().await;
 
     for step in harness.timeline() {
@@ -465,5 +465,456 @@ async fn taking_the_render_back_waits_for_the_cloud_before_loading() {
         harness.engine().snapshot().is_playing,
         "a takeback onto torn-down audio must reload, not bare-resume"
     );
+    harness.assert_invariants();
+}
+
+// ======================================================== queue and cursor
+
+/// The queue the controller pushed must arrive at the player intact, with the
+/// cursor on the track the user picked.
+///
+/// Materialization is what turns the cloud's list of ids into the player's own
+/// queue. Skip it and the audio still starts — the SetState that follows loads
+/// the track by itself — so the failure is silent: the right song plays out of
+/// an empty queue, and the next track never comes.
+#[tokio::test]
+async fn a_pushed_queue_arrives_at_the_player_with_the_cursor_on_the_selection() {
+    let harness = ControllerHarness::new().await;
+    harness.become_active_renderer().await;
+    harness.controller().push_queue_and_play(&TRACKS, 1).await;
+
+    let (queue, cursor) = harness.player_queue();
+    assert_eq!(
+        queue,
+        TRACKS.to_vec(),
+        "the player must hold the queue the controller pushed; timeline:\n{}",
+        harness.rendered_timeline()
+    );
+    assert_eq!(
+        cursor,
+        Some(102),
+        "the cursor must name the track the user picked; timeline:\n{}",
+        harness.rendered_timeline()
+    );
+    harness.assert_player_queue_matches_the_cloud();
+    harness.assert_invariants();
+}
+
+/// The same queue pushed twice is materialized once.
+///
+/// The cloud re-announces the queue on reconnects and on unrelated edits.
+/// Rebuilding the player's queue each time tears down the cursor and, with it,
+/// whatever was playing.
+#[tokio::test]
+async fn an_identical_queue_push_is_not_materialized_twice() {
+    let harness = ControllerHarness::new().await;
+    harness.become_active_renderer().await;
+    let items = harness.controller().push_queue(&TRACKS, 0).await;
+    harness.controller().tap_track(&items, 0).await;
+    harness.let_the_load_windows_expire();
+
+    let before = harness.engine_calls().len();
+    harness.controller().announce_queue(&items, 0).await;
+
+    let after: Vec<_> = harness.engine_calls().into_iter().skip(before).collect();
+    assert!(
+        !after.iter().any(|call| matches!(
+            call,
+            EngineCall::SetQueue { .. } | EngineCall::SetQueueWithOrder { .. }
+        )),
+        "an identical push must not rebuild the queue; it did {after:?}\ntimeline:\n{}",
+        harness.rendered_timeline()
+    );
+    assert_eq!(harness.player_queue().1, Some(101));
+    harness.assert_player_queue_matches_the_cloud();
+    harness.assert_invariants();
+}
+
+/// When the cloud names a track, the player's CURSOR follows it — not just the
+/// audio. The cursor is what names the now-playing title in `qbzd status` and
+/// in the moOde overlay, so a cursor left behind shows one song's title over
+/// another song's audio.
+#[tokio::test]
+async fn the_cursor_follows_the_track_the_cloud_names() {
+    let harness = ControllerHarness::new().await;
+    harness.become_active_renderer().await;
+    harness.controller().push_queue_and_play(&TRACKS, 0).await;
+    harness.let_the_load_windows_expire();
+
+    harness.controller().tap_next_track(103, None).await;
+
+    assert_eq!(
+        harness.player_queue().1,
+        Some(103),
+        "the cursor must land on the track the cloud named; timeline:\n{}",
+        harness.rendered_timeline()
+    );
+    assert_eq!(harness.engine().snapshot().track_id, 103);
+    harness.assert_invariants();
+}
+
+// ============================================================ load dedup
+
+/// The cloud re-emitting a SetState for the track already playing must not
+/// restart it.
+///
+/// It re-emits routinely — a next_track correction, a queue_item_id refresh —
+/// and re-states `current_position` as 0 each time. Reloading on every one of
+/// those is the "first track hiccups on album change" and "needs several taps"
+/// report.
+#[tokio::test]
+async fn the_cloud_re_emitting_the_current_state_does_not_restart_the_track() {
+    let harness = ControllerHarness::new().await;
+    harness.become_active_renderer().await;
+    harness.controller().push_queue_and_play(&TRACKS, 0).await;
+    harness.advance_playback(40_000);
+    harness.let_the_load_windows_expire();
+
+    let before = harness.engine_calls().len();
+    harness
+        .controller()
+        .reemits_the_current_state(101, 1000)
+        .await;
+
+    let after: Vec<_> = harness.engine_calls().into_iter().skip(before).collect();
+    assert!(
+        !after
+            .iter()
+            .any(|call| matches!(call, EngineCall::StartStream { .. })),
+        "a re-emitted state must not reload the track; it did {after:?}\ntimeline:\n{}",
+        harness.rendered_timeline()
+    );
+    assert_eq!(
+        harness.engine().snapshot().position,
+        40,
+        "and it must not drag the clock back to zero either"
+    );
+    harness.assert_invariants();
+}
+
+// ================================================================= volume
+
+/// A volume-up key is a RELATIVE step. The report that goes back must state the
+/// ABSOLUTE level it landed on, because that is the number the controller draws
+/// on its slider — it does not track the arithmetic itself.
+#[tokio::test]
+async fn a_relative_volume_step_is_reported_as_the_absolute_level() {
+    let harness = ControllerHarness::new().await;
+    harness.become_active_renderer().await;
+    harness.controller().push_queue_and_play(&TRACKS, 0).await;
+
+    harness.controller().set_volume(40).await;
+    harness.controller().nudge_volume(15).await;
+
+    assert!(
+        harness
+            .engine_calls()
+            .contains(&EngineCall::SetVolume { pct: 55 }),
+        "the relative step must reach the player as an absolute level; timeline:\n{}",
+        harness.rendered_timeline()
+    );
+    assert_eq!(
+        harness.view().volume,
+        Some(55),
+        "and the slider must show 55, not the +15; timeline:\n{}",
+        harness.rendered_timeline()
+    );
+    harness.assert_invariants();
+}
+
+/// Mute silences the player and says so; unmute puts the level back where it
+/// was. A renderer that mutes without restoring leaves the controller showing a
+/// level nobody can hear.
+#[tokio::test]
+async fn muting_and_unmuting_round_trips_the_level() {
+    let harness = ControllerHarness::new().await;
+    harness.become_active_renderer().await;
+    harness.controller().push_queue_and_play(&TRACKS, 0).await;
+    harness.controller().set_volume(70).await;
+
+    harness.controller().set_muted(true).await;
+    assert!(
+        harness
+            .engine_calls()
+            .contains(&EngineCall::SetVolume { pct: 0 }),
+        "mute must silence the player; timeline:\n{}",
+        harness.rendered_timeline()
+    );
+    assert_eq!(harness.view().muted, Some(true));
+
+    harness.controller().set_muted(false).await;
+    assert_eq!(
+        harness.engine_calls().last(),
+        Some(&EngineCall::SetVolume { pct: 70 }),
+        "unmute must restore the level the controller still shows; timeline:\n{}",
+        harness.rendered_timeline()
+    );
+    assert_eq!(harness.view().muted, Some(false));
+    harness.assert_invariants();
+}
+
+// ======================================= the window where the audio thread lags
+
+/// A SetState naming a track the audio thread has not reached yet must not be
+/// seeked.
+///
+/// This is the ordinary shape of an album change: the push starts track 0, and
+/// the cloud's SetState for that same track lands while the stream is still
+/// filling. The player therefore still reports the PREVIOUS track, at the
+/// previous track's clock, and the frame's `current_position: 0` refers to
+/// neither. Acting on it cost 140 ms of dead air and a PCM stop+prepare at the
+/// top of every freshly started track — the faint click on each one.
+#[tokio::test]
+async fn a_setstate_for_a_track_the_audio_thread_has_not_reached_does_not_seek() {
+    let harness = ControllerHarness::new().await;
+    harness.become_active_renderer().await;
+    harness.controller().push_queue_and_play(&TRACKS, 0).await;
+    harness.advance_playback(62_000);
+    harness.report_tick().await;
+    harness.let_the_load_windows_expire();
+
+    // From here a stream opens but stays inaudible until we say so.
+    harness.make_the_audio_thread_lag();
+    harness.controller().tap_next_track(102, Some(103)).await;
+
+    assert!(
+        !harness
+            .engine_calls()
+            .iter()
+            .any(|call| matches!(call, EngineCall::Seek { .. })),
+        "the outgoing track's clock must not be seeked on the incoming track's \
+         frame; timeline:\n{}",
+        harness.rendered_timeline()
+    );
+
+    harness.audio_thread_catches_up();
+    assert_eq!(harness.engine().snapshot().track_id, 102);
+    assert_eq!(
+        harness.engine().snapshot().position,
+        0,
+        "the new track must start at its beginning"
+    );
+    harness.assert_invariants();
+}
+
+/// A takeback loads the peer's track AT the peer's position. Having done so, it
+/// must not also seek there.
+///
+/// The stream already begins at that offset — it waits for the buffer and
+/// pre-skips — so a seek behind it is pure waste, and worse than waste: it is
+/// either dropped for being past the buffered watermark, or it lands later and
+/// rebuilds the engine, re-running the whole multi-second sample skip.
+#[tokio::test]
+async fn a_takeback_load_at_a_position_is_not_seeked_on_top_of() {
+    let harness = ControllerHarness::new().await;
+    harness.become_active_renderer().await;
+    harness.controller().push_queue_and_play(&TRACKS, 0).await;
+    harness.peer_takes_the_render().await;
+    harness.let_the_load_windows_expire();
+
+    // The peer is 77 s into a track of its own; the audio thread will need a
+    // moment to get there.
+    harness.make_the_audio_thread_lag();
+    harness.controller().take_renderer().await;
+    harness.controller().resume_at(202, 77_000).await;
+
+    let seeks: Vec<_> = harness
+        .engine_calls()
+        .into_iter()
+        .filter(|call| matches!(call, EngineCall::Seek { .. }))
+        .collect();
+    assert!(
+        seeks.is_empty(),
+        "the load already started at the offset; it was seeked anyway: {seeks:?}\ntimeline:\n{}",
+        harness.rendered_timeline()
+    );
+    assert!(
+        harness.engine_calls().contains(&EngineCall::StartStream {
+            track_id: 202,
+            start_secs: 77
+        }),
+        "the takeback must stream from the peer's position, not from zero; timeline:\n{}",
+        harness.rendered_timeline()
+    );
+    harness.audio_thread_catches_up();
+    assert_eq!(harness.engine().snapshot().position, 77);
+    harness.assert_invariants();
+}
+
+/// A track change that states no position starts the new track at ZERO.
+///
+/// The cloud does send this shape. The position blank must stay blank — filling
+/// it in from the cached renderer state starts the new track wherever the
+/// previous one had got to.
+#[tokio::test]
+async fn a_track_change_without_a_position_starts_at_the_beginning() {
+    let harness = ControllerHarness::new().await;
+    harness.become_active_renderer().await;
+    harness.controller().push_queue_and_play(&TRACKS, 0).await;
+    harness.advance_playback(96_000);
+    harness.report_tick().await;
+    harness.let_the_load_windows_expire();
+
+    harness
+        .controller()
+        .tap_next_track_without_a_position(102, Some(103))
+        .await;
+
+    assert!(
+        harness.engine_calls().contains(&EngineCall::StartStream {
+            track_id: 102,
+            start_secs: 0
+        }),
+        "a new track with no stated position starts at 0, not at the previous \
+         track's 96 s; timeline:\n{}",
+        harness.rendered_timeline()
+    );
+    assert_eq!(harness.engine().snapshot().position, 0);
+    harness.assert_invariants();
+}
+
+/// A resume while the cloud's position trails the player by a second must not
+/// seek.
+///
+/// The cloud only hears from the renderer every ~1.8 s, so its cached position
+/// is ALWAYS a little behind. A resume whose blank position is filled in from
+/// that cache would therefore drag the clock back by a second every single
+/// time — an audible stutter on every play tap. The `> 2 s` margin exists for
+/// exactly this, and shrinking it is not a harmless tightening.
+#[tokio::test]
+async fn a_resume_does_not_seek_on_the_ordinary_report_lag() {
+    let harness = ControllerHarness::new().await;
+    harness.become_active_renderer().await;
+    harness.controller().push_queue_and_play(&TRACKS, 0).await;
+
+    // The cloud last heard 30 s...
+    harness.advance_playback(30_000);
+    harness.report_tick().await;
+    // ...and the player has moved on by one report period since.
+    harness.advance_playback(1_800);
+    harness.let_the_load_windows_expire();
+
+    harness.controller().tap_pause().await;
+    harness.controller().tap_play().await;
+
+    assert!(
+        !harness
+            .engine_calls()
+            .iter()
+            .any(|call| matches!(call, EngineCall::Seek { .. })),
+        "an ordinary report lag is not a seek; timeline:\n{}",
+        harness.rendered_timeline()
+    );
+    assert_eq!(harness.engine().snapshot().position, 31);
+    harness.assert_invariants();
+}
+
+/// A state-only resume onto torn-down audio must RELOAD, not bare-resume.
+///
+/// After a hand-off the player still remembers the track id but holds no audio,
+/// so a plain resume dies in the audio thread with "cannot resume - no audio
+/// data available" — while the cloud goes on reporting paused 0:00 to the
+/// controller forever. Deciding on the track id alone is what misses it; the
+/// question is whether there is anything loaded.
+#[tokio::test]
+async fn a_resume_onto_torn_down_audio_reloads_instead_of_dying_quietly() {
+    let harness = ControllerHarness::new().await;
+    harness.become_active_renderer().await;
+    harness.controller().push_queue_and_play(&TRACKS, 0).await;
+    harness.advance_playback(20_000);
+    harness.report_tick().await;
+
+    // The peer takes the render, which tears our audio down but leaves the
+    // track id in place; then it hands the render straight back.
+    harness.peer_takes_the_render().await;
+    harness.let_the_load_windows_expire();
+    harness.controller().take_renderer().await;
+
+    let before = harness.engine_calls().len();
+    harness.make_the_audio_thread_lag();
+    harness.controller().tap_play().await;
+
+    let after: Vec<_> = harness.engine_calls().into_iter().skip(before).collect();
+    assert!(
+        after
+            .iter()
+            .any(|call| matches!(call, EngineCall::StartStream { .. })),
+        "a resume with no audio loaded must reload; it did {after:?}\ntimeline:\n{}",
+        harness.rendered_timeline()
+    );
+    // And the cold load already began at the cached position, so nothing may
+    // seek on top of it: a seek there is either dropped for being past the
+    // buffered watermark, or lands later and rebuilds the engine, re-running the
+    // whole multi-second sample skip.
+    assert!(
+        !after
+            .iter()
+            .any(|call| matches!(call, EngineCall::Seek { .. })),
+        "the cold load started at the cached position; it was seeked anyway: {after:?}\ntimeline:\n{}",
+        harness.rendered_timeline()
+    );
+
+    harness.audio_thread_catches_up();
+    assert!(
+        harness.engine().snapshot().is_playing,
+        "and it must actually be playing afterwards"
+    );
+    harness.assert_invariants();
+}
+
+/// The cloud re-emitting a SetState WHILE THE LOAD IS STILL IN FLIGHT must not
+/// start a second stream.
+///
+/// This is the same re-emission as above, in the window where it actually
+/// hurts. The audio thread has not adopted the new track yet, so a check on
+/// "what is the player playing" still answers with the OUTGOING track and reads
+/// as "not loaded" — which is why the dedup is keyed on the load ATTEMPT
+/// instead. Getting this wrong tore the stream down and reopened it, mid-fill,
+/// on every routine re-emission.
+#[tokio::test]
+async fn a_re_emitted_state_during_a_load_does_not_open_a_second_stream() {
+    let harness = ControllerHarness::new().await;
+    harness.become_active_renderer().await;
+    harness.controller().push_queue_and_play(&TRACKS, 0).await;
+    harness.advance_playback(62_000);
+    harness.report_tick().await;
+    harness.let_the_load_windows_expire();
+
+    // Track 102 starts loading; nothing is audible yet, so the player still
+    // reports 101 at 62 s.
+    harness.make_the_audio_thread_lag();
+    harness.controller().tap_next_track(102, Some(103)).await;
+    let after_first_load = harness.engine_calls().len();
+
+    // The cloud restates the same track mid-load — a next_track correction.
+    harness
+        .controller()
+        .reemits_the_current_state(102, 2000)
+        .await;
+
+    let after: Vec<_> = harness
+        .engine_calls()
+        .into_iter()
+        .skip(after_first_load)
+        .collect();
+    assert!(
+        !after
+            .iter()
+            .any(|call| matches!(call, EngineCall::StartStream { .. })),
+        "the re-emission opened a second stream mid-fill: {after:?}\ntimeline:\n{}",
+        harness.rendered_timeline()
+    );
+    assert!(
+        !after
+            .iter()
+            .any(|call| matches!(call, EngineCall::Seek { .. })),
+        "and it must not seek the OUTGOING track to the incoming track's 0 \
+         either — that is the click at the top of every fresh track: {after:?}\ntimeline:\n{}",
+        harness.rendered_timeline()
+    );
+
+    harness.audio_thread_catches_up();
+    assert_eq!(harness.engine().snapshot().track_id, 102);
+    assert_eq!(harness.engine().snapshot().position, 0);
     harness.assert_invariants();
 }

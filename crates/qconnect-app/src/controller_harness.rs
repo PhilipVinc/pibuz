@@ -45,7 +45,7 @@
 //! h.become_active_renderer().await;
 //! h.controller().push_queue_and_play(&[101, 102, 103], 0).await;
 //! h.advance_playback(30_000);
-//! h.leave_handoff_echo_window();
+//! h.let_the_load_windows_expire();
 //! h.controller().tap_pause().await;
 //! h.assert_invariants();
 //! ```
@@ -98,8 +98,21 @@ struct FakePlayer {
     duration_ms: u64,
     loaded_audio: bool,
     volume: f32,
-    queue_len: usize,
+    /// The queue as the player really holds it, ids and all.
+    ///
+    /// Storing the real tracks rather than regenerating placeholders is not a
+    /// detail: `align_queue_cursor` looks the target track UP in this list, and
+    /// a fake that answers with the wrong ids sends it down the "not in queue"
+    /// fallback on every call — which replaces the whole queue with a
+    /// single-track one and hides every cursor bug behind harness noise.
+    queue: Vec<QueueTrack>,
     queue_index: Option<usize>,
+    /// While set, the audio thread has not caught up with the last
+    /// `start_track_stream`: the stream is open but nothing is audible yet, so
+    /// the player still reports the OUTGOING track. Applied by `catch_up`.
+    pending_track: Option<(u64, u64, u64)>,
+    /// Whether `start_track_stream` lands instantly or has to be caught up.
+    audio_thread_lags: bool,
 }
 
 /// A player that models just enough to answer the orchestration's questions.
@@ -157,6 +170,13 @@ impl FakeEngine {
         player.duration_ms = self.track_duration_secs * 1000;
         player.loaded_audio = true;
         player.playing = true;
+        // The player pulls the next track from its OWN queue, so the cursor
+        // moves with the audio. Only the cloud is left behind — which is the
+        // whole point of the manoeuvre, and would be lost if the fake let the
+        // local cursor go stale too.
+        if let Some(index) = player.queue.iter().position(|track| track.id == track_id) {
+            player.queue_index = Some(index);
+        }
     }
 
     /// Give up local playback on a hand-off to a peer.
@@ -171,6 +191,13 @@ impl FakeEngine {
         let mut player = self.player.lock().expect("fake player");
         player.playing = false;
         player.loaded_audio = false;
+        // A hand-off goes through `stop()`, which drops the buffer and with it
+        // the clock. Keeping the old position here would be comfortable and
+        // wrong: the takeback then finds the engine already sitting at the
+        // position the cloud is about to ask for, and every guard that exists
+        // for the gap between "stream opened at 77 s" and "player is at 0"
+        // becomes unreachable.
+        player.position_ms = 0;
     }
 
     /// Move the playback clock forward, as the audio thread would.
@@ -179,6 +206,46 @@ impl FakeEngine {
         if player.playing {
             player.position_ms = player.position_ms.saturating_add(ms);
         }
+    }
+
+    /// From here on, opening a stream does not make it audible.
+    ///
+    /// This is how the real player behaves and the fake does not: the audio
+    /// thread adopts a track only once it has samples, so between
+    /// `start_track_stream` and the first sample the player STILL REPORTS THE
+    /// OUTGOING TRACK at the outgoing clock. Several guards exist only for that
+    /// window, and with an instantly-adopting fake they are unreachable.
+    pub fn make_the_audio_thread_lag(&self) {
+        self.player.lock().expect("fake player").audio_thread_lags = true;
+    }
+
+    /// Whether a stream has been opened that the audio thread has not adopted.
+    pub fn is_catching_up(&self) -> bool {
+        self.player
+            .lock()
+            .expect("fake player")
+            .pending_track
+            .is_some()
+    }
+
+    /// The first samples of the pending stream arrive.
+    pub fn catch_up(&self) {
+        let mut player = self.player.lock().expect("fake player");
+        if let Some((track_id, position_ms, duration_ms)) = player.pending_track.take() {
+            player.track_id = track_id;
+            player.position_ms = position_ms;
+            player.duration_ms = duration_ms;
+            player.loaded_audio = true;
+            player.playing = true;
+        }
+    }
+
+    /// What the player holds: how many tracks, and which one the cursor names.
+    pub fn queue(&self) -> (Vec<u64>, Option<u64>) {
+        let player = self.player.lock().expect("fake player");
+        let ids: Vec<u64> = player.queue.iter().map(|track| track.id).collect();
+        let current = player.queue_index.and_then(|index| ids.get(index).copied());
+        (ids, current)
     }
 
     fn mock_track(&self, id: u64) -> Track {
@@ -255,14 +322,8 @@ impl QconnectRendererEngine for FakeEngine {
     }
 
     async fn get_all_queue_tracks(&self) -> (Vec<QueueTrack>, Option<usize>) {
-        let (len, index) = {
-            let player = self.player.lock().expect("fake player");
-            (player.queue_len, player.queue_index)
-        };
-        let tracks = (0..len)
-            .map(|i| crate::renderer::model_track_to_core_queue_track(&self.mock_track(i as u64)))
-            .collect();
-        (tracks, index)
+        let player = self.player.lock().expect("fake player");
+        (player.queue.clone(), player.queue_index)
     }
 
     async fn set_queue(&self, tracks: Vec<QueueTrack>, start_index: Option<usize>) {
@@ -271,7 +332,7 @@ impl QconnectRendererEngine for FakeEngine {
             start: start_index,
         });
         let mut player = self.player.lock().expect("fake player");
-        player.queue_len = tracks.len();
+        player.queue = tracks;
         player.queue_index = start_index;
     }
 
@@ -287,7 +348,7 @@ impl QconnectRendererEngine for FakeEngine {
             shuffle: shuffle_enabled,
         });
         let mut player = self.player.lock().expect("fake player");
-        player.queue_len = tracks.len();
+        player.queue = tracks;
         player.queue_index = start_index;
     }
 
@@ -321,13 +382,20 @@ impl QconnectRendererEngine for FakeEngine {
             start_secs: start_position_secs,
         });
         let mut player = self.player.lock().expect("fake player");
-        player.track_id = track_id;
-        player.position_ms = start_position_secs * 1000;
-        player.duration_ms = if duration_secs > 0 {
+        let duration_ms = if duration_secs > 0 {
             duration_secs * 1000
         } else {
             self.track_duration_secs * 1000
         };
+        if player.audio_thread_lags {
+            // The stream is open; nothing is audible yet. The player goes on
+            // reporting the outgoing track until `catch_up`.
+            player.pending_track = Some((track_id, start_position_secs * 1000, duration_ms));
+            return Ok(());
+        }
+        player.track_id = track_id;
+        player.position_ms = start_position_secs * 1000;
+        player.duration_ms = duration_ms;
         player.loaded_audio = true;
         player.playing = true;
         Ok(())
@@ -463,10 +531,10 @@ fn fold_report_into_view(view: &mut ControllerView, message_type: &str, payload:
                 }
             }
             if let Some(duration) = payload.get("duration") {
-                view.total_ms = as_positive_ms(duration);
+                view.total_ms = as_stated_ms(duration);
             }
             if let Some(position) = payload.get("current_position") {
-                view.elapsed_ms = as_positive_ms(position);
+                view.elapsed_ms = as_stated_ms(position);
             }
             if let Some(track_id) = payload.get("current_queue_item_id").and_then(Value::as_u64) {
                 view.track_id = Some(track_id);
@@ -486,9 +554,16 @@ fn fold_report_into_view(view: &mut ControllerView, message_type: &str, payload:
     }
 }
 
-fn as_positive_ms(value: &Value) -> Option<u64> {
+/// A stated millisecond field, or `None` when the renderer stated nothing.
+///
+/// The distinction that matters is `null` versus a number, NOT zero versus
+/// non-zero: `current_position: 0` is a real answer — the top of a track — while
+/// `null` is a refusal to answer, and only the refusal blanks the display. An
+/// earlier version of this folded them together and reported every track change
+/// as a blanked progress bar.
+fn as_stated_ms(value: &Value) -> Option<u64> {
     match value.as_i64() {
-        Some(ms) if ms > 0 => Some(ms as u64),
+        Some(ms) if ms >= 0 => Some(ms as u64),
         _ => None,
     }
 }
@@ -506,6 +581,19 @@ pub struct Step {
     /// ECHO of its own report — which must always be empty. Acting on an echo is
     /// how a pause becomes two pauses and a resume fights the user.
     pub echo_engine_calls: Vec<EngineCall>,
+    /// Track ids in the player's queue after this step.
+    pub player_queue: Vec<u64>,
+    /// The track the player's CURSOR names — what `qbzd status` and the moOde
+    /// overlay would call the now-playing title.
+    pub cursor_track: Option<u64>,
+    /// The track that is actually AUDIBLE. When this and `cursor_track` disagree
+    /// outside a load, the title on screen belongs to a different song than the
+    /// one coming out of the speakers.
+    pub audible_track: u64,
+    /// Track ids in the queue the CLOUD holds.
+    pub cloud_queue: Vec<u64>,
+    /// A stream is open that the audio thread has not adopted yet.
+    pub audio_catching_up: bool,
 }
 
 // =================================================================== the cloud
@@ -543,26 +631,54 @@ pub struct VirtualController {
 }
 
 impl VirtualController {
-    /// Tap play on a queue the controller just picked: the cloud pushes
-    /// `QUEUE_TRACKS_LOADED` naming the selection, then a `SET_STATE` naming the
-    /// track. This is the ordinary "user tapped a track in an album" flow.
-    pub async fn push_queue_and_play(&self, track_ids: &[u64], selected: usize) {
+    /// The queue push on its own: `QUEUE_TRACKS_LOADED` naming the selection,
+    /// with no SetState behind it. Returns the queue items the cloud minted, so
+    /// a caller can name them in a later frame.
+    ///
+    /// Queue item ids are minted fresh on every call, exactly as the cloud does
+    /// — so pushing the same track ids twice is a re-announcement of the same
+    /// QUEUE, not of the same items.
+    pub async fn push_queue(&self, track_ids: &[u64], selected: usize) -> Vec<QueueItem> {
         let items = self.queue_items(track_ids);
+        self.announce_queue(&items, selected).await;
+        items
+    }
+
+    /// Announce a queue the cloud has ALREADY minted, item ids and all.
+    ///
+    /// This is how a re-announcement really looks — a reconnect, an
+    /// AskForQueueState, an edit elsewhere in the queue. Handing the same items
+    /// back is the whole point: minting fresh ids would make it a different
+    /// queue, and the renderer would be right to rebuild.
+    pub async fn announce_queue(&self, items: &[QueueItem], selected: usize) {
+        let payload = json!({
+            "tracks": items.iter().map(queue_item_json).collect::<Vec<_>>(),
+            "queue_position": selected,
+        });
+        let ids: Vec<u64> = items.iter().map(|item| item.track_id).collect();
         self.harness
             .step(
-                &format!("push queue {track_ids:?} select {selected}"),
-                |_| {
+                &format!("push queue {ids:?} select {selected}"),
+                move |_| {
                     vec![queue_event(
                         "MESSAGE_TYPE_SRVR_CTRL_QUEUE_TRACKS_LOADED",
-                        json!({
-                            "tracks": items.iter().map(queue_item_json).collect::<Vec<_>>(),
-                            "queue_position": selected,
-                        }),
+                        payload.clone(),
                     )]
                 },
             )
             .await;
+    }
 
+    /// Tap play on a queue the controller just picked: the cloud pushes
+    /// `QUEUE_TRACKS_LOADED` naming the selection, then a `SET_STATE` naming the
+    /// track. This is the ordinary "user tapped a track in an album" flow.
+    pub async fn push_queue_and_play(&self, track_ids: &[u64], selected: usize) {
+        let items = self.push_queue(track_ids, selected).await;
+        self.tap_track(&items, selected).await;
+    }
+
+    /// The `SET_STATE` that follows a push: play THIS item of THAT queue.
+    pub async fn tap_track(&self, items: &[QueueItem], selected: usize) {
         let current = items[selected].clone();
         let next = items.get(selected + 1).cloned();
         self.harness
@@ -644,6 +760,100 @@ impl VirtualController {
                         "current_track": queue_item_json(&current),
                         "next_track": next.as_ref().map(queue_item_json),
                     }),
+                )]
+            })
+            .await;
+    }
+
+    /// Tap next, in the shape that carries NO position.
+    ///
+    /// The controller does send this — the track is stated, the position is
+    /// not. A new track starts at zero; filling the blank in from the cloud's
+    /// cached position starts it wherever the PREVIOUS one had got to.
+    pub async fn tap_next_track_without_a_position(
+        &self,
+        track_id: u64,
+        next_track_id: Option<u64>,
+    ) {
+        let current = self.mint_item(track_id);
+        let next = next_track_id.map(|id| self.mint_item(id));
+        self.harness
+            .step(&format!("tap next (no position) -> {track_id}"), |_| {
+                vec![renderer_command(
+                    RendererCommandType::SrvrRndrSetState,
+                    json!({
+                        "playing_state": 2,
+                        "current_track": queue_item_json(&current),
+                        "next_track": next.as_ref().map(queue_item_json),
+                    }),
+                )]
+            })
+            .await;
+    }
+
+    /// The cloud states where the session is: this track, at this position,
+    /// playing. The authoritative frame that follows a takeback.
+    pub async fn resume_at(&self, track_id: u64, position_ms: u64) {
+        let item = self.mint_item(track_id);
+        self.harness
+            .step(&format!("resume {track_id} at {position_ms}ms"), |_| {
+                vec![renderer_command(
+                    RendererCommandType::SrvrRndrSetState,
+                    json!({
+                        "playing_state": 2,
+                        "current_position": position_ms,
+                        "current_track": queue_item_json(&item),
+                    }),
+                )]
+            })
+            .await;
+    }
+
+    /// The cloud re-emits a SetState for the track already playing.
+    ///
+    /// It does this routinely when only secondary fields change — a next_track
+    /// correction, a queue_item_id refresh — and it re-states `current_position`
+    /// as 0 while doing so. Treating each one as a fresh load is the "first
+    /// track hiccups on album change" and "needs several taps" report.
+    pub async fn reemits_the_current_state(&self, track_id: u64, queue_item_id: u64) {
+        let item = QueueItem {
+            track_context_uuid: "ctx-harness".to_string(),
+            track_id,
+            queue_item_id,
+        };
+        self.harness
+            .step(&format!("cloud re-emits state for {track_id}"), |_| {
+                vec![renderer_command(
+                    RendererCommandType::SrvrRndrSetState,
+                    json!({
+                        "playing_state": 2,
+                        "current_position": 0,
+                        "current_track": queue_item_json(&item),
+                    }),
+                )]
+            })
+            .await;
+    }
+
+    /// Press the volume-up key: a RELATIVE step, with no absolute level.
+    pub async fn nudge_volume(&self, delta: i32) {
+        self.harness
+            .step(&format!("volume {delta:+}"), |_| {
+                vec![renderer_command(
+                    RendererCommandType::SrvrRndrSetVolume,
+                    json!({ "volume_delta": delta }),
+                )]
+            })
+            .await;
+    }
+
+    /// Tap the mute button.
+    pub async fn set_muted(&self, muted: bool) {
+        self.harness
+            .step(if muted { "mute" } else { "unmute" }, |_| {
+                vec![renderer_command(
+                    RendererCommandType::SrvrRndrMuteVolume,
+                    json!({ "value": muted }),
                 )]
             })
             .await;
@@ -743,6 +953,20 @@ impl HarnessInner {
         for frame in frames(&self.cloud) {
             let event = match frame {
                 CloudFrame::Renderer(command) => {
+                    // The cloud does not wait to be told what it just ordered.
+                    // A SetState naming a track moves its own view of the
+                    // session there immediately, and the phone redraws on that
+                    // — the renderer's report only confirms it. Without this the
+                    // harness would credit the renderer for knowledge the cloud
+                    // already had, and read a perfectly ordinary track change as
+                    // the screen losing track of the song.
+                    if let Some(item) = command.payload.get("current_track") {
+                        if let Some(queue_item_id) =
+                            item.get("queue_item_id").and_then(Value::as_u64)
+                        {
+                            self.cloud.view.lock().expect("view").track_id = Some(queue_item_id);
+                        }
+                    }
                     TransportEvent::InboundRendererServerCommand(command)
                 }
                 CloudFrame::Queue(envelope) => TransportEvent::InboundReceived(envelope),
@@ -807,12 +1031,28 @@ impl HarnessInner {
             fresh
         };
 
+        let (player_queue, cursor_track) = self.engine.queue();
+        let audible_track = self.engine.snapshot().track_id;
+        let cloud_queue = self
+            .app
+            .queue_state_snapshot()
+            .await
+            .queue_items
+            .iter()
+            .map(|item| item.track_id)
+            .collect();
+
         self.timeline.lock().expect("timeline").push(Step {
             label: label.to_string(),
             view: self.cloud.view(),
             reports,
             engine_calls,
             echo_engine_calls,
+            player_queue,
+            cursor_track,
+            audible_track,
+            cloud_queue,
+            audio_catching_up: self.engine.is_catching_up(),
         });
     }
 }
@@ -968,14 +1208,24 @@ impl ControllerHarness {
         self.inner.engine.advance_gaplessly_to(track_id);
     }
 
-    /// Step outside the 1.5 s handoff-echo window by backdating the load stamp.
+    /// Let time pass for the two windows that hang off the last load.
     ///
-    /// The window is keyed on `std::time::Instant::elapsed()`, so the only
-    /// alternatives are sleeping through it for real or leaving a whole class of
-    /// gesture untestable. Any test where the user "taps pause a while after the
-    /// track started" must call this first, or the renderer will read the pause
-    /// as the previous renderer's handoff echo and ignore it.
-    pub fn leave_handoff_echo_window(&self) {
+    /// # Read this before writing a test
+    ///
+    /// `last_load_attempt` is one `std::time::Instant`, and TWO rules read it:
+    /// the 5 s load-dedup window and the 1.5 s handoff-echo window. A test runs
+    /// in microseconds, so unless it says otherwise it is permanently inside
+    /// BOTH — every pause is swallowed as a peer echo and every load is deduped
+    /// away. That is not a neutral default: it silently walks the happy path and
+    /// makes whole guards untestable, which is how a mutation that deletes one
+    /// of them can pass a suite that looks thorough.
+    ///
+    /// So: unless a case is specifically ABOUT one of those windows, call this
+    /// first. The alternative is sleeping through 1.5 s of wall clock per case,
+    /// or teaching the renderer to take its clock as a parameter — which is the
+    /// real fix, and the reason this helper carries a warning instead of being
+    /// quietly convenient.
+    pub fn let_the_load_windows_expire(&self) {
         let sync = Arc::clone(&self.inner.sync_state);
         // The lock is never contended between steps, so try_lock is enough and
         // keeps this helper synchronous at the call site.
@@ -983,6 +1233,43 @@ impl ControllerHarness {
         if let Some((track_id, _)) = state.last_load_attempt {
             state.last_load_attempt = Some((track_id, Instant::now() - Duration::from_secs(10)));
         }
+    }
+
+    /// From here on, a stream that opens is not instantly audible. See
+    /// [`FakeEngine::make_the_audio_thread_lag`].
+    pub fn make_the_audio_thread_lag(&self) {
+        self.inner.engine.make_the_audio_thread_lag();
+    }
+
+    /// The first samples of the pending stream arrive.
+    pub fn audio_thread_catches_up(&self) {
+        self.inner.engine.catch_up();
+    }
+
+    /// The queue the PLAYER holds, and the track its cursor names.
+    pub fn player_queue(&self) -> (Vec<u64>, Option<u64>) {
+        self.inner.engine.queue()
+    }
+
+    /// The player is holding exactly the queue the cloud is.
+    ///
+    /// Not a blanket invariant, because one legitimate divergence exists:
+    /// `align_queue_cursor` falls back to a single-track queue when the cloud
+    /// names a track the player does not hold. So this is asserted where a test
+    /// means it, rather than everywhere.
+    pub fn assert_player_queue_matches_the_cloud(&self) {
+        let timeline = self.timeline();
+        let Some(step) = timeline.last() else {
+            panic!("no steps recorded");
+        };
+        assert_eq!(
+            step.player_queue,
+            step.cloud_queue,
+            "the player holds {:?} while the cloud holds {:?}; timeline:\n{}",
+            step.player_queue,
+            step.cloud_queue,
+            render_timeline(&timeline),
+        );
     }
 
     pub async fn queue_snapshot(&self) -> QConnectQueueState {
@@ -1042,7 +1329,33 @@ impl ControllerHarness {
                     step.label, step.echo_engine_calls
                 ));
             }
-            // 5. No report storm. One gesture is one or two reports; anything
+            // 5. The queue cursor names the track that is actually audible.
+            //    When it does not, `qbzd status` and the moOde overlay show one
+            //    song's title over another song's audio — the title said
+            //    "Golden Seams" while the 213 s duration belonged to "Pulse".
+            //
+            //    Exempt while a load is in flight: the cursor is legitimately
+            //    AHEAD there, because the stream for the new track has opened
+            //    and the audio thread has not adopted it yet. That exemption has
+            //    to outlast the step that opened the stream — the gap is the
+            //    whole point of it, and a load can stay unadopted across several
+            //    frames from the cloud.
+            let load_in_flight = step.audio_catching_up
+                || step
+                    .engine_calls
+                    .iter()
+                    .any(|call| matches!(call, EngineCall::StartStream { .. }));
+            if !load_in_flight
+                && step.audible_track != 0
+                && step.cursor_track.is_some()
+                && step.cursor_track != Some(step.audible_track)
+            {
+                violations.push(format!(
+                    "'{}': the queue cursor names {:?} while {} is audible",
+                    step.label, step.cursor_track, step.audible_track
+                ));
+            }
+            // 6. No report storm. One gesture is one or two reports; anything
             //    more is the renderer answering the cloud's echo of its own
             //    report, which is the feedback loop that used to lock the app up.
             if step.reports.len() > 2 {
@@ -1076,7 +1389,7 @@ pub fn render_timeline(timeline: &[Step]) -> String {
         .iter()
         .map(|step| {
             format!(
-                "  {:<34} {:?} track={:?} {:?}/{:?} vol={:?}  reports={:?} engine={:?}{}",
+                "  {:<34} {:?} track={:?} {:?}/{:?} vol={:?}  reports={:?} cursor={:?} audible={} engine={:?}{}",
                 step.label,
                 step.view.transport,
                 step.view.track_id,
@@ -1088,6 +1401,8 @@ pub fn render_timeline(timeline: &[Step]) -> String {
                     .map(|(message_type, _)| message_type
                         .trim_start_matches("MESSAGE_TYPE_RNDR_SRVR_"))
                     .collect::<Vec<_>>(),
+                step.cursor_track,
+                step.audible_track,
                 step.engine_calls,
                 if step.echo_engine_calls.is_empty() {
                     String::new()
