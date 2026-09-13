@@ -448,6 +448,26 @@ impl QconnectRendererEngine for DaemonRendererEngine {
             });
         }
 
+        // Ask the cache before the network. This path did not, which made the
+        // daemon fill a cache its primary route never read: the driver writes
+        // L1/L2 on a natural advance, and then a `previous` tap from the phone
+        // — which arrives here, not there — re-downloaded a track already on
+        // the card. The L2 directory on the test Pi was empty for exactly this
+        // reason.
+        //
+        // Done before `abort_current_feeder` and before the buffering latch is
+        // armed: a cache hit is audible almost immediately and has no feeder,
+        // so neither is needed. `Loading` has already been emitted above, which
+        // is what frees the card on moOde, and that must still happen.
+        {
+            let player = self.core().player();
+            if player.play_cached_if_present(track_id, quality, start_position_secs) {
+                self.abort_current_feeder();
+                log::info!("[QConnect] Track {track_id} served from the cache — no stream needed");
+                return Ok(());
+            }
+        }
+
         let stream_url = self
             .core()
             .get_stream_url(track_id, quality)

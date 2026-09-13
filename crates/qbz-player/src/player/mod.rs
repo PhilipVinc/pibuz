@@ -4707,30 +4707,22 @@ impl Player {
         self.state.is_current_play(gen)
     }
 
-    /// Play a track by ID.
+    /// L1 then L2 for `track_id`, honouring the quality gate.
     ///
-    /// First attempts the CMAF streaming pipeline (Akamai CDN, encrypted
-    /// segments): only the init segment is fetched synchronously to derive
-    /// stream parameters, playback starts immediately, and audio segments are
-    /// fetched + decrypted + pushed to the streaming buffer in a background
-    /// task. If the CMAF setup fails for any reason, falls back to the legacy
-    /// `/track/getFileUrl` path (full FLAC download, then `play_data`).
-    pub async fn play_track(
+    /// `Some(_)` means this call has handled the play — the caller must not go
+    /// to the network. `None` means neither tier could serve it.
+    ///
+    /// Factored out of `play_track` so the CAST path can use the same ladder.
+    /// It could not before: `start_track_stream` went straight to
+    /// `get_stream_url`, so pressing previous in the Qobuz app re-downloaded a
+    /// track the driver had already written to the card on the way past.
+    fn try_play_cached(
         &self,
-        client: &QobuzClient,
         track_id: u64,
         quality: Quality,
         start_position_secs: u64,
-    ) -> Result<(), String> {
-        // Supersede any earlier in-flight play_track for a different intent.
-        let gen = self.begin_play();
-        log::info!(
-            "Player: Starting playback for track {} with quality {:?} (start {}s, gen {gen})",
-            track_id,
-            quality,
-            start_position_secs
-        );
-
+        gen: u64,
+    ) -> Option<Result<(), String>> {
         // Cache hit: replay instantly from L1/L2 unless the cached copy is
         // a lower quality than now requested.
         if let Some(cached) = self.audio_cache.get(track_id) {
@@ -4745,7 +4737,7 @@ impl Player {
                     log::info!(
                         "Player: cache-hit play for track {track_id} superseded (gen {gen})"
                     );
-                    return Ok(());
+                    return Some(Ok(()));
                 }
                 log::info!(
                     "[CACHE HIT] Track {} ({} bytes) — playing from cache",
@@ -4760,7 +4752,7 @@ impl Player {
                 if r.is_ok() && start_position_secs > 0 && self.is_current_play(gen) {
                     let _ = self.seek(start_position_secs);
                 }
-                return r;
+                return Some(r);
             }
         }
 
@@ -4795,7 +4787,7 @@ impl Player {
             if head_ok {
                 if !self.is_current_play(gen) {
                     log::info!("Player: L2-hit play for track {track_id} superseded (gen {gen})");
-                    return Ok(());
+                    return Some(Ok(()));
                 }
                 match self.apply_play_file(&path, track_id) {
                     Ok(()) => {
@@ -4807,7 +4799,7 @@ impl Player {
                         if start_position_secs > 0 && self.is_current_play(gen) {
                             let _ = self.seek(start_position_secs);
                         }
-                        return Ok(());
+                        return Some(Ok(()));
                     }
                     // A file we cannot decode is not a reason to fail the play:
                     // fall through to the network exactly as before.
@@ -4820,6 +4812,83 @@ impl Player {
                     "[CACHE] Track {track_id} on disk is below the requested {quality:?} — re-fetching"
                 );
             }
+        }
+
+        None
+    }
+
+    /// The disk cache a streaming feeder may tee into, when settings allow it
+    /// and the track is not already there.
+    ///
+    /// `None` under `streaming_only`, when no L2 is configured
+    /// (`audio.cache_to_disk false`), or when the track is already on the card
+    /// — writing it again would be pure SD wear for no gain.
+    pub fn disk_cache_for_streaming(&self, track_id: u64) -> Option<Arc<qbz_cache::PlaybackCache>> {
+        let streaming_only = self
+            .audio_settings
+            .lock()
+            .map(|s| s.streaming_only)
+            .unwrap_or(false);
+        if streaming_only {
+            return None;
+        }
+        let l2 = self.audio_cache.get_playback_cache()?.clone();
+        if l2.path_if_present(track_id).is_some() {
+            return None;
+        }
+        Some(l2)
+    }
+
+    /// Start `track_id` from the cache if either tier has it at an acceptable
+    /// quality. Returns whether playback was started.
+    ///
+    /// The entry point for callers that own their own fetch path — the
+    /// QConnect renderer — and want the cache consulted first.
+    pub fn play_cached_if_present(
+        &self,
+        track_id: u64,
+        quality: Quality,
+        start_position_secs: u64,
+    ) -> bool {
+        let gen = self.begin_play();
+        match self.try_play_cached(track_id, quality, start_position_secs, gen) {
+            Some(Ok(())) => true,
+            Some(Err(e)) => {
+                log::warn!("[CACHE] Track {track_id} failed to start from cache: {e}");
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Play a track by ID.
+    ///
+    /// First attempts the CMAF streaming pipeline (Akamai CDN, encrypted
+    /// segments): only the init segment is fetched synchronously to derive
+    /// stream parameters, playback starts immediately, and audio segments are
+    /// fetched + decrypted + pushed to the streaming buffer in a background
+    /// task. If the CMAF setup fails for any reason, falls back to the legacy
+    /// `/track/getFileUrl` path (full FLAC download, then `play_data`).
+    pub async fn play_track(
+        &self,
+        client: &QobuzClient,
+        track_id: u64,
+        quality: Quality,
+        start_position_secs: u64,
+    ) -> Result<(), String> {
+        // Supersede any earlier in-flight play_track for a different intent.
+        let gen = self.begin_play();
+        log::info!(
+            "Player: Starting playback for track {} with quality {:?} (start {}s, gen {gen})",
+            track_id,
+            quality,
+            start_position_secs
+        );
+
+        // Cache hit: L1 then L2, unless the cached copy is below the quality
+        // now requested.
+        if let Some(done) = self.try_play_cached(track_id, quality, start_position_secs, gen) {
+            return done;
         }
 
         // `streaming_only` suppresses writing the track into the cache.
