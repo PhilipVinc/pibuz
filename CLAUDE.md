@@ -152,10 +152,18 @@ and it gates four production behaviours.** Anything that calls it in a test gets
 runs is the one that never executes. Do not reach for a settable global: the
 cases share a process, so whichever test set it first would decide for all of
 them. Pass the class instead, as `release_finished_track_on` /
-`release_finished_track_from` and `should_promote_streaming_buffer` now do. Two
-behaviours still read the singleton directly and have no coverage for that
-reason: `allow_gapless_prefetch` and the engine's `pcm_ring_seconds` (so even the
-audio behaviour tests build a 6 s ring, never the Pi's 2 s one).
+`release_finished_track_from` and `should_promote_streaming_buffer` now do.
+
+The ring depth is NOT one of these, despite reading the same singleton: the
+sizing lives in the pure `qbz_audio::pcm_ring::ring_capacity_frames`, which takes
+both the override and the profile's seconds as arguments, and
+`auto_takes_the_hosts_profile` already pins 6 s for a Normal board and 2 s for a
+low-memory one. Running the ENGINE at 2 s would test no new logic — the fill,
+drain and boundary handling are depth-independent; what a shallower ring changes
+is how long the decoder may stall before the ring runs dry, and no test can
+settle that honestly, because it depends on real decode speed and real I/O.
+`allow_gapless_prefetch` is the one behaviour still gated on the singleton with
+no coverage.
 
 Assert `Arc::strong_count`, not just byte totals. A residency leak here IS one
 extra live `TrackBytes` clone, so "the release dropped the last reference" is a
