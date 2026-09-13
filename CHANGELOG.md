@@ -3,7 +3,7 @@
 Notable changes per release. Versions are plain semver; releases are `vX.Y.Z`
 tags on `main`.
 
-## 2.3.1 — unreleased
+## 2.3.2 — unreleased
 
 Bounded streaming. Verified on a 905 MB Pi 3B against a live Qobuz Connect
 session: the held buffer stays at 2.9 MB where it used to grow to the whole
@@ -50,6 +50,19 @@ is paced at the track's own byte-rate instead of the link's.
   metadata accessors, and a reader may re-request any region the window threw
   away, with the feeder staying up to serve it instead of exiting once the file
   has been walked.
+- **A seek reports its position within the track, not within the source.** A
+  cached track played from an offset used to start the clock at zero and seek
+  afterwards, so the controller saw a position below the one it asked for and
+  spun until it caught up. It now starts where it was asked to, which also
+  stops it decoding the whole song to throw the result away.
+- **The disk cache is usable again.** A quality gate demanded more than 96 kHz
+  for the Hi-Res+ tier, which most hi-res masters do not have, so every cached
+  copy of such a track was refused and re-downloaded forever.
+- **The cast path keeps the controller in step.** A track served from the cache
+  no longer lets a stale report for the outgoing track reach the controller,
+  which showed as the artwork flicking to the previous song.
+- **A gapless successor whose track was skipped past is discarded** rather than
+  queued, which used to send the player backwards through the queue.
 - **Gapless is no longer refused for the whole track.** A third gate was keyed
   on the download being complete, which a bounded window makes false until the
   very end; the prefetch ran, succeeded, and was discarded at every hand-off.
