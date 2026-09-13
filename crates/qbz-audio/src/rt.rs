@@ -107,6 +107,72 @@ pub fn clamp_rt_priority(requested: i32, min: i32, max: i32) -> i32 {
     requested.clamp(min, max)
 }
 
+/// Try to raise this process's `RLIMIT_RTPRIO` to at least `wanted`.
+///
+/// Returns `None` on success (including "already high enough"), or the reason
+/// it could not.
+///
+/// This is what makes the promotion work where qbzd is actually deployed.
+/// moOde does not use the shipped systemd unit: `renderer.php` launches
+/// `qbzd run &` as a bare background process, which inherits the invoking
+/// shell's `RLIMIT_RTPRIO` — measured as **0** on the test Pi. With that, the
+/// `LimitRTPRIO=20` in the unit is irrelevant and `pthread_setschedparam`
+/// returns EPERM, so the writer silently stayed on the ordinary scheduler.
+///
+/// Raising the HARD limit needs `CAP_SYS_RESOURCE`. moOde's `sysCmd` shells
+/// out through `sudo`, so the daemon is root there and has it. Where it does
+/// not, we still try to raise the SOFT limit up to whatever hard limit exists,
+/// which any process may do unprivileged — that is the case a `limits.d` entry
+/// or a system unit sets up. Both failing is not an error: the caller logs and
+/// carries on at normal priority.
+#[cfg(target_os = "linux")]
+fn ensure_rtprio_rlimit(wanted: u32) -> Option<String> {
+    // SAFETY: `getrlimit` writes a plain C struct of two integers into the
+    // pointer we own; all-zero is a valid starting value for it.
+    let mut lim: libc::rlimit = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrlimit(libc::RLIMIT_RTPRIO, &mut lim) } != 0 {
+        return Some(format!(
+            "cannot read RLIMIT_RTPRIO: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let wanted = libc::rlim_t::from(wanted);
+    if lim.rlim_cur >= wanted {
+        return None;
+    }
+
+    // Privileged path: raise both halves. Needs CAP_SYS_RESOURCE.
+    let raised = libc::rlimit {
+        rlim_cur: wanted.max(lim.rlim_cur),
+        rlim_max: wanted.max(lim.rlim_max),
+    };
+    // SAFETY: same plain struct, passed by const pointer; the kernel copies it.
+    if unsafe { libc::setrlimit(libc::RLIMIT_RTPRIO, &raised) } == 0 {
+        return None;
+    }
+
+    // Unprivileged path: soft up to the existing hard limit. Pointless when
+    // the hard limit is already 0, which is exactly the bare-process case, but
+    // it costs one syscall and covers every host that DID configure limits.
+    if lim.rlim_max > lim.rlim_cur {
+        let soft_only = libc::rlimit {
+            rlim_cur: wanted.min(lim.rlim_max),
+            rlim_max: lim.rlim_max,
+        };
+        // SAFETY: as above.
+        if unsafe { libc::setrlimit(libc::RLIMIT_RTPRIO, &soft_only) } == 0 {
+            return None;
+        }
+    }
+
+    Some(format!(
+        "RLIMIT_RTPRIO is {}/{} and could not be raised ({})",
+        lim.rlim_cur,
+        lim.rlim_max,
+        std::io::Error::last_os_error()
+    ))
+}
+
 /// Promote the CALLING thread to `SCHED_FIFO` at `priority`.
 ///
 /// `priority == 0` is "leave it alone" and returns [`RtOutcome::Disabled`].
@@ -132,6 +198,13 @@ pub fn promote_current_thread(priority: u8) -> RtOutcome {
     }
     let wanted = clamp_rt_priority(i32::from(priority), min, max);
 
+    // Ask for the rlimit headroom BEFORE asking for the policy change: on the
+    // deployment that matters the daemon is root and can simply grant itself
+    // what the unit would have granted it. A failure here is not fatal — the
+    // promotion below may still succeed on a host that configured limits, and
+    // if it does not, its EPERM is the message the user sees.
+    let rlimit_note = ensure_rtprio_rlimit(wanted.max(0) as u32);
+
     // `sched_param` has private padding on some targets, so build it from the
     // zeroed representation rather than naming every field.
     // SAFETY: `sched_param` is a plain C struct of integers; all-zero is a
@@ -147,7 +220,11 @@ pub fn promote_current_thread(priority: u8) -> RtOutcome {
     if rc == 0 {
         RtOutcome::Promoted(wanted)
     } else {
-        RtOutcome::Refused(std::io::Error::from_raw_os_error(rc).to_string())
+        let why = std::io::Error::from_raw_os_error(rc).to_string();
+        RtOutcome::Refused(match rlimit_note {
+            Some(note) => format!("{why} ({note})"),
+            None => why,
+        })
     }
 }
 
@@ -183,17 +260,65 @@ pub fn promote_writer_thread_and_log() -> RtOutcome {
                 log::info!(
                     "[Audio RT] writer thread stays at normal priority: {why}. Playback is \
                      unaffected — this only costs resilience to scheduling delay on a busy \
-                     host. qbzd runs as a systemd USER unit, and `LimitRTPRIO=` there cannot \
-                     exceed the limit the user manager inherited (0 on stock Raspberry Pi OS), \
-                     so the unit alone is not enough: add `DefaultLimitRTPRIO=20` to \
-                     /etc/systemd/user.conf and run `systemctl --user daemon-reexec`, or put \
-                     the user in the `audio` group with an `@audio - rtprio 20` line in \
-                     /etc/security/limits.d/. Set `audio.writer_rt_priority off` to stop trying."
+                     host. qbzd already tried to raise its own RLIMIT_RTPRIO, which works \
+                     when it has CAP_SYS_RESOURCE (it does when started through sudo, as \
+                     moOde does); this message means it does not. Either start the daemon \
+                     with that capability, or grant the limit externally: `LimitRTPRIO=20` \
+                     in a SYSTEM unit, or an `@audio - rtprio 20` line in \
+                     /etc/security/limits.d/ with the user in the `audio` group. In a \
+                     systemd USER unit `LimitRTPRIO=` cannot exceed what the user manager \
+                     inherited (0 on stock Raspberry Pi OS), so add `DefaultLimitRTPRIO=20` \
+                     to /etc/systemd/user.conf and `systemctl --user daemon-reexec`. Set \
+                     `audio.writer_rt_priority off` to stop trying."
                 );
             }
         }
     }
     outcome
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_rt_tests {
+    use super::*;
+
+    /// The promotion must either take effect or say why — never claim success
+    /// it did not get.
+    ///
+    /// Asserted through the kernel rather than through our own return value:
+    /// `sched_getscheduler` is the only thing that knows. Privilege-agnostic on
+    /// purpose, because CI is unprivileged and the daemon on moOde is root, and
+    /// both have to pass.
+    #[test]
+    fn a_promotion_that_claims_success_really_changed_the_policy() {
+        let outcome = promote_current_thread(DEFAULT_WRITER_RT_PRIORITY);
+        // SAFETY: takes a pid (0 = calling thread) and returns an integer.
+        let policy = unsafe { libc::sched_getscheduler(0) };
+        match outcome {
+            RtOutcome::Promoted(p) => {
+                assert_eq!(
+                    policy,
+                    libc::SCHED_FIFO,
+                    "reported Promoted({p}) but the scheduler says {policy}"
+                );
+            }
+            RtOutcome::Refused(_) | RtOutcome::Disabled => {
+                assert_ne!(
+                    policy,
+                    libc::SCHED_FIFO,
+                    "did not report a promotion but the thread is SCHED_FIFO"
+                );
+            }
+        }
+    }
+
+    /// Asking for headroom we already have is a no-op, not a failure.
+    #[test]
+    fn an_rlimit_that_is_already_high_enough_is_left_alone() {
+        assert!(
+            ensure_rtprio_rlimit(0).is_none(),
+            "zero is always already satisfied"
+        );
+    }
 }
 
 #[cfg(test)]
