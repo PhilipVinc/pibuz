@@ -10,9 +10,11 @@
 //! Uses a dedicated audio thread since rodio's OutputStream is not Send.
 //! Supports both rodio (PipeWire/Pulse) and direct ALSA (hw: devices).
 
+mod disk_tee;
 mod playback_engine;
 mod streaming_source;
 
+pub use disk_tee::DiskTee;
 pub use streaming_source::{
     max_initial_buffer_bytes, set_max_initial_buffer_bytes, BufferWriter, BufferedMediaSource,
     FetchPlan, InMemorySource, IncrementalStreamingSource, StreamSeekMode, StreamingConfig,
