@@ -3,6 +3,10 @@
 //! Application adapter that composes qconnect core + protocol + transport.
 
 mod app;
+#[cfg(test)]
+mod controller_harness;
+#[cfg(test)]
+mod controller_sync_tests;
 mod error;
 mod events;
 mod feature_flags;
