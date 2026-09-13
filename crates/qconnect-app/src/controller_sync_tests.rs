@@ -10,7 +10,7 @@
 //! by every case at once, and a case written for one bug catches the next one
 //! for free.
 
-use qbz_models::RepeatMode;
+use qbz_models::{Quality, RepeatMode};
 
 use super::controller_harness::{
     ControllerHarness, EngineCall, ReportTick, Transport, BUFFER_STATE_BUFFERING,
@@ -44,7 +44,8 @@ async fn tapping_a_track_starts_it_once_and_settles_the_screen() {
         streams,
         vec![EngineCall::StartStream {
             track_id: 101,
-            start_secs: 0
+            start_secs: 0,
+            quality: Quality::UltraHiRes,
         }],
         "one tap must open exactly one stream; timeline:\n{}",
         harness.rendered_timeline()
@@ -733,7 +734,8 @@ async fn a_takeback_load_at_a_position_is_not_seeked_on_top_of() {
     assert!(
         harness.engine_calls().contains(&EngineCall::StartStream {
             track_id: 202,
-            start_secs: 77
+            start_secs: 77,
+            quality: Quality::UltraHiRes,
         }),
         "the takeback must stream from the peer's position, not from zero; timeline:\n{}",
         harness.rendered_timeline()
@@ -765,7 +767,8 @@ async fn a_track_change_without_a_position_starts_at_the_beginning() {
     assert!(
         harness.engine_calls().contains(&EngineCall::StartStream {
             track_id: 102,
-            start_secs: 0
+            start_secs: 0,
+            quality: Quality::UltraHiRes,
         }),
         "a new track with no stated position starts at 0, not at the previous \
          track's 96 s; timeline:\n{}",
@@ -984,6 +987,53 @@ async fn tapping_shuffle_flips_the_flag_without_inventing_an_order() {
             .iter()
             .any(|call| matches!(call, EngineCall::SetShuffleWithLocalOrder { .. })),
         "the order-generating call must never be reached from here"
+    );
+    harness.assert_invariants();
+}
+
+/// The quality ceiling the controller announces is the quality the stream is
+/// opened at.
+///
+/// This is the one setting on this path with no audible failure mode. If the
+/// ceiling is dropped and the stream defaults to the top, everything works —
+/// music plays, the screen is right — and a user who chose CD quality to spare
+/// a metered connection silently gets Hi-Res. If it is dropped the other way,
+/// a Hi-Res subscriber silently gets MP3. Neither shows up anywhere except the
+/// bandwidth bill and the sound.
+#[tokio::test]
+async fn the_announced_quality_ceiling_is_what_the_stream_opens_at() {
+    let harness = ControllerHarness::new().await;
+    harness.become_active_renderer().await;
+
+    // The controller announces CD quality before naming a track, as it does on
+    // join.
+    harness.controller().set_max_audio_quality(2).await;
+    harness.controller().push_queue_and_play(&TRACKS, 0).await;
+
+    assert!(
+        harness.engine_calls().contains(&EngineCall::StartStream {
+            track_id: 101,
+            start_secs: 0,
+            quality: Quality::Lossless,
+        }),
+        "a stated ceiling of CD must open a CD stream, not the default top; \
+         timeline:\n{}",
+        harness.rendered_timeline()
+    );
+
+    // Raising the ceiling applies to the next track, not retroactively.
+    harness.controller().set_max_audio_quality(4).await;
+    harness.let_the_load_windows_expire();
+    harness.controller().tap_next_track(102, Some(103)).await;
+
+    assert!(
+        harness.engine_calls().contains(&EngineCall::StartStream {
+            track_id: 102,
+            start_secs: 0,
+            quality: Quality::UltraHiRes,
+        }),
+        "the raised ceiling must reach the next stream; timeline:\n{}",
+        harness.rendered_timeline()
     );
     harness.assert_invariants();
 }

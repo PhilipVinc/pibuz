@@ -88,6 +88,12 @@ pub enum EngineCall {
     StartStream {
         track_id: u64,
         start_secs: u64,
+        /// The quality the stream was opened at. Recorded, not discarded: the
+        /// controller announces a ceiling and the renderer has to honour it,
+        /// and a fake that drops the argument cannot tell honouring it from
+        /// defaulting to the top — which on the bit-perfect path is the
+        /// difference between passthrough and a silent resample.
+        quality: Quality,
     },
     PlayIndex {
         index: usize,
@@ -401,13 +407,14 @@ impl QconnectRendererEngine for FakeEngine {
     async fn start_track_stream(
         &self,
         track_id: u64,
-        _quality: Quality,
+        quality: Quality,
         duration_secs: u64,
         start_position_secs: u64,
     ) -> Result<(), String> {
         self.record(EngineCall::StartStream {
             track_id,
             start_secs: start_position_secs,
+            quality,
         });
         let mut player = self.player.lock().expect("fake player");
         let duration_ms = if duration_secs > 0 {
@@ -870,6 +877,19 @@ impl VirtualController {
                 vec![renderer_command(
                     RendererCommandType::SrvrRndrSetVolume,
                     json!({ "volume_delta": delta }),
+                )]
+            })
+            .await;
+    }
+
+    /// Announce the ceiling for stream quality. The controller sends this on
+    /// join and whenever the user changes the streaming-quality preference.
+    pub async fn set_max_audio_quality(&self, level: i32) {
+        self.harness
+            .step(&format!("max audio quality {level}"), |_| {
+                vec![renderer_command(
+                    RendererCommandType::SrvrRndrSetMaxAudioQuality,
+                    json!({ "max_audio_quality": level }),
                 )]
             })
             .await;
