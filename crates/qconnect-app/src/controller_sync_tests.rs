@@ -10,6 +10,8 @@
 //! by every case at once, and a case written for one bug catches the next one
 //! for free.
 
+use qbz_models::RepeatMode;
+
 use super::controller_harness::{
     ControllerHarness, EngineCall, ReportTick, Transport, BUFFER_STATE_BUFFERING,
 };
@@ -916,5 +918,72 @@ async fn a_re_emitted_state_during_a_load_does_not_open_a_second_stream() {
     harness.audio_thread_catches_up();
     assert_eq!(harness.engine().snapshot().track_id, 102);
     assert_eq!(harness.engine().snapshot().position, 0);
+    harness.assert_invariants();
+}
+
+// ====================================================== modes the cloud owns
+
+/// Repeat mode from the controller reaches the player, with the right meaning.
+///
+/// The wire values are 1 = off, 2 = repeat one, 3 = repeat all, and a renderer
+/// that maps them by position rather than by value turns "repeat all" into
+/// "repeat one" — the queue plays one song forever and the user cannot see why.
+#[tokio::test]
+async fn the_controllers_repeat_mode_reaches_the_player_with_its_meaning_intact() {
+    let harness = ControllerHarness::new().await;
+    harness.become_active_renderer().await;
+    harness.controller().push_queue_and_play(&TRACKS, 0).await;
+
+    harness.controller().set_loop_mode(3).await;
+    assert!(
+        harness.engine_calls().contains(&EngineCall::SetRepeatMode {
+            mode: RepeatMode::All
+        }),
+        "loop_mode 3 is repeat-ALL; timeline:\n{}",
+        harness.rendered_timeline()
+    );
+
+    harness.controller().set_loop_mode(2).await;
+    assert_eq!(
+        harness.engine_calls().last(),
+        Some(&EngineCall::SetRepeatMode {
+            mode: RepeatMode::One
+        }),
+        "loop_mode 2 is repeat-ONE; timeline:\n{}",
+        harness.rendered_timeline()
+    );
+    harness.assert_invariants();
+}
+
+/// Tapping shuffle flips the FLAG and nothing else.
+///
+/// QConnect is WS-authoritative for queue order: the cloud decides what the
+/// shuffled order is and sends it separately. A renderer that reaches for the
+/// order-generating call here invents its own random order, and the phone and
+/// the speakers then disagree about what plays next for the rest of the
+/// session — the documented "es un infierno" failure.
+#[tokio::test]
+async fn tapping_shuffle_flips_the_flag_without_inventing_an_order() {
+    let harness = ControllerHarness::new().await;
+    harness.become_active_renderer().await;
+    harness.controller().push_queue_and_play(&TRACKS, 0).await;
+
+    let before = harness.engine_calls().len();
+    harness.controller().set_shuffle(true).await;
+
+    let after: Vec<_> = harness.engine_calls().into_iter().skip(before).collect();
+    assert_eq!(
+        after,
+        vec![EngineCall::SetShuffleFlag { enabled: true }],
+        "shuffle must set the flag alone — anything that generates a local \
+         order diverges from the cloud for good; timeline:\n{}",
+        harness.rendered_timeline()
+    );
+    assert!(
+        !after
+            .iter()
+            .any(|call| matches!(call, EngineCall::SetShuffleWithLocalOrder { .. })),
+        "the order-generating call must never be reached from here"
+    );
     harness.assert_invariants();
 }

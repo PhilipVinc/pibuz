@@ -79,15 +79,43 @@ pub enum EngineCall {
     Resume,
     Pause,
     Stop,
-    Seek { position_secs: u64 },
-    SetVolume { pct: i32 },
-    StartStream { track_id: u64, start_secs: u64 },
-    PlayIndex { index: usize },
-    SetQueue { len: usize, start: Option<usize> },
-    SetQueueWithOrder { len: usize, shuffle: bool },
-    ClearQueue { keep_current: bool },
-    SetRepeatMode,
-    SetShuffleFlag { enabled: bool },
+    Seek {
+        position_secs: u64,
+    },
+    SetVolume {
+        pct: i32,
+    },
+    StartStream {
+        track_id: u64,
+        start_secs: u64,
+    },
+    PlayIndex {
+        index: usize,
+    },
+    SetQueue {
+        len: usize,
+        start: Option<usize>,
+    },
+    SetQueueWithOrder {
+        len: usize,
+        shuffle: bool,
+    },
+    ClearQueue {
+        keep_current: bool,
+    },
+    SetRepeatMode {
+        mode: RepeatMode,
+    },
+    /// The flag only. QConnect is WS-authoritative for order.
+    SetShuffleFlag {
+        enabled: bool,
+    },
+    /// The ORDER-GENERATING call. Distinct from `SetShuffleFlag` on purpose:
+    /// folding the two together makes the rule that the renderer must never
+    /// invent a local random order impossible to state, let alone assert.
+    SetShuffleWithLocalOrder {
+        enabled: bool,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -309,12 +337,12 @@ impl QconnectRendererEngine for FakeEngine {
         self.player.lock().expect("fake player").loaded_audio
     }
 
-    async fn set_repeat_mode(&self, _mode: RepeatMode) {
-        self.record(EngineCall::SetRepeatMode);
+    async fn set_repeat_mode(&self, mode: RepeatMode) {
+        self.record(EngineCall::SetRepeatMode { mode });
     }
 
     async fn set_shuffle(&self, enabled: bool) {
-        self.record(EngineCall::SetShuffleFlag { enabled });
+        self.record(EngineCall::SetShuffleWithLocalOrder { enabled });
     }
 
     async fn set_shuffle_flag(&self, enabled: bool) {
@@ -842,6 +870,31 @@ impl VirtualController {
                 vec![renderer_command(
                     RendererCommandType::SrvrRndrSetVolume,
                     json!({ "volume_delta": delta }),
+                )]
+            })
+            .await;
+    }
+
+    /// Set the repeat mode from the controller. 1 = off, 2 = one, 3 = all.
+    pub async fn set_loop_mode(&self, loop_mode: i32) {
+        self.harness
+            .step(&format!("loop mode {loop_mode}"), |_| {
+                vec![renderer_command(
+                    RendererCommandType::SrvrRndrSetLoopMode,
+                    json!({ "loop_mode": loop_mode }),
+                )]
+            })
+            .await;
+    }
+
+    /// Tap shuffle. The cloud owns the resulting ORDER and sends it separately;
+    /// this frame carries the flag alone.
+    pub async fn set_shuffle(&self, shuffle_mode: bool) {
+        self.harness
+            .step(&format!("shuffle {shuffle_mode}"), |_| {
+                vec![renderer_command(
+                    RendererCommandType::SrvrRndrSetShuffleMode,
+                    json!({ "shuffle_mode": shuffle_mode }),
                 )]
             })
             .await;
