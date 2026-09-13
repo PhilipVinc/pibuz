@@ -280,8 +280,12 @@ struct BufferState {
     ///
     /// Only readers that have performed a read appear here. That matters: the
     /// original `BufferedMediaSource` is kept alive as a handle to mint readers
-    /// from and never reads a byte itself, so counting it would pin the trim
-    /// window at offset 0 and the cap would never do anything.
+    /// from and never reads a byte itself, so counting it would anchor any
+    /// window measurement at offset 0 and nothing keyed on it would ever fire.
+    ///
+    /// Nothing reads this yet — it is the anchor the bounded streaming window
+    /// needs, kept from the reverted `max_buffer_bytes` trim so the next change
+    /// does not have to rediscover the distinction above.
     reader_positions: std::collections::HashMap<u64, u64>,
 }
 
@@ -361,56 +365,6 @@ impl BufferState {
     fn begin(&mut self, offset: u64) {
         self.range_start = offset;
         self.write_pos = offset;
-    }
-
-    /// Drop buffered bytes that every live reader has moved well past, so the
-    /// held buffer stays under `max_buffer_bytes`.
-    ///
-    /// # Why this exists
-    ///
-    /// `max_buffer_bytes` was a field nobody read: set to 100 MB, asserted in
-    /// one test, and never consulted. The buffer therefore held the WHOLE
-    /// track — 120-220 MB at Hi-Res, by this file's own reckoning — beside a
-    /// 153 MB L1 cache, on boards with 512-905 MB of RAM. A cap that does not
-    /// exist is worse than no cap, because the code reads as though it is
-    /// bounded.
-    ///
-    /// # Why it is safe to throw bytes away
-    ///
-    /// Only under `RangeRequests`, where a reader that later jumps back into a
-    /// trimmed region finds a hole, `should_request` fires, and the feeder
-    /// re-opens there — the same machinery a forward seek already uses.
-    /// A `Sequential` stream (CMAF) has no way to re-fetch, so it is never
-    /// trimmed and keeps its old behaviour exactly.
-    ///
-    /// `SEEK_LOOKBEHIND_BYTES` of slack stays behind the slowest reader so the
-    /// short backward seeks a decoder makes on its own never force a refetch.
-    fn trim_behind_readers(&mut self, max_buffer_bytes: usize) {
-        if self.seek_mode != StreamSeekMode::RangeRequests {
-            return;
-        }
-        if self.downloaded() <= max_buffer_bytes as u64 {
-            return;
-        }
-        let Some(slowest) = self.reader_positions.values().copied().min() else {
-            return;
-        };
-        let keep_from = slowest.saturating_sub(SEEK_LOOKBEHIND_BYTES);
-        if keep_from == 0 {
-            return;
-        }
-        self.segments.retain_mut(|seg| {
-            if seg.end() <= keep_from {
-                return false; // wholly behind the window
-            }
-            if seg.offset < keep_from {
-                // Straddles it: drop the prefix, keep the tail.
-                let cut = (keep_from - seg.offset) as usize;
-                seg.data.drain(..cut);
-                seg.offset = keep_from;
-            }
-            true
-        });
     }
 
     /// Merge `chunk` in at `offset`, keeping runs sorted and disjoint.
@@ -853,7 +807,6 @@ impl Read for BufferedMediaSource {
                 let next = read_pos + to_read as u64;
                 self.read_pos.store(next, Ordering::SeqCst);
                 state.reader_positions.insert(self.reader_id, next);
-                state.trim_behind_readers(self.config.max_buffer_bytes);
                 return Ok(to_read);
             }
 
@@ -1957,101 +1910,6 @@ mod tests {
         assert_eq!(source.primary_offset(), target);
         assert_eq!(source.head_bytes(), 1024);
         assert_eq!(source.buffer_size(), 1024 + 4);
-    }
-
-    /// THE CAP IS REAL. `max_buffer_bytes` was a field nobody read, so the
-    /// buffer grew to the whole track: 120-220 MB at Hi-Res, on a board with
-    /// 512-905 MB, beside a 153 MB L1 cache. This is the bound.
-    ///
-    /// Drive a reader forward through far more than the cap and assert the
-    /// held buffer stays near it rather than tracking the download.
-    #[test]
-    fn the_buffer_stays_under_its_cap_as_the_reader_advances() {
-        const CAP: usize = 256 * 1024;
-        const CHUNK: usize = 64 * 1024;
-        const TOTAL: u64 = 4 * 1024 * 1024;
-        let config = StreamingConfig {
-            initial_buffer_bytes: 1024,
-            max_buffer_bytes: CAP,
-        };
-        let (source, writer) = BufferedMediaSource::new_seekable(config, Some(TOTAL));
-        let mut reader = source.create_reader();
-
-        let mut consumed = 0u64;
-        let mut buf = vec![0u8; CHUNK];
-        while consumed < TOTAL {
-            writer.push_chunk(&vec![7u8; CHUNK]).unwrap();
-            reader.read_exact(&mut buf).unwrap();
-            consumed += CHUNK as u64;
-            assert!(
-                source.buffer_size() as u64 <= CAP as u64 + SEEK_LOOKBEHIND_BYTES + CHUNK as u64,
-                "buffer grew to {} bytes after {consumed} consumed — the cap is not being \
-                 enforced, and a Hi-Res track will take the whole file into RAM",
-                source.buffer_size()
-            );
-        }
-        // And it really did stay small rather than never filling.
-        assert!(
-            (source.buffer_size() as u64) < TOTAL / 2,
-            "nothing was trimmed at all"
-        );
-    }
-
-    /// The trim must not cost a decoder its ordinary short backward seeks:
-    /// `SEEK_LOOKBEHIND_BYTES` behind the reader is always kept.
-    #[test]
-    fn a_short_seek_back_still_reads_from_memory_after_a_trim() {
-        const CAP: usize = 128 * 1024;
-        let config = StreamingConfig {
-            initial_buffer_bytes: 1024,
-            max_buffer_bytes: CAP,
-        };
-        let (source, writer) = BufferedMediaSource::new_seekable(config, Some(8 * 1024 * 1024));
-        let mut reader = source.create_reader();
-
-        for _ in 0..40 {
-            writer.push_chunk(&vec![3u8; 64 * 1024]).unwrap();
-        }
-        let mut buf = vec![0u8; 64 * 1024];
-        for _ in 0..30 {
-            reader.read_exact(&mut buf).unwrap();
-        }
-        let pos = reader.stream_position().unwrap();
-
-        // Half the lookbehind back: still buffered, so no refetch is posted.
-        reader
-            .seek(SeekFrom::Start(pos - SEEK_LOOKBEHIND_BYTES / 2))
-            .unwrap();
-        let mut one = [0u8; 1];
-        reader.read_exact(&mut one).unwrap();
-        assert_eq!(one[0], 3);
-        assert!(
-            writer.take_request().is_none(),
-            "a seek inside the lookbehind window must not force a range re-request"
-        );
-    }
-
-    /// A sequential stream cannot re-fetch what it drops, so it is never
-    /// trimmed — CMAF keeps exactly its old behaviour.
-    #[test]
-    fn a_sequential_stream_is_never_trimmed() {
-        const CAP: usize = 64 * 1024;
-        let config = StreamingConfig {
-            initial_buffer_bytes: 1024,
-            max_buffer_bytes: CAP,
-        };
-        // `new` is the Sequential constructor.
-        let (source, writer) = BufferedMediaSource::new(config, Some(1024 * 1024));
-        let mut reader = source.create_reader();
-        let mut buf = vec![0u8; 64 * 1024];
-        for _ in 0..8 {
-            writer.push_chunk(&vec![9u8; 64 * 1024]).unwrap();
-            reader.read_exact(&mut buf).unwrap();
-        }
-        assert!(
-            source.buffer_size() > CAP * 4,
-            "a sequential stream has no way to re-fetch a trimmed range; it must keep everything"
-        );
     }
 
     #[test]
