@@ -177,9 +177,16 @@ pub fn cascade_on_backend_change(a: &mut StagedAudio) {
     if a.backend != AudioBackendType::Alsa {
         a.exclusive_mode = false; // item 5
     }
-    if a.backend == AudioBackendType::Alsa {
-        a.gapless_enabled = false; // item 6
-    }
+    // §3.2.3 item 6 used to force gapless off on the ALSA backend. Removed:
+    // ALSA is the bit-perfect path this daemon exists to serve, moOde pushes
+    // `audio.gapless_enabled true` on every start, and this cascade silently
+    // undid that for anyone who opened this screen and touched Backend.
+    //
+    // The hazard it was standing in for — a hand-off between tracks of
+    // different sample rate or channel count on a device opened exclusively —
+    // is already refused, per track, by the format gate in the player's
+    // `PlayNext` handler. That guard is narrower and correct; this one was a
+    // whole feature off for a case that cannot arise.
     a.output_device = None; // item 7: never carry the old backend's device id
 }
 
@@ -970,13 +977,16 @@ mod tests {
         assert!(!a.exclusive_mode, "item 5: exclusive is ALSA-only");
     }
 
+    /// ALSA is the bit-perfect path and the one moOde configures; choosing it
+    /// must not switch gapless off behind the user. A format change at the
+    /// seam is refused per track by the player's format gate instead.
     #[test]
-    fn backend_alsa_forces_gapless_off() {
+    fn backend_alsa_leaves_gapless_alone() {
         let mut a = base();
         a.gapless_enabled = true;
         a.backend = AudioBackendType::Alsa;
         cascade_on_backend_change(&mut a);
-        assert!(!a.gapless_enabled, "item 6");
+        assert!(a.gapless_enabled, "choosing ALSA must not disable gapless");
     }
 
     #[test]

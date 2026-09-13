@@ -335,7 +335,7 @@ impl AudioSettingsStore {
             [],
         );
         let _ = conn.execute(
-            "ALTER TABLE audio_settings ADD COLUMN gapless_enabled INTEGER DEFAULT 0",
+            "ALTER TABLE audio_settings ADD COLUMN gapless_enabled INTEGER DEFAULT 1",
             [],
         );
         let _ = conn.execute(
@@ -502,7 +502,7 @@ impl AudioSettingsStore {
                         device_sample_rate_limits,
                         normalization_enabled: row.get::<_, Option<i64>>(12)?.unwrap_or(0) != 0,
                         normalization_target_lufs: row.get::<_, Option<f64>>(13)?.unwrap_or(-14.0) as f32,
-                        gapless_enabled: row.get::<_, Option<i64>>(14)?.unwrap_or(0) != 0,
+                        gapless_enabled: row.get::<_, Option<i64>>(14)?.unwrap_or(1) != 0,
                         pw_force_bitperfect: row.get::<_, Option<i64>>(16)?.unwrap_or(0) != 0,
                         sync_audio_on_startup: row.get::<_, Option<i64>>(17)?.unwrap_or(0) != 0,
                         quality_fallback_behavior: row
@@ -1157,7 +1157,10 @@ mod tests {
         // Fresh store is seeded with the OOTB default backend "System" (#470).
         assert_eq!(settings.backend_type, Some(AudioBackendType::SystemDefault));
         assert_eq!(settings.alsa_plugin, None);
-        assert!(!settings.gapless_enabled);
+        // The store and the struct must answer the same question the same way.
+        // They did not: `AudioSettings::default()` said true and a fresh store
+        // said false, and the two assertions sat in adjacent tests.
+        assert!(settings.gapless_enabled);
         assert_eq!(settings.quality_fallback_behavior, "ask");
         assert!(!settings.reserve_dac_while_running);
         let _ = std::fs::remove_dir_all(dir);
