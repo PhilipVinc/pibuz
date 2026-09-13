@@ -110,12 +110,34 @@ Assert only what is visible from outside: bytes held, bytes fetched, bodies
 opened, whether a read returned. `fetched` is the important one — a re-download
 loop has no other external symptom.
 
-Three fidelity limits, same spirit as the audio harness: the feeder is a
-stand-in for `qbzd/src/qconnect/remote_stream.rs` rather than that code, so a
-change there needs a change here; there is no socket, so nothing exercises TCP
-back-pressure, a stalled body, or this CDN's ~5 s cold-offset
-time-to-first-byte; and an unpaced feeder means "as fast as this machine
-allows", which is useful for ratios and meaningless for absolute timings.
+There are TWO scripted feeders because there are two real ones, and they differ
+in the smallest thing they can restart at. `feed` mirrors
+`qbzd/src/qconnect/remote_stream.rs` and restarts at a byte. `feed_cmaf` mirrors
+`Player::cmaf_stream_segments` and restarts at a whole CMAF segment, so its
+seeks land up to a segment early, its window overshoots by a segment rather than
+a chunk, and a reader waiting inside the segment in flight is a case the byte
+feeder does not have.
+
+Three fidelity limits, same spirit as the audio harness: both feeders are
+stand-ins for the code they mirror rather than that code, so a change there
+needs a change here; there is no socket, so nothing exercises TCP back-pressure,
+a stalled body, or this CDN's ~5 s cold-offset time-to-first-byte; and an
+unpaced feeder means "as fast as this machine allows", which is useful for
+ratios and meaningless for absolute timings.
+
+## The CMAF segment table is a byte index
+
+`crates/qbz-cmaf/src/map.rs` has the evidence in full, and it is load-bearing:
+the init segment's `byte_len` per segment is EXACTLY what that segment
+assembles to, so prefix sums over it are the assembled FLAC's own offsets. That
+is what lets the CMAF path be `RangeRequests` — seek by fetching the segment
+holding the byte — and therefore what lets its buffer be windowed instead of
+holding the whole compressed track (120-220 MB at Hi-Res).
+
+Do not weaken this to "approximately". If it ever stops being true the feeder
+fails the track loudly, by comparing each decrypted segment against the length
+the table declared; a silent mismatch would serve audio at offsets it does not
+belong to, which decodes as noise rather than as an error.
 
 ## Formatting and lints
 

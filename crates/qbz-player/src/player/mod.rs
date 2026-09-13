@@ -617,6 +617,50 @@ pub(crate) fn spill_to_disk(total: usize, budget: usize) -> bool {
     total.saturating_mul(2) > budget
 }
 
+/// A reader's range request for the CMAF feeder, unless it asks for a byte the
+/// run of segments in hand has already produced or is producing.
+///
+/// `served` is the inclusive range of segment indices this body has covered so
+/// far, `write_head` the offset the next push belongs at.
+///
+/// The distinction matters because the two sides measure in different units. A
+/// reader asks for a BYTE and treats anything more than `FORWARD_WAIT_BYTES`
+/// ahead of the write head as worth a fresh request; the feeder answers in
+/// SEGMENTS, and a Hi-Res segment is nearly 4 MB against that 2 MB threshold.
+/// So a decoder sitting at the far end of the very segment being fetched does
+/// ask — and honouring it would throw away the fetch in flight to ask for the
+/// same segment again. Likewise a request that arrived while a segment was
+/// landing is still pending after the reader has been unblocked by it: taking
+/// that one re-fetches a segment already in the buffer.
+///
+/// Neither is a seek. Both are spins. A request for anything else — earlier
+/// than this body started, or further ahead than it has reached — is a real
+/// jump and is handed back.
+///
+/// `take_request` has already pointed the write head at the offset it returned,
+/// so a dropped request has to put it back where the next push belongs.
+fn cmaf_take_request(
+    writer: &BufferWriter,
+    map: &qbz_cmaf::SegmentMap,
+    served: std::ops::RangeInclusive<usize>,
+    write_head: u64,
+) -> Result<Option<FetchPlan>, String> {
+    let Some(next) = writer.take_request() else {
+        return Ok(None);
+    };
+    if served.contains(&map.resume_at(next.offset).first_segment) {
+        log::debug!(
+            "[CMAF-STREAM] byte {} is in a segment this run already has in hand — not re-opening",
+            next.offset
+        );
+        writer
+            .begin_at(write_head)
+            .map_err(|e| format!("restore CMAF write head: {e}"))?;
+        return Ok(None);
+    }
+    Ok(Some(next))
+}
+
 fn decode_file_with_fallback(
     path: &std::path::Path,
 ) -> Result<Box<dyn Source<Item = f32> + Send>, String> {
@@ -3517,23 +3561,15 @@ impl Player {
                             //
 
                             // Four cases reach this handler:
-                            //   * full-file playback (current_audio_data set)
+                            //   * full-file playback (current_audio_data set).
+                            //     Cache and local-library playback arrive this
+                            //     way and skip the streaming branch entirely
+                            //     (issue #335).
                             //   * streaming, download complete (buffered
                             //     source holds the full file)
                             //   * streaming over a range-capable feeder —
-                            //     anywhere in the track is one HTTP request
-                            //     away, so no watermark applies
-                            //   * sequential streaming (CMAF segment assembly),
-                            //     download IN PROGRESS — only allowed if the
-                            //     target position falls inside the
-                            //     already-buffered region. Such a feeder can
-                            //     only produce bytes in order, so seeking past
-                            //     the watermark would block the audio thread
-                            //     waiting for the rest of the download.
-                            //     Cache, offline-cache, and local-library
-                            //     playback reach this handler with
-                            //     current_audio_data Some and skip the
-                            //     streaming branch entirely (issue #335).
+                            //     anywhere in the track is one fetch away, so
+                            //     no watermark applies
                             //   * a track handed over as a FILE (the disk
                             //     gapless path) — `current_audio_file` set,
                             //     `current_audio_data` empty by design, because
@@ -3554,37 +3590,24 @@ impl Player {
                                             stream_src.buffer_size()
                                         );
                                     } else {
-                                        // Approximate bytes-to-seconds mapping via
-                                        // download fraction × total duration. Exact
-                                        // for CBR, close-enough for FLAC/VBR; the
-                                        // 0.90 margin covers the error band so the
-                                        // decoder never reads past the watermark.
-                                        let duration_secs = thread_state.duration();
-                                        let progress = stream_src.progress().unwrap_or(0.0);
-                                        if duration_secs == 0 || progress <= 0.0 {
-                                            log::warn!(
-                                                "Audio thread: seek to {}s ignored — streaming progress unknown",
-                                                position_secs
-                                            );
-                                            return;
-                                        }
-                                        let max_seekable_secs =
-                                            (progress * 0.90 * duration_secs as f32) as u64;
-                                        if position_secs > max_seekable_secs {
-                                            log::warn!(
-                                                "Audio thread: seek to {}s ignored — past buffered watermark ({}s, progress {:.1}%)",
-                                                position_secs,
-                                                max_seekable_secs,
-                                                progress * 100.0
-                                            );
-                                            return;
-                                        }
-                                        log::info!(
-                                            "Audio thread: seek to {}s within buffered zone (watermark {}s, progress {:.1}%)",
-                                            position_secs,
-                                            max_seekable_secs,
-                                            progress * 100.0
+                                        // A feeder that only produces bytes in
+                                        // order cannot be sent to a byte it has
+                                        // not reached: the audio thread would
+                                        // block here until the rest of the
+                                        // track downloaded. There used to be a
+                                        // `0.90 x progress` watermark guessing
+                                        // where the download head was in
+                                        // SECONDS, which existed solely because
+                                        // the CMAF path could not seek — it now
+                                        // can, and the only way to reach this
+                                        // branch is a feeder that has said it
+                                        // cannot. Refuse, rather than guess at
+                                        // a margin nothing produces any more.
+                                        log::warn!(
+                                            "Audio thread: seek to {}s ignored — this stream's feeder cannot restart mid-file",
+                                            position_secs
                                         );
+                                        return;
                                     }
                                 }
                             }
@@ -4964,12 +4987,34 @@ impl Player {
                 let sample_rate = cmaf_info.sampling_rate.unwrap_or(44100);
                 let channels = 2u16; // FLAC from Qobuz is always stereo
                 let bit_depth = cmaf_info.bit_depth.unwrap_or(16);
-                let total_flac_size = cmaf_info.flac_header.len() as u64
-                    + cmaf_info
-                        .segment_table
-                        .iter()
-                        .map(|s| s.byte_len as u64)
-                        .sum::<u64>();
+                // The segment table is a byte index, not an estimate: prefix
+                // sums over `byte_len` are the assembled FLAC's own offsets.
+                // See `qbz_cmaf::map` for what that rests on.
+                let map = qbz_cmaf::SegmentMap::new(
+                    cmaf_info.flac_header.len(),
+                    &cmaf_info.segment_table,
+                );
+                let total_flac_size = map.total_len();
+
+                // The map can only steer a seek if it describes every segment
+                // the feeder will fetch. When the init table and the API
+                // disagree about how many there are — warned about above, and
+                // never yet observed — the offsets past the shorter of the two
+                // are unknown, so the stream stays sequential and seeks fall
+                // back to waiting, exactly as they did before.
+                let seek_mode = if map.segment_count() == cmaf_info.n_segments as usize
+                    && cmaf_info.n_segments > 0
+                {
+                    StreamSeekMode::RangeRequests
+                } else {
+                    log::warn!(
+                        "[CMAF] Track {track_id}: segment table describes {} segments but the API \
+                         says {} — streaming without seek support",
+                        map.segment_count(),
+                        cmaf_info.n_segments
+                    );
+                    StreamSeekMode::Sequential
+                };
 
                 // Track duration from the CMAF segment table. The streaming
                 // path's position timer clamps `current_position` to the
@@ -5016,9 +5061,11 @@ impl Player {
                     speed_mbps,
                     duration_secs,
                     start_position_secs, // session-resume offset (0 = from start)
-                    // CMAF frames are decrypted and concatenated in segment
-                    // order, so the feeder cannot start mid-file.
-                    StreamSeekMode::Sequential,
+                    // The feeder below restarts at whichever SEGMENT holds the
+                    // byte the buffer asks for, so a seek or a session resume
+                    // costs one segment fetch instead of a download of
+                    // everything before it — and the buffer can be windowed.
+                    seek_mode,
                 )?;
 
                 // Spawn the background task that fetches + decrypts + pushes
@@ -5027,7 +5074,12 @@ impl Player {
                 let content_key = cmaf_info.content_key;
                 let flac_header = cmaf_info.flac_header;
                 let n_segments = cmaf_info.n_segments;
-                let cache = self.audio_cache.clone();
+                // The L2 cache to stage this track into as it streams, if
+                // settings allow and it is not already there. A windowed
+                // buffer no longer holds the whole track at the end, so this
+                // is the only route into the cache — the same one the cast
+                // path takes.
+                let disk_cache = self.disk_cache_for_streaming(track_id);
 
                 tokio::spawn(async move {
                     match Self::cmaf_stream_segments(
@@ -5035,11 +5087,10 @@ impl Player {
                         n_segments,
                         content_key,
                         flac_header,
+                        map,
                         buffer_writer,
                         track_id,
-                        cache,
-                        skip_cache,
-                        total_flac_size,
+                        disk_cache,
                     )
                     .await
                     {
@@ -5364,20 +5415,39 @@ impl Player {
 
     /// Stream CMAF segments to the player's buffer, decrypting on the fly.
     ///
-    /// Writes the FLAC header first so the decoder can identify the format,
-    /// then fetches each audio segment, decrypts encrypted frames, and pushes
-    /// the resulting FLAC frame data to the streaming buffer. The player
-    /// starts playing as soon as enough data is buffered.
+    /// Range-aware, like the remote body pump it now mirrors: it opens
+    /// "the body" wherever the buffer asks and re-opens somewhere else the
+    /// moment a reader jumps. The body here is a run of segments rather than
+    /// an HTTP response, and the difference that makes is granularity — a
+    /// segment is the smallest decryptable unit, because its frame table lives
+    /// in the segment and every frame before the target has to be walked to
+    /// reach it. So a seek lands on the segment boundary at or before the
+    /// target: up to one segment early, which is the same shape of overshoot
+    /// `SEEK_LOOKBEHIND_BYTES` accepts on the other path.
+    ///
+    /// What makes this possible at all is that [`qbz_cmaf::SegmentMap`]'s
+    /// offsets are exact rather than approximate — see its module docs for the
+    /// evidence. Each decrypted segment is checked against the length the table
+    /// declared for it, so if that ever stops being true the track fails here,
+    /// loudly, instead of serving bytes at offsets they do not belong to.
+    ///
+    /// Two consequences of being range-aware, both of them the point:
+    ///
+    /// * The buffer can be WINDOWED. `wait_for_space` parks between segments,
+    ///   so what is held is the window plus the segment in hand rather than the
+    ///   whole compressed track — 120-220 MB at Hi-Res, on boards with 439-905.
+    /// * The track is no longer resident at the end, so it cannot be handed to
+    ///   the in-memory cache from the buffer. It is staged to L2 as it goes
+    ///   past instead, which is what [`DiskTee`] is for.
     async fn cmaf_stream_segments(
         url_template: &str,
         n_segments: u8,
         content_key: [u8; 16],
         flac_header: Vec<u8>,
+        map: qbz_cmaf::SegmentMap,
         writer: BufferWriter,
         track_id: u64,
-        cache: Arc<qbz_cache::AudioCache>,
-        skip_cache: bool,
-        declared_total: u64,
+        disk_cache: Option<Arc<qbz_cache::PlaybackCache>>,
     ) -> Result<(), String> {
         struct FailGuard {
             writer: BufferWriter,
@@ -5402,81 +5472,186 @@ impl Player {
             .build()
             .map_err(|e| format!("CMAF client error: {}", e))?;
 
-        // Write the FLAC header first so the decoder can identify the format.
-        if let Err(e) = writer.push_chunk(&flac_header) {
-            let msg = format!("Failed to write FLAC header to buffer: {e}");
-            let _ = writer.error(msg.clone());
-            return Err(msg);
-        }
+        // Stage to L2 as the bytes go past. The windowed buffer will not be
+        // holding them at the end.
+        let mut tee = DiskTee::open(disk_cache, track_id, map.total_len());
 
-        let mut total_written: u64 = flac_header.len() as u64;
         // One reusable scratch buffer for the decrypted frames of the segment
-        // in hand, rather than a `to_vec()` per FLAC frame. The cache copy that
-        // used to be accumulated here in parallel is gone: the buffer already
-        // holds the assembled track, so it is read back once at the end
-        // instead of being built twice as it arrives.
+        // in hand, rather than a `to_vec()` per FLAC frame.
         let mut scratch: Vec<u8> = Vec::new();
+        let mut plan = writer.initial_plan();
+        let mut pushed: u64 = 0;
+        let mut segments_done: u32 = 0;
+        // Plans that produced no bytes at all since the last one that did. One
+        // is ordinary (a reader jumping past the end of the track); a streak
+        // means the geometry disagrees with what the buffer believes and the
+        // loop would otherwise spin.
+        let mut barren_plans: u32 = 0;
         let start = Instant::now();
 
-        for seg_idx in 1..=n_segments {
-            let seg_url = url_template.replace("$SEGMENT$", &seg_idx.to_string());
-            let seg_data = client
-                .get(&seg_url)
-                .header("User-Agent", "Mozilla/5.0")
-                .send()
-                .await
-                .map_err(|e| format!("CMAF segment {} fetch: {}", seg_idx, e))?
-                .bytes()
-                .await
-                .map_err(|e| format!("CMAF segment {} read: {}", seg_idx, e))?;
-
-            // Decrypt the whole segment into the scratch buffer in one pass.
-            // This is `qbz_qobuz::cmaf::decrypt_segment_into`, which exists for
-            // exactly this and whose own doc records "one copy instead of
-            // three, zero per-frame allocations" — the live path had been
-            // open-coding a worse version of it.
-            scratch.clear();
-            if let Err(e) = qbz_qobuz::cmaf::decrypt_segment_into(
-                &seg_data,
-                seg_idx as usize,
-                &content_key,
-                &mut scratch,
-            ) {
-                let msg = format!("CMAF segment {} decrypt: {e}", seg_idx);
-                let _ = writer.error(msg.clone());
-                return Err(msg);
-            }
-            if let Err(e) = writer.push_chunk(&scratch) {
-                let msg = format!("Failed to push segment {seg_idx}: {e}");
-                let _ = writer.error(msg.clone());
-                return Err(msg);
-            }
-            total_written += scratch.len() as u64;
-
-            // Progress logging every 5 segments or on the last segment.
-            if seg_idx % 5 == 0 || seg_idx == n_segments {
-                let elapsed = start.elapsed().as_secs_f64();
-                let mbps = if elapsed > 0.0 {
-                    total_written as f64 / (1024.0 * 1024.0) / elapsed
-                } else {
-                    0.0
-                };
-                // Feed the adaptive prefetch throttle with the cumulative MB/s
-                // the log already reports; also the offline detector's
-                // positive liveness signal (#467, #591).
-                qbz_audio::network_throttle::state().record_segment_bandwidth(mbps);
+        'plans: loop {
+            let resume = map.resume_at(plan.offset);
+            // The write head goes where the SEGMENT begins, not where the
+            // reader asked. Skipping this is the bug that fills a buffer with
+            // bytes attributed to offsets they do not belong to.
+            writer
+                .begin_at(resume.body_offset)
+                .map_err(|e| format!("re-point CMAF write head: {e}"))?;
+            if resume.body_offset != plan.offset {
                 log::info!(
-                    "[CMAF-STREAM] Segment {}/{} ({:.1} MB, {:.1} MB/s)",
-                    seg_idx,
-                    n_segments - 1,
-                    total_written as f64 / (1024.0 * 1024.0),
-                    mbps
+                    "[CMAF-STREAM] Track {track_id}: byte {} is in segment {}, resuming from byte {} ({} bytes early)",
+                    plan.offset,
+                    resume.first_segment,
+                    resume.body_offset,
+                    plan.offset - resume.body_offset
                 );
+            }
+
+            let mut at = resume.body_offset;
+            let plan_bytes_before = pushed;
+
+            if resume.with_header {
+                // The FLAC header first, so the decoder can identify the
+                // format before any frame reaches it.
+                if let Err(e) = writer.push_chunk(&flac_header) {
+                    let msg = format!("Failed to write FLAC header to buffer: {e}");
+                    let _ = writer.error(msg.clone());
+                    return Err(msg);
+                }
+                if let Some(t) = tee.as_mut() {
+                    t.write_at(at, &flac_header);
+                }
+                at += flac_header.len() as u64;
+                pushed += flac_header.len() as u64;
+            }
+
+            let mut seg = resume.first_segment;
+            while seg <= n_segments as usize {
+                let served = resume.first_segment..=seg;
+                if let Some(next) = cmaf_take_request(writer, &map, served.clone(), at)? {
+                    plan = next;
+                    continue 'plans;
+                }
+                // THE BOUND: park while the window ahead of the decoder is
+                // full, so the segment below is not even fetched — the whole
+                // point of holding a window instead of a track.
+                writer.wait_for_space().await;
+                if let Some(next) = cmaf_take_request(writer, &map, served, at)? {
+                    plan = next;
+                    continue 'plans;
+                }
+
+                let seg_url = url_template.replace("$SEGMENT$", &seg.to_string());
+                let seg_data = client
+                    .get(&seg_url)
+                    .header("User-Agent", "Mozilla/5.0")
+                    .send()
+                    .await
+                    .map_err(|e| format!("CMAF segment {} fetch: {}", seg, e))?
+                    .bytes()
+                    .await
+                    .map_err(|e| format!("CMAF segment {} read: {}", seg, e))?;
+
+                // Decrypt the whole segment into the scratch buffer in one
+                // pass: one copy instead of three, zero per-frame allocations.
+                scratch.clear();
+                if let Err(e) = qbz_qobuz::cmaf::decrypt_segment_into(
+                    &seg_data,
+                    seg,
+                    &content_key,
+                    &mut scratch,
+                ) {
+                    let msg = format!("CMAF segment {} decrypt: {e}", seg);
+                    let _ = writer.error(msg.clone());
+                    return Err(msg);
+                }
+
+                // The table said how long this segment would be, and every
+                // offset in the map is built on that. If it ever stops being
+                // true, stop here: wrong offsets decode as noise instead of
+                // failing, so there is nothing to be gained by carrying on.
+                if let Some(declared) = map.segment_len(seg) {
+                    if declared != scratch.len() as u64 {
+                        let msg = format!(
+                            "CMAF segment {seg} of track {track_id} assembled to {} bytes but the \
+                             segment table declared {declared} — the table is no longer a byte \
+                             index and every offset after this one would be wrong",
+                            scratch.len()
+                        );
+                        let _ = writer.error(msg.clone());
+                        return Err(msg);
+                    }
+                }
+
+                if let Err(e) = writer.push_chunk(&scratch) {
+                    let msg = format!("Failed to push segment {seg}: {e}");
+                    let _ = writer.error(msg.clone());
+                    return Err(msg);
+                }
+                if let Some(t) = tee.as_mut() {
+                    t.write_at(at, &scratch);
+                }
+                at += scratch.len() as u64;
+                pushed += scratch.len() as u64;
+                segments_done += 1;
+
+                // Progress logging every 5 segments or on the last segment.
+                if segments_done.is_multiple_of(5) || seg == n_segments as usize {
+                    let elapsed = start.elapsed().as_secs_f64();
+                    let mbps = if elapsed > 0.0 {
+                        pushed as f64 / (1024.0 * 1024.0) / elapsed
+                    } else {
+                        0.0
+                    };
+                    // Feed the adaptive prefetch throttle with the cumulative
+                    // MB/s the log already reports; also the offline detector's
+                    // positive liveness signal (#467, #591).
+                    qbz_audio::network_throttle::state().record_segment_bandwidth(mbps);
+                    log::info!(
+                        "[CMAF-STREAM] Segment {}/{} ({:.1} MB held, {:.1} MB/s)",
+                        seg,
+                        n_segments,
+                        writer.buffer_size() as f64 / (1024.0 * 1024.0),
+                        mbps
+                    );
+                }
+
+                // A bounded plan is a gap fill: stop once it is filled rather
+                // than running to the end of the track.
+                if plan.end.is_some_and(|end| at >= end) {
+                    break;
+                }
+                seg += 1;
+            }
+
+            if pushed > plan_bytes_before {
+                barren_plans = 0;
+            } else {
+                barren_plans += 1;
+                if barren_plans >= 3 {
+                    let msg = format!(
+                        "CMAF stream for track {track_id} made no progress at byte {} after \
+                         {barren_plans} plans",
+                        plan.offset
+                    );
+                    let _ = writer.error(msg.clone());
+                    return Err(msg);
+                }
+            }
+
+            match writer.next_plan() {
+                Some(next) => plan = next,
+                // Nothing left to fetch, or no reader left to fetch it for.
+                None => break 'plans,
             }
         }
 
-        // Signal end of stream (disarm fail-guard so Drop does not error).
+        // Disarm the fail-guard: past here a failure is a reporting problem,
+        // not a torn stream.
         guard.armed = false;
+        if let Some(t) = tee.take() {
+            t.finish();
+        }
         if let Err(e) = writer.complete() {
             log::error!("[CMAF-STREAM] Failed to mark buffer complete: {}", e);
             let _ = writer.error(format!("Failed to mark buffer complete: {e}"));
@@ -5484,58 +5659,15 @@ impl Player {
         }
 
         log::info!(
-            "[CMAF-STREAM] Complete: {:.2} MB written in {:.1}s for track {}, segments fetched: 1..{}",
-            total_written as f64 / (1024.0 * 1024.0),
+            "[CMAF-STREAM] Complete: {:.2} MB pushed in {:.1}s for track {} ({} of {} segments \
+             fetched, {:.2} MB declared)",
+            pushed as f64 / (1024.0 * 1024.0),
             start.elapsed().as_secs_f64(),
             track_id,
-            n_segments - 1
+            segments_done,
+            n_segments,
+            map.total_len() as f64 / (1024.0 * 1024.0),
         );
-
-        // Is the segment table's byte_len sum EXACTLY the assembled size, or
-        // only an estimate?
-        //
-        // This decides whether the CMAF path can become range-seekable. Doing
-        // so means marking it `RangeRequests`, and `at_eof` then trusts
-        // `total_size` absolutely — so an over-estimate cuts every track short
-        // and an under-estimate turns the tail into EOF. `at_eof`'s own doc
-        // calls the CMAF total an estimate, which is exactly the reason the
-        // switch has not been made. Nothing in the tree had ever compared the
-        // two, and no open-source client implements a segmented Qobuz path to
-        // check against.
-        //
-        // One line per track, and a warning when they differ, so a few plays on
-        // hardware settle it either way.
-        if total_written == declared_total {
-            log::info!(
-                "[CMAF-STREAM] Segment table is byte-exact for track {track_id}: {total_written} bytes as declared"
-            );
-        } else {
-            log::warn!(
-                "[CMAF-STREAM] Segment table is NOT byte-exact for track {track_id}: wrote \
-                 {total_written}, table declared {declared_total} (delta {}). The CMAF path \
-                 cannot be made range-seekable while this differs.",
-                total_written as i64 - declared_total as i64
-            );
-        }
-
-        // Cache the assembled FLAC for instant replay, read back from the
-        // buffer that already holds it. Building it here rather than
-        // accumulating a parallel `Vec` as the segments arrived removes a
-        // whole second copy of the track — 120-220 MB at Hi-Res, resident for
-        // the length of the track rather than for the instant of the insert.
-        if !skip_cache {
-            match writer.complete_track_bytes() {
-                Some(bytes) => {
-                    let len = bytes.len();
-                    cache.insert(track_id, bytes);
-                    log::info!("[CMAF-STREAM] Track {} cached ({} bytes)", track_id, len);
-                }
-                None => log::debug!(
-                    "[CMAF-STREAM] Track {} not cached: the buffer is not one complete run",
-                    track_id
-                ),
-            }
-        }
 
         Ok(())
     }

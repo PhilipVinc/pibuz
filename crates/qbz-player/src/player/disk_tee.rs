@@ -2,10 +2,11 @@
 //!
 //! Every windowed feeder needs this. A bounded buffer holds a window, not the
 //! track, so by the time the last byte arrives the first is long gone and
-//! there is nothing left to hand the cache — `complete_track_bytes` only ever
-//! answers for a buffer that is still one whole run from byte 0. Writing the
-//! bytes out as they go past is what keeps a streamed track replayable without
-//! ever holding it twice.
+//! there is nothing left to hand the cache: the route that used to exist —
+//! reading the finished track back out of the buffer — only ever answered for
+//! a buffer still holding one whole run from byte 0, and no feeder leaves one
+//! behind any more. Writing the bytes out as they go past is what keeps a
+//! streamed track replayable without ever holding it twice.
 
 use std::sync::Arc;
 

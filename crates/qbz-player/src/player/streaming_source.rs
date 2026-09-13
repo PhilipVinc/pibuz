@@ -175,13 +175,19 @@ pub fn max_initial_buffer_bytes() -> usize {
 /// Whether the feeder behind a [`BufferedMediaSource`] can restart its body
 /// at an arbitrary byte offset.
 ///
-/// This is what makes a seek cheap. A `Sequential` feeder only ever
-/// produces bytes in the order it generates them (CMAF segment assembly,
-/// synthesis), so a read ahead of the write head can do nothing
-/// but wait for the download to walk there. A `RangeRequests` feeder
-/// re-opens the HTTP body with a `Range` header wherever a reader asks, so
-/// resuming at 2:30 costs one request instead of two and a half minutes of
-/// hi-res FLAC.
+/// This is what makes a seek cheap, and with it the bounded window: a feeder
+/// that cannot go back for a byte can never be allowed to discard one. A
+/// `Sequential` feeder only ever produces bytes in the order it generates
+/// them, so a read ahead of the write head can do nothing but wait for the
+/// download to walk there. A `RangeRequests` feeder restarts wherever a reader
+/// asks, so resuming at 2:30 costs one request instead of two and a half
+/// minutes of hi-res FLAC.
+///
+/// "Restart" does not have to mean an HTTP `Range` header. The remote path
+/// re-opens the body; the CMAF path re-enters at the segment holding the byte,
+/// which is the smallest unit it can decrypt. Landing up to one segment early
+/// is the price, and it is the same shape of overshoot as
+/// [`SEEK_LOOKBEHIND_BYTES`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamSeekMode {
     /// Bytes arrive in order from wherever the feeder started; reads ahead
@@ -447,11 +453,13 @@ impl BufferState {
     /// True once `pos` is past everything the feeder will ever produce, so
     /// a read there is EOF rather than a wait.
     ///
-    /// `total_size` settles this only for a range stream, where it came from
-    /// `Content-Length` and is exact. A sequential stream's total is an
-    /// estimate — CMAF derives it by summing a segment table — so trusting
-    /// it would cut playback off early; there, only the feeder saying it is
-    /// done makes an unbuffered offset EOF.
+    /// `total_size` settles this only for a range stream, whose feeder can
+    /// reach any byte the total claims exists — from `Content-Length` on the
+    /// remote path, and from the CMAF segment table on the other, which is a
+    /// byte index rather than an estimate (see `qbz_cmaf::map`). A sequential
+    /// feeder has no such guarantee: it may be told a total it cannot walk to,
+    /// so there only the feeder saying it is done makes an unbuffered offset
+    /// EOF.
     fn at_eof(&self, pos: u64) -> bool {
         if self.seek_mode == StreamSeekMode::RangeRequests {
             if let Some(total) = self.total_size {
@@ -1344,24 +1352,6 @@ impl BufferWriter {
     /// body would otherwise pin the seek.
     pub async fn request_notified(&self) {
         self.shared.wanted.notified().await;
-    }
-
-    /// The whole track's bytes, once the feeder has reported itself done.
-    ///
-    /// The writer-side twin of [`BufferedMediaSource::take_complete_data`],
-    /// for a feeder that assembles a track it also wants cached. Without it
-    /// such a feeder has to keep its own parallel `Vec` of everything it
-    /// pushed — a second full copy of a 120-220 MB track, live at the same
-    /// time as the buffer, for the whole track rather than for an instant.
-    ///
-    /// `None` unless the buffer is one complete run from byte 0, which is the
-    /// same condition the source-side method requires and for the same reason.
-    pub fn complete_track_bytes(&self) -> Option<TrackBytes> {
-        let state = self.shared.state.lock().ok()?;
-        if !state.download_complete || state.download_error.is_some() || state.segments.len() != 1 {
-            return None;
-        }
-        state.head_run().map(|seg| TrackBytes::from(seg.bytes()))
     }
 
     /// Mark download as complete
@@ -2549,12 +2539,20 @@ mod tests {
 /// whether a read returned — never a private field. A test that reaches into
 /// `BufferState` pins the implementation instead of the behaviour.
 ///
+/// There are TWO scripted feeders, because there are two real ones and they
+/// differ in the unit they can restart at. `feed` mirrors
+/// `qbzd/src/qconnect/remote_stream.rs`, whose unit is a byte. `feed_cmaf`
+/// mirrors `Player::cmaf_stream_segments`, whose unit is a whole CMAF segment —
+/// so its seeks land early, its window overshoots by a segment rather than a
+/// chunk, and a reader waiting inside the segment in flight is a case the other
+/// one does not have.
+///
 /// **Three fidelity limits, stated so nobody reads more into a green run than
-/// is there.** The feeder here is a stand-in: it calls the same `BufferWriter`
-/// methods in the same order as `qbzd/src/qconnect/remote_stream.rs`, but it is
-/// not that code, so a change there needs a change here. There is no socket, so
+/// is there.** Both feeders are stand-ins: they call the same `BufferWriter`
+/// methods in the same order as the code they mirror, but they are not that
+/// code, so a change there needs a change here. There is no socket, so
 /// nothing exercises TCP back-pressure, a stalled body, or the ~5 s
-/// time-to-first-byte this CDN charges for a cold offset. And `pace: None`
+/// time-to-first-byte this CDN charges for a cold offset. And an unpaced feeder
 /// means "as fast as this machine allows", which on a dev box is far faster
 /// than 4.5 MB/s — fine for ratios, useless for absolute timings.
 #[cfg(test)]
@@ -2592,6 +2590,10 @@ mod buffer_behaviour_tests {
         /// How many times the feeder opened a body at a fresh offset. One is
         /// the initial whole-file GET; each further one is a seek or a gap.
         bodies: AtomicU64,
+        /// Offset the most recent body actually started at. For a feeder whose
+        /// unit is bigger than a byte — the CMAF one, whose unit is a segment —
+        /// this is how far before the requested offset it had to begin.
+        last_body: AtomicU64,
     }
 
     impl FeedLog {
@@ -2603,6 +2605,9 @@ mod buffer_behaviour_tests {
         }
         fn bodies(&self) -> u64 {
             self.bodies.load(AtomicOrdering::SeqCst)
+        }
+        fn last_body(&self) -> u64 {
+            self.last_body.load(AtomicOrdering::SeqCst)
         }
     }
 
@@ -2944,6 +2949,297 @@ mod buffer_behaviour_tests {
             "fetched {} of {} — the skipped region must not have been downloaded",
             log.fetched(),
             TOTAL
+        );
+    }
+
+    // =========================================================================
+    // The CMAF feeder: the same buffer, fed a segment at a time.
+    // =========================================================================
+
+    /// FLAC header length the CMAF init segment actually yields: `fLaC` plus
+    /// one STREAMINFO block. Qobuz sends no other metadata block.
+    const FLAC_HEADER: usize = 42;
+
+    fn segment_map(seg_len: usize, count: usize) -> qbz_cmaf::SegmentMap {
+        let table: Vec<qbz_cmaf::SegmentTableEntry> = (0..count)
+            .map(|_| qbz_cmaf::SegmentTableEntry {
+                byte_len: seg_len as u32,
+                sample_count: 4096,
+            })
+            .collect();
+        qbz_cmaf::SegmentMap::new(FLAC_HEADER, &table)
+    }
+
+    /// The scripted CMAF feeder.
+    ///
+    /// Mirrors `Player::cmaf_stream_segments`: resolve the plan down to the
+    /// SEGMENT carrying it, point the write head at that segment's start rather
+    /// than at the byte asked for, push whole segments, park between them, and
+    /// drop a request for a segment this run already has in hand.
+    ///
+    /// It shares exactly one thing with the real feeder — `cmaf_take_request`,
+    /// which is the subtle half and would be worth nothing duplicated. Every
+    /// assertion below is on what the buffer does, not on that function.
+    ///
+    /// `fetch` stands in for the segment GET, so a reader can seek while a
+    /// segment is in flight, which is when the interesting cases happen.
+    async fn feed_cmaf(
+        writer: BufferWriter,
+        map: qbz_cmaf::SegmentMap,
+        fetch: Option<Duration>,
+        log: Arc<FeedLog>,
+    ) {
+        let mut plan = writer.initial_plan();
+        'plans: loop {
+            let resume = map.resume_at(plan.offset);
+            log.bodies.fetch_add(1, AtomicOrdering::SeqCst);
+            log.last_body
+                .store(resume.body_offset, AtomicOrdering::SeqCst);
+            if writer.begin_at(resume.body_offset).is_err() {
+                return;
+            }
+            let mut at = resume.body_offset;
+            if resume.with_header {
+                if writer.push_chunk(&track_bytes(0, FLAC_HEADER)).is_err() {
+                    return;
+                }
+                log.fetched
+                    .fetch_add(FLAC_HEADER as u64, AtomicOrdering::SeqCst);
+                at += FLAC_HEADER as u64;
+            }
+
+            let mut seg = resume.first_segment;
+            while seg <= map.segment_count() {
+                let served = resume.first_segment..=seg;
+                match crate::player::cmaf_take_request(&writer, &map, served.clone(), at) {
+                    Ok(Some(next)) => {
+                        plan = next;
+                        continue 'plans;
+                    }
+                    Ok(None) => {}
+                    Err(_) => return,
+                }
+                writer.wait_for_space().await;
+                match crate::player::cmaf_take_request(&writer, &map, served, at) {
+                    Ok(Some(next)) => {
+                        plan = next;
+                        continue 'plans;
+                    }
+                    Ok(None) => {}
+                    Err(_) => return,
+                }
+
+                // The fetch.
+                match fetch {
+                    Some(d) => tokio::time::sleep(d).await,
+                    None => tokio::task::yield_now().await,
+                }
+
+                let len = map.segment_len(seg).expect("in range") as usize;
+                if writer.push_chunk(&track_bytes(at, len)).is_err() {
+                    return;
+                }
+                log.fetched.fetch_add(len as u64, AtomicOrdering::SeqCst);
+                log.peak_held
+                    .fetch_max(writer.buffer_size() as u64, AtomicOrdering::SeqCst);
+                at += len as u64;
+
+                // A bounded plan is a gap fill; stop once it is filled.
+                if plan.end.is_some_and(|end| at >= end) {
+                    break;
+                }
+                seg += 1;
+            }
+
+            match writer.next_plan() {
+                Some(next) => plan = next,
+                None => return,
+            }
+        }
+    }
+
+    /// The baseline, and the one that could not be written before the segment
+    /// table was known to be a byte index.
+    ///
+    /// Under `RangeRequests` a read at or past `total_size` is EOF on the
+    /// buffer's own authority, and the feeder stops when `next_plan` finds no
+    /// hole left below that total. Both hang off the declared figure being the
+    /// real one: too large and the reader waits for bytes nobody will send
+    /// while the feeder loops on a tail it cannot fill; too small and the last
+    /// segment is cut off. The feeder task RETURNING here — not being aborted —
+    /// is half the assertion.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_segment_stream_is_fetched_once_and_read_whole() {
+        let map = segment_map(128 * KB, 32);
+        let total = map.total_len();
+        let log = Arc::new(FeedLog::default());
+        let (source, writer) = BufferedMediaSource::new_seekable(config(64 * KB), Some(total));
+        let source = Arc::new(source);
+        let mut reader = source.create_reader();
+
+        let feeder = tokio::spawn(feed_cmaf(writer, map, None, log.clone()));
+        let read = tokio::task::spawn_blocking(move || drain_verifying(&mut reader, 0))
+            .await
+            .expect("reader thread");
+        feeder.await.expect("feeder task finished on its own");
+
+        assert_eq!(read, total, "reader saw the whole assembled track");
+        assert_eq!(
+            log.fetched(),
+            total,
+            "every segment fetched exactly once — anything more is a refetch loop"
+        );
+        assert_eq!(log.bodies(), 1, "one run of segments, no seeks");
+    }
+
+    /// THE BOUND, for the path that was the last unbounded one in the daemon.
+    ///
+    /// The overshoot is a whole SEGMENT rather than a chunk, because a segment
+    /// is the smallest thing this feeder can decrypt and therefore the smallest
+    /// thing it can push. That is the price of the granularity, and it is worth
+    /// stating in an assertion: a Hi-Res segment is ~4 MB, so a window of a few
+    /// MB is held to roughly double, not to the 120-220 MB of the whole track.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_segment_feeder_holds_the_window_not_the_track() {
+        const SEG: usize = MB;
+        const WINDOW: usize = MB;
+        let map = segment_map(SEG, 16);
+        let total = map.total_len();
+        let log = Arc::new(FeedLog::default());
+        let cfg = StreamingConfig {
+            initial_buffer_bytes: 64 * KB,
+            window_bytes: WINDOW,
+        };
+        let (source, writer) = BufferedMediaSource::new_seekable(cfg, Some(total));
+        let source = Arc::new(source);
+        let mut reader = source.create_reader();
+
+        let feeder = tokio::spawn(feed_cmaf(writer, map, None, log.clone()));
+        tokio::task::spawn_blocking(move || {
+            let mut buf = vec![0u8; 64 * KB];
+            reader.read_exact(&mut buf).expect("first read");
+        })
+        .await
+        .expect("reader thread");
+
+        // Give a runaway feeder every chance to prove it is one.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let held = log.peak_held();
+        feeder.abort();
+
+        assert!(
+            held <= (WINDOW + SEG) as u64 + HEADER_PIN_BYTES,
+            "held {held} against a {WINDOW} byte window and a {SEG} byte segment — the feeder did not park"
+        );
+        assert!(
+            held < total / 4,
+            "held {held} of a {total} byte track — this is the unbounded case"
+        );
+    }
+
+    /// A forward seek re-enters at the segment holding the target instead of
+    /// walking there, and lands at most one segment early.
+    ///
+    /// The bytes in between are never fetched, which is the whole saving: a
+    /// resume at 2:30 of a Hi-Res track used to mean downloading the first two
+    /// and a half minutes of it first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_seek_re_enters_at_the_segment_holding_the_target() {
+        const SEG: usize = 128 * KB;
+        const TARGET: u64 = 6 * MB as u64;
+        let map = segment_map(SEG, 64);
+        let total = map.total_len();
+        let log = Arc::new(FeedLog::default());
+        let (source, writer) = BufferedMediaSource::new_seekable(config(16 * KB), Some(total));
+        let source = Arc::new(source);
+        let mut reader = source.create_reader();
+
+        // Paced so the head stays well behind the seek target.
+        let feeder = tokio::spawn(feed_cmaf(
+            writer,
+            map,
+            Some(Duration::from_millis(1)),
+            log.clone(),
+        ));
+        tokio::task::spawn_blocking(move || {
+            let mut buf = vec![0u8; 16 * KB];
+            reader.read_exact(&mut buf).expect("read at the head");
+            reader.seek(SeekFrom::Start(TARGET)).expect("seek");
+            let mut at_target = vec![0u8; 16 * KB];
+            reader.read_exact(&mut at_target).expect("read at target");
+            for (i, got) in at_target.iter().enumerate() {
+                assert_eq!(*got, byte_at(TARGET + i as u64), "wrong byte at the target");
+            }
+        })
+        .await
+        .expect("reader thread");
+        let fetched = log.fetched();
+        let landed = log.last_body();
+        feeder.abort();
+
+        assert!(log.bodies() >= 2, "a seek must re-enter, not wait");
+        assert!(landed <= TARGET, "re-entered at {landed}, past the target");
+        assert!(
+            TARGET - landed < SEG as u64,
+            "re-entered {} bytes early — more than one segment",
+            TARGET - landed
+        );
+        assert!(
+            fetched < total / 2,
+            "fetched {fetched} of {total} — the skipped region must not have been downloaded"
+        );
+    }
+
+    /// A reader blocked in the MIDDLE of the segment being fetched must not
+    /// make the feeder fetch that segment again.
+    ///
+    /// The two sides measure in different units: the reader asks for a byte and
+    /// wants a fresh request for anything more than `FORWARD_WAIT_BYTES` (2 MB)
+    /// ahead of the write head, while the feeder answers in segments that are
+    /// nearly 4 MB at Hi-Res. So a decoder sitting past the halfway point of the
+    /// very segment on its way DOES ask, and a feeder that honoured it would
+    /// drop the fetch in flight to start the same one over — forever, since the
+    /// answer never changes. The symptom is `fetched` above the track length,
+    /// which is the one thing a re-download loop always shows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_read_inside_the_segment_in_flight_does_not_re_fetch_it() {
+        const SEG: usize = 6 * MB;
+        // Comfortably past FORWARD_WAIT_BYTES into the first segment, so the
+        // reader is certain to ask rather than wait.
+        const TARGET: u64 = 5 * MB as u64;
+        let map = segment_map(SEG, 2);
+        let total = map.total_len();
+        let log = Arc::new(FeedLog::default());
+        let (source, writer) = BufferedMediaSource::new_seekable(config(16 * KB), Some(total));
+        let source = Arc::new(source);
+        let mut reader = source.create_reader();
+
+        // Slow enough that the seek below lands while segment 1 is in flight.
+        let feeder = tokio::spawn(feed_cmaf(
+            writer,
+            map,
+            Some(Duration::from_millis(60)),
+            log.clone(),
+        ));
+        let read = tokio::task::spawn_blocking(move || {
+            reader.seek(SeekFrom::Start(TARGET)).expect("seek");
+            drain_verifying(&mut reader, TARGET)
+        })
+        .await
+        .expect("reader thread");
+        feeder.await.expect("feeder task finished on its own");
+
+        assert_eq!(read, total - TARGET, "the rest of the track was readable");
+        assert_eq!(
+            log.bodies(),
+            1,
+            "the run was restarted — a request inside the segment in hand is not a seek"
+        );
+        assert_eq!(
+            log.fetched(),
+            total,
+            "fetched {} of a {total} byte track — the segment in flight was fetched twice",
+            log.fetched()
         );
     }
 }
