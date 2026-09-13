@@ -1,10 +1,8 @@
 //! Lenient deserializers for the Purchases wire models.
 //!
-//! Ported verbatim from `src-tauri/src/api/models.rs:8-119` so the shared,
-//! frontend-agnostic models deserialize real Qobuz `/purchase/*` JSON exactly
-//! as the Tauri reference path does. The purchase endpoints return loosely
-//! typed JSON (numeric-or-string ids, missing booleans, occasionally malformed
-//! pages); these helpers coerce rather than fail the whole response.
+//! The purchase endpoints return loosely typed JSON (numeric-or-string ids,
+//! missing booleans, occasionally malformed pages); these helpers coerce
+//! rather than fail the whole response.
 //!
 //! NOTE: `deserialize_string_or_int` in `types.rs` returns `Option<String>` and
 //! is NOT a substitute for `deserialize_string_id` (which yields a bare
@@ -61,7 +59,7 @@ where
 /// defaulting any missing `total`/`offset`/`limit` (the Qobuz `/radio/*` pages
 /// OMIT `total`). Unlike [`lenient_page`] — which returns an EMPTY page on any
 /// parse failure and would silently drop every radio track — this PRESERVES the
-/// items. Ported verbatim from `src-tauri/src/api/models.rs:42-91`.
+/// items.
 pub fn lenient_page_flexible<'de, D, T>(deserializer: D) -> Result<SearchResultsPage<T>, D::Error>
 where
     D: Deserializer<'de>,
@@ -150,9 +148,9 @@ pub fn serde_true() -> bool {
 mod tests {
     use crate::types::{PurchaseIdsResponse, PurchaseResponse, PurchaseTrack};
 
-    // No captured `/purchase/*` sample exists under `qbz-nix-docs/qobuz-api/`
-    // (the user cannot exercise a populated-purchase path), so this fixture is
-    // hand-built to exercise every quirk the source-of-truth §4 calls out:
+    // No captured `/purchase/*` sample exists (the user cannot exercise a
+    // populated-purchase path), so this fixture is hand-built to exercise every
+    // quirk the source-of-truth §4 calls out:
     //   - album `id` arriving as a NUMBER (deserialize_string_id → "12345")
     //   - track `id` arriving as a numeric STRING (deserialize_u64_id → 777)
     //   - `downloadable` / `streamable` ABSENT → must default TRUE (serde_true)

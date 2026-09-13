@@ -2,11 +2,9 @@
 //
 // This re-hosts, as a PURE decision function plus a thin IO shell, the playback
 // bookkeeping that today only exists inside the desktop's 450 ms poll loop
-// (`crates/qbz/src/playback.rs::start_poll_loop`): end-of-track detection,
-// auto-advance, gapless pre-queue, stop-after, seamless-transition cursor sync
-// and the periodic session-position save. Every branch below cites the exact
-// desktop line it mirrors — the desktop is the reference for tie-breaks, the
-// unit tests pin the observable contract (01-architecture.md §3.2).
+// 450 ms poll loop: end-of-track detection, auto-advance, gapless pre-queue,
+// stop-after, seamless-transition cursor sync and the periodic session-position
+// save. The unit tests pin the observable contract (01-architecture.md §3.2).
 //
 // Split of concerns:
 //   * `plan_tick`      — side-effect-free: (state, event, queue, error) → actions
@@ -26,19 +24,11 @@ use qbz_core::{FrontendAdapter, QbzCore};
 use qbz_models::{Quality, QueueTrack, RepeatMode};
 use qbz_player::PlaybackEvent;
 
-use crate::session_store::{
-    PersistedPlaybackSession, PersistedQueueTrack, PersistedSessionSnapshot,
-    PersistedShellViewState,
-};
 use crate::shell::AppRuntime;
 
 /// Poll cadence — the same 450 ms the desktop loop uses
 /// (`playback.rs:4088`).
 const TICK_MS: u64 = 450;
-
-/// Session-position save cadence: every ~11 ticks ≈ 5 s
-/// (`playback.rs:4306`, `save_pos_tick % 11 == 0`).
-const SAVE_POSITION_EVERY_N_TICKS: u64 = 11;
 
 /// QConnect report cadence while playing: every ~4 ticks ≈ 2 s
 /// (`playback.rs:4069`, `QCONNECT_REPORT_EVERY_N_TICKS`).
@@ -66,7 +56,6 @@ pub enum DriverAction {
     /// (`playback.rs:4720`).
     PauseStopAfter,
     /// Persist the live position (throttled ~5 s; `playback.rs:4307`).
-    SavePosition(u64),
     /// Latch a drained stream-error message so `status` stays diagnosable
     /// (`playback.rs:4111`).
     LatchError(String),
@@ -112,7 +101,6 @@ pub struct DriverState {
     /// Previous tick (`last_track_id`, `seen_position`, `was_playing`).
     pub last: LastTick,
     /// ~11-tick throttle counter for the periodic position save.
-    pub save_pos_tick: u64,
     /// Track id an `ArmGapless` already fired for, so the ticker does not
     /// re-request it every tick (`gapless_requested_for`).
     pub gapless_requested_for: u64,
@@ -126,12 +114,10 @@ pub struct DriverState {
 
 impl DriverState {
     /// A state whose `last` snapshot (and report trackers) come from `ev` — the
-    /// "the previous tick looked like this" constructor used by the tests and by
-    /// the shell to seed a baseline.
+    /// "the previous tick looked like this" constructor the tests seed from.
     pub fn after(ev: &PlaybackEvent) -> DriverState {
         DriverState {
             last: LastTick::from_event(ev),
-            save_pos_tick: 0,
             gapless_requested_for: 0,
             report_tick: 0,
             last_reported_track_id: ev.track_id,
@@ -213,16 +199,6 @@ pub fn plan_tick(
     //    user-readable message drained exactly once per failure.
     if let Some(msg) = stream_error {
         actions.push(DriverAction::LatchError(msg.to_string()));
-    }
-
-    // 2. Periodic session-position save (playback.rs:4305-4308): ~11 ticks ≈ 5 s
-    //    while a track is actually playing.
-    let next_save_tick = state.save_pos_tick.wrapping_add(1);
-    if ev.is_playing
-        && ev.track_id != 0
-        && next_save_tick.is_multiple_of(SAVE_POSITION_EVERY_N_TICKS)
-    {
-        actions.push(DriverAction::SavePosition(ev.position));
     }
 
     // 3. Seamless gapless transition (playback.rs:4324-4371): the engine advanced
@@ -335,9 +311,7 @@ pub fn advance_state(
         .iter()
         .any(|a| matches!(a, DriverAction::ReportEdge));
 
-    // save_pos_tick advances every tick — playback.rs:4305 runs before the
-    // seamless `continue`.
-    let save_pos_tick = prev.save_pos_tick.wrapping_add(1);
+    //     // seamless `continue`.
 
     if seamless {
         // Seamless branch (playback.rs:4363-4369): last <- ev, gapless guard
@@ -345,7 +319,6 @@ pub fn advance_state(
         // block, so report_tick does NOT advance this tick).
         return DriverState {
             last: LastTick::from_event(ev),
-            save_pos_tick,
             gapless_requested_for: 0,
             report_tick: prev.report_tick,
             last_reported_track_id: prev.last_reported_track_id,
@@ -389,7 +362,6 @@ pub fn advance_state(
 
     DriverState {
         last,
-        save_pos_tick,
         gapless_requested_for,
         report_tick,
         last_reported_track_id,
@@ -397,11 +369,10 @@ pub fn advance_state(
     }
 }
 
-/// Map the desktop `ui_prefs.streaming_quality` key to a request-layer
-/// [`Quality`]. Byte-identical contract to `crates/qbz/src/ui_prefs.rs:823`
-/// (`streaming_quality_for_key`), replicated here because the desktop crate is
-/// out of the daemon's dependency graph. Unknown/unset keys fall back to the
-/// top tier so hi-res never silently downgrades (01 §3.1).
+/// Map a `streaming_quality` preference key to a request-layer [`Quality`].
+///
+/// Unknown/unset keys fall back to the top tier so hi-res never silently
+/// downgrades (01 §3.1).
 pub fn quality_from_key(key: &str) -> Quality {
     match key {
         "mp3" => Quality::Mp3,
@@ -534,13 +505,6 @@ pub async fn run_driver<A: FrontendAdapter + Send + Sync + 'static>(
                 DriverAction::AdvanceAndPlay => {
                     advance_and_play_logged(&runtime, (deps.quality)()).await;
                 }
-                DriverAction::SavePosition(p) => {
-                    runtime.with_session_store(|s| {
-                        if let Err(e) = s.save_position(*p) {
-                            log::debug!("[qbzd] driver: save_position failed: {e}");
-                        }
-                    });
-                }
                 DriverAction::LatchError(m) => {
                     (deps.on_latch)("stream", m.clone());
                 }
@@ -594,10 +558,9 @@ async fn advance_and_play_logged<A: FrontendAdapter + Send + Sync + 'static>(
 /// the successors for gapless → persist the session. Never a bare cursor move
 /// (02 §2.2). The skip-walk mirrors `playback.rs::advance_to_playable` (capped
 /// at `MAX_OFFLINE_SKIPS`); `next_track()`/`previous_track()` are the atomic
-/// cursor movers — `forward` selects which one, exactly like the desktop's
-/// `advance_to_playable(runtime, weak, forward)` (`crates/qbz/src/playback.rs:358`),
-/// so `qbzd next` and `qbzd prev` share this one ritual instead of duplicating
-/// the play → prefetch → persist tail.
+/// cursor movers — `forward` selects which one, so `qbzd next` and `qbzd prev`
+/// share this one ritual instead of duplicating the play → prefetch → persist
+/// tail.
 pub async fn advance_and_play<A: FrontendAdapter + Send + Sync + 'static>(
     runtime: &AppRuntime<A>,
     quality: Quality,
@@ -637,8 +600,6 @@ pub async fn advance_and_play<A: FrontendAdapter + Send + Sync + 'static>(
     core.play_track_resolved(track_id, quality, 0).await?;
     // Warm the successors so the next transition can be gapless (best-effort).
     prefetch_successors(runtime, quality).await;
-    // Persist the session (queue + current + position) so a restart resumes.
-    save_session_now(runtime).await;
     Ok(Some(track))
 }
 
@@ -692,139 +653,11 @@ async fn queue_snapshot<A: FrontendAdapter + Send + Sync + 'static>(
     }
 }
 
-// ───────────────────── session persistence (daemon) ─────────────────────
-
-/// Capture the live queue + playback state and persist it via the active
-/// session store. No-op when no session is active (`with_session_store` returns
-/// `None`). Mirrors `crates/qbz/src/session_persist.rs::capture_and_save`, minus
-/// the desktop-only `persist_session` gate (the daemon's store IS its queue
-/// persistence, so it always saves).
-pub async fn save_session_now<A: FrontendAdapter + Send + Sync + 'static>(runtime: &AppRuntime<A>) {
-    let core = runtime.core();
-    let (tracks, current_index) = core.get_all_queue_tracks().await;
-    let full = core.get_queue_state_full().await;
-    let ev = core.player().get_playback_event();
-    let snapshot = PersistedSessionSnapshot {
-        playback: PersistedPlaybackSession {
-            queue_tracks: tracks.iter().map(to_persisted).collect(),
-            current_index,
-            current_position_secs: ev.position,
-            volume: ev.volume,
-            shuffle_enabled: full.shuffle,
-            repeat_mode: repeat_to_str(full.repeat).to_string(),
-            was_playing: ev.is_playing,
-            saved_at: 0, // set inside save_session
-        },
-        // Shell-view columns are desktop-only; keep defaults so the schema
-        // round-trips unchanged.
-        shell_view: PersistedShellViewState::default(),
-    };
-    let saved = runtime.with_session_store(|s| s.save_session(&snapshot));
-    match saved {
-        Some(Ok(())) => {}
-        Some(Err(e)) => log::warn!("[qbzd] driver: session save failed: {e}"),
-        None => log::debug!("[qbzd] driver: session save skipped (no active session)"),
-    }
-}
-
-/// Restore the persisted queue at boot, PAUSED (queue + order + repeat + volume,
-/// never auto-playing). Returns `true` when a non-empty queue was restored.
-/// Mirrors `session_persist::restore`'s Phase A; the daemon has no
-/// `resume_playback_position` gate, so the saved position is threaded into the
-/// snapshot but only replayed when the CLI later plays the restored track.
-pub async fn restore_session_paused<A: FrontendAdapter + Send + Sync + 'static>(
-    runtime: &AppRuntime<A>,
-) -> bool {
-    let Some(loaded) = runtime.with_session_store(|s| s.load_session()) else {
-        return false; // no active session
-    };
-    let snapshot = match loaded {
-        Ok(s) => s,
-        Err(e) => {
-            log::warn!("[qbzd] driver: session load failed: {e}");
-            return false;
-        }
-    };
-    let pb = snapshot.playback;
-    if pb.queue_tracks.is_empty() {
-        log::info!("[qbzd] driver: nothing to restore (saved queue is empty)");
-        return false;
-    }
-    let count = pb.queue_tracks.len();
-    let index = pb.current_index;
-    let position = pb.current_position_secs;
-    let tracks: Vec<QueueTrack> = pb.queue_tracks.into_iter().map(from_persisted).collect();
-    let core = runtime.core();
-    core.set_queue_with_order(tracks, index, pb.shuffle_enabled, None)
-        .await;
-    core.set_repeat_mode(repeat_from_str(&pb.repeat_mode)).await;
-    let _ = core.set_volume(pb.volume);
-    log::info!(
-        "[qbzd] driver: restored {count} queue tracks (index {index:?}), paused; \
-         saved position {position}s"
-    );
-    true
-}
-
 fn repeat_to_str(mode: RepeatMode) -> &'static str {
     match mode {
         RepeatMode::Off => "off",
         RepeatMode::All => "all",
         RepeatMode::One => "one",
-    }
-}
-
-fn repeat_from_str(s: &str) -> RepeatMode {
-    match s {
-        "all" => RepeatMode::All,
-        "one" => RepeatMode::One,
-        _ => RepeatMode::Off,
-    }
-}
-
-fn to_persisted(t: &QueueTrack) -> PersistedQueueTrack {
-    PersistedQueueTrack {
-        id: t.id,
-        title: t.title.clone(),
-        artist: t.artist.clone(),
-        album: t.album.clone(),
-        duration_secs: t.duration_secs,
-        artwork_url: t.artwork_url.clone(),
-        hires: t.hires,
-        bit_depth: t.bit_depth,
-        sample_rate: t.sample_rate,
-        is_local: t.is_local,
-        album_id: t.album_id.clone(),
-        artist_id: t.artist_id,
-        streamable: t.streamable,
-        source: t.source.clone(),
-        parental_warning: t.parental_warning,
-        source_item_id_hint: t.source_item_id_hint.clone(),
-    }
-}
-
-fn from_persisted(t: PersistedQueueTrack) -> QueueTrack {
-    QueueTrack {
-        id: t.id,
-        title: t.title,
-        version: None,
-        artist: t.artist,
-        album: t.album,
-        album_version: None,
-        duration_secs: t.duration_secs,
-        artwork_url: t.artwork_url,
-        hires: t.hires,
-        bit_depth: t.bit_depth,
-        sample_rate: t.sample_rate,
-        is_local: t.is_local,
-        album_id: t.album_id,
-        artist_id: t.artist_id,
-        streamable: t.streamable,
-        source: t.source,
-        parental_warning: t.parental_warning,
-        source_item_id_hint: t.source_item_id_hint,
-        context_kind: None,
-        context_id: None,
     }
 }
 
@@ -1032,21 +865,6 @@ mod tests {
         );
         let all_bad: Vec<(u64, bool)> = (0..60).map(|i| (i, false)).collect();
         assert_eq!(next_playable(&all_bad, 50), None); // bounded — never walks forever
-    }
-
-    #[test]
-    fn position_save_cadence_11_ticks() {
-        let mut s = DriverState::after(&ev(1, true, 10, 581));
-        for tick in 1..=11u32 {
-            let e = ev(1, true, 10 + tick as u64, 581);
-            let a = plan_tick(&s, &e, &q(1, &[], "off", None), None);
-            if tick == 11 {
-                assert!(a.contains(&DriverAction::SavePosition(21)));
-            } else {
-                assert!(!a.iter().any(|x| matches!(x, DriverAction::SavePosition(_))));
-            }
-            s = advance_state(&s, &e, &a);
-        }
     }
 
     #[test]

@@ -4,8 +4,8 @@
 //! card index N, signalling to PulseAudio/PipeWire/WirePlumber that another
 //! application owns the device exclusively. Released on Drop.
 //!
-//! See `qbz-nix-docs/specs/2026-05-07-alsa-exclusive-hardening-design.md`
-//! for the full protocol specification and lifetime model.
+//! The protocol and the lifetime model are documented on the Linux
+//! implementation in `device_reservation/linux.rs`.
 
 #[cfg(target_os = "linux")]
 mod linux;

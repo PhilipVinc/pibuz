@@ -1,11 +1,9 @@
 //! Frontend-agnostic renderer-side pure helpers (slice 6).
 //!
 //! Pure protocol/format math used by the renderer orchestration (queue
-//! materialize / cursor-align). No engine, no I/O, no Tauri. Relocated here so
-//! both the Tauri adapter and the Slint adapter share one definition; the
-//! src-tauri side re-exports these. The load-dedup predicates and the
-//! audio-quality report helpers move here alongside their orchestration /
-//! report consumers in the later slice-6 steps.
+//! materialize / cursor-align). No engine, no I/O. The load-dedup predicates
+//! and the audio-quality report helpers live here alongside their
+//! orchestration / report consumers.
 
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -670,12 +670,9 @@ pub async fn download_raw_with_progress(
 
 /// Build a reqwest client configured for Akamai CDN fetches.
 ///
-/// Uses the workspace reqwest feature set (rustls-tls). The original in-tree
-/// version in `src-tauri/commands_v2/helpers.rs` called `.use_native_tls()`
-/// but the src-tauri Cargo opts into both stacks; this crate stays on
-/// rustls for smaller binary + no system SSL dependency. If Akamai ever
-/// surfaces a cert issue, adding the `native-tls` feature to qbz-qobuz is
-/// the escape hatch.
+/// Uses the workspace reqwest feature set (rustls-tls): smaller binary, no
+/// system SSL dependency. If Akamai ever surfaces a cert issue, adding the
+/// `native-tls` feature to qbz-qobuz is the escape hatch.
 fn build_cdn_client() -> std::result::Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))

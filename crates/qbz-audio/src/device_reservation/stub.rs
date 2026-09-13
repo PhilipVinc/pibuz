@@ -11,7 +11,7 @@ impl DeviceReservation {
     /// Acquire a reservation for the given ALSA hw: device string.
     ///
     /// On non-Linux platforms this always returns a degraded guard (no-op).
-    pub fn acquire(_hw_device: &str, _app_device_name: &str) -> Result<Self, ReservationError> {
+    pub fn acquire(_hw_device: &str) -> Result<Self, ReservationError> {
         Ok(Self)
     }
 
@@ -32,8 +32,7 @@ impl Drop for DeviceReservation {
 /// Stub: variants exist for cross-platform pattern-matching parity with
 /// the Linux `ReservationError`, but are never constructed on this target
 /// (`acquire()` always returns a degraded `Ok`). The `#[allow(dead_code)]`
-/// is intentional and load-bearing for downstream `match` blocks (e.g.,
-/// the `DacReservationStatus` mapping introduced in Task 5) which must
+/// is intentional and load-bearing for downstream `match` blocks, which must
 /// compile on every platform.
 #[derive(Debug)]
 #[allow(dead_code)]

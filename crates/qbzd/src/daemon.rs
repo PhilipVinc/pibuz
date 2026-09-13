@@ -74,7 +74,7 @@ pub async fn run(roots: ProfileRoots, cfg: QbzdConfig, warns: Vec<String>) -> Re
         );
     }
 
-    // 6.-9. compose stores + runtime + restore credentials + restore session.
+    // 6.-9. compose the daemon-root stores and the runtime.
     let mut booted = boot(&roots, &cfg, warns.len()).await?;
 
     // Attach the CoreEvent bus to the shared state so the qconnect lifecycle
@@ -119,14 +119,6 @@ pub async fn run(roots: ProfileRoots, cfg: QbzdConfig, warns: Vec<String>) -> Re
         deps,
         shutdown_rx,
     ));
-
-    // 10b. Queue-persistence subscriber (T10, §7.5): a `CoreEvent::QueueUpdated`
-    //      on the DaemonAdapter bus — from driver auto-advance, the CLI queue
-    //      verbs OR a QConnect-driven remote mutation — is debounced 2 s and then
-    //      flushed to the session store, so a restart resumes the remote-set queue
-    //      PAUSED (boot already restores it, §8.1-9½). Holds an `Arc<AppRuntime>`
-    //      clone, so it is aborted+joined ahead of `drop(booted)` (#521 ordering).
-    let queue_persist = spawn_queue_persist(booted.runtime.clone(), booted.bus.subscribe());
 
     // 10c½. Events bridge: translate the driver's transition edges into the
     //       playback CoreEvents the bus consumers above (and SSE, and the event
@@ -239,8 +231,6 @@ pub async fn run(roots: ProfileRoots, cfg: QbzdConfig, warns: Vec<String>) -> Re
     // T10 (§7.5): stop the queue-persistence subscriber before the authoritative
     // final save, so it neither races the flush below nor keeps its
     // `Arc<AppRuntime>` clone alive past `drop(booted)` (#521 ordering).
-    queue_persist.abort();
-    let _ = queue_persist.await;
     // Stop the events bridge BEFORE `drop(booted)`: it upgrades its Weak to a
     // strong Arc<AppRuntime> for the span of each wake (#521 ordering).
     events_bridge.abort();
@@ -255,8 +245,6 @@ pub async fn run(roots: ProfileRoots, cfg: QbzdConfig, warns: Vec<String>) -> Re
     if let Some(mpris) = mpris {
         mpris.shutdown().await;
     }
-    // Final full session save (queue + position) now that playback is quiesced.
-    playback_driver::save_session_now(booted.runtime.as_ref()).await;
     // The background auth-retry task also holds an Arc<AppRuntime> clone — abort
     // AND join it so its Arc is dropped before `drop(booted)`; otherwise the
     // ordering claim below (drop releases the device) breaks once playback has
@@ -278,9 +266,9 @@ pub async fn run(roots: ProfileRoots, cfg: QbzdConfig, warns: Vec<String>) -> Re
     // Release the audio device by dropping the runtime (its Player) BEFORE the
     // #521 pair (§8.2 step 3 precedes step 4).
     drop(booted);
-    //    THE #521 PAIR runs unconditionally on Linux — exactly the desktop quit
-    //    choke-point (crates/qbz/src/main.rs:20393): a forced PipeWire clock left
-    //    set would pin the whole system's sample rate after the process dies.
+    //    THE #521 PAIR runs unconditionally on Linux: a forced PipeWire clock
+    //    left set would pin the whole system's sample rate after the process
+    //    dies.
     //    Both calls self-gate to no-ops when QBZ forced nothing.
     #[cfg(target_os = "linux")]
     {
@@ -291,20 +279,15 @@ pub async fn run(roots: ProfileRoots, cfg: QbzdConfig, warns: Vec<String>) -> Re
     Ok(0) // instance lock released on drop of `_lock`
 }
 
-/// Steps 6-9 of §8.1: open the daemon-root stores, compose the runtime with the
-/// two NORMATIVE substitutions (`with_audio_settings` + `activate_at`), and
-/// restore the saved session per the §6.2 clearing taxonomy.
+/// Steps 6-9 of §8.1: open the daemon-root stores and compose the runtime.
 async fn boot(
     roots: &ProfileRoots,
     cfg: &QbzdConfig,
     warn_count: usize,
 ) -> Result<BootedRuntime, String> {
-    // 6.+7. stores + runtime composition. The two substitutions (01 §2.2):
-    //   - with_audio_settings, NOT AppRuntime::new (which hardcodes the
-    //     desktop-global AudioSettingsStore — shell.rs:87-101);
-    //   - activate_at (below), NOT activate (which resolves desktop
-    //     UserDataPaths — shell.rs:195-203).
-    // Everything routes through the T2 daemon roots.
+    // 6.+7. stores + runtime composition. `with_audio_settings` takes the
+    // settings the caller already opened, so everything routes through the T2
+    // daemon roots rather than any global path.
     let store = qbz_audio::settings::AudioSettingsStore::new_at(&roots.data)?; // settings.rs:263
     let settings = store.get_settings()?;
     let (adapter, _rx) = DaemonAdapter::new();
@@ -400,49 +383,6 @@ fn build_driver_deps(
             }
         }),
     }
-}
-
-/// T10 (§7.5): the queue-persistence subscriber. Debounces `CoreEvent::QueueUpdated`
-/// bursts by 2 s, then flushes the live queue + position to the session store via
-/// `save_session_now`. QConnect-driven mutations (`materialize_remote_queue` ->
-/// `set_queue`) also emit `QueueUpdated`, so a remote-set queue survives a restart
-/// (boot restores it PAUSED). Non-queue events (e.g. position ticks) are drained
-/// WITHOUT extending the debounce window, so they can never starve the flush.
-fn spawn_queue_persist(
-    runtime: Arc<AppRuntime<DaemonAdapter>>,
-    mut rx: broadcast::Receiver<CoreEvent>,
-) -> JoinHandle<()> {
-    use tokio::sync::broadcast::error::RecvError;
-    const DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(2);
-    tokio::spawn(async move {
-        loop {
-            // Block until the FIRST queue mutation of a burst.
-            match rx.recv().await {
-                Ok(CoreEvent::QueueUpdated { .. }) => {}
-                Ok(_) => continue,
-                Err(RecvError::Lagged(_)) => continue,
-                Err(RecvError::Closed) => return,
-            }
-            // Debounce: a fixed deadline that only a further QueueUpdated extends.
-            // Other events are consumed but never push the deadline out.
-            let mut deadline = tokio::time::Instant::now() + DEBOUNCE;
-            loop {
-                tokio::select! {
-                    _ = tokio::time::sleep_until(deadline) => break,
-                    r = rx.recv() => match r {
-                        Ok(CoreEvent::QueueUpdated { .. }) => {
-                            deadline = tokio::time::Instant::now() + DEBOUNCE;
-                        }
-                        Ok(_) => {}
-                        Err(RecvError::Lagged(_)) => {}
-                        Err(RecvError::Closed) => return,
-                    }
-                }
-            }
-            playback_driver::save_session_now(runtime.as_ref()).await;
-            log::debug!("[qbzd] queue-persist: session flushed after QueueUpdated burst");
-        }
-    })
 }
 
 /// Fresh shared state.

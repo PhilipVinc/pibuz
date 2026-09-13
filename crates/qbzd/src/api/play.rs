@@ -107,9 +107,7 @@ pub(crate) fn start_resolved(
             if let Ok(mut s) = shared.lock() {
                 s.last_errors.stream = Some(format!("play: {err}"));
             }
-            return;
         }
-        qbz_app::playback_driver::save_session_now(runtime.as_ref()).await;
     });
 
     json(

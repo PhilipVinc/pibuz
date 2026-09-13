@@ -2,8 +2,7 @@
 // TUI's SEVENTH section (owner-sanctioned cap break). A six-step content-frame
 // flow: Welcome → Check → Select DACs → Review → Test → Done.
 //
-// The heavy, frontend-agnostic logic is COPIED into `tui/wizard_core.rs` (from
-// the Slint `qbz-dac-wizard` crate, which the slint-free daemon must not link).
+// The heavy, frontend-agnostic logic lives in `tui/wizard_core.rs`.
 // This screen owns the transient step state + rendering and asks the App to run
 // the blocking probes on a worker (NEVER on the render thread, §5.5). The owner
 // emphasis — copyable generated config blocks — is the Review step: one bordered

@@ -62,24 +62,6 @@ fn find_uuid_box(data: &[u8], target_uuid: &[u8; 16]) -> Option<(usize, usize)> 
     None
 }
 
-/// Walk ISO BMFF boxes and find the `mdat` box.
-/// Returns `(data_start, box_end)` where data_start = box_start + 8.
-#[allow(dead_code)]
-fn find_mdat_box(data: &[u8]) -> Option<(usize, usize)> {
-    let mut pos = 0;
-    while pos + 8 <= data.len() {
-        let size = read_box_size(data, pos);
-        if size < 8 || pos + size > data.len() {
-            break;
-        }
-        if &data[pos + 4..pos + 8] == b"mdat" {
-            return Some((pos + 8, pos + size));
-        }
-        pos += size;
-    }
-    None
-}
-
 /// Parse the init segment (segment 0) to extract the FLAC header and segment table.
 pub fn parse_init_segment(data: &[u8]) -> Result<InitInfo, CmafError> {
     let (payload_start, box_end) = find_uuid_box(data, &QBZ_INIT_UUID)

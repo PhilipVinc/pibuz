@@ -1,7 +1,3 @@
-// TODO(converge: qconnect-glue) — derived from crates/qbz/src/qconnect_service.rs @ 5d50158e
-// (the connect/disconnect facade + startup auto-connect, UI stripped);
-// do not fix bugs here without fixing the source, and vice versa.
-//
 //! Daemon QConnect service facade + boot-step-12 entry point.
 //!
 //! Composes the copied glue (engine / sink / session / report / transport /

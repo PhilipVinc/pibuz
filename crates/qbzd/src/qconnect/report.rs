@@ -1,6 +1,3 @@
-// TODO(converge: qconnect-glue) — copied from crates/qbz/src/qconnect_service.rs @ 5d50158e;
-// do not fix bugs here without fixing the source, and vice versa.
-//
 //! Renderer playback-state report (the UI-free body of the desktop
 //! `report_playback_state`, qconnect_service.rs:592).
 //!
@@ -12,7 +9,6 @@
 //! `RndrSrvrStateUpdated`, keeps the app's renderer position in sync, and reports
 //! the live output format for the controller's quality badge. `position_ms` /
 //! `duration_ms` are MILLISECONDS (the QConnect protocol unit).
-#![allow(dead_code)]
 
 use std::sync::Arc;
 

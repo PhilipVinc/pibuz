@@ -332,7 +332,7 @@ pub fn export(source: ExportSource, _opts: &ExportOptions) -> Result<Bundle, Bun
 
     // per-user domains — resolve the source uid.
     let uid = match &source {
-        ExportSource::Desktop => crate::user_data::UserDataPaths::load_last_user_id(),
+        ExportSource::Desktop => crate::user_data::load_last_user_id(),
         ExportSource::Daemon(_) => read_last_user_id(&paths.data_root),
     };
     match uid {

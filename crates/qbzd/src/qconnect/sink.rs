@@ -1,6 +1,3 @@
-// TODO(converge: qconnect-glue) — copied from crates/qbz/src/qconnect_event_sink.rs @ c8ef2a1b;
-// do not fix bugs here without fixing the source, and vice versa.
-//
 //! Daemon `QconnectEventSink`.
 //!
 //! Receives `QconnectAppEvent`s from the qconnect-app crate and dispatches the
@@ -58,7 +55,7 @@ pub struct DaemonEventSink {
     /// stale until the peer changes track. Edge-detected to avoid spamming on
     /// every periodic state-update frame.
     last_peer_active: std::sync::atomic::AtomicBool,
-    /// DAEMON-ONLY (qconnect.initial_volume): when this renderer last became the
+    /// `qconnect.initial_volume`: when this renderer last became the
     /// session's active one, and whether the join-time volume has already been
     /// defended once since. See `assert_join_volume`.
     became_active_at: std::sync::Mutex<Option<std::time::Instant>>,
@@ -127,7 +124,7 @@ impl DaemonEventSink {
         }
     }
 
-    /// DAEMON-ONLY: send this renderer's real volume to the controller.
+    /// send this renderer's real volume to the controller.
     async fn report_volume(&self, reason: &str) {
         let Some(app) = self.app.get().and_then(Weak::upgrade) else {
             return;
@@ -145,7 +142,7 @@ impl DaemonEventSink {
         }
     }
 
-    /// DAEMON-ONLY (qconnect.initial_volume): defend the join-time volume, once.
+    /// `qconnect.initial_volume`: defend the join-time volume, once.
     ///
     /// "Volume on connect" exists so an app that has never spoken to this player
     /// cannot push its own level — near full scale on the phone apps — at a
@@ -213,7 +210,7 @@ impl DaemonEventSink {
     /// the returned `SessionApplyOutcome` asks for. Mirrors the Tauri
     /// `apply_session_management_event`; the post-lock ordering (loop mode ->
     /// local-playback handoff -> projection -> freeze -> watchdog) is identical.
-    /// DAEMON-ONLY: latch whether the session still renders HERE, for
+    /// latch whether the session still renders HERE, for
     /// `/api/status`.
     ///
     /// `session_active` only says we hold a cloud connection, which stays true
@@ -476,7 +473,7 @@ impl QconnectEventSink for DaemonEventSink {
                     }
                     self.report_volume("took the render").await;
                 }
-                // DAEMON-ONLY: re-latch the published role. The cloud states it
+                // re-latch the published role. The cloud states it
                 // outright in this message, and until now the latch ran ONLY on
                 // session-management events — so `/api/status` could still say
                 // `is_active: true` after a SetActive(false) had already stopped

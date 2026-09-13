@@ -7,8 +7,7 @@ use std::path::Path;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DaemonPrefs {
-    /// Same key contract as desktop ui_prefs.streaming_quality:
-    /// "mp3" | "cd" | "hires" | "hires_plus" (crates/qbz/src/ui_prefs.rs:307-308)
+    /// "mp3" | "cd" | "hires" | "hires_plus".
     pub streaming_quality: String,
     /// Restored at boot; NEVER imported (04 §3 — power-amp hazard).
     pub volume: f32,

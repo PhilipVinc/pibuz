@@ -1,6 +1,3 @@
-// TODO(converge: qconnect-glue) — copied from crates/qbz/src/qconnect_engine.rs @ c8ef2a1b;
-// do not fix bugs here without fixing the source, and vice versa.
-//
 //! Qobuz Connect renderer engine for the qbzd daemon.
 //!
 //! Implements [`qconnect_app::QconnectRendererEngine`] over the daemon
@@ -84,13 +81,13 @@ pub struct DaemonRendererEngine {
     runtime: Arc<AppRuntime<DaemonAdapter>>,
     /// T10 (OD4): resolved volume policy for this session (from the KV at connect).
     volume_mode: VolumeMode,
-    /// DAEMON-ONLY: the current track's progressive-download feeder. A track
+    /// the current track's progressive-download feeder. A track
     /// change MUST abort the previous feeder — left alone it downloads the
     /// full file at line speed to the very end, and a few quick skips stack
     /// concurrent hi-res downloads that starve the new track's startup buffer
     /// (5-8 s starts observed on a Pi).
     current_feeder: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
-    /// DAEMON-ONLY: the track whose buffer is still filling, so renderer
+    /// the track whose buffer is still filling, so renderer
     /// reports can say BUFFERING (see `BufferingLatch`).
     buffering: Arc<BufferingLatch>,
     /// Daemon status + event bus, so a starting stream can announce itself to
@@ -325,7 +322,7 @@ impl QconnectRendererEngine for DaemonRendererEngine {
         self.core().stop().map_err(|err| err.to_string())
     }
     fn seek(&self, position_secs: u64) -> Result<(), String> {
-        // DAEMON-ONLY: tell the controller we are buffering, exactly as a load
+        // tell the controller we are buffering, exactly as a load
         // does. A seek is not instant — Qobuz FLACs carry no SEEKTABLE, so
         // Symphonia bisects, and a cold ranged open off the CDN costs seconds.
         // Measured on hardware: `Resume: landed on 60s in 10498ms`, ten and a
@@ -498,11 +495,11 @@ impl QconnectRendererEngine for DaemonRendererEngine {
             .await
             .map_err(|err| format!("resolve stream url for remote track {track_id}: {err}"))?;
 
-        // DAEMON-ONLY: stop the previous track's download before starting the
+        // stop the previous track's download before starting the
         // next one (see `current_feeder`).
         self.abort_current_feeder();
 
-        // DAEMON-ONLY: tell the controller we are loading. The stream is not
+        // tell the controller we are loading. The stream is not
         // audible until the feeder reaches `start_position_secs` and the
         // pre-skip completes; the report scheduler clears this once the player
         // starts producing audio.
@@ -531,7 +528,7 @@ impl QconnectRendererEngine for DaemonRendererEngine {
             Err(err) => err,
         };
 
-        // DAEMON-ONLY: past this point the raw stream is gone and the latch,
+        // past this point the raw stream is gone and the latch,
         // armed above, no longer necessarily describes what is happening. Its
         // only other exits are the audible edge and a 90 s safety expiry, so a
         // stale entry means a minute and a half of spinner for audio that will

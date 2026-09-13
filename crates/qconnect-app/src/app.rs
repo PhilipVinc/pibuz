@@ -4,7 +4,7 @@ use std::{
 };
 
 use qconnect_core::{
-    apply_event, apply_renderer_command, telemetry, PendingCorrelation, PendingQueueAction,
+    apply_event, apply_renderer_command, PendingCorrelation, PendingQueueAction,
     QConnectQueueState, QConnectRendererState, QueueEvent, QueueItem, QueueVersion,
     RendererCommand,
 };
@@ -459,8 +459,7 @@ where
                 state.concurrency_canceled_action_uuid = None;
             } else {
                 let queue_event = map_server_event(&event, &state.queue);
-                let reducer_outcome = apply_event(&mut state.queue, &queue_event, now_ms());
-                let _metric_name = telemetry::queue_reducer_event_name(reducer_outcome.event_name);
+                apply_event(&mut state.queue, &queue_event, now_ms());
                 should_emit_queue_update = true;
                 if matches!(
                     event.event_type,

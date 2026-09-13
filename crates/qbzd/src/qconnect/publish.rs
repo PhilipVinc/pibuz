@@ -1,12 +1,8 @@
-// TODO(converge: qconnect-glue) — ported from crates/qbz/src/qconnect_service.rs
-// `sync_local_queue_if_changed` @ f18960ba; do not fix bugs here without fixing
-// the source, and vice versa.
-//
 //! Daemon-side local-queue -> Connect-cloud publish (the desktop's
 //! `sync_local_queue_if_changed`, qconnect_service.rs:875).
 //!
-//! The daemon was queue RECEIVE-ONLY: a daemon-originated queue (CLI/TUI/MPRIS/
-//! restored session) never reached the cloud, so controllers rendered a
+//! The daemon was queue RECEIVE-ONLY: a daemon-originated queue (CLI/TUI/MPRIS)
+//! never reached the cloud, so controllers rendered a
 //! different queue than the one actually playing (design doc had flagged this
 //! as knowingly unported — design-input/qconnect-headless.md:250-252).
 //!
@@ -19,9 +15,9 @@
 //! toasts on refusal; the daemon logs.
 //!
 //! Trigger: the desktop calls it on every track transition from its poll loop.
-//! The daemon instead runs a debounced `CoreEvent::QueueUpdated` subscriber
-//! (same pattern as `daemon.rs::spawn_queue_persist`), which ALSO covers queue
-//! edits while paused/stopped — a transition-only hook would miss those.
+//! The daemon instead runs a debounced `CoreEvent::QueueUpdated` subscriber,
+//! which ALSO covers queue edits while paused/stopped — a transition-only hook
+//! would miss those.
 
 use std::sync::Arc;
 
@@ -144,7 +140,7 @@ pub async fn publish_local_queue_if_changed(
 }
 
 /// The queue-publish subscriber: debounces `CoreEvent::QueueUpdated` bursts by
-/// 2 s (same ritual as `daemon.rs::spawn_queue_persist`), then runs
+/// 2 s, then runs
 /// [`publish_local_queue_if_changed`]. Non-queue events are drained WITHOUT
 /// extending the debounce window, so they can never starve the publish. Holds
 /// `Arc` clones of the qconnect inner + the runtime, so the handle is

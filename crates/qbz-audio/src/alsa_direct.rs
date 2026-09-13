@@ -682,8 +682,8 @@ pub fn mixer_ctl_name(device_id: &str) -> Option<String> {
 ///
 /// Only applied when the reservation actually transitioned ownership (i.e.
 /// `DeviceReservation::is_active()` is `true`). Sized conservatively; do not
-/// reduce without revisiting the Lifetime-A safety contract in
-/// `qbz-nix-docs/specs/2026-05-07-alsa-exclusive-hardening-design.md`.
+/// reduce without revisiting the Lifetime-A safety contract on
+/// `DeviceReservation::acquire`.
 #[cfg(target_os = "linux")]
 const PIPEWIRE_VACATE_MARGIN: std::time::Duration = std::time::Duration::from_millis(50);
 
@@ -736,8 +736,7 @@ impl AlsaDirectStream {
         // tight-coupling rule allows: a `DeviceReservation` is created
         // immediately before a real `PCM::new()` and held for as long as that
         // PCM is open.
-        // TODO(Task 5): replace second arg with user-facing DAC name from settings.
-        let reservation = crate::DeviceReservation::acquire(device_id, device_id)
+        let reservation = crate::DeviceReservation::acquire(device_id)
             .map_err(|e| format!("Cannot acquire exclusive device '{}': {}", device_id, e))?;
 
         // Defensive margin only matters when the reservation actually displaced

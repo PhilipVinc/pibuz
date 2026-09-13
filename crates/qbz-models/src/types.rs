@@ -499,8 +499,7 @@ pub struct SearchResultsPage<T> {
 
 // ============ Purchases API Models ============
 //
-// Ported field-for-field from `src-tauri/src/api/models.rs:546-628`. These are
-// the wire shapes returned by the Qobuz `/purchase/*` endpoints. The lenient
+// The wire shapes returned by the Qobuz `/purchase/*` endpoints. The lenient
 // deserializers live in `crate::purchase_serde` (see that module's docs for the
 // per-field coercion rules).
 

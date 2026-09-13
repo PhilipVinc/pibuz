@@ -1,9 +1,8 @@
 //! QConnect startup mode: persisted preference for whether QConnect
 //! auto-connects when the app launches.
 //!
-//! Pure logic only — no SQLite, no FS. Persistence lives in the Tauri
-//! adapter (src-tauri/src/qconnect/startup.rs) matching the existing
-//! `device_name` persistence pattern in `transport.rs`.
+//! Pure logic only — no SQLite, no FS. Persistence lives in the host, next to
+//! its `device_name` handling (`qbzd::qconnect::transport`).
 
 use serde::{Deserialize, Serialize};
 

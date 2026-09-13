@@ -16,8 +16,7 @@
 // requirement — a silent no-op reads as broken, 02 §1.4).
 //
 // Mute is daemon-owned state in `DaemonShared.{muted, premute_volume}` (T2
-// seam), NOT the desktop's process statics (`crates/qbz/src/playback.rs:
-// 3907-3930`) — same semantics (stash-then-zero / restore), different owner.
+// seam), with stash-then-zero / restore semantics.
 // The reported `playback.volume` is always the NOMINAL (pre-mute) level, both
 // muted and unmuted: `premute_volume` when muted, the live player volume
 // otherwise. This is what makes `now`'s and `mute`'s human lines ("vol 80%",
@@ -73,8 +72,7 @@ pub fn now_playing(state: &ApiState) -> Response<Cursor<Vec<u8>>> {
 }
 
 /// `POST /api/playback/play` (02 §3.3.5). Resume if paused; cold-start the
-/// current queue track when `!has_loaded_audio()` (the desktop's
-/// `toggle_play_pause` cold-start branch, `crates/qbz/src/playback.rs:3837-3860`).
+/// current queue track when `!has_loaded_audio()`.
 pub fn play(state: &ApiState) -> Response<Cursor<Vec<u8>>> {
     let player = state.runtime.core().player();
     if player.has_loaded_audio() {
@@ -209,9 +207,7 @@ pub fn volume(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
         );
     };
 
-    // An explicit non-zero target clears an active mute (desktop parity:
-    // `crates/qbz/src/playback.rs:3921-3924` — "a non-zero level clears any
-    // active mute").
+    // An explicit non-zero target clears an active mute.
     let mut muted_after = muted_before;
     if target > 0.0 && muted_before {
         if let Ok(mut s) = state.shared.lock() {
@@ -282,10 +278,9 @@ pub fn repeat(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
 
 // ============================ internals ============================
 
-/// `{"mute": "on"|"off"|"toggle"}` — stash-then-zero / restore, mirroring the
-/// desktop's `toggle_mute` (`crates/qbz/src/playback.rs:3936-3961`) but
-/// against `DaemonShared` instead of process statics. `live` is the player's
-/// volume BEFORE this call (the value to stash on a fresh mute).
+/// `{"mute": "on"|"off"|"toggle"}` — stash-then-zero / restore against
+/// `DaemonShared`. `live` is the player's volume BEFORE this call (the value
+/// to stash on a fresh mute).
 fn apply_mute(state: &ApiState, live: f32, arg: &str) -> Response<Cursor<Vec<u8>>> {
     let mute_on = match arg {
         "on" => true,
@@ -421,9 +416,7 @@ fn cold_start(state: &ApiState) -> Result<(), Response<Cursor<Vec<u8>>>> {
             if let Ok(mut s) = shared.lock() {
                 s.last_errors.stream = Some(format!("play: {err}"));
             }
-            return;
         }
-        qbz_app::playback_driver::save_session_now(runtime.as_ref()).await;
     });
     Ok(())
 }

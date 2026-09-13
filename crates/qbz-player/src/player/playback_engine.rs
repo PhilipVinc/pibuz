@@ -34,7 +34,7 @@ type BoxedSampleIter = Box<dyn Iterator<Item = f32> + Send>;
 /// one that was seeked or resumed. It has to travel WITH the source rather than
 /// being a property of the engine, because a gapless hand-off queues the next
 /// track (offset 0) while a seeked one (offset 166 s, say) is still playing.
-#[allow(dead_code)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) struct QueuedSource {
     iter: BoxedSampleIter,
     start_frame: u64,
@@ -64,8 +64,7 @@ pub(crate) struct SourceQueue<S> {
 }
 
 impl<S> SourceQueue<S> {
-    // Part of the Linux ALSA Direct engine; unused on other platforms.
-    #[allow(dead_code)]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn new() -> Self {
         Self {
             queue: Mutex::new(VecDeque::new()),
@@ -107,8 +106,7 @@ pub enum PlaybackEngine {
     /// Rodio-based (PipeWire, Pulse, ALSA via CPAL)
     Rodio { sink: RodioPlayer },
     /// Direct ALSA (hw: devices, bit-perfect) with gapless source queue
-    // Part of the Linux ALSA Direct engine; unused on other platforms.
-    #[allow(dead_code)]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     AlsaDirect {
         /// The output, behind a trait so the engine can be driven against a
         /// virtual device in a test. See `qbz_audio::audio_out`.
@@ -161,8 +159,7 @@ impl PlaybackEngine {
 
     /// Create ALSA Direct engine with gapless source queue.
     /// Spawns a single writer thread that lives for the engine's lifetime.
-    // Part of the Linux ALSA Direct engine; unused on other platforms.
-    #[allow(dead_code)]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn new_alsa_direct(stream: Arc<dyn AudioOut>, hardware_volume: bool) -> Self {
         let is_playing = Arc::new(AtomicBool::new(false));
         let should_stop = Arc::new(AtomicBool::new(false));
@@ -651,38 +648,6 @@ impl PlaybackEngine {
             }
         }
     }
-
-    /// Check if using ALSA Direct engine
-    #[allow(dead_code)]
-    pub fn is_alsa_direct(&self) -> bool {
-        matches!(self, Self::AlsaDirect { .. })
-    }
-}
-
-/// Single long-lived writer thread for ALSA Direct.
-///
-/// Continuously reads samples from the current source and writes to ALSA.
-/// When a source ends, seamlessly picks up the next one from the queue
-/// (gapless transition). If no next source is available, drains the ALSA
-/// buffer and waits for the next source or a stop signal.
-#[allow(clippy::too_many_arguments)]
-/// Should a writer that drained at a natural end resume for the source it has
-/// just picked up?
-///
-/// Only when a stop is NOT in progress. `stop_inner` sets `should_stop` and then
-/// `is_playing = false` before joining this thread, and the writer's pause gate
-/// is what notices: it re-checks `should_stop` and exits. Resuming here would
-/// sail straight past that gate into the blocking ALSA write below — and a
-/// device that has stopped draining never lets such a write return. The join
-/// then waits forever, the audio thread is gone for the life of the process, and
-/// playback is silent while the position counter keeps ticking. Observed once on
-/// hardware, after a seek.
-///
-/// `is_playing` already true means there is nothing to do.
-// Part of the Linux ALSA Direct engine; unused on other platforms.
-#[allow(dead_code)]
-fn should_resume_after_drain(resume_pending: bool, should_stop: bool, is_playing: bool) -> bool {
-    resume_pending && !should_stop && !is_playing
 }
 
 /// How long an idle turn of the writer thread may wait before topping the
@@ -701,8 +666,7 @@ fn should_resume_after_drain(resume_pending: bool, should_stop: bool, is_playing
 /// With the keep-alive off, each caller keeps the cadence it always had —
 /// `when_off` — so turning the feature off changes nothing about how the
 /// writer idles.
-// Part of the Linux ALSA Direct engine; unused on other platforms.
-#[allow(dead_code)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn keepalive_poll_interval(depth_ms: u32, when_off: Duration) -> Duration {
     if depth_ms == 0 {
         return when_off;
@@ -731,14 +695,12 @@ fn keepalive_poll_interval(depth_ms: u32, when_off: Duration) -> Duration {
 /// writer thread down with it. One warning, then we go quiet about it — the
 /// idle paths call this many times a second.
 /// The two gates on the keep-alive, named so they can be tested.
-// Part of the Linux ALSA Direct engine; unused on other platforms.
-#[allow(dead_code)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn would_keep_alive(primed: bool, depth_ms: u32) -> bool {
     primed && depth_ms > 0
 }
 
-// Part of the Linux ALSA Direct engine; unused on other platforms.
-#[allow(dead_code)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 /// Returns the frames of silence actually queued.
 ///
 /// The count is not decoration. `snd_pcm_delay` reports everything the device
@@ -772,7 +734,7 @@ fn keep_dac_awake(stream: &Arc<dyn AudioOut>, cancel: &Arc<AtomicBool>, primed: 
 /// It bears no relation to the ALSA period — that was the OLD writer's problem,
 /// when one thread did both jobs and a 8192-frame decode block was 1.5x the
 /// whole hardware ring at 44.1 kHz. This thread has no deadline at all.
-#[allow(dead_code)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const DECODE_BLOCK_FRAMES: usize = 4096;
 
 /// How long the decoder waits for room before looking again.
@@ -781,7 +743,7 @@ const DECODE_BLOCK_FRAMES: usize = 4096;
 /// takes. This bounds the cost of a missed notification — `RingLink::notify_space`
 /// deliberately does not take the lock, because the writer is real-time — and
 /// gives the thread a regular chance to notice `should_stop`.
-#[allow(dead_code)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const DECODER_SPACE_WAIT: Duration = Duration::from_millis(50);
 
 /// How long the writer sleeps when the decoded ring has run dry.
@@ -789,7 +751,7 @@ const DECODER_SPACE_WAIT: Duration = Duration::from_millis(50);
 /// Only reached when the decoder is behind, which is the failure the ring
 /// exists to prevent — so by the time this runs, a few milliseconds are not
 /// what is going wrong.
-#[allow(dead_code)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const WRITER_STARVED_SLEEP: Duration = Duration::from_millis(2);
 
 /// How long an empty ring must stay empty before the writer concludes that
@@ -800,11 +762,11 @@ const WRITER_STARVED_SLEEP: Duration = Duration::from_millis(2);
 /// tracks, short tails and a resume with little buffered all land here. Long
 /// enough not to fire on a decoder that is merely a moment behind; short enough
 /// that nobody notices it before a track begins.
-#[allow(dead_code)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const WRITER_START_ON_IDLE: Duration = Duration::from_millis(120);
 
 /// Absolute ceiling on waiting for the ring to prime before starting anyway.
-#[allow(dead_code)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const WRITER_PRIME_DEADLINE: Duration = Duration::from_secs(3);
 
 /// Decode sources into the ring. Ordinary priority, and free to block.
@@ -817,8 +779,7 @@ const WRITER_PRIME_DEADLINE: Duration = Duration::from_secs(3);
 ///
 /// Holds NO `Arc<AlsaDirectStream>`, and that is a safety property rather than
 /// an accident of what it needs — see the comment in `new_alsa_direct`.
-// Part of the Linux ALSA Direct engine; unused on other platforms.
-#[allow(dead_code)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn alsa_decoder_thread(
     mut producer: HeapProd<f32>,
     link: Arc<RingLink>,
@@ -842,6 +803,15 @@ fn alsa_decoder_thread(
     log::info!("[ALSA Direct Engine] Decoder thread started");
 
     'thread: loop {
+        // UNCONDITIONAL, and first. Before the decode/output split the writer
+        // could drain at a natural end and turn playback back on for a late
+        // gapless hand-off, sailing past this check into the blocking write
+        // below — and a device that has stopped draining never lets that write
+        // return. The join in `stop_inner` then waited forever and the audio
+        // thread was lost for the life of the process, silently. Nothing sets
+        // `is_playing` from in here any more, so the hazard is structural now;
+        // keep it that way. `a_stop_completes_promptly_from_any_state` is the
+        // regression test.
         if should_stop.load(Ordering::SeqCst) {
             break 'thread;
         }
@@ -944,8 +914,7 @@ fn alsa_decoder_thread(
 /// convert, hand to ALSA. That is what makes it safe to run this thread at
 /// `SCHED_FIFO` (see `qbz_audio::rt`), and it is why nothing which can wait may
 /// ever be added to it.
-// Part of the Linux ALSA Direct engine; unused on other platforms.
-#[allow(dead_code)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
 fn alsa_writer_thread(
     mut consumer: HeapCons<f32>,
@@ -1598,41 +1567,6 @@ mod keepalive_cadence_tests {
     }
 }
 
-#[cfg(test)]
-mod writer_stop_tests {
-    use super::should_resume_after_drain;
-
-    /// The regression this exists for. A writer that drained at a natural end
-    /// picks up a LATE gapless hand-off and turns playback back on — but if a
-    /// stop is already in progress, doing so defeats the pause gate that is the
-    /// writer's only way to notice it. It then enters a blocking ALSA write, and
-    /// against a device that has stopped draining that write never returns: the
-    /// join in `stop_inner` waits forever and the audio thread is lost for the
-    /// life of the process, silently.
-    #[test]
-    fn a_stop_in_progress_beats_a_late_hand_off() {
-        // resume_pending, should_stop, is_playing
-        assert!(!should_resume_after_drain(true, true, false), "stop wins");
-        assert!(!should_resume_after_drain(true, true, true), "stop wins");
-    }
-
-    /// The case the resume exists for: the writer drained, a hand-off arrived
-    /// late, nothing is stopping. Without this the writer parks holding a track
-    /// it will never play.
-    #[test]
-    fn a_late_hand_off_resumes_when_nothing_is_stopping() {
-        assert!(should_resume_after_drain(true, false, false));
-    }
-
-    /// Already playing, or nothing pending: no-ops. `is_playing` true means the
-    /// first source of a track, which `append` already started.
-    #[test]
-    fn nothing_to_do_when_already_playing_or_not_pending() {
-        assert!(!should_resume_after_drain(true, false, true));
-        assert!(!should_resume_after_drain(false, false, false));
-        assert!(!should_resume_after_drain(false, true, false));
-    }
-}
 /// Behaviour tests for the ALSA-direct engine, driven against a virtual device.
 ///
 /// # Why these exist

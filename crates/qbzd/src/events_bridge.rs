@@ -15,7 +15,7 @@
 //
 // Holds only a Weak<AppRuntime> (upgraded per wake, dropped before the next
 // wait), so it sits outside the #521 audio-release ordering — the caller
-// aborts it for a clean shutdown, same as the queue-persist subscriber.
+// aborts it for a clean shutdown.
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 

@@ -10,20 +10,15 @@ way when editing docs and CI.
 
 A standard Cargo workspace: manifest at the repo root, members under `crates/`,
 artifacts in `target/`. Plain `cargo build` / `cargo test` from the root work.
-(It was not always so — the manifest used to live in `crates/`, so older commit
-messages and comments may mention `--manifest-path crates/Cargo.toml`.)
 
 The workspace is `qbzd` plus **exactly** its dependency closure — 15 crates, the
 set `cargo tree -p qbzd` resolves. If you find yourself adding a workspace member,
 check whether `qbzd` really needs it.
 
-It was 23 until the desktop-era code came out: `qbz-offline-cache`, `qbz-library`
-and `qbz-secrets` were the offline-download tier, reachable only through three
-`qbz-core` methods whose `offline:` argument every call site in the tree passed
-`None` to. `qbz-dsd` went later — local-file DSD, whose only entry point took a
-`&Path` nothing ever supplied. If a feature here looks orphaned, check whether
-anything actually calls it before assuming it is load-bearing — a lot of this
-tree is a desktop app that was never fully unwound.
+A lot of this tree is a desktop app that was never fully unwound, and orphans
+keep turning up: whole crates have gone because their only entry points took an
+argument every call site passed `None`. If a feature here looks orphaned, check
+whether anything actually calls it before assuming it is load-bearing.
 
 ### Finding dead code: the probe
 
@@ -37,6 +32,14 @@ same-named method on another type. Get the compiler to answer instead:
    unreachable ones, transitively and through serde attribute paths,
 3. **run the probe in the arm64 container too, and delete only the
    INTERSECTION.** `dsd_mode` was reported dead on macOS and was live on Linux.
+
+For a LIBRARY crate the same trick needs one more turn, because `pub` there is
+also the cross-crate API. Rewrite every `pub` item in the crate to `pub(crate)`,
+build the WHOLE workspace, and iterate: each round, put back to `pub` every name
+rustc names in an error (`E0603`, `E0364`/`E0365` for re-exports, and the plain
+`type ... is private` of `private_interfaces`), then rebuild. **Only once the
+workspace is at zero errors is the warning list meaningful** — before that, a
+still-private root drags its whole live call tree into the "dead" list with it.
 
 Two classes the lint names that you should NOT delete: an item reachable only
 from other dead code (it goes when that does, not before), and an item whose
@@ -58,12 +61,6 @@ cargo build --release -p qbzd
 `./scripts/cargo-test.sh` passes clean — 0 failures — on macOS and
 linux/arm64. `cargo clippy --workspace --all-targets -- -D warnings` is clean on
 both too, and CI enforces fmt + clippy + tests. **A failure is a regression.**
-
-(Historical note, because older commit messages say otherwise: there used to be
-"9 known failures" written off as macOS quirks. Eight were real and failed on
-Linux too — nothing installed the rustls `CryptoProvider` outside `qbzd`'s
-`main`, so any test building a reqwest client panicked. The ninth asserted XDG
-paths on a platform that does not use them. All fixed.)
 
 ## The audio behaviour tests
 
@@ -141,8 +138,7 @@ belong to, which decodes as noise rather than as an error.
 
 ## Formatting and lints
 
-Run `cargo fmt --all`; the tree is rustfmt-clean and CI checks it. (Older
-comments say to format only touched lines — that rule is retired.)
+Run `cargo fmt --all`; the tree is rustfmt-clean and CI checks it.
 
 For clippy, prefer fixing over silencing. When a lint is genuinely wrong for the
 code, allow it **at the item**, with the reason in a comment beside it — not with
@@ -210,12 +206,3 @@ path-filtered to `crates/**`. Releases are **tags on main**: pushing a `vX.Y.Z` 
 triggers `release.yml`, whose first job refuses any tag whose commit is not an
 ancestor of `origin/main`. `build-arm64.yml` is manual-dispatch and publishes
 nothing — use it for a Pi test binary without tagging.
-
-## Stale markers you will run into
-
-`crates/qbzd/src/qconnect/*` and `src/tui/wizard_core.rs` carry headers like
-`TODO(converge: qconnect-glue) — copied from crates/qbz/src/... ; do not fix bugs
-here without fixing the source`, and `DAEMON-ONLY` annotations marking deltas against
-that copy. **The file they point at is not in this tree any more** — it went with the
-GUI. Treat them as provenance, not as an instruction to go edit a second copy. The
-code they head is now the only copy.

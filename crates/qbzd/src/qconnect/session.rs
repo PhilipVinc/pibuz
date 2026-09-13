@@ -1,6 +1,3 @@
-// TODO(converge: qconnect-glue) — copied from crates/qbz/src/qconnect_service.rs @ 5d50158e;
-// do not fix bugs here without fixing the source, and vice versa.
-//
 //! Daemon session-loop host + controller bootstrap + deferred renderer-join.
 //!
 //! [`DaemonSessionLoopHost`] implements the frontend-agnostic
@@ -63,10 +60,10 @@ pub struct DaemonSessionLoopHost {
     /// percentage; `None` leaves the player alone. See
     /// `transport::load_initial_volume_at`.
     pub initial_volume: Option<u8>,
-    /// DAEMON-ONLY (pairing): reconnect credential re-resolve prefers a live
+    /// Pairing: reconnect credential re-resolve prefers a live
     /// handed-over token, mirroring the preference in `connect()`.
     pub pairing_store: super::pairing::PairingStore,
-    /// DAEMON-ONLY (pairing): one-shot latch armed by a handoff takeover. The
+    /// Pairing: one-shot latch armed by a handoff takeover. The
     /// handoff IS the user's output selection, so the next renderer join must
     /// claim the active slot (official receivers join with is_active=true
     /// after a handoff — qobuz-proxy/StreamCore32 parity). Joining available
@@ -88,7 +85,7 @@ impl SessionLoopHost for DaemonSessionLoopHost {
         // credentials (fresh `/qws/createToken`) and latch the new config into the
         // runtime so a subsequent full reconnect uses valid credentials. The
         // desktop copy does NOT do this.
-        // DAEMON-ONLY (pairing): same source order as `connect()` — a live
+        // Pairing: same source order as `connect()` — a live
         // handed-over token outranks a fresh `/qws/createToken` (the paired
         // session must survive its own reconnects, not fall back to the
         // daemon account's session).
@@ -114,7 +111,7 @@ impl SessionLoopHost for DaemonSessionLoopHost {
     }
 
     async fn deferred_renderer_join(&self, session_uuid: String, reason: i32) {
-        // DAEMON-ONLY (pairing): consume the handoff latch exactly once.
+        // Pairing: consume the handoff latch exactly once.
         let force_active = self
             .handoff_join_pending
             .swap(false, std::sync::atomic::Ordering::SeqCst);
@@ -227,7 +224,7 @@ pub async fn deferred_renderer_join(
     initial_volume: Option<u8>, // join-time volume safety (qconnect.initial_volume)
     session_uuid: &str,
     join_reason: i32,
-    force_active: bool, // DAEMON-ONLY (pairing): handoff join claims the render
+    force_active: bool, // Pairing: handoff join claims the render
 ) {
     let already_joined = {
         let st = sync_state.lock().await;
@@ -252,7 +249,7 @@ pub async fn deferred_renderer_join(
     // Do NOT auto-steal the render on a fresh connect: join as an AVAILABLE
     // renderer (is_active=false), not the active one. Only a post-drop
     // RECONNECTION rejoins as active, so a network blip mid-render does not lose
-    // the render. DAEMON-ONLY (pairing) exception: a join right after a local
+    // the render. Pairing exception: a join right after a local
     // handoff claims the render (`force_active`) — the handoff is the user's
     // output selection and no separate SET_ACTIVE_RENDERER ever arrives.
     let join_as_active = force_active || join_reason == JOIN_SESSION_REASON_RECONNECTION;

@@ -3,14 +3,12 @@
 //! The hard-won renderer orchestration (echo-seek rejection, cursor align,
 //! queue materialize, shuffle deferral, load dedup window) lives ABOVE this
 //! trait in `qconnect-app` and is written ONLY against these methods plus
-//! `QconnectRemoteSyncState`. It must never be re-derived per frontend.
+//! `QconnectRemoteSyncState`. It must never be re-derived per host.
 //!
-//! Implemented by:
-//!   - src-tauri: `CoreBridge` (forwards to `QbzCore` + `Player`)
-//!   - qbz-slint: a thin adapter over `runtime.core()` (`QbzCore` + `Player`)
+//! Implemented by `qbzd`'s `DaemonRendererEngine` (one-line forwards to
+//! `QbzCore` + `Player`), and by a mock in this crate's tests.
 //!
-//! Errors are `String` (CoreBridge already returns `String`; the Slint impl maps
-//! `CoreError::to_string()`). The two protected bit-perfect audio seams
+//! Errors are `String`. The two protected bit-perfect audio seams
 //! (`play_data` / `play_streaming_dynamic`) are reached ONLY through
 //! [`QconnectRendererEngine::start_track_stream`]; they are never modified, only
 //! called, and the probe-derived sample_rate/channels/bit_depth must pass
@@ -20,11 +18,10 @@ use async_trait::async_trait;
 use qbz_models::{Quality, QueueTrack, RepeatMode, Track};
 use qbz_player::PlaybackState;
 
-/// The renderer-side engine surface. Both frontends implement it with zero-cost
-/// one-line forwards to their `QbzCore` / `Player`; the async/sync split mirrors
-/// `QbzCore`/`CoreBridge` verbatim (queue/catalog are async; raw transport is
-/// sync). Keep this MINIMAL — exactly these methods. A unified controller engine
-/// is a separate trait; do not pollute this one.
+/// The renderer-side engine surface. An implementor forwards each method to its
+/// `QbzCore` / `Player` in one line; the async/sync split follows `QbzCore`
+/// (queue/catalog are async; raw transport is sync). Keep this MINIMAL — exactly
+/// these methods.
 #[async_trait]
 pub trait QconnectRendererEngine: Send + Sync {
     // ---- transport (sync on the engine) ----

@@ -203,14 +203,6 @@ impl Seek for CursorMediaSource {
     }
 }
 
-/// Audio specifications extracted from decoded audio
-#[allow(dead_code)]
-struct AudioSpecs {
-    samples: SamplesBuffer,
-    sample_rate: u32,
-    channels: u16,
-}
-
 fn cpal_device_name(device: &rodio::cpal::Device) -> Option<String> {
     device
         .description()
@@ -240,7 +232,7 @@ fn monotonic_millis() -> u64 {
         .max(1) as u64
 }
 
-fn decode_with_symphonia(data: &TrackBytes) -> Result<AudioSpecs, String> {
+fn decode_with_symphonia(data: &TrackBytes) -> Result<SamplesBuffer, String> {
     let source = Box::new(CursorMediaSource::new(data.clone())) as Box<dyn MediaSource>;
     let mss = MediaSourceStream::new(source, Default::default());
 
@@ -307,15 +299,11 @@ fn decode_with_symphonia(data: &TrackBytes) -> Result<AudioSpecs, String> {
         return Err("Symphonia decode produced no audio".to_string());
     }
 
-    Ok(AudioSpecs {
-        samples: SamplesBuffer::new(
-            std::num::NonZero::new(channels).unwrap(),
-            std::num::NonZero::new(sample_rate).unwrap(),
-            samples,
-        ),
-        sample_rate,
-        channels,
-    })
+    Ok(SamplesBuffer::new(
+        std::num::NonZero::new(channels).unwrap(),
+        std::num::NonZero::new(sample_rate).unwrap(),
+        samples,
+    ))
 }
 
 fn is_isomp4(data: &[u8]) -> bool {
@@ -326,20 +314,11 @@ fn is_isomp4(data: &[u8]) -> bool {
     &data[4..8] == b"ftyp"
 }
 
-/// Extract audio metadata (sample rate, channels) without full decode.
-/// This is much faster than decode_with_symphonia as it only reads headers.
-/// Audio metadata extracted from file headers
-#[allow(dead_code)]
+/// Audio metadata extracted from file headers, without a full decode.
 struct AudioMetadata {
     sample_rate: u32,
     channels: u16,
     bit_depth: Option<u32>,
-}
-
-#[allow(dead_code)]
-fn extract_audio_metadata(data: &TrackBytes) -> Result<(u32, u16), String> {
-    let meta = extract_audio_metadata_full(data)?;
-    Ok((meta.sample_rate, meta.channels))
 }
 
 fn extract_audio_metadata_full(data: &TrackBytes) -> Result<AudioMetadata, String> {
@@ -712,9 +691,9 @@ fn read_tag_head(path: &std::path::Path) -> Option<TrackBytes> {
 
 fn decode_with_fallback(data: &TrackBytes) -> Result<Box<dyn Source<Item = f32> + Send>, String> {
     if is_isomp4(data) {
-        return decode_with_symphonia(data).map(|specs| {
+        return decode_with_symphonia(data).map(|samples| {
             log::info!("Decoded audio using symphonia fallback (isomp4)");
-            Box::new(specs.samples) as Box<dyn Source<Item = f32> + Send>
+            Box::new(samples) as Box<dyn Source<Item = f32> + Send>
         });
     }
 
@@ -753,9 +732,9 @@ fn decode_with_fallback(data: &TrackBytes) -> Result<Box<dyn Source<Item = f32> 
     }
 
     match decode_with_symphonia(data) {
-        Ok(specs) => {
+        Ok(samples) => {
             log::info!("Decoded audio using symphonia fallback");
-            Ok(Box::new(specs.samples))
+            Ok(Box::new(samples))
         }
         Err(err) => Err(err),
     }
@@ -1987,11 +1966,6 @@ impl Player {
             let mut stream_opt: Option<StreamType> = None;
             let mut current_track_sample_rate: Option<u32> = None;
             let mut current_track_channels: Option<u16> = None;
-
-            #[allow(dead_code)]
-            const MAX_INIT_RETRIES: u32 = 5;
-            #[allow(dead_code)]
-            const RETRY_DELAY_MS: u64 = 500;
 
             let mut current_engine: Option<PlaybackEngine> = None;
             // Store audio data for seeking (we need to re-decode from the beginning)

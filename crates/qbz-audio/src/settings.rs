@@ -180,7 +180,7 @@ pub struct AudioSettings {
     /// When true, hold a per-process ALSA device reservation (Lifetime B) for the
     /// configured output device while QBZ is running, so other PulseAudio/PipeWire
     /// clients won't grab the DAC and break exclusive playback. Off by default.
-    /// See `qbz-nix-docs/specs/2026-05-07-alsa-exclusive-hardening-design.md`.
+    /// See `crate::device_reservation` for the protocol and the lifetime model.
     #[serde(default)]
     pub reserve_dac_while_running: bool,
 }

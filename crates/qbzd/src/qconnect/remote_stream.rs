@@ -1,5 +1,3 @@
-// TODO(converge: qconnect-glue) — copied from crates/qbz/src/remote_stream.rs @ b4450965;
-// do not fix bugs here without fixing the source, and vice versa.
 //! Shared HTTP streaming feeder.
 //!
 //! Probe a remote audio URL for size + FLAC format, open the player's
@@ -43,9 +41,9 @@ pub struct RemoteStreamInfo {
 /// spawned task. Errors here mean the caller should fall back to a full
 /// download (the probe or the sink open failed).
 ///
-/// DAEMON-ONLY divergence from the desktop copy: returns the feeder's
-/// JoinHandle so the caller can abort a superseded download on track change
-/// (the qconnect engine keeps exactly one feeder alive).
+/// Returns the feeder's JoinHandle so the caller can abort a superseded
+/// download on track change (the qconnect engine keeps exactly one feeder
+/// alive).
 pub async fn stream_remote_track_into_player(
     player: &Player,
     track_id: u64,

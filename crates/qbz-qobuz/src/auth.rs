@@ -127,10 +127,9 @@ pub fn parse_login_response(response: &serde_json::Value) -> Result<UserSession>
         .and_then(|c| c.get("parameters"))
         .and_then(parse_subscription_valid_until);
 
-    // Account territory + language (snake_case wire names, verbatim in
-    // Qobuz's own embedded /user/login fixture — see qbz-nix-docs
-    // offline-mode/tauri-review-2026-06-09/10-subscription-trial-offline-
-    // gating.md §1.2). Absent on older captures -> None (feature stays off).
+    // Account territory + language (snake_case wire names, verbatim in Qobuz's
+    // own embedded /user/login fixture). Absent on older captures -> None
+    // (feature stays off).
     let country_code = user
         .get("country_code")
         .and_then(|v| v.as_str())

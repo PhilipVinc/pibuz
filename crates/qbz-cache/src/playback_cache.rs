@@ -13,8 +13,6 @@ use std::time::SystemTime;
 /// Entry metadata for tracking cache usage
 #[derive(Debug, Clone)]
 struct CacheEntry {
-    #[allow(dead_code)]
-    track_id: u64,
     size_bytes: u64,
     last_accessed: SystemTime,
 }
@@ -134,7 +132,6 @@ impl PlaybackCache {
                                     state.entries.insert(
                                         track_id,
                                         CacheEntry {
-                                            track_id,
                                             size_bytes: size,
                                             last_accessed,
                                         },
@@ -296,7 +293,6 @@ impl PlaybackCache {
         state.entries.insert(
             track_id,
             CacheEntry {
-                track_id,
                 size_bytes: actual_size,
                 last_accessed: SystemTime::now(),
             },
@@ -402,7 +398,6 @@ impl PlaybackCache {
                     state.entries.insert(
                         track_id,
                         CacheEntry {
-                            track_id,
                             size_bytes: size,
                             last_accessed: SystemTime::now(),
                         },

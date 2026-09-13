@@ -5,27 +5,12 @@
 //! data across multiple separate frames; this module owns the lookups
 //! that reconcile those signals into a single coherent cursor.
 
-use crate::{QConnectQueueState, QConnectRendererState};
+use crate::QConnectQueueState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QconnectOrderedQueueCursor {
     Queue(usize),
     Autoplay(usize),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QconnectRemoteSkipDirection {
-    Next,
-    Previous,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct QconnectControllerQueueItemResolution {
-    pub target_queue_item_id: Option<u64>,
-    pub strategy: &'static str,
-    pub queue_index: Option<usize>,
-    pub matched_track_id: Option<u64>,
-    pub matched_queue_item_id: Option<u64>,
 }
 
 pub fn is_valid_ordered_queue_shuffle_order(order: &[usize], track_count: usize) -> bool {
@@ -134,165 +119,6 @@ pub fn find_cursor_index_by_queue_item_id(
     })
 }
 
-pub fn find_cursor_index_by_track_id(
-    cursors: &[QconnectOrderedQueueCursor],
-    queue: &QConnectQueueState,
-    track_id: Option<u64>,
-) -> Option<usize> {
-    let track_id = track_id?;
-    cursors
-        .iter()
-        .position(|cursor| queue_item_track_id_for_cursor(queue, *cursor) == Some(track_id))
-}
-
-fn find_cursor_index_by_track_id_before(
-    cursors: &[QconnectOrderedQueueCursor],
-    queue: &QConnectQueueState,
-    track_id: Option<u64>,
-    end_exclusive: usize,
-) -> Option<usize> {
-    let track_id = track_id?;
-    if end_exclusive == 0 {
-        return None;
-    }
-
-    (0..end_exclusive)
-        .rev()
-        .find(|&index| queue_item_track_id_for_cursor(queue, cursors[index]) == Some(track_id))
-}
-
-fn resolve_current_cursor_index_from_snapshots(
-    queue: &QConnectQueueState,
-    renderer: &QConnectRendererState,
-    cursors: &[QconnectOrderedQueueCursor],
-) -> (Option<usize>, &'static str) {
-    let current_queue_index = find_cursor_index_by_queue_item_id(
-        cursors,
-        queue,
-        renderer
-            .current_track
-            .as_ref()
-            .map(|item| item.queue_item_id),
-    );
-    if current_queue_index.is_some() {
-        return (
-            current_queue_index,
-            "renderer_current_queue_item_id_verified",
-        );
-    }
-
-    let next_queue_index = find_cursor_index_by_queue_item_id(
-        cursors,
-        queue,
-        renderer.next_track.as_ref().map(|item| item.queue_item_id),
-    );
-    let track_index_before_next = next_queue_index.and_then(|next_index| {
-        find_cursor_index_by_track_id_before(
-            cursors,
-            queue,
-            renderer.current_track.as_ref().map(|item| item.track_id),
-            next_index,
-        )
-    });
-    if track_index_before_next.is_some() {
-        return (
-            track_index_before_next,
-            "queue_track_id_before_renderer_next",
-        );
-    }
-
-    let current_track_index = find_cursor_index_by_track_id(
-        cursors,
-        queue,
-        renderer.current_track.as_ref().map(|item| item.track_id),
-    );
-    if current_track_index.is_some() {
-        return (current_track_index, "queue_track_id_match");
-    }
-
-    if let Some(next_index) = next_queue_index {
-        if next_index > 0 {
-            return (Some(next_index - 1), "queue_item_before_renderer_next");
-        }
-    }
-
-    (None, "no_current_queue_item")
-}
-
-pub fn resolve_controller_queue_item_from_snapshots(
-    queue: &QConnectQueueState,
-    renderer: &QConnectRendererState,
-    direction: QconnectRemoteSkipDirection,
-) -> QconnectControllerQueueItemResolution {
-    let cursors = ordered_queue_cursors(queue);
-    if cursors.is_empty() {
-        return QconnectControllerQueueItemResolution {
-            target_queue_item_id: None,
-            strategy: "no_queue_items",
-            queue_index: None,
-            matched_track_id: None,
-            matched_queue_item_id: None,
-        };
-    }
-
-    let (current_index, _current_strategy) =
-        resolve_current_cursor_index_from_snapshots(queue, renderer, &cursors);
-
-    let (target_index, strategy) = match direction {
-        QconnectRemoteSkipDirection::Next => {
-            let next_index = find_cursor_index_by_queue_item_id(
-                &cursors,
-                queue,
-                renderer.next_track.as_ref().map(|item| item.queue_item_id),
-            );
-            if let Some(next_index) = next_index {
-                (Some(next_index), "renderer_next_queue_item_id_verified")
-            } else if let Some(current_index) = current_index {
-                if current_index + 1 < cursors.len() {
-                    (Some(current_index + 1), "queue_item_after_current")
-                } else {
-                    (None, "no_next_queue_item")
-                }
-            } else {
-                (None, "no_next_queue_item")
-            }
-        }
-        QconnectRemoteSkipDirection::Previous => {
-            if let Some(current_index) = current_index {
-                if current_index > 0 {
-                    (Some(current_index - 1), "queue_item_before_current")
-                } else {
-                    (Some(current_index), "restart_current_queue_item")
-                }
-            } else {
-                (None, "no_previous_queue_item")
-            }
-        }
-    };
-
-    let Some(target_index) = target_index else {
-        return QconnectControllerQueueItemResolution {
-            target_queue_item_id: None,
-            strategy,
-            queue_index: None,
-            matched_track_id: None,
-            matched_queue_item_id: None,
-        };
-    };
-
-    let cursor = cursors[target_index];
-    let matched_track_id = queue_item_track_id_for_cursor(queue, cursor);
-    let matched_queue_item_id = normalized_queue_item_id_for_cursor(queue, cursor);
-
-    QconnectControllerQueueItemResolution {
-        target_queue_item_id: matched_queue_item_id,
-        strategy,
-        queue_index: Some(target_index),
-        matched_track_id,
-        matched_queue_item_id,
-    }
-}
-
 pub fn resolve_queue_item_ids_from_queue_state(
     queue: &QConnectQueueState,
     track_id: u64,
@@ -395,38 +221,6 @@ pub fn resolve_remote_start_index(
         {
             return Some(index);
         }
-    }
-
-    None
-}
-
-/// Resolve the `shuffle_pivot_queue_item_id` for an outbound
-/// `CtrlSrvrSetShuffleMode` command: the queue item the cloud keeps fixed while
-/// it generates the shuffled order (so the currently-playing track stays at the
-/// front). Prefers the renderer's reported `queue_item_id`; falls back to the
-/// item carrying the renderer's `track_id` when the qid is a placeholder; `None`
-/// when the renderer has no current track. Frontend-agnostic (ADR-006): used by
-/// both the Tauri and Slint controller shuffle paths.
-pub fn resolve_qconnect_shuffle_pivot(
-    queue: &QConnectQueueState,
-    renderer: &QConnectRendererState,
-) -> Option<u64> {
-    let current_track = renderer.current_track.as_ref()?;
-
-    if queue
-        .queue_items
-        .iter()
-        .any(|item| item.queue_item_id == current_track.queue_item_id)
-    {
-        return Some(current_track.queue_item_id);
-    }
-
-    if let Some(item) = queue
-        .queue_items
-        .iter()
-        .find(|item| item.track_id == current_track.track_id)
-    {
-        return Some(item.queue_item_id);
     }
 
     None
@@ -585,28 +379,5 @@ mod tests {
     fn track_id_lookup_when_qid_absent_from_queue() {
         let q = queue(vec![item(0, 100), item(7, 200)]);
         assert_eq!(resolve_remote_start_index(&q, Some(99), Some(200)), Some(1));
-    }
-
-    /// Shuffle pivot prefers the renderer's reported queue_item_id.
-    #[test]
-    fn shuffle_pivot_from_renderer_queue_item_id() {
-        let q = queue(vec![item(10, 100), item(11, 101), item(12, 102)]);
-        let renderer = QConnectRendererState {
-            current_track: Some(item(11, 101)),
-            ..Default::default()
-        };
-        assert_eq!(resolve_qconnect_shuffle_pivot(&q, &renderer), Some(11));
-    }
-
-    /// When the renderer's qid is a placeholder (0), fall back to the item that
-    /// carries the renderer's track_id.
-    #[test]
-    fn shuffle_pivot_by_track_id_when_qid_is_placeholder() {
-        let q = queue(vec![item(20, 200), item(21, 201), item(22, 202)]);
-        let renderer = QConnectRendererState {
-            current_track: Some(item(0, 202)),
-            ..Default::default()
-        };
-        assert_eq!(resolve_qconnect_shuffle_pivot(&q, &renderer), Some(22));
     }
 }

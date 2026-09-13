@@ -12,10 +12,7 @@
 // Server-side materialization (brief, non-negotiable): `add` NEVER accepts a
 // client-built `QueueTrack`. It resolves each `track_id` via `core.get_track`
 // (the Qobuz catalog `Track`) and maps it to a `QueueTrack` with
-// `track_to_queue_track` below — the same shape the desktop's single-track
-// play path builds server-side (`crates/qbz/src/playback.rs:2028-2073`,
-// off-limits here since `qbz` is the Slint crate; this is an independent,
-// Slint-free re-derivation from `qbz_models::Track`, not a copy of that file).
+// `track_to_queue_track` below, derived from `qbz_models::Track`.
 //
 // Response shape note on `add`: 02 §3.3.14's sketch is `{"added","total_tracks"}`.
 // This handler additively includes `"tracks"`: the materialized `QueueTrack`
@@ -311,9 +308,7 @@ pub fn jump(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
             if let Ok(mut s) = shared.lock() {
                 s.last_errors.stream = Some(format!("jump: {err}"));
             }
-            return;
         }
-        qbz_app::playback_driver::save_session_now(runtime.as_ref()).await;
     });
     json(
         200,
@@ -505,15 +500,8 @@ fn repeat_str(mode: RepeatMode) -> String {
     .to_string()
 }
 
-/// Qobuz catalog `Track` (`crates/qbz-models/src/types.rs:301-342`, what
-/// `core.get_track` returns) -> `QueueTrack` (`crates/qbz-models/src/
-/// playback.rs:15`, what the queue stores). An independent Slint-free
-/// re-derivation of the same mapping the desktop's single-track play path
-/// performs (`crates/qbz/src/playback.rs:2028-2073`) and `qbz-mixtape`'s
-/// `track_to_queue_track_from_api` (`crates/qbz-mixtape/src/enqueue.rs:
-/// 430-472`) — `qbzd` cannot depend on `qbz` (Slint) and this task's file
-/// list does not add a new workspace dependency, so the ~20-line mapping is
-/// duplicated rather than imported. `source_item_id_hint`/`context_kind`/
+/// Qobuz catalog `Track` (what `core.get_track` returns) -> `QueueTrack`
+/// (what the queue stores). `source_item_id_hint`/`context_kind`/
 /// `context_id` are left `None`: those are "playing from" provenance fields
 /// with no equivalent in a bare `qbzd queue add <TRACK_ID>` call (no album/
 /// playlist/artist container in play).

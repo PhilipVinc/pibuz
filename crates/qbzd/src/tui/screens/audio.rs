@@ -5,11 +5,9 @@
 // persistence). The three load-bearing PURE pieces (unit-tested at the bottom):
 //   1. the constraint matrix (§3.2.3 shown/enabled) — `row_state`;
 //   2. the cross-setting cascades (§3.2.3 items 1-7) — `cascade_*`;
-//   3. the device picker grouping (§3.2.2), re-derived from the desktop
-//      `crates/qbz/src/settings.rs` rules (we must NOT depend on the qbz bin
-//      crate — it pulls qbz-ui). `group_devices` reproduces `alsa_section` /
-//      `device_is_bit_perfect` / `group_alsa_devices` 1:1, including the
-//      is_default-vs-section badge edge case.
+//   3. the device picker grouping (§3.2.2) — `group_devices`, built from
+//      `alsa_section` / `device_is_bit_perfect` / `group_alsa_devices`,
+//      including the is_default-vs-section badge edge case.
 
 use qbz_audio::settings::AudioSettings;
 use qbz_audio::{AlsaPlugin, AudioBackendType, AudioDevice, BackendManager};
@@ -200,7 +198,7 @@ enum AlsaSection {
     Other,
 }
 
-/// 1:1 with desktop `alsa_section` (`crates/qbz/src/settings.rs:286-301`).
+/// Which badge an ALSA device carries in the picker.
 fn alsa_section(id: &str, is_default: bool, label: &str) -> AlsaSection {
     let id_l = id.to_ascii_lowercase();
     if id.is_empty() || id_l == "default" || is_default {

@@ -1,6 +1,3 @@
-// TODO(converge: qconnect-glue) — copied from crates/qbz/src/qconnect_transport.rs @ 00a44e12;
-// do not fix bugs here without fixing the source, and vice versa.
-//
 //! QConnect transport config + credential discovery + device identity for the
 //! qbzd daemon.
 //!
@@ -12,7 +9,6 @@
 //! fresh, NEVER the desktop's global KV; (2) the default device name is
 //! "QBZ (hostname)" (OD6). The KV load/persist helpers are path-parameterized
 //! `*_at` variants so T11 (settings) and T13 (TUI) drive the same daemon-root DB.
-#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -196,12 +192,14 @@ pub struct QconnectJoinSessionRequest {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)] // controller-port scaffolding, see the block comment above
 pub struct QconnectQueueVersionPayload {
     pub major: u64,
     pub minor: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[allow(dead_code)] // controller-port scaffolding, see the block comment above
 pub struct QconnectSetPlayerStateQueueItemPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub queue_version: Option<QconnectQueueVersionPayload>,
@@ -216,6 +214,7 @@ pub struct QconnectSetPlayerStateQueueItemPayload {
 // wire without these. Each SetPlayerState field is independently optional per the
 // protocol, so omitting them is the intended "do one or several" behavior.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[allow(dead_code)] // controller-port scaffolding, see the block comment above
 pub struct QconnectSetPlayerStateRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub playing_state: Option<i32>,
@@ -226,6 +225,7 @@ pub struct QconnectSetPlayerStateRequest {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[allow(dead_code)] // controller-port scaffolding, see the block comment above
 pub struct QconnectSetVolumeRequest {
     pub renderer_id: Option<i32>,
     pub volume: Option<i32>,
@@ -233,12 +233,14 @@ pub struct QconnectSetVolumeRequest {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[allow(dead_code)] // controller-port scaffolding, see the block comment above
 pub struct QconnectMuteVolumeRequest {
     pub renderer_id: Option<i32>,
     pub value: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[allow(dead_code)] // controller-port scaffolding, see the block comment above
 pub struct QconnectSetActiveRendererRequest {
     pub renderer_id: Option<i32>,
 }
@@ -248,6 +250,7 @@ pub struct QconnectSetActiveRendererRequest {
 ///
 /// `playing_state` is intentionally `None`: a seek must not toggle play/pause.
 /// Pure mirror of the Tauri `build_set_position_player_state_request`.
+#[allow(dead_code)] // controller-port scaffolding, see the block comment above
 pub fn build_set_position_player_state_request(
     position_ms: i64,
     current_queue_item_id: Option<u64>,
@@ -411,6 +414,13 @@ pub fn save_startup_mode_at(path: &Path, mode: qconnect_app::QconnectStartupMode
 
 /// Load the last-known QConnect on/off state, if recorded (`last_known_state` =
 /// "on" | "off").
+///
+/// The persistence half of `QconnectStartupMode::RememberLast`. Both halves are
+/// written and tested but NOT yet wired: `qconnect::start` passes
+/// `last_known = None` (see the P0 note at `qconnect/mod.rs`), so a daemon
+/// configured for `remember_last` currently resolves to off. Wiring these two
+/// calls in is all that mode needs.
+#[allow(dead_code)] // unwired half of RememberLast — see the doc comment
 pub fn load_last_known_state_at(path: &Path) -> Option<bool> {
     let conn = open_qconnect_settings_conn_at(path)?;
     let value: Option<String> = conn
@@ -427,7 +437,8 @@ pub fn load_last_known_state_at(path: &Path) -> Option<bool> {
     }
 }
 
-/// Persist the last-known on/off state.
+/// Persist the last-known on/off state. See [`load_last_known_state_at`].
+#[allow(dead_code)] // unwired half of RememberLast — see load_last_known_state_at
 pub fn save_last_known_state_at(path: &Path, state: bool) {
     let Some(conn) = open_qconnect_settings_conn_at(path) else {
         return;
@@ -766,6 +777,15 @@ mod tests {
         let name = resolve_default_qconnect_device_name();
         std::env::remove_var("HOSTNAME");
         assert_eq!(name, "QBZ (studio-pi)");
+    }
+
+    #[test]
+    fn device_uuid_env_override_takes_precedence() {
+        // SAFETY: single-threaded test process for this var; restore after.
+        std::env::set_var("QBZ_QCONNECT_DEVICE_UUID", "env-override-uuid-123");
+        let uuid = resolve_qconnect_device_uuid();
+        std::env::remove_var("QBZ_QCONNECT_DEVICE_UUID");
+        assert_eq!(uuid, "env-override-uuid-123");
     }
 
     #[test]

@@ -7,8 +7,7 @@
 //! index `N` to the well-known bus name `org.freedesktop.ReserveDevice1.AudioN`
 //! and request ownership of it.
 //!
-//! Acquisition algorithm (matches the spec at
-//! `qbz-nix-docs/specs/2026-05-07-alsa-exclusive-hardening-design.md`):
+//! Acquisition algorithm:
 //!
 //! 1. `RequestName` with `DO_NOT_QUEUE`.
 //! 2. `PrimaryOwner` / `AlreadyOwner` -> we own it. Done.
@@ -40,14 +39,6 @@ use zbus::names::WellKnownName;
 /// recording session.
 pub(crate) const QBZ_PRIORITY: i32 = 5;
 
-/// Application name advertised over D-Bus when QBZ publishes the
-/// `ReserveDevice1` interface as a server. Deferred to a future commit — see
-/// `qbz-nix-docs/specs/2026-05-07-alsa-exclusive-hardening-design.md`,
-/// section "The org.freedesktop.ReserveDevice1 protocol", subsections
-/// "Note on `app_device_name`" / "Note on `ApplicationName`".
-#[allow(dead_code)]
-pub(crate) const QBZ_APPLICATION_NAME: &str = "QBZ";
-
 /// D-Bus interface every `ReserveDevice1` holder publishes under
 /// `/org/freedesktop/ReserveDevice1/AudioN`.
 const RESERVE_DEVICE1_INTERFACE: &str = "org.freedesktop.ReserveDevice1";
@@ -60,12 +51,9 @@ pub struct DeviceReservation {
 #[derive(Debug)]
 enum ReservationState {
     /// We own the bus name `bus_name` on `connection`. `Drop` releases it.
-    /// `app_device_name` is stashed for Task 5 (status payload) — kept private.
     Active {
         connection: Connection,
         bus_name: String,
-        #[allow(dead_code)] // Surfaced via Tauri status command in Task 5.
-        app_device_name: String,
     },
     /// D-Bus session bus was unreachable, or some other graceful-degrade
     /// path. `is_active()` reports `false`; `Drop` is a no-op.
@@ -102,7 +90,7 @@ impl DeviceReservation {
     /// and drop it without a real device consumer in between.** The pattern
     ///
     /// ```ignore
-    /// let r = DeviceReservation::acquire("hw:1,0", "test")?;
+    /// let r = DeviceReservation::acquire("hw:1,0")?;
     /// std::thread::sleep(Duration::from_secs(2));
     /// drop(r);
     /// ```
@@ -119,10 +107,8 @@ impl DeviceReservation {
     /// `acquire` opens a fresh `zbus::blocking::Connection::session()` per
     /// call. zbus 4.4 does not internally pool session-bus connections, so
     /// each call pays a SASL handshake cost (~1-5 ms on a healthy bus). For
-    /// per-stream (Lifetime A) acquisition this is acceptable. For the
-    /// nested-inside-Lifetime-B pattern landing in Task 5, prefer reusing an
-    /// existing connection via the future `acquire_with_connection` overload.
-    pub fn acquire(hw_device: &str, app_device_name: &str) -> Result<Self, ReservationError> {
+    /// per-stream (Lifetime A) acquisition this is acceptable.
+    pub fn acquire(hw_device: &str) -> Result<Self, ReservationError> {
         // Parse failures must not propagate — the caller (AlsaDirectStream)
         // will treat any Err as fatal and abort stream creation, regressing
         // playback for devices we can't introspect. Names that don't target
@@ -183,14 +169,13 @@ impl DeviceReservation {
         match reply {
             // Either we just took ownership, or we already owned this name on
             // this same connection (idempotent for Lifetime-A nested under
-            // Lifetime-B in Task 5).
+            // Lifetime B).
             RequestNameReply::PrimaryOwner | RequestNameReply::AlreadyOwner => {
                 log::debug!("[reservation] acquired {}", bus_name);
                 Ok(Self {
                     state: ReservationState::Active {
                         connection,
                         bus_name,
-                        app_device_name: app_device_name.to_string(),
                     },
                 })
             }
@@ -201,7 +186,7 @@ impl DeviceReservation {
             // RequestNameReply is exhaustively matched and the contention
             // logic handles it identically to Exists.
             RequestNameReply::Exists | RequestNameReply::InQueue => {
-                match resolve_contention(&connection, &bus_name, &object_path, app_device_name) {
+                match resolve_contention(&connection, &bus_name, &object_path) {
                     Ok(res) => Ok(res),
                     // A cooperative higher-priority holder (DAW / pro-audio app)
                     // refused to release: honor it — the one deliberate fatal case.
@@ -344,7 +329,6 @@ fn resolve_contention(
     conn: &Connection,
     bus_name: &str,
     object_path: &str,
-    app_device_name: &str,
 ) -> Result<DeviceReservation, ReservationError> {
     // One Proxy serves all reads + the RequestRelease call against the
     // current holder. zbus's Proxy is cheap to keep alive, but constructing
@@ -407,7 +391,6 @@ fn resolve_contention(
                 state: ReservationState::Active {
                     connection: conn.clone(),
                     bus_name: bus_name.to_string(),
-                    app_device_name: app_device_name.to_string(),
                 },
             })
         }
