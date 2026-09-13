@@ -1012,3 +1012,190 @@ mod tests {
         assert!(a.contains(&DriverAction::ReportEdge)); // play-state edge
     }
 }
+
+/// What stays resident across a whole playlist.
+///
+/// # Why this is a session and not two unit tests
+///
+/// The release policy is already unit-tested twice: `plan_tick` emits
+/// `ReleaseCachedTrack` at a transition, and `AudioCache::release` frees one
+/// track. Both pass while the daemon still swaps, because neither asks the
+/// question the Pi asks — *how many tracks are resident at once, twenty tracks
+/// in*. That is a property of the two composed, over time, and it is the shape
+/// that had qbzd at 465 MB RSS on a 905 MB box: the track just finished sitting
+/// beside the one now playing AND the gapless prefetch.
+///
+/// So this drives the REAL `plan_tick`/`advance_state` over a REAL `AudioCache`
+/// for a whole playlist, and asserts residency at every single tick rather than
+/// at the end — a peak this misses is a peak the Pi does not.
+///
+/// Sizes are scaled down (1 MB a track, not 100) because only the RATIO matters
+/// here: the budget is set high enough that LRU never fires, so anything that
+/// bounds residency is the release policy and nothing else.
+#[cfg(test)]
+mod residency_session_tests {
+    use qbz_cache::AudioCache;
+    use qbz_models::system_capabilities::MemoryClass;
+    use qbz_player::release_finished_track_from;
+
+    use super::{
+        advance_state, plan_tick, DriverAction, DriverState, PlaybackEvent, QueueSnapshot,
+    };
+
+    /// One track's bytes, scaled down from the 60-170 MB of a real Hi-Res FLAC.
+    const TRACK_BYTES: usize = 1024 * 1024;
+    /// Room for the whole playlist, so LRU can never be what bounds residency.
+    const BUDGET: usize = 64 * 1024 * 1024;
+    const PLAYLIST: usize = 20;
+
+    fn ev(track: u64, playing: bool, pos: u64, dur: u64) -> PlaybackEvent {
+        PlaybackEvent {
+            is_playing: playing,
+            position: pos,
+            duration: dur,
+            track_id: track,
+            volume: 1.0,
+            sample_rate: None,
+            output_sample_rate: None,
+            bit_depth: None,
+            shuffle: None,
+            repeat: None,
+            normalization_gain: None,
+            gapless_ready: false,
+            gapless_next_track_id: 0,
+            bit_perfect_mode: None,
+            buffer_progress: None,
+        }
+    }
+
+    fn queue_at(index: usize) -> QueueSnapshot {
+        let current = (index + 1) as u64;
+        let upcoming = if index + 1 < PLAYLIST {
+            vec![((index + 2) as u64, true)]
+        } else {
+            Vec::new()
+        };
+        QueueSnapshot {
+            current,
+            upcoming,
+            repeat: "off".to_string(),
+            stop_after: None,
+            autoplay_infinite: false,
+        }
+    }
+
+    /// Play a gapless playlist under `class`, and report the worst residency
+    /// seen at ANY tick — not the residency at the end.
+    ///
+    /// Each track is prefetched into the cache before it is reached, exactly as
+    /// the driver's `ArmGapless` -> `prefetch_into_cache` pair does, so the
+    /// "outgoing + playing + prefetched" triple really forms.
+    fn worst_residency_over_a_gapless_playlist(class: MemoryClass) -> (usize, usize) {
+        let cache = AudioCache::new(BUDGET);
+        let mut state = DriverState::default();
+        let mut worst_tracks = 0usize;
+        let mut worst_bytes = 0usize;
+
+        // The first track and its successor are already warm when playback
+        // starts, which is the state a running gapless queue is always in.
+        cache.insert(1, vec![0u8; TRACK_BYTES]);
+        cache.insert(2, vec![0u8; TRACK_BYTES]);
+
+        for index in 0..PLAYLIST {
+            let playing = (index + 1) as u64;
+            // Mid-track, then the seamless hand-off into the next one.
+            for event in [
+                ev(playing, true, 100, 240),
+                ev(playing, true, 239, 240),
+                ev((index + 2).min(PLAYLIST) as u64, true, 0, 240),
+            ] {
+                let actions = plan_tick(&state, &event, &queue_at(index), None);
+                for action in &actions {
+                    if let DriverAction::ReleaseCachedTrack(track_id) = action {
+                        release_finished_track_from(&cache, *track_id, class);
+                    }
+                }
+                state = advance_state(&state, &event, &actions);
+
+                let stats = cache.stats();
+                worst_tracks = worst_tracks.max(stats.cached_tracks);
+                worst_bytes = worst_bytes.max(stats.current_size_bytes);
+            }
+            // The gapless prefetch for the track after next lands.
+            if index + 3 <= PLAYLIST {
+                cache.insert((index + 3) as u64, vec![0u8; TRACK_BYTES]);
+            }
+            let stats = cache.stats();
+            worst_tracks = worst_tracks.max(stats.cached_tracks);
+            worst_bytes = worst_bytes.max(stats.current_size_bytes);
+        }
+        (worst_tracks, worst_bytes)
+    }
+
+    /// The whole point: on the host the Pi actually is, twenty tracks of gapless
+    /// playback never hold more than the playing track and its prefetch.
+    #[test]
+    fn a_gapless_playlist_on_a_small_board_never_holds_more_than_two_tracks() {
+        let (tracks, bytes) = worst_residency_over_a_gapless_playlist(MemoryClass::LowMemory);
+        assert!(
+            tracks <= 2,
+            "twenty gapless tracks peaked at {tracks} resident — the playing \
+             track and its prefetch are two; a third is the finished one that \
+             was never released"
+        );
+        assert!(
+            bytes <= 2 * TRACK_BYTES,
+            "peaked at {bytes} bytes, more than two tracks' worth"
+        );
+    }
+
+    /// The class gate is load-bearing, not decoration: the SAME session on a
+    /// normal host deliberately keeps everything, because there a back-skip
+    /// should be instant and LRU will evict when something needs the room.
+    ///
+    /// Pinned so nobody "simplifies" the gate away and calls the low-memory
+    /// behaviour the default — that would make every desktop back-skip re-read
+    /// from disk.
+    #[test]
+    fn the_same_playlist_on_a_normal_host_deliberately_keeps_them() {
+        let (tracks, _) = worst_residency_over_a_gapless_playlist(MemoryClass::Normal);
+        assert!(
+            tracks > 2,
+            "a normal host should be holding the whole warm playlist, not {tracks}"
+        );
+    }
+
+    /// A release must actually drop the last reference, not merely forget the
+    /// entry.
+    ///
+    /// `TrackBytes` is an `Arc<[u8]>` precisely so the cache, the audio thread's
+    /// copy and the decoder's cursor share one allocation. The corollary is that
+    /// removing it from the map frees NOTHING while any clone survives — and a
+    /// residency bug in this code is exactly that: one extra live clone. Bytes
+    /// and counts both go to zero, or the accounting is lying.
+    #[test]
+    fn releasing_a_track_drops_the_last_reference_to_its_bytes() {
+        let cache = AudioCache::new(BUDGET);
+        cache.insert(7, vec![0u8; TRACK_BYTES]);
+
+        let held = cache.get(7).expect("just inserted").data;
+        assert_eq!(
+            std::sync::Arc::strong_count(&held),
+            2,
+            "the cache's copy and ours"
+        );
+
+        assert!(release_finished_track_from(
+            &cache,
+            7,
+            MemoryClass::LowMemory
+        ));
+        assert_eq!(
+            std::sync::Arc::strong_count(&held),
+            1,
+            "the release must have dropped the cache's reference, not just \
+             unlinked the entry"
+        );
+        assert_eq!(cache.stats().current_size_bytes, 0);
+    }
+}

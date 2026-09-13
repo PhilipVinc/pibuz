@@ -547,6 +547,50 @@ fn release_streaming_source(slot: &mut Option<Arc<BufferedMediaSource>>) {
     }
 }
 
+/// Whether a fully-buffered streaming track should be COPIED out of its
+/// streaming buffer into an owned `TrackBytes` for the cached-transition path.
+///
+/// The copy buys an instant seek and an instant gapless hand-off, at the price
+/// of holding both copies of the track for the seconds it takes. That is a fair
+/// trade on a desktop and a fatal one on a 1 GB Pi, where both copies of a
+/// 200 MB+ Hi-Res track are resident at once — and the buffer already held
+/// serves resume and seek perfectly well.
+///
+/// A named function rather than an expression inline in the audio thread, for
+/// the same reason `release_finished_track_on` takes its class: the decision is
+/// a policy worth stating and asserting, and inside the thread it is reachable
+/// only by running the thread on a host with the right amount of RAM.
+fn should_promote_streaming_buffer(class: qbz_models::system_capabilities::MemoryClass) -> bool {
+    class != qbz_models::system_capabilities::MemoryClass::LowMemory
+}
+
+/// The finished-track release policy, over a cache rather than over a `Player`.
+///
+/// Separated from [`Player::release_finished_track_on`] so the policy can be
+/// driven over a real [`qbz_cache::AudioCache`] without constructing a `Player`
+/// — which spawns an audio thread and needs a real output device, and so cannot
+/// appear in a test of what stays resident across a playlist.
+///
+/// On a **low-memory** host the bytes go at the transition: the track just
+/// finished (~100 MB at Hi-Res) would otherwise sit beside the one now playing
+/// AND the gapless prefetch, which is the shape that had qbzd at 465 MB RSS on
+/// a 905 MB box. It is quality-neutral — the bytes land in the L2 disk cache, so
+/// a back-skip re-reads them from there instead of the network.
+///
+/// On a **normal** host there is nothing to gain: keeping them means an instant
+/// back-skip, and LRU evicts them the moment something else needs the room.
+pub fn release_finished_track_from(
+    cache: &qbz_cache::AudioCache,
+    track_id: u64,
+    class: qbz_models::system_capabilities::MemoryClass,
+) -> bool {
+    if class != qbz_models::system_capabilities::MemoryClass::LowMemory {
+        log::debug!("Keeping finished track {track_id} in the memory cache ({class:?} host)");
+        return false;
+    }
+    cache.release(track_id)
+}
+
 fn begin_new_track(
     thread_state: &SharedState,
     gapless_pending: &mut Option<GaplessPending>,
@@ -4129,10 +4173,9 @@ impl Player {
                                         // The buffer we already hold serves resume and
                                         // seek perfectly well, so on a low-memory host
                                         // we keep it and skip the copy entirely.
-                                        let profile =
-                                            qbz_models::system_capabilities::memory_profile();
-                                        let promote = profile.class
-                                            != qbz_models::system_capabilities::MemoryClass::LowMemory;
+                                        let promote = should_promote_streaming_buffer(
+                                            qbz_models::system_capabilities::memory_profile().class,
+                                        );
                                         if promote {
                                             if current_audio_data.is_none() {
                                                 if let Some(full_data) =
@@ -5057,16 +5100,26 @@ impl Player {
     /// Returns whether the bytes were actually released.
     pub fn release_finished_track(&self, track_id: u64) -> bool {
         let profile = qbz_models::system_capabilities::memory_profile();
-        if profile.class != qbz_models::system_capabilities::MemoryClass::LowMemory {
-            log::debug!(
-                "Keeping finished track {} in the memory cache ({:?} host, {} MB RAM)",
-                track_id,
-                profile.class,
-                profile.mem_total_kb / 1024
-            );
-            return false;
-        }
-        self.audio_cache.release(track_id)
+        self.release_finished_track_on(track_id, profile.class)
+    }
+
+    /// [`Self::release_finished_track`] with the host class stated instead of
+    /// detected.
+    ///
+    /// The class is an argument rather than a lookup because
+    /// [`qbz_models::system_capabilities::memory_profile`] is a process-wide
+    /// `OnceLock` resolved from the host's RAM. Every dev machine and every CI
+    /// runner resolves to `Normal`, so a test calling the detecting version
+    /// exercises the branch that does NOTHING — and the branch the Pi actually
+    /// runs, the one this whole function exists for, is unreachable. A settable
+    /// global would not fix that either: the cases run in one process, so
+    /// whichever test set it first would decide for all of them.
+    pub fn release_finished_track_on(
+        &self,
+        track_id: u64,
+        class: qbz_models::system_capabilities::MemoryClass,
+    ) -> bool {
+        release_finished_track_from(&self.audio_cache, track_id, class)
     }
 
     /// Fetch a track's audio bytes for a gapless handoff: L1 memory →
