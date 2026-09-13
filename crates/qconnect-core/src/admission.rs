@@ -83,7 +83,6 @@ pub fn validate_track_origins_for_admission(origins: &[TrackOrigin]) -> Admissio
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qbz_models::PlaybackSource;
 
     #[test]
     fn blocks_command_when_any_track_origin_is_non_qobuz() {
@@ -104,23 +103,6 @@ mod tests {
         assert!(!validate_track_origins_for_admission(&[TrackOrigin::Plex]).accepted);
         assert!(!validate_track_origins_for_admission(&[TrackOrigin::ExternalUnknown]).accepted);
         assert!(!validate_track_origins_for_admission(&[]).accepted); // empty -> blocked
-    }
-
-    #[test]
-    fn admission_matches_cast_predicate() {
-        let pairs = [
-            (TrackOrigin::QobuzOnline, PlaybackSource::Qobuz),
-            (TrackOrigin::QobuzOfflineCache, PlaybackSource::OfflineCache),
-            (TrackOrigin::LocalLibrary, PlaybackSource::Local),
-            (TrackOrigin::Plex, PlaybackSource::Plex),
-        ];
-        for (origin, source) in pairs {
-            assert_eq!(
-                evaluate_remote_queue_admission(origin).accepted,
-                source.is_castable_to_qconnect(),
-                "admission/predicate disagree for {origin:?}",
-            );
-        }
     }
 
     #[test]

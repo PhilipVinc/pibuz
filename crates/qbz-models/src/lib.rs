@@ -34,7 +34,6 @@ pub mod events;
 pub mod lenient;
 pub mod playback;
 pub mod purchase_serde;
-pub mod source;
 pub mod system_capabilities;
 pub mod traits;
 pub mod types;
@@ -44,10 +43,8 @@ pub use error::{QbzError, QbzResult};
 pub use events::CoreEvent;
 pub use lenient::{parse_items_array, parse_items_lenient};
 pub use playback::{PlaybackState, PlaybackStatus, QueueState, QueueTrack, RepeatMode};
-pub use source::{plex_thumb_url, ArtworkRef, PlaybackSource, TrackOriginTag};
 pub use traits::{FrontendAdapter, LoggingAdapter, NoOpAdapter};
 pub use types::{
-    probe_streaminfo,
     Album,
     AlbumAward,
     // Award types
@@ -56,7 +53,6 @@ pub use types::{
     ArtistAlbums,
     ArtistBiography,
     // Artist page types
-    AudioParams,
     // Discover types
     DiscoverAlbum,
     DiscoverAlbumDates,

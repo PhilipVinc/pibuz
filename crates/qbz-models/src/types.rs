@@ -68,25 +68,6 @@ impl Quality {
             Quality::Mp3,
         ]
     }
-
-    /// Returns the next lower quality level, or None if already at the lowest (Mp3).
-    /// Used for CDN fallback when a quality level consistently fails.
-    pub fn lower(&self) -> Option<Quality> {
-        match self {
-            Quality::UltraHiRes => Some(Quality::HiRes),
-            Quality::HiRes => Some(Quality::Lossless),
-            Quality::Lossless => Some(Quality::Mp3),
-            Quality::Mp3 => None,
-        }
-    }
-
-    /// The lower of two tiers. Implementable as plain `min` because the
-    /// derived `Ord` on `Quality` is tier-correct: the Qobuz format-id
-    /// discriminants (5 Mp3 < 6 Lossless < 7 HiRes < 27 UltraHiRes) ascend
-    /// with tier. Used to clamp a requested tier against a cap (#638).
-    pub fn min_tier(a: Quality, b: Quality) -> Quality {
-        a.min(b)
-    }
 }
 
 // ============ User Session ============
@@ -190,27 +171,6 @@ impl StreamQualityInfo {
     }
 }
 
-/// Parse a FLAC STREAMINFO block from the head of a stream. Returns `None`
-/// for non-FLAC or short buffers — never guesses defaults (callers that need
-/// a fallback keep their own). Bit math hoisted verbatim from the proven
-/// QConnect remote-stream probe (`qbz::remote_stream`), shared so the cast
-/// path can measure the bytes it actually serves (#638 fix 1).
-pub fn probe_streaminfo(bytes: &[u8]) -> Option<AudioParams> {
-    if bytes.len() >= 26 && bytes.starts_with(b"fLaC") {
-        let sample_rate =
-            ((bytes[18] as u32) << 12) | ((bytes[19] as u32) << 4) | ((bytes[20] as u32) >> 4);
-        let channels = ((bytes[20] >> 1) & 0x07) + 1;
-        let bit_depth = ((bytes[20] & 0x01) << 4) | ((bytes[21] >> 4) & 0x0F);
-        Some(AudioParams {
-            sample_rate,
-            bits_per_sample: (bit_depth + 1) as u32,
-            channels: channels as u16,
-        })
-    } else {
-        None
-    }
-}
-
 // ============ CMAF Stream Types ============
 
 /// Response from POST /api.json/0.2/session/start
@@ -276,17 +236,6 @@ impl ImageSet {
             .or(self.large.as_ref())
             .or(self.thumbnail.as_ref())
             .or(self.small.as_ref())
-    }
-
-    /// The smallest available variant — for list-row thumbnails, where
-    /// `best()` (mega/large) would needlessly download huge images.
-    pub fn smallest(&self) -> Option<&String> {
-        self.small
-            .as_ref()
-            .or(self.thumbnail.as_ref())
-            .or(self.large.as_ref())
-            .or(self.extralarge.as_ref())
-            .or(self.mega.as_ref())
     }
 }
 
@@ -836,15 +785,6 @@ pub struct ArtistBiography {
     pub summary: Option<String>,
     pub content: Option<String>,
     pub source: Option<String>,
-}
-
-/// Measured stream parameters read from the head of an audio buffer
-/// (FLAC STREAMINFO). `sample_rate` is in Hz.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AudioParams {
-    pub sample_rate: u32,
-    pub bits_per_sample: u32,
-    pub channels: u16,
 }
 
 /// Album dates from discover

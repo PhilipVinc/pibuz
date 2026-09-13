@@ -43,11 +43,6 @@ pub fn install(default_level: &str) {
     }
 }
 
-/// Runtime log-level toggle (e.g. info <-> debug) with no restart.
-pub fn set_level(level: log::LevelFilter) {
-    log::set_max_level(level);
-}
-
 /// Path to the current-run log file (`~/.local/share/qbz/logs/qbz.log`), if a data dir exists.
 pub fn log_file_path() -> Option<PathBuf> {
     Some(dirs::data_dir()?.join("qbz").join("logs").join("qbz.log"))

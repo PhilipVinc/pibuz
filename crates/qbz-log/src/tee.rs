@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use log::{Log, Metadata, Record};
 
 use crate::line::LogLine;
-use crate::{redact, ring};
+use crate::redact;
 
 /// Wraps `env_logger`'s built `Logger` and tees every record to the in-memory ring and
 /// (optionally) the on-disk log file, with secret redaction applied once at this single
@@ -51,8 +51,6 @@ impl Log for TeeLogger {
             target: record.target().to_owned(),
             message: msg.clone(),
         };
-
-        ring::push(line.clone());
 
         if let Some(file) = &self.file {
             if let Ok(mut writer) = file.lock() {
