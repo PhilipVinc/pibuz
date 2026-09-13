@@ -4141,18 +4141,44 @@ impl Player {
                                         let promote = profile.class
                                             != qbz_models::system_capabilities::MemoryClass::LowMemory;
                                         if promote {
-                                            if current_audio_data.is_none() {
-                                                if let Some(full_data) =
-                                                    streaming_src.take_complete_data()
-                                                {
-                                                    log::info!(
-                                                        "Streaming promotion: full track buffered ({} bytes), enabling cached transition path",
-                                                        full_data.len()
-                                                    );
-                                                    current_audio_data = Some(full_data);
-                                                }
+                                            // Only drop the buffer once something
+                                            // has replaced it.
+                                            //
+                                            // This used to clear unconditionally,
+                                            // while `current_audio_data` was set
+                                            // only on the `Some` arm — so a
+                                            // `take_complete_data` that returned
+                                            // `None` left the player with no data,
+                                            // no file and no source. Playback
+                                            // carried on, because the bytes ahead
+                                            // of the reader were still buffered,
+                                            // and then the next pause or seek hit
+                                            // "no audio data available". A silent
+                                            // loss of the track, with no error on
+                                            // the path that caused it.
+                                            //
+                                            // `None` is now the COMMON case, not a
+                                            // corner: a windowed buffer is never
+                                            // one contiguous run from byte 0 once
+                                            // the trim has fired, which is exactly
+                                            // what that call requires.
+                                            if current_audio_data.is_some() {
+                                                clear_streaming_source = true;
+                                            } else if let Some(full_data) =
+                                                streaming_src.take_complete_data()
+                                            {
+                                                log::info!(
+                                                    "Streaming promotion: full track buffered ({} bytes), enabling cached transition path",
+                                                    full_data.len()
+                                                );
+                                                current_audio_data = Some(full_data);
+                                                clear_streaming_source = true;
+                                            } else {
+                                                log::debug!(
+                                                    "Streaming promotion declined: the buffer is windowed, not one run from byte 0                                                      ({} bytes held) — keeping it, since dropping it would leave nothing to resume from",
+                                                    streaming_src.buffer_size()
+                                                );
                                             }
-                                            clear_streaming_source = true;
                                         } else {
                                             log::debug!(
                                                 "Streaming promotion skipped ({} bytes): low-memory host keeps the buffer instead of copying it",
