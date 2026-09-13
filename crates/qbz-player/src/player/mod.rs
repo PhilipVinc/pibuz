@@ -413,13 +413,43 @@ fn cached_quality_below_requested(data: &TrackBytes, requested: Quality) -> bool
         Ok(m) => m,
         Err(_) => return false,
     };
-    let sample_rate = meta.sample_rate;
-    let bit_depth = meta.bit_depth.unwrap_or(16);
+    quality_below_requested(meta.sample_rate, meta.bit_depth.unwrap_or(16), requested)
+}
+
+/// The decision behind [`cached_quality_below_requested`], without the parse.
+///
+/// Separate so it can be tested: the parse returns `false` on ANY error, so a
+/// test that feeds it bytes it cannot read passes for the wrong reason.
+pub(crate) fn quality_below_requested(
+    sample_rate: u32,
+    bit_depth: u32,
+    requested: Quality,
+) -> bool {
+    // Bit depth only. A tier is a CEILING — "up to 24/192" — not a promise,
+    // and most of the hi-res catalogue masters at 24/96, so a 24/96 file is
+    // frequently the best copy that exists.
+    //
+    // This used to also require `sample_rate > 96000` for Hi-Res+, which made
+    // the cache unusable for exactly those tracks: the entry was written,
+    // rejected on every later play, and re-downloaded forever. Observed on the
+    // Pi, where an 86 MB cached copy was refused —
+    //
+    //   [CACHE] Track 208204223 on disk is below the requested UltraHiRes
+    //
+    // — and the stream fetched in its place arrived at 96000 Hz / 24-bit, byte
+    // for byte the same thing. The L2 cache had grown to 862 MB of entries
+    // that could never be hit.
+    //
+    // What is lost: a copy cached while the HiRes tier was selected is now
+    // accepted for an UltraHiRes request, so a track that really does have a
+    // 24/192 master would play at 24/96 until the entry is evicted. That needs
+    // the user to have changed quality between plays, and it costs sample rate
+    // rather than a re-download of every track. Recording the tier a file was
+    // fetched at, in a sidecar beside it, would settle it exactly.
+    let _ = sample_rate;
     match requested {
-        // Hi-Res+: expect 24-bit AND > 96 kHz.
-        Quality::UltraHiRes => bit_depth < 24 || sample_rate <= 96000,
-        // Hi-Res: expect 24-bit.
-        Quality::HiRes => bit_depth < 24,
+        // Either hi-res tier: expect 24-bit.
+        Quality::UltraHiRes | Quality::HiRes => bit_depth < 24,
         // Lossless / Mp3: any FLAC satisfies the request.
         _ => false,
     }
@@ -6367,6 +6397,49 @@ mod spill_rule_tests {
     #[test]
     fn an_overflowing_size_still_spills() {
         assert!(spill_to_disk(usize::MAX, PI_1GB));
+    }
+}
+
+#[cfg(test)]
+mod cached_quality_tests {
+    use super::quality_below_requested;
+    use qbz_models::Quality;
+
+    /// THE CACHE BUG. Most hi-res masters are 24/96, and a tier is a ceiling
+    /// rather than a promise, so demanding >96 kHz for Hi-Res+ rejected the
+    /// best copy that exists — every time, forever.
+    ///
+    /// Measured on the Pi: an 86 MB cached 24/96 copy refused with
+    /// "[CACHE] Track 208204223 on disk is below the requested UltraHiRes",
+    /// and the stream fetched to replace it arrived at 96000 Hz / 24-bit. The
+    /// L2 cache had grown to 862 MB of entries that could never be hit.
+    #[test]
+    fn a_24_96_copy_satisfies_either_hi_res_tier() {
+        assert!(
+            !quality_below_requested(96_000, 24, Quality::UltraHiRes),
+            "24/96 is what Qobuz has for most hi-res tracks — refusing it means never using the cache"
+        );
+        assert!(!quality_below_requested(96_000, 24, Quality::HiRes));
+    }
+
+    /// The check that still has to bite: a 16-bit copy is a real downgrade.
+    #[test]
+    fn a_16_bit_copy_does_not_satisfy_a_hi_res_tier() {
+        assert!(quality_below_requested(44_100, 16, Quality::UltraHiRes));
+        assert!(quality_below_requested(44_100, 16, Quality::HiRes));
+        assert!(quality_below_requested(96_000, 16, Quality::HiRes));
+    }
+
+    /// A 24/192 copy is obviously fine for everything.
+    #[test]
+    fn a_24_192_copy_satisfies_everything() {
+        assert!(!quality_below_requested(192_000, 24, Quality::UltraHiRes));
+    }
+
+    /// Lossless asks for nothing a FLAC cannot give.
+    #[test]
+    fn any_flac_satisfies_lossless() {
+        assert!(!quality_below_requested(44_100, 16, Quality::Lossless));
     }
 }
 
