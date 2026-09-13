@@ -2187,3 +2187,334 @@ mod tests {
         assert!(!to_eof(1).is_whole_file());
     }
 }
+
+/// Behaviour tests for the bytes layer: a scripted feeder and a scripted
+/// reader driving the REAL [`BufferedMediaSource`] / [`BufferWriter`] pair.
+///
+/// The unit tests above push and read in lockstep. That is the one regime in
+/// which the download head cannot run ahead of the reader — and so the one
+/// regime in which an unbounded buffer looks bounded. A cap that was 28x out
+/// passed review because every test it had was written that way. These tests
+/// exist so the two sides can move at different speeds, which is the only
+/// arrangement that resembles a Pi on WiFi: the link measured 4.5 MB/s against
+/// a track consumed at ~0.26 MB/s, a ratio of 17.
+///
+/// What they assert is deliberately external — bytes held, bytes fetched,
+/// whether a read returned — never a private field. A test that reaches into
+/// `BufferState` pins the implementation instead of the behaviour.
+///
+/// **Three fidelity limits, stated so nobody reads more into a green run than
+/// is there.** The feeder here is a stand-in: it calls the same `BufferWriter`
+/// methods in the same order as `qbzd/src/qconnect/remote_stream.rs`, but it is
+/// not that code, so a change there needs a change here. There is no socket, so
+/// nothing exercises TCP back-pressure, a stalled body, or the ~5 s
+/// time-to-first-byte this CDN charges for a cold offset. And `pace: None`
+/// means "as fast as this machine allows", which on a dev box is far faster
+/// than 4.5 MB/s — fine for ratios, useless for absolute timings.
+#[cfg(test)]
+mod buffer_behaviour_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    const KB: usize = 1024;
+    const MB: usize = 1024 * 1024;
+
+    /// Deterministic track content, so a reader can prove it got the right
+    /// bytes at the right offsets after a seek rather than merely the right
+    /// count. 251 is prime, so the pattern does not align with any chunk size.
+    fn byte_at(offset: u64) -> u8 {
+        (offset % 251) as u8
+    }
+
+    fn track_bytes(from: u64, len: usize) -> Vec<u8> {
+        (from..from + len as u64).map(byte_at).collect()
+    }
+
+    /// What the feeder did, as the tests see it from outside.
+    #[derive(Default)]
+    struct FeedLog {
+        /// Every byte the feeder pushed, including any it pushed twice.
+        ///
+        /// This is the counter that makes a re-download loop visible: it was
+        /// the only externally observable symptom of the reverted trim, whose
+        /// discarded prefix `first_gap` kept reporting as a hole.
+        fetched: AtomicU64,
+        /// Highest `buffer_size()` seen, sampled after each push.
+        peak_held: AtomicU64,
+        /// How many times the feeder opened a body at a fresh offset. One is
+        /// the initial whole-file GET; each further one is a seek or a gap.
+        bodies: AtomicU64,
+    }
+
+    impl FeedLog {
+        fn fetched(&self) -> u64 {
+            self.fetched.load(AtomicOrdering::SeqCst)
+        }
+        fn peak_held(&self) -> u64 {
+            self.peak_held.load(AtomicOrdering::SeqCst)
+        }
+        fn bodies(&self) -> u64 {
+            self.bodies.load(AtomicOrdering::SeqCst)
+        }
+    }
+
+    /// The scripted feeder.
+    ///
+    /// Mirrors `download_and_stream_remote_track`: open the body the buffer
+    /// asks for, push it chunk by chunk, honour a range request the moment one
+    /// arrives, and when the body ends ask `next_plan` what to do next.
+    async fn feed(
+        writer: BufferWriter,
+        total: u64,
+        chunk: usize,
+        pace: Option<Duration>,
+        log: Arc<FeedLog>,
+    ) {
+        let mut plan = writer.initial_plan();
+        'bodies: loop {
+            log.bodies.fetch_add(1, AtomicOrdering::SeqCst);
+            let end = plan.end.unwrap_or(total);
+            let mut pos = plan.offset;
+
+            while pos < end {
+                let n = chunk.min((end - pos) as usize);
+                if writer.push_chunk(&track_bytes(pos, n)).is_err() {
+                    return;
+                }
+                log.fetched.fetch_add(n as u64, AtomicOrdering::SeqCst);
+                log.peak_held
+                    .fetch_max(writer.buffer_size() as u64, AtomicOrdering::SeqCst);
+                pos += n as u64;
+
+                if let Some(p) = pace {
+                    tokio::time::sleep(p).await;
+                } else {
+                    tokio::task::yield_now().await;
+                }
+
+                // A reader jumped: abandon this body for the one it wants,
+                // exactly as the `biased` select in the real feeder does.
+                if let Some(next) = writer.take_request() {
+                    plan = next;
+                    continue 'bodies;
+                }
+            }
+
+            match writer.next_plan() {
+                Some(next) => plan = next,
+                None => return,
+            }
+        }
+    }
+
+    /// Read `reader` to EOF, verifying content as it goes. Returns bytes read.
+    fn drain_verifying(reader: &mut BufferedMediaSource, from: u64) -> u64 {
+        let mut buf = vec![0u8; 32 * KB];
+        let mut at = from;
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => return at - from,
+                Ok(n) => {
+                    for (i, got) in buf[..n].iter().enumerate() {
+                        assert_eq!(
+                            *got,
+                            byte_at(at + i as u64),
+                            "wrong byte at offset {}",
+                            at + i as u64
+                        );
+                    }
+                    at += n as u64;
+                }
+                Err(e) => panic!("read failed at {at}: {e}"),
+            }
+        }
+    }
+
+    fn config(initial: usize) -> StreamingConfig {
+        StreamingConfig {
+            initial_buffer_bytes: initial,
+            max_buffer_bytes: 100 * MB,
+        }
+    }
+
+    /// The baseline: a reader that keeps up gets every byte, in order, once.
+    ///
+    /// Also the guard against a re-download loop. `fetched` counts everything
+    /// the feeder pushed, so anything that makes the buffer ask for bytes it
+    /// already had shows up here as a total above the track length — which is
+    /// how the reverted trim would have been caught.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_track_is_fetched_once_and_read_whole() {
+        const TOTAL: u64 = 4 * MB as u64;
+        let log = Arc::new(FeedLog::default());
+        let (source, writer) = BufferedMediaSource::new_seekable(config(64 * KB), Some(TOTAL));
+        let source = Arc::new(source);
+        let mut reader = source.create_reader();
+
+        let feeder = tokio::spawn(feed(writer, TOTAL, 64 * KB, None, log.clone()));
+        let read = tokio::task::spawn_blocking(move || drain_verifying(&mut reader, 0))
+            .await
+            .expect("reader thread");
+        feeder.await.expect("feeder task");
+
+        assert_eq!(read, TOTAL, "reader saw the whole track");
+        assert_eq!(
+            log.fetched(),
+            TOTAL,
+            "the feeder fetched the track exactly once — anything more is a refetch loop"
+        );
+        assert_eq!(log.bodies(), 1, "one body, no seeks");
+    }
+
+    /// CHARACTERISATION, not an endorsement: today the buffer holds the whole
+    /// track.
+    ///
+    /// The feeder runs flat out while the reader is paced, which is the real
+    /// ratio (measured 4.5 MB/s of link against ~0.26 MB/s of 24/96 playback).
+    /// Nothing bounds the distance between them, so everything the feeder
+    /// fetched is still resident when the reader is barely started.
+    ///
+    /// This test is expected to CHANGE when the bounded window lands — it is
+    /// here so that change is visible in a diff rather than silent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn today_the_buffer_grows_to_the_whole_track() {
+        const TOTAL: u64 = 4 * MB as u64;
+        let log = Arc::new(FeedLog::default());
+        let (source, writer) = BufferedMediaSource::new_seekable(config(64 * KB), Some(TOTAL));
+        let source = Arc::new(source);
+        let mut reader = source.create_reader();
+
+        // Reader takes one small bite and stops, standing in for a track that
+        // has only just started playing.
+        let feeder = tokio::spawn(feed(writer, TOTAL, 64 * KB, None, log.clone()));
+        tokio::task::spawn_blocking(move || {
+            let mut buf = vec![0u8; 64 * KB];
+            reader.read_exact(&mut buf).expect("first read");
+        })
+        .await
+        .expect("reader thread");
+        feeder.await.expect("feeder task");
+
+        assert!(
+            log.peak_held() > TOTAL * 3 / 4,
+            "held {} of a {} byte track — the buffer is unbounded today",
+            log.peak_held(),
+            TOTAL
+        );
+    }
+
+    /// A backward seek inside what is still buffered costs nothing: no extra
+    /// body, no extra bytes. This is what `SEEK_LOOKBEHIND_BYTES` protects, and
+    /// it must keep holding once the buffer is windowed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_backward_seek_inside_the_buffer_costs_no_extra_fetch() {
+        const TOTAL: u64 = 2 * MB as u64;
+        let log = Arc::new(FeedLog::default());
+        let (source, writer) = BufferedMediaSource::new_seekable(config(16 * KB), Some(TOTAL));
+        let source = Arc::new(source);
+        let mut reader = source.create_reader();
+
+        let feeder = tokio::spawn(feed(writer, TOTAL, 32 * KB, None, log.clone()));
+        let bodies_after = tokio::task::spawn_blocking({
+            let log = log.clone();
+            move || {
+                let mut buf = vec![0u8; 512 * KB];
+                reader.read_exact(&mut buf).expect("read forward");
+                reader.seek(SeekFrom::Start(128 * KB as u64)).expect("seek");
+                let mut back = vec![0u8; 64 * KB];
+                reader.read_exact(&mut back).expect("read after seek");
+                for (i, got) in back.iter().enumerate() {
+                    assert_eq!(*got, byte_at(128 * KB as u64 + i as u64));
+                }
+                log.bodies()
+            }
+        })
+        .await
+        .expect("reader thread");
+        feeder.await.expect("feeder task");
+
+        assert_eq!(
+            bodies_after, 1,
+            "a seek into buffered bytes must not re-open the body"
+        );
+    }
+
+    /// A reader that stops for a while and comes back keeps playing.
+    ///
+    /// Stands in for pause/resume, which is where a buffer that quietly loses
+    /// its head run turns a pause into a dead track — the resume path treats
+    /// "complete but not one run from zero" as fatal and returns.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reader_that_pauses_mid_track_can_carry_on() {
+        const TOTAL: u64 = 2 * MB as u64;
+        let log = Arc::new(FeedLog::default());
+        let (source, writer) = BufferedMediaSource::new_seekable(config(16 * KB), Some(TOTAL));
+        let source = Arc::new(source);
+        let mut reader = source.create_reader();
+
+        let feeder = tokio::spawn(feed(writer, TOTAL, 32 * KB, None, log.clone()));
+        let read_after_pause = tokio::task::spawn_blocking(move || {
+            let mut buf = vec![0u8; 256 * KB];
+            reader.read_exact(&mut buf).expect("read before pause");
+            std::thread::sleep(Duration::from_millis(50));
+            drain_verifying(&mut reader, 256 * KB as u64)
+        })
+        .await
+        .expect("reader thread");
+        feeder.await.expect("feeder task");
+
+        assert_eq!(
+            read_after_pause,
+            TOTAL - 256 * KB as u64,
+            "the rest of the track is still readable after a pause"
+        );
+    }
+
+    /// A forward seek past the download head re-opens the body there rather
+    /// than waiting for the download to walk to it — one extra body, and the
+    /// bytes in between are never fetched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_long_forward_seek_re_opens_the_body_at_the_target() {
+        const TOTAL: u64 = 8 * MB as u64;
+        let log = Arc::new(FeedLog::default());
+        let (source, writer) = BufferedMediaSource::new_seekable(config(16 * KB), Some(TOTAL));
+        let source = Arc::new(source);
+        let mut reader = source.create_reader();
+
+        // Paced so the head stays well behind the seek target.
+        let feeder = tokio::spawn(feed(
+            writer,
+            TOTAL,
+            32 * KB,
+            Some(Duration::from_millis(1)),
+            log.clone(),
+        ));
+        tokio::task::spawn_blocking(move || {
+            let mut buf = vec![0u8; 32 * KB];
+            reader.read_exact(&mut buf).expect("read at the head");
+            reader.seek(SeekFrom::Start(6 * MB as u64)).expect("seek");
+            let mut at_target = vec![0u8; 32 * KB];
+            reader.read_exact(&mut at_target).expect("read at target");
+            for (i, got) in at_target.iter().enumerate() {
+                assert_eq!(*got, byte_at(6 * MB as u64 + i as u64));
+            }
+        })
+        .await
+        .expect("reader thread");
+        feeder.abort();
+
+        assert!(
+            log.bodies() >= 2,
+            "a seek {} bytes ahead must re-open the body, not wait",
+            6 * MB
+        );
+        assert!(
+            log.fetched() < TOTAL,
+            "fetched {} of {} — the skipped region must not have been downloaded",
+            log.fetched(),
+            TOTAL
+        );
+    }
+}
