@@ -13,16 +13,35 @@ artifacts in `target/`. Plain `cargo build` / `cargo test` from the root work.
 (It was not always so — the manifest used to live in `crates/`, so older commit
 messages and comments may mention `--manifest-path crates/Cargo.toml`.)
 
-The workspace is `qbzd` plus **exactly** its dependency closure — 20 crates, the
+The workspace is `qbzd` plus **exactly** its dependency closure — 15 crates, the
 set `cargo tree -p qbzd` resolves. If you find yourself adding a workspace member,
 check whether `qbzd` really needs it.
 
 It was 23 until the desktop-era code came out: `qbz-offline-cache`, `qbz-library`
 and `qbz-secrets` were the offline-download tier, reachable only through three
 `qbz-core` methods whose `offline:` argument every call site in the tree passed
-`None` to. Linked, never used. If a feature here looks orphaned, check whether
+`None` to. `qbz-dsd` went later — local-file DSD, whose only entry point took a
+`&Path` nothing ever supplied. If a feature here looks orphaned, check whether
 anything actually calls it before assuming it is load-bearing — a lot of this
 tree is a desktop app that was never fully unwound.
+
+### Finding dead code: the probe
+
+`pub fn` has NO dead-code lint — anything reachable from the crate root counts
+as used — so a grep is the only thing most sweeps have to go on, and a grep
+cannot see through `Type::name(...)` call syntax, serde attribute strings, or a
+same-named method on another type. Get the compiler to answer instead:
+
+1. rewrite the candidates `pub fn` -> `pub(crate) fn` (a PROBE, reverted after),
+2. `cargo clippy --all-targets -- -D warnings`; dead_code now names the truly
+   unreachable ones, transitively and through serde attribute paths,
+3. **run the probe in the arm64 container too, and delete only the
+   INTERSECTION.** `dsd_mode` was reported dead on macOS and was live on Linux.
+
+Two classes the lint names that you should NOT delete: an item reachable only
+from other dead code (it goes when that does, not before), and an item whose
+only caller is a test that covers real behaviour — move the coverage rather than
+dropping it.
 
 ## Commands
 
@@ -36,7 +55,7 @@ cargo build --release -p qbzd
 
 ## Tests and lints: the suite is GREEN, keep it that way
 
-`./scripts/cargo-test.sh` passes clean — 997 tests, 0 failures — on macOS and
+`./scripts/cargo-test.sh` passes clean — 0 failures — on macOS and
 linux/arm64. `cargo clippy --workspace --all-targets -- -D warnings` is clean on
 both too, and CI enforces fmt + clippy + tests. **A failure is a regression.**
 
