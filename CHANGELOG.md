@@ -3,6 +3,43 @@
 Notable changes per release. Versions are plain semver; releases are `vX.Y.Z`
 tags on `main`.
 
+## Unreleased
+
+### Changed
+
+- **The streaming buffer is bounded.** The downloader now parks when it is
+  `audio.stream_window_seconds` (default 8) of the track's own byte-rate ahead
+  of the decoder, and resumes at 75 % of that. Before, nothing bounded it: the
+  link measured 4.5 MB/s against ~0.26 MB/s of playback, so the whole
+  compressed track — 120–220 MB at Hi-Res — was resident within seconds of
+  pressing play. A Hi-Res stream now holds single-digit megabytes.
+  The window is in *seconds*, not bytes, because a byte constant is a
+  different amount of music at every quality.
+- **The cast path uses the cache.** Casting from the Qobuz app now checks the
+  memory and disk caches before the network, and stages what it streams into
+  the disk cache. Previously that path read neither and wrote neither, so
+  pressing *previous* re-downloaded a track already on the card.
+- **Gapless arms on "this track can spare the bandwidth"** rather than "this
+  track has finished downloading", which a bounded window makes true only at
+  the very end of a track.
+- **CMAF playback holds one copy of a track instead of three**, and no longer
+  allocates per FLAC frame.
+- **Gapless defaults agree.** The struct default, the database default and
+  `reset_all()` gave three different answers; a fresh install had it off while
+  `AudioSettings::default()` claimed on. Choosing the ALSA backend no longer
+  switches gapless off.
+
+### Fixed
+
+- The daemon now raises its own `RLIMIT_RTPRIO`, so the ALSA writer actually
+  gets `SCHED_FIFO` where it is started without a systemd unit — which is how
+  moOde starts it, and where the promotion had been silently refused.
+- A completed stream that could not be promoted no longer drops its buffer
+  anyway, which left the track unresumable after the next pause.
+- The HTTP client used a *total* request timeout, which a rate-matched
+  download would have hit on every track over five minutes; it now times out
+  on stalls instead.
+
 ## 2.3.0 — 2026-09-13
 
 First release of μqbzd as its own project rather than a fork branch, and the
@@ -68,8 +105,8 @@ to the project this forked from.
 
 ### Known issue
 
-`audio.stream_window_seconds` does not exist yet, and the streaming buffer is
-still unbounded: it holds the whole compressed track, 120–220 MB at Hi-Res. The
-`max_buffer_bytes` cap present in this release only discards bytes *behind* the
-reader, so it does not bound the buffer, and enforcing it is expensive. Prefer
-`audio.streaming_only` on a 512 MB board until the next release.
+The streaming buffer is unbounded in this release: it holds the whole
+compressed track, 120–220 MB at Hi-Res. The `max_buffer_bytes` cap present here
+only discards bytes *behind* the reader, so it does not bound the buffer, and
+enforcing it is expensive. Prefer `audio.streaming_only` on a 512 MB board.
+Fixed after 2.3.0 by `audio.stream_window_seconds`.

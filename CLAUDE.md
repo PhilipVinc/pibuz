@@ -92,6 +92,31 @@ against a real driver, RT scheduling, whether moOde's `_audioout` really passes
 through. Green here means the state machine is right, not that the Pi sounds
 right.
 
+## The bytes-layer behaviour tests
+
+`crates/qbz-player/src/player/streaming_source.rs` → `mod buffer_behaviour_tests`
+runs a scripted feeder (tokio) and a scripted reader (its own thread) at
+INDEPENDENT rates against the real `BufferedMediaSource`/`BufferWriter` pair.
+`cargo test -p qbz-player buffer_behaviour`, well under a second.
+
+The existing unit tests above it push one chunk and read it back in lockstep.
+That is the one regime where the download head cannot run ahead of the reader,
+and therefore the one regime where an unbounded buffer looks bounded — which is
+how a memory cap that was 28x out shipped with a passing test asserting it
+worked. **A test for anything in this layer must let the two sides move at
+different speeds**, or it is testing the wrong thing.
+
+Assert only what is visible from outside: bytes held, bytes fetched, bodies
+opened, whether a read returned. `fetched` is the important one — a re-download
+loop has no other external symptom.
+
+Three fidelity limits, same spirit as the audio harness: the feeder is a
+stand-in for `qbzd/src/qconnect/remote_stream.rs` rather than that code, so a
+change there needs a change here; there is no socket, so nothing exercises TCP
+back-pressure, a stalled body, or this CDN's ~5 s cold-offset
+time-to-first-byte; and an unpaced feeder means "as fast as this machine
+allows", which is useful for ratios and meaningless for absolute timings.
+
 ## Formatting and lints
 
 Run `cargo fmt --all`; the tree is rustfmt-clean and CI checks it. (Older
