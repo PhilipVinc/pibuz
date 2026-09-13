@@ -10,7 +10,6 @@ members = [
     "crates/qbz-core",
     "crates/qbz-cache",
     "crates/qbz-cmaf",
-    "crates/qbz-dsd",
     "crates/qconnect-core",
     "crates/qconnect-protocol",
     "crates/qconnect-transport-ws",

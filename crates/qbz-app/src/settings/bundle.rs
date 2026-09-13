@@ -81,7 +81,6 @@ pub struct ExportOptions {
 #[derive(Debug, Clone, Default)]
 pub struct ImportOptions {
     pub include_auth: bool,
-    pub trust_dsd: bool,
     /// Repeatable `--remap OLD=NEW` prefix rewrites for `library_folders`.
     pub remap: Vec<(String, String)>,
     /// True when there is no interactive terminal — machine fields that would
@@ -691,7 +690,7 @@ fn plan_audio(
         }
     }
 
-    // Second pass: the machine block (backend + device + intent + alsa + dsd).
+    // Second pass: the machine block (backend + device + intent + alsa).
     plan_audio_machine(map, &current, opts, live, forced_device, plan);
 
     // Any genuinely-unknown audio keys.
@@ -714,7 +713,6 @@ fn plan_audio(
                     | "pcm_ring_ms"
                     | "writer_rt_priority"
                     | "cache_to_disk"
-                    | "dsd_mode"
             )
             || k.eq_ignore_ascii_case("volume");
         if !known {
@@ -961,23 +959,10 @@ fn plan_audio_machine(
         }
     }
 
-    // dsd_mode — no-change short-circuit, else downgrade unless --trust-dsd (§5.3 step 4).
-    if let Some(v) = map.get("dsd_mode") {
-        let bundle_dsd = v.as_str().unwrap_or("convert");
-        if bundle_dsd == current.dsd_mode {
-            applied_line(plan, "audio.dsd_mode", v, "");
-        } else if matches!(bundle_dsd, "dop" | "native") && (!opts.trust_dsd || fallback) {
-            adapted_line(
-                plan,
-                "audio.dsd_mode",
-                v,
-                &Value::String("convert".into()),
-                "pass --trust-dsd to keep DoP",
-            );
-        } else {
-            applied_line(plan, "audio.dsd_mode", v, "");
-        }
-    }
+    // `audio.dsd_mode` used to be handled here, with a --trust-dsd downgrade
+    // ladder. DSD playback is gone, so a bundle carrying the key now falls
+    // through to the unknown-field skip — which is the honest outcome: the
+    // setting has nothing left to configure.
 }
 
 /// The backend the device options belong to: the bundle's backend when present,
@@ -1205,7 +1190,6 @@ fn apply_audio_writes(data_root: &Path, writes: &[(&str, &Value)]) -> Result<(),
             "pw_force_bitperfect" => store.set_pw_force_bitperfect(as_bool(value))?,
             "skip_sink_switch" => store.set_skip_sink_switch(as_bool(value))?,
             "reserve_dac_while_running" => store.set_reserve_dac_while_running(as_bool(value))?,
-            "dsd_mode" => store.set_dsd_mode(value.as_str().unwrap_or("convert"))?,
             "stream_first_track" => store.set_stream_first_track(as_bool(value))?,
             "stream_buffer_seconds" => {
                 store.set_stream_buffer_seconds(value.as_u64().unwrap_or(2) as u8)?

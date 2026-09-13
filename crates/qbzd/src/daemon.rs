@@ -613,7 +613,6 @@ pub(crate) fn audio_routing_changed(
         || old.exclusive_mode != new.exclusive_mode
         || old.dac_passthrough != new.dac_passthrough
         || old.skip_sink_switch != new.skip_sink_switch
-        || old.dsd_mode != new.dsd_mode
         || old.device_max_sample_rate != new.device_max_sample_rate
 }
 
@@ -714,10 +713,6 @@ mod tests {
         let mut lock_out = base.clone();
         lock_out.skip_sink_switch = !base.skip_sink_switch;
         assert!(audio_routing_changed(&base, &lock_out), "skip_sink_switch");
-
-        let mut dsd = base.clone();
-        dsd.dsd_mode = "dop".to_string();
-        assert!(audio_routing_changed(&base, &dsd), "dsd_mode");
 
         let mut rate = base.clone();
         rate.device_max_sample_rate = Some(192_000);

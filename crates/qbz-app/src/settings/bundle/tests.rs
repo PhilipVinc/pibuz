@@ -158,35 +158,6 @@ fn device_uuid_never_imported() {
 }
 
 #[test]
-fn dsd_downgrades_without_trust_flag() {
-    // §5.3 step 4: dop/native → convert unless --trust-dsd (current is convert,
-    // so this is a CHANGE — the no-change short-circuit does not fire).
-    let p = scratch("dsd");
-    let bundle = bundle_with(json!({ "audio": { "dsd_mode": "dop" } }));
-
-    let plan_no_trust = plan(&bundle, &p, &ImportOptions::default(), &live()).expect("plan");
-    let line = find(&plan_no_trust.adapted, "audio.dsd_mode").expect("dsd adapted");
-    assert_eq!(line.old.as_deref(), Some("dop"));
-    assert_eq!(line.new, "convert");
-    assert_eq!(
-        write_of(&plan_no_trust, "audio.dsd_mode"),
-        Some(&json!("convert"))
-    );
-
-    let opts = ImportOptions {
-        trust_dsd: true,
-        ..Default::default()
-    };
-    let plan_trust = plan(&bundle, &p, &opts, &live()).expect("plan");
-    assert!(find(&plan_trust.adapted, "audio.dsd_mode").is_none());
-    assert_eq!(
-        find(&plan_trust.applied, "audio.dsd_mode").unwrap().new,
-        "dop"
-    );
-    cleanup(&p);
-}
-
-#[test]
 fn ask_maps_to_always_fallback_in_adapted() {
     // §5.5: "ask" needs a UI the daemon lacks → always_fallback, in adapted,
     // never a silent skip.
@@ -434,7 +405,6 @@ fn roundtrip_same_box_is_noop() {
             .unwrap();
         audio.set_output_device(Some("hw:1,0")).unwrap();
         audio.set_exclusive_mode(true).unwrap();
-        audio.set_dsd_mode("dop").unwrap(); // a working DSD daemon
         audio
             .set_quality_fallback_behavior("always_fallback")
             .unwrap();
@@ -471,8 +441,6 @@ fn roundtrip_same_box_is_noop() {
         plan.adapted
     );
     assert!(plan.device_pick.is_none());
-    // dsd dop survived without --trust-dsd (no-change short-circuit).
-    assert_eq!(find(&plan.applied, "audio.dsd_mode").unwrap().new, "dop");
     assert_eq!(
         find(&plan.applied, "audio.output_device").unwrap().new,
         "hw:1,0"
@@ -540,7 +508,6 @@ fn apply_writes_are_idempotent_and_persist() {
         "qconnect": { "device_name": "Kitchen", "startup_mode": "on" }
     }));
     let opts = ImportOptions {
-        trust_dsd: true,
         ..Default::default()
     };
 
@@ -555,7 +522,6 @@ fn apply_writes_are_idempotent_and_persist() {
     assert_eq!(audio.output_device.as_deref(), Some("hw:1,0"));
     assert_eq!(audio.backend_type, Some(AudioBackendType::Alsa));
     assert!(audio.gapless_enabled);
-    assert_eq!(audio.dsd_mode, "dop");
 
     let pb = PlaybackPreferencesStore::new_at(&p.data_root)
         .unwrap()

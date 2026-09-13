@@ -68,7 +68,6 @@ const KEY_TABLE: &[(&str, ApplyClass)] = &[
     ("audio.exclusive_mode", ApplyClass::Reinit),
     ("audio.dac_passthrough", ApplyClass::Reinit),
     ("audio.skip_sink_switch", ApplyClass::Reinit),
-    ("audio.dsd_mode", ApplyClass::Reinit),
     ("audio.device_max_sample_rate", ApplyClass::Reinit),
     // --- audio (Reload) -----------------------------------------------------
     ("audio.stream_first_track", ApplyClass::Reload),
@@ -257,15 +256,6 @@ fn parse_opt_u32(v: &str) -> Result<Option<u32>, String> {
 fn render_opt_u32(v: Option<u32>) -> String {
     v.map(|r| r.to_string())
         .unwrap_or_else(|| "none".to_string())
-}
-
-fn parse_dsd_mode(v: &str) -> Result<String, String> {
-    match v.to_ascii_lowercase().as_str() {
-        "convert" | "dop" | "native" => Ok(v.to_ascii_lowercase()),
-        other => Err(format!(
-            "invalid DSD mode '{other}' — expected one of: convert, dop, native"
-        )),
-    }
 }
 
 /// The daemon has no one to ask (03-setup-tui.md §3.3.2) — `settings set`
@@ -509,7 +499,6 @@ fn read_all(roots: &ProfileRoots) -> Result<Vec<(&'static str, String)>, String>
             "audio.exclusive_mode" => render_bool(audio.exclusive_mode),
             "audio.dac_passthrough" => render_bool(audio.dac_passthrough),
             "audio.skip_sink_switch" => render_bool(audio.skip_sink_switch),
-            "audio.dsd_mode" => audio.dsd_mode.clone(),
             "audio.device_max_sample_rate" => render_opt_u32(audio.device_max_sample_rate),
             "audio.stream_first_track" => render_bool(audio.stream_first_track),
             "audio.stream_buffer_seconds" => audio.stream_buffer_seconds.to_string(),
@@ -683,13 +672,6 @@ pub(crate) fn write_one(
             open_audio(roots)
                 .map_err(SetError::Io)?
                 .set_skip_sink_switch(v)
-                .map_err(SetError::Io)?
-        }
-        "audio.dsd_mode" => {
-            let v = parse_dsd_mode(raw).map_err(SetError::Usage)?;
-            open_audio(roots)
-                .map_err(SetError::Io)?
-                .set_dsd_mode(&v)
                 .map_err(SetError::Io)?
         }
         "audio.device_max_sample_rate" => {
@@ -1202,7 +1184,7 @@ pub fn export(roots: &ProfileRoots, file: Option<String>, from: &str, include_au
     0
 }
 
-/// `qbzd settings import FILE [--include-auth] [--trust-dsd] [--remap OLD=NEW]...
+/// `qbzd settings import FILE [--include-auth] [--remap OLD=NEW]...
 /// [--dry-run]` (⬇, 04 §5.3). read → version-gate → plan → (TTY device re-pick /
 /// non-tty safe defaults) → validate secrets BEFORE any write → apply →
 /// reload-nudge → three-bucket summary. Exit: 0 · 1 · 2 · 4.
@@ -1210,7 +1192,6 @@ pub async fn import(
     roots: &ProfileRoots,
     file: &str,
     include_auth: bool,
-    trust_dsd: bool,
     remap_raw: &[String],
     dry_run: bool,
 ) -> i32 {
@@ -1254,7 +1235,6 @@ pub async fn import(
     let non_tty = !std::io::stdin().is_terminal();
     let opts = ImportOptions {
         include_auth,
-        trust_dsd,
         remap,
         non_tty,
     };
@@ -1835,14 +1815,6 @@ mod tests {
         assert_eq!(parse_opt_u32("none"), Ok(None));
         assert_eq!(parse_opt_u32("192000"), Ok(Some(192_000)));
         assert!(parse_opt_u32("loud").is_err());
-    }
-
-    #[test]
-    fn parse_dsd_mode_rejects_unknown_modes() {
-        for ok in ["convert", "dop", "native"] {
-            assert!(parse_dsd_mode(ok).is_ok());
-        }
-        assert!(parse_dsd_mode("bogus").is_err());
     }
 
     #[test]

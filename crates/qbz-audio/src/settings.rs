@@ -170,17 +170,6 @@ pub struct AudioSettings {
     /// See `qbz-nix-docs/specs/2026-05-07-alsa-exclusive-hardening-design.md`.
     #[serde(default)]
     pub reserve_dac_while_running: bool,
-    /// DSD delivery mode: "convert" (default — DSD→PCM, works everywhere),
-    /// "dop" (DSD over PCM, opt-in: NOT detectable, wrong DAC = loud noise),
-    /// or "native" (ALSA DSD_U32 formats, needs a kernel quirk for the DAC).
-    /// Only takes effect on the ALSA direct backend with stereo tracks;
-    /// everything else converts.
-    #[serde(default = "default_dsd_mode")]
-    pub dsd_mode: String,
-}
-
-fn default_dsd_mode() -> String {
-    "convert".to_string()
 }
 
 /// Perceptual by default: it is what every other player on the host does, and a
@@ -250,7 +239,6 @@ impl Default for AudioSettings {
             skip_sink_switch: false, // Off by default — only for JACK/DAW routing setups
             allow_quality_fallback: false, // Off by default — fail rather than silently downgrade
             reserve_dac_while_running: false, // Off by default — opt-in DAC reservation (Lifetime B)
-            dsd_mode: default_dsd_mode(),     // "convert" — safe on every DAC
         }
     }
 }
@@ -358,10 +346,6 @@ impl AudioSettingsStore {
             [],
         );
         let _ = conn.execute(
-            "ALTER TABLE audio_settings ADD COLUMN dsd_mode TEXT DEFAULT 'convert'",
-            [],
-        );
-        let _ = conn.execute(
             "ALTER TABLE audio_settings ADD COLUMN memory_cache_mb INTEGER DEFAULT 0",
             [],
         );
@@ -458,7 +442,7 @@ impl AudioSettingsStore {
     pub fn get_settings(&self) -> Result<AudioSettings, String> {
         self.conn
             .query_row(
-                "SELECT output_device, exclusive_mode, dac_passthrough, preferred_sample_rate, backend_type, alsa_plugin, alsa_hardware_volume, stream_first_track, stream_buffer_seconds, streaming_only, limit_quality_to_device, device_max_sample_rate, normalization_enabled, normalization_target_lufs, gapless_enabled, device_sample_rate_limits, pw_force_bitperfect, sync_audio_on_startup, quality_fallback_behavior, skip_sink_switch, allow_quality_fallback, reserve_dac_while_running, dsd_mode, memory_cache_mb, alsa_mixer_device, volume_curve, alsa_buffer_ms, cache_to_disk, dac_keepalive_ms, pcm_ring_ms, writer_rt_priority FROM audio_settings WHERE id = 1",
+                "SELECT output_device, exclusive_mode, dac_passthrough, preferred_sample_rate, backend_type, alsa_plugin, alsa_hardware_volume, stream_first_track, stream_buffer_seconds, streaming_only, limit_quality_to_device, device_max_sample_rate, normalization_enabled, normalization_target_lufs, gapless_enabled, device_sample_rate_limits, pw_force_bitperfect, sync_audio_on_startup, quality_fallback_behavior, skip_sink_switch, allow_quality_fallback, reserve_dac_while_running, memory_cache_mb, alsa_mixer_device, volume_curve, alsa_buffer_ms, cache_to_disk, dac_keepalive_ms, pcm_ring_ms, writer_rt_priority FROM audio_settings WHERE id = 1",
                 [],
                 |row| {
                     // Parse backend_type from JSON string
@@ -505,20 +489,17 @@ impl AudioSettingsStore {
                             .get::<_, Option<i64>>(21)?
                             .unwrap_or(0)
                             != 0,
-                        dsd_mode: row
-                            .get::<_, Option<String>>(22)?
-                            .unwrap_or_else(default_dsd_mode),
-                        memory_cache_mb: row.get::<_, Option<i64>>(23)?.unwrap_or(0) as u16,
-                        alsa_mixer_device: row.get::<_, Option<String>>(24)?.unwrap_or_default(),
+                        memory_cache_mb: row.get::<_, Option<i64>>(22)?.unwrap_or(0) as u16,
+                        alsa_mixer_device: row.get::<_, Option<String>>(23)?.unwrap_or_default(),
                         volume_curve: row
-                            .get::<_, Option<String>>(25)?
+                            .get::<_, Option<String>>(24)?
                             .filter(|v| !v.is_empty())
                             .unwrap_or_else(default_volume_curve),
-                        alsa_buffer_ms: row.get::<_, Option<i64>>(26)?.unwrap_or(0) as u16,
-                        cache_to_disk: row.get::<_, Option<i64>>(27)?.unwrap_or(1) != 0,
-                        dac_keepalive_ms: row.get::<_, Option<i64>>(28)?.unwrap_or(0) as u16,
-                        pcm_ring_ms: row.get::<_, Option<i64>>(29)?.unwrap_or(0) as u32,
-                        writer_rt_priority: row.get::<_, Option<i64>>(30)?.unwrap_or_else(
+                        alsa_buffer_ms: row.get::<_, Option<i64>>(25)?.unwrap_or(0) as u16,
+                        cache_to_disk: row.get::<_, Option<i64>>(26)?.unwrap_or(1) != 0,
+                        dac_keepalive_ms: row.get::<_, Option<i64>>(27)?.unwrap_or(0) as u16,
+                        pcm_ring_ms: row.get::<_, Option<i64>>(28)?.unwrap_or(0) as u32,
+                        writer_rt_priority: row.get::<_, Option<i64>>(29)?.unwrap_or_else(
                             || i64::from(default_writer_rt_priority()),
                         ) as u8,
                     })
@@ -884,18 +865,6 @@ impl AudioSettingsStore {
                 params![enabled as i64],
             )
             .map_err(|e| format!("Failed to set reserve_dac_while_running: {}", e))?;
-        Ok(())
-    }
-
-    /// Persist the DSD delivery mode ("convert" | "dop" | "native", DSD plan
-    /// Phases 2-3). Deliberately NOT part of reset_all's UPDATE.
-    pub fn set_dsd_mode(&self, mode: &str) -> Result<(), String> {
-        self.conn
-            .execute(
-                "UPDATE audio_settings SET dsd_mode = ?1 WHERE id = 1",
-                params![mode],
-            )
-            .map_err(|e| format!("Failed to set dsd_mode: {}", e))?;
         Ok(())
     }
 

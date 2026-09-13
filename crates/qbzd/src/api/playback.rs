@@ -156,14 +156,6 @@ pub fn previous(state: &ApiState) -> Response<Cursor<Vec<u8>>> {
 /// "post-state" is knowable synchronously.
 pub fn seek(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
     let player = state.runtime.core().player();
-    if player.is_dsd_direct_active() {
-        return err_json(
-            409,
-            "seek_unsupported_dsd",
-            "seek is unsupported in DSD-direct mode (bit-perfect passthrough)",
-            "set DSD mode to \"convert\": qbzd setup (Audio screen)",
-        );
-    }
     let ev = player.get_playback_event();
     let target: u64 = if let Some(pos) = body.get("position").and_then(|v| v.as_u64()) {
         pos
@@ -194,17 +186,9 @@ pub fn seek(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
 /// `POST /api/playback/volume` (02 §3.3.12). One of three body forms:
 /// `{"volume": F}` (absolute 0.0-1.0), `{"delta": F}` (additive), or
 /// `{"mute": "on"|"off"|"toggle"}` (also `qbzd mute`'s route — no dedicated
-/// route, §2.2). All three are gated by the same DSD-direct guard as `seek`.
+/// route, §2.2).
 pub fn volume(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
     let player = state.runtime.core().player();
-    if player.is_dsd_direct_active() {
-        return err_json(
-            409,
-            "volume_fixed_dsd",
-            "volume is fixed in DSD-direct mode (bit-perfect passthrough)",
-            "set DSD mode to \"convert\": qbzd setup (Audio screen)",
-        );
-    }
     let live = player.get_playback_event().volume;
 
     if let Some(mute_arg) = body.get("mute").and_then(|v| v.as_str()) {

@@ -68,10 +68,6 @@ impl StreamingConfig {
     ///
     /// For Hi-Res FLAC at 192kHz/24bit stereo, bitrate is roughly 9.2 Mbps
     /// We estimate ~1MB per second as a conservative approximation
-    ///
-    /// Reached only from the local-file DSD path, which has no caller of its
-    /// own — so the dead-code lint calls this dead too, transitively. It stays
-    /// as long as that path does.
     pub fn from_seconds(seconds: u8) -> Self {
         // Minimum 256KB to ensure format detection works
         let bytes = ((seconds as usize) * 1024 * 1024).max(256 * 1024);
@@ -172,7 +168,7 @@ pub fn max_initial_buffer_bytes() -> usize {
 ///
 /// This is what makes a seek cheap. A `Sequential` feeder only ever
 /// produces bytes in the order it generates them (CMAF segment assembly,
-/// DSD-to-WAV synthesis), so a read ahead of the write head can do nothing
+/// synthesis), so a read ahead of the write head can do nothing
 /// but wait for the download to walk there. A `RangeRequests` feeder
 /// re-opens the HTTP body with a `Range` header wherever a reader asks, so
 /// resuming at 2:30 costs one request instead of two and a half minutes of

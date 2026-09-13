@@ -181,11 +181,7 @@ fn handle_media_event(rt: &Runtime, roots: &ProfileRoots, handle: &Handle, ev: M
         MediaEvent::Next => spawn_advance(rt, roots, handle, true),
         MediaEvent::Previous => spawn_advance(rt, roots, handle, false),
         MediaEvent::SeekBy(micros) => {
-            let player = core.player();
-            if player.is_dsd_direct_active() {
-                return;
-            }
-            let ev = player.get_playback_event();
+            let ev = core.player().get_playback_event();
             let target = (ev.position as i64 + micros / 1_000_000).max(0) as u64;
             let clamped = if ev.duration > 0 {
                 target.min(ev.duration)
@@ -195,11 +191,7 @@ fn handle_media_event(rt: &Runtime, roots: &ProfileRoots, handle: &Handle, ev: M
             let _ = core.seek(clamped);
         }
         MediaEvent::SetPosition(micros) => {
-            let player = core.player();
-            if player.is_dsd_direct_active() {
-                return;
-            }
-            let ev = player.get_playback_event();
+            let ev = core.player().get_playback_event();
             let target = (micros.max(0) as u64) / 1_000_000;
             let clamped = if ev.duration > 0 {
                 target.min(ev.duration)
@@ -209,10 +201,7 @@ fn handle_media_event(rt: &Runtime, roots: &ProfileRoots, handle: &Handle, ev: M
             let _ = core.seek(clamped);
         }
         MediaEvent::SetVolume(vol) => {
-            let player = core.player();
-            if !player.is_dsd_direct_active() {
-                let _ = core.set_volume((vol as f32).clamp(0.0, 1.0));
-            }
+            let _ = core.set_volume((vol as f32).clamp(0.0, 1.0));
         }
         // Headless daemon: no window to raise, and self-quit on a media-widget
         // "close" would be surprising — ignore both.

@@ -1333,7 +1333,6 @@ fn plan_import(roots: &ProfileRoots, path: &str) -> Result<PendingImport, String
     };
     let opts = ImportOptions {
         include_auth: false,
-        trust_dsd: false,
         remap: Vec::new(),
         non_tty: false,
     };

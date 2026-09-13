@@ -303,9 +303,8 @@ pub enum SampleLayout {
 }
 
 impl SampleLayout {
-    /// The layout for an ALSA format, or `None` for one this path cannot encode
-    /// (the DSD carriers, whose words are packed by `qbz-dsd` and written
-    /// verbatim).
+    /// The layout for an ALSA format, or `None` for one this path cannot
+    /// encode.
     ///
     /// Linux-only because `alsa::Format` is; the enum itself stays portable so
     /// the byte-order arithmetic can be tested anywhere.
@@ -467,10 +466,6 @@ fn should_log_ring_fill(pct: u8, last_logged_ms: u64, now_ms: u64, every_ms: u64
 /// zero that step is a click — one after every song, at every sample rate,
 /// which is exactly how it was reported. Landing on silence first makes the
 /// stop happen from a settled state.
-///
-/// Not a new idea here: the DoP writer has always padded ~150 ms before
-/// closing, in its own words because "DACs pop when a DSD stream stops
-/// mid-pattern". The PCM path simply never got the same treatment.
 pub const STOP_PAD_MS: u32 = 60;
 
 /// Frames in a silence pad of `pad_ms` at `sample_rate`.
@@ -630,14 +625,6 @@ pub struct AlsaDirectStream {
     /// True when ALSA's plug layer is rate-converting under us, i.e. this
     /// stream is NOT bit-perfect. See [`Self::is_bit_perfect`].
     resampled: bool,
-    /// True for the DoP and native-DSD constructors.
-    ///
-    /// Cannot be derived from `format`: a DoP stream is `S32LE`, exactly like a
-    /// PCM one, and the difference is what the words MEAN. Digital zero is
-    /// silence in PCM and is NOT silence in DoP, whose idle pattern carries
-    /// alternating 0x05/0xFA markers over 0x69 data — so every path that writes
-    /// zeros has to know which kind of stream it is holding.
-    dsd_carrier: bool,
     /// The last frame handed to the device, kept so a stop can ramp down from
     /// it instead of stepping to zero. `channels` long once anything has been
     /// written. See [`Self::fade_out_and_pad`].
@@ -836,7 +823,6 @@ impl AlsaDirectStream {
             buffer_frames,
             period_frames,
             resampled,
-            dsd_carrier: false,
             last_frame: Mutex::new(Vec::new()),
             device_id: device_id.to_string(),
             mixer_device: None,
@@ -922,229 +908,6 @@ impl AlsaDirectStream {
         );
 
         Ok((format, buffer_frames, period_frames))
-    }
-
-    /// Create an ALSA direct stream for DoP (DSD over PCM) delivery.
-    ///
-    /// ADDITIVE to the protected PCM paths (DSD plan Phase 2, owner-approved
-    /// 2026-07-03): S32_LE ONLY — DoP words are pre-packed 24-bit frames
-    /// left-justified in S32 and must reach the device bit-exactly, so no
-    /// format fallback, no plughw, no float. If the device has no S32_LE at
-    /// the carrier rate the caller falls back to DSD→PCM conversion.
-    /// Mirrors `new()` for reservation / buffer sizing / field order.
-    pub fn new_dop(device_id: &str, carrier_rate: u32, channels: u16) -> Result<Self, String> {
-        log::info!(
-            "[ALSA Direct] Opening device for DoP: {} ({}Hz carrier, {}ch, S32_LE)",
-            device_id,
-            carrier_rate,
-            channels
-        );
-
-        let reservation = crate::DeviceReservation::acquire(device_id, device_id)
-            .map_err(|e| format!("Cannot acquire exclusive device '{}': {}", device_id, e))?;
-        if reservation.is_active() {
-            std::thread::sleep(PIPEWIRE_VACATE_MARGIN);
-        }
-
-        let pcm = PCM::new(device_id, Direction::Playback, false)
-            .map_err(|e| format!("Failed to open ALSA device '{}': {}", device_id, e))?;
-
-        let (buffer_frames, period_frames) = {
-            let hwp =
-                HwParams::any(&pcm).map_err(|e| format!("Failed to get hardware params: {}", e))?;
-            // A DoP carrier must reach the device bit-exactly: no plug-layer
-            // rate conversion, ever. Unlike the PCM path there is no fail-open
-            // retry — resampled DoP is not degraded DoP, it is noise.
-            hwp.set_rate_resample(false)
-                .map_err(|e| format!("Failed to disable rate conversion for DoP: {}", e))?;
-            hwp.set_access(Access::RWInterleaved)
-                .map_err(|e| format!("Failed to set access: {}", e))?;
-            hwp.set_format(Format::S32LE)
-                .map_err(|e| format!("Device has no S32_LE (required for DoP): {}", e))?;
-            hwp.set_channels(channels as u32)
-                .map_err(|e| format!("Failed to set channels: {}", e))?;
-            hwp.set_rate(carrier_rate, ValueOr::Nearest)
-                .map_err(|e| format!("Failed to set DoP carrier rate {}: {}", carrier_rate, e))?;
-            let buffer_size = buffer_frames_for(carrier_rate);
-            hwp.set_buffer_size_near(buffer_size)
-                .map_err(|e| format!("Failed to set buffer size: {}", e))?;
-            hwp.set_period_size_near(buffer_size / PERIODS_PER_BUFFER, ValueOr::Nearest)
-                .map_err(|e| format!("Failed to set period size: {}", e))?;
-            pcm.hw_params(&hwp)
-                .map_err(|e| format!("Failed to apply hardware params: {}", e))?;
-            ensure_exact_rate(&hwp, carrier_rate, "DoP carrier")?;
-            let geometry = granted_geometry(&hwp)?;
-            log::info!(
-                "[ALSA Direct] DoP hardware configured: {}Hz, {}ch, S32_LE, ring {} frames, period {}",
-                carrier_rate,
-                channels,
-                geometry.0,
-                geometry.1
-            );
-            geometry
-        };
-
-        configure_sw_params(&pcm, buffer_frames, period_frames, "DoP carrier")?;
-
-        pcm.prepare()
-            .map_err(|e| format!("Failed to prepare PCM: {}", e))?;
-
-        Ok(Self {
-            pcm: Arc::new(Mutex::new(pcm)),
-            scratch: Mutex::new(ConvScratch::default()),
-            is_playing: Arc::new(AtomicBool::new(false)),
-            sample_rate: carrier_rate,
-            channels,
-            format: Format::S32LE,
-            buffer_frames,
-            period_frames,
-            // A DoP carrier is S32 at an exact rate or it is nothing; there is
-            // no resampled fallback for it.
-            resampled: false,
-            dsd_carrier: true,
-            last_frame: Mutex::new(Vec::new()),
-            device_id: device_id.to_string(),
-            mixer_device: None,
-            // Last field: drops after `pcm` (see field-order note on the struct).
-            _reservation: reservation,
-        })
-    }
-
-    /// Create an ALSA direct stream for NATIVE DSD (DSD plan Phase 3).
-    ///
-    /// ADDITIVE like `new_dop`. Tries `DSD_U32_BE` first (what the kernel's
-    /// generic USB DSD quirk grants), then `DSD_U32_LE`. Frame rate =
-    /// dsd_rate / 32. Returns the stream plus `little_endian` so the packer
-    /// lays the 4 DSD bytes out correctly. Fails cleanly when the kernel
-    /// hasn't granted the device a DSD format (no quirk) — the caller falls
-    /// back to DoP/conversion.
-    pub fn new_native_dsd(
-        device_id: &str,
-        dsd_rate: u32,
-        channels: u16,
-    ) -> Result<(Self, bool), String> {
-        let rate = dsd_rate / 32;
-        log::info!(
-            "[ALSA Direct] Opening device for native DSD: {} ({} DSD bits/s → {} Hz U32, {}ch)",
-            device_id,
-            dsd_rate,
-            rate,
-            channels
-        );
-
-        let reservation = crate::DeviceReservation::acquire(device_id, device_id)
-            .map_err(|e| format!("Cannot acquire exclusive device '{}': {}", device_id, e))?;
-        if reservation.is_active() {
-            std::thread::sleep(PIPEWIRE_VACATE_MARGIN);
-        }
-
-        let pcm = PCM::new(device_id, Direction::Playback, false)
-            .map_err(|e| format!("Failed to open ALSA device '{}': {}", device_id, e))?;
-
-        let selected = {
-            let hwp =
-                HwParams::any(&pcm).map_err(|e| format!("Failed to get hardware params: {}", e))?;
-            // Native DSD is a bit stream carried in 32-bit words. There is no
-            // meaningful "resampled DSD"; refuse rather than convert.
-            hwp.set_rate_resample(false)
-                .map_err(|e| format!("Failed to disable rate conversion for native DSD: {}", e))?;
-            hwp.set_access(Access::RWInterleaved)
-                .map_err(|e| format!("Failed to set access: {}", e))?;
-            let mut selected = None;
-            for (format, le) in [(Format::DSDU32BE, false), (Format::DSDU32LE, true)] {
-                if hwp.set_format(format).is_ok() {
-                    selected = Some((format, le));
-                    break;
-                }
-            }
-            let Some((format, le)) = selected else {
-                return Err("Device has no native DSD format (kernel quirk missing?)".to_string());
-            };
-            hwp.set_channels(channels as u32)
-                .map_err(|e| format!("Failed to set channels: {}", e))?;
-            hwp.set_rate(rate, ValueOr::Nearest)
-                .map_err(|e| format!("Failed to set native DSD rate {}: {}", rate, e))?;
-            let buffer_size = buffer_frames_for(rate);
-            hwp.set_buffer_size_near(buffer_size)
-                .map_err(|e| format!("Failed to set buffer size: {}", e))?;
-            hwp.set_period_size_near(buffer_size / PERIODS_PER_BUFFER, ValueOr::Nearest)
-                .map_err(|e| format!("Failed to set period size: {}", e))?;
-            pcm.hw_params(&hwp)
-                .map_err(|e| format!("Failed to apply hardware params: {}", e))?;
-            ensure_exact_rate(&hwp, rate, "native DSD")?;
-            let (buffer_frames, period_frames) = granted_geometry(&hwp)?;
-            log::info!(
-                "[ALSA Direct] Native DSD configured: {:?} @ {} Hz, {}ch, ring {} frames, period {}",
-                format,
-                rate,
-                channels,
-                buffer_frames,
-                period_frames
-            );
-            (format, le, buffer_frames, period_frames)
-        };
-
-        configure_sw_params(&pcm, selected.2, selected.3, "native DSD")?;
-
-        pcm.prepare()
-            .map_err(|e| format!("Failed to prepare PCM: {}", e))?;
-
-        Ok((
-            Self {
-                pcm: Arc::new(Mutex::new(pcm)),
-                scratch: Mutex::new(ConvScratch::default()),
-                is_playing: Arc::new(AtomicBool::new(false)),
-                sample_rate: rate,
-                channels,
-                format: selected.0,
-                buffer_frames: selected.2,
-                period_frames: selected.3,
-                resampled: false,
-                dsd_carrier: true,
-                last_frame: Mutex::new(Vec::new()),
-                device_id: device_id.to_string(),
-                mixer_device: None,
-                // Last field: drops after `pcm` (see field-order note).
-                _reservation: reservation,
-            },
-            selected.1,
-        ))
-    }
-
-    /// Write pre-packed 32-bit direct words (DoP frames in S32, or native
-    /// DSD_U32 words) VERBATIM — no scaling, no conversion. Only valid on
-    /// streams created with [`Self::new_dop`] / [`Self::new_native_dsd`].
-    /// DSD_U32 formats fail alsa-rs's checked-format i32 IO, so they use the
-    /// unchecked accessor — sound because both layouts are exactly 32 bits
-    /// per channel per frame, same as S32.
-    pub fn write_dop_i32(&self, samples: &[i32], cancel: &AtomicBool) -> Result<usize, String> {
-        // Bounded, interruptible, and sharing the PCM path's write loop.
-        //
-        // This used to be a single blocking `writei` holding the PCM mutex for
-        // however long the device took — the exact shape that, on the PCM side,
-        // lost the audio thread for the life of the process when a card stopped
-        // draining: the writer sat inside the call, `stop()` could not get the
-        // mutex it needs, and the join waited forever. `write_bytes_interruptible`
-        // was written to escape that; the DSD path simply never got it.
-        //
-        // Byte-casting is sound for every format this is called with.
-        // `io_i32().writei()` writes each `i32`'s NATIVE representation, which
-        // is what `io_bytes()` writes too, and `frames_to_bytes` is
-        // format-aware — `snd_pcm_format_physical_width` is 32 bits per channel
-        // for `S32_LE` and for both `DSD_U32` layouts alike — so the frame
-        // arithmetic is identical. (It also drops the `io_unchecked` the DSD
-        // formats needed: `io_bytes` does no format verification, so there is
-        // nothing left to bypass.)
-        let (head, body, tail) = unsafe { samples.align_to::<u8>() };
-        // SAFETY-adjacent, but checked rather than assumed: `i32` has alignment
-        // 4 and `u8` alignment 1, so a `&[i32]` is always perfectly aligned for
-        // `u8` and `align_to` cannot split it. The assert pins that instead of
-        // trusting it.
-        debug_assert!(head.is_empty() && tail.is_empty());
-        if !head.is_empty() || !tail.is_empty() {
-            return Err("[ALSA Direct] DoP sample buffer is not byte-aligned".to_string());
-        }
-        self.write_bytes_interruptible(body, cancel)
     }
 
     /// Write audio samples to ALSA (auto-converts from i16 based on detected format)
@@ -1440,12 +1203,8 @@ impl AlsaDirectStream {
     /// real source arriving finds at most that much silence ahead of it. Keep
     /// it small: this is latency added to the start of the next track.
     ///
-    /// # PCM only
-    ///
     /// Silence here is digital zero, which is silence in every PCM layout this
-    /// path supports. It is NOT silence in DoP, whose idle pattern carries
-    /// marker bytes — the DoP writer is a separate thread and must not call
-    /// this.
+    /// path supports.
     #[cfg(target_os = "linux")]
     pub fn write_silence_to_depth(
         &self,
@@ -1455,15 +1214,6 @@ impl AlsaDirectStream {
         if target_ms == 0 {
             return Ok(0);
         }
-        // Keyed on the stream's ROLE, not its format. A DoP carrier is `S32LE`,
-        // indistinguishable from a PCM stream by format alone, and digital zero
-        // is not silence in DoP — it is a broken marker pattern, which a DAC
-        // locked in DSD renders as noise. The old check tested the format and
-        // so caught native DSD but missed every DoP stream.
-        if self.dsd_carrier {
-            return Ok(0);
-        }
-
         let (frame_bytes, held, target_frames) = {
             let pcm = self.pcm.lock().unwrap();
             let frame_bytes = pcm.frames_to_bytes(1);
@@ -1763,14 +1513,6 @@ impl AlsaDirectStream {
         if fade_ms == 0 && pad_ms == 0 {
             return;
         }
-        // Digital zero is silence in PCM and noise in DoP, whose idle pattern
-        // carries markers. A DoP stream's own writer pads it correctly; this
-        // must not touch it. Checked on the stream's role, not its format —
-        // a DoP carrier IS `S32LE`.
-        if self.dsd_carrier {
-            return;
-        }
-
         let deadline = std::time::Instant::now()
             + std::time::Duration::from_millis(u64::from(fade_ms + pad_ms) * 2);
         let frame_bytes = {
@@ -2006,9 +1748,8 @@ impl AlsaDirectStream {
 
     /// Whether the PCM direct path may open `device_id` by name.
     ///
-    /// Wider than [`is_hw_device`], which stays as-is because the DSD paths
-    /// (DoP, native DSD) really do need a raw card: their formats cannot
-    /// survive any plugin in the way.
+    /// Wider than [`is_hw_device`], which stays as-is: a bit-perfect open
+    /// really does want a raw card, with no plugin in the way.
     ///
     /// A bare ALSA PCM name — no `:` — is one somebody defined on purpose, in
     /// `/etc/alsa/conf.d` or `.asoundrc`, and it should be opened as written.

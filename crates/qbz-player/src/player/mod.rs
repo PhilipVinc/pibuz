@@ -106,30 +106,6 @@ enum AudioCommand {
         sample_rate: u32,
         channels: u16,
     },
-    /// Play a local DSD file via DoP (DSD over PCM) on ALSA direct (DSD plan
-    /// Phase 2). The audio thread opens the demuxer + an S32 stream at the
-    /// DoP carrier rate and feeds pre-packed words through the DoP engine.
-    // Constructed only on Linux (DoP/native DSD is an ALSA-only path).
-    #[allow(dead_code)]
-    PlayDsdDop {
-        path: std::path::PathBuf,
-        track_id: u64,
-    },
-    /// Play a local DSD file NATIVELY (ALSA DSD_U32, DSD plan Phase 3) —
-    /// requires the kernel to grant the device a DSD format (quirk table).
-    // Constructed only on Linux (DoP/native DSD is an ALSA-only path).
-    #[allow(dead_code)]
-    PlayDsdNative {
-        path: std::path::PathBuf,
-        track_id: u64,
-    },
-    /// Queue the next DSD track on the ACTIVE DoP engine (gapless DSD).
-    /// Ignored (with gapless_ready reset) when the engine isn't DoP or the
-    /// carrier rate differs — the normal track-end advance then handles it.
-    PlayNextDsdDop {
-        path: std::path::PathBuf,
-        track_id: u64,
-    },
 }
 
 /// Where a gapless-queued track's audio lives between the prefetch and the
@@ -1265,10 +1241,6 @@ pub struct SharedState {
     duration: Arc<AtomicU64>,
     /// Current track ID
     current_track_id: Arc<AtomicU64>,
-    /// DSD-direct mode: 0 = none, 1 = DoP, 2 = native DSD_U32_BE,
-    /// 3 = native DSD_U32_LE. Non-zero means volume is fixed and seek is
-    /// unsupported; the gapless arm uses it to build the matching packing.
-    dsd_direct: Arc<std::sync::atomic::AtomicU8>,
     /// True when audio data/source is available for playback or resume
     has_loaded_audio: Arc<AtomicBool>,
     /// Volume (0.0 - 1.0, f32 stored as u32 bits — same idiom as
@@ -1336,7 +1308,6 @@ impl SharedState {
             position: Arc::new(AtomicU64::new(0)),
             duration: Arc::new(AtomicU64::new(0)),
             current_track_id: Arc::new(AtomicU64::new(0)),
-            dsd_direct: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             has_loaded_audio: Arc::new(AtomicBool::new(false)),
             volume: Arc::new(AtomicU32::new(0.75f32.to_bits())),
             playback_start_millis: Arc::new(AtomicU64::new(0)),
@@ -1356,26 +1327,6 @@ impl SharedState {
         }
     }
 
-    /// Clearing (`error = false`) also drops any pending
-    /// `stream_error_message`. This is intentional: if init recovers before
-    /// the Tauri polling loop drains the message, we'd rather swallow the
-    /// toast than surface a notification for a transient failure the user
-    /// never perceived. The trade-off is that a fast record→clear→drain
-    /// sequence loses the message — accepted because a recovered error is
-    /// not a user-actionable event.
-    /// 0 = none, 1 = DoP, 2 = native BE, 3 = native LE.
-    pub fn set_dsd_mode(&self, mode: u8) {
-        self.dsd_direct.store(mode, Ordering::SeqCst);
-    }
-
-    pub fn dsd_mode(&self) -> u8 {
-        self.dsd_direct.load(Ordering::SeqCst)
-    }
-
-    pub fn is_dsd_direct(&self) -> bool {
-        self.dsd_direct.load(Ordering::SeqCst) != 0
-    }
-
     pub fn set_stream_error(&self, error: bool) {
         self.stream_error.store(error, Ordering::SeqCst);
         if !error {
@@ -1387,10 +1338,6 @@ impl SharedState {
 
     /// Whether the current stream has recorded an error.
     ///
-    /// Read only by the `DsdErrorReport` tests. Kept because those cover real
-    /// behaviour — an io error surfacing at stream end vs a clean EOF — and
-    /// this is the field's accessor; dropping it to satisfy a dead-code sweep
-    /// would mean deleting the coverage, which is the wrong trade.
     pub fn has_stream_error(&self) -> bool {
         self.stream_error.load(Ordering::SeqCst)
     }
@@ -1994,7 +1941,6 @@ impl Player {
                                 gapless_request_armed,
                                 pause_suspend_deadline,
                             );
-                            thread_state.set_dsd_mode(0);
 
                             let StreamRecreateDecision {
                                 needs_new_stream,
@@ -3130,7 +3076,6 @@ impl Player {
                                 return;
                             }
 
-                            thread_state.set_dsd_mode(0);
                             thread_state.is_playing.store(true, Ordering::SeqCst);
                             thread_state
                                 .position
@@ -3146,340 +3091,6 @@ impl Player {
                             start_wait.elapsed().as_millis(),
                             start_position_secs
                         );
-                        }
-                        AudioCommand::PlayDsdDop { path, track_id } => {
-                            #[cfg(target_os = "linux")]
-                            {
-                                log::info!(
-                                    "Audio thread: DoP playback for track {} ({})",
-                                    track_id,
-                                    path.display()
-                                );
-                                *pause_suspend_deadline = None;
-                                *gapless_pending = None;
-                                *gapless_request_armed = false;
-                                thread_state.set_gapless_ready(false);
-                                thread_state.set_gapless_next_track_id(0);
-
-                                let demux = match qbz_dsd::open_dsd(&path) {
-                                    Ok(d) => d,
-                                    Err(e) => {
-                                        log::error!("DoP: cannot open DSD file: {}", e);
-                                        thread_state.set_stream_error(true);
-                                        return;
-                                    }
-                                };
-                                let dop = match qbz_dsd::DopStream::new(demux) {
-                                    Ok(d) => d,
-                                    Err(e) => {
-                                        log::error!("DoP: cannot build DoP stream: {}", e);
-                                        thread_state.set_stream_error(true);
-                                        return;
-                                    }
-                                };
-                                let carrier = dop.carrier_rate();
-                                let dsd_rate = dop.dsd_rate();
-                                let duration = dop.total_frames() / (carrier.max(1) as u64);
-
-                                // DoP always needs a fresh S32 stream at the
-                                // carrier rate — tear down whatever is open.
-                                if let Some(engine) = current_engine.take() {
-                                    engine.stop();
-                                    std::thread::sleep(Duration::from_millis(50));
-                                }
-                                drop(stream_opt.take());
-                                std::thread::sleep(Duration::from_millis(50));
-
-                                let device = thread_settings
-                                    .lock()
-                                    .ok()
-                                    .and_then(|s| s.output_device.clone());
-                                let Some(device) = device else {
-                                    log::error!("DoP: no output device configured");
-                                    thread_state.set_stream_error(true);
-                                    return;
-                                };
-                                let stream = match qbz_audio::alsa_backend::create_dop_stream(
-                                    &device, carrier, 2,
-                                ) {
-                                    Ok(st) => Arc::new(st),
-                                    Err(e) => {
-                                        log::error!("DoP: stream open failed: {}", e);
-                                        thread_state.set_stream_error(true);
-                                        thread_state.set_current_device(None);
-                                        return;
-                                    }
-                                };
-                                log::info!(
-                                    "DoP: {} locked at {} Hz carrier on {}",
-                                    qbz_dsd::dsd_label(dsd_rate),
-                                    carrier,
-                                    device
-                                );
-                                *stream_opt = Some(StreamType::AlsaDirect(stream.clone()));
-                                thread_state.set_current_device(Some(device));
-                                *current_track_sample_rate = Some(carrier);
-                                *current_track_channels = Some(2);
-                                *current_audio_data = None;
-                                *current_audio_file = None;
-                                release_streaming_source(current_streaming_source);
-
-                                let mut engine = PlaybackEngine::new_alsa_dop(stream, false);
-                                if let Err(e) = engine.append_dop(Box::new(DsdErrorReport::new(
-                                    dop,
-                                    thread_state.clone(),
-                                ))) {
-                                    log::error!("DoP: append failed: {}", e);
-                                    thread_state.set_stream_error(true);
-                                    return;
-                                }
-                                *current_engine = Some(engine);
-                                thread_state.set_loaded_audio(true);
-                                thread_state.set_stream_error(false);
-                                thread_state.set_stream_quality(dsd_rate, 1);
-                                thread_state.duration.store(duration, Ordering::SeqCst);
-                                thread_state.set_dsd_mode(1);
-                                thread_state.is_playing.store(true, Ordering::SeqCst);
-                                thread_state.position.store(0, Ordering::SeqCst);
-                                thread_state
-                                    .current_track_id
-                                    .store(track_id, Ordering::SeqCst);
-                                thread_state.start_playback_timer(0);
-                                log::info!("Audio thread: DoP playback STARTED");
-                            }
-                            #[cfg(not(target_os = "linux"))]
-                            {
-                                let _ = (path, track_id);
-                                log::error!("DoP playback is Linux-only");
-                                thread_state.set_stream_error(true);
-                            }
-                        }
-                        AudioCommand::PlayDsdNative { path, track_id } => {
-                            #[cfg(target_os = "linux")]
-                            {
-                                log::info!(
-                                    "Audio thread: native DSD playback for track {} ({})",
-                                    track_id,
-                                    path.display()
-                                );
-                                *pause_suspend_deadline = None;
-                                *gapless_pending = None;
-                                *gapless_request_armed = false;
-                                thread_state.set_gapless_ready(false);
-                                thread_state.set_gapless_next_track_id(0);
-
-                                let info = match qbz_dsd::open_dsd(&path) {
-                                    Ok(d) => d.info().clone(),
-                                    Err(e) => {
-                                        log::error!("Native DSD: cannot open file: {}", e);
-                                        thread_state.set_stream_error(true);
-                                        return;
-                                    }
-                                };
-                                if info.channels != 2 {
-                                    log::error!("Native DSD: stereo only");
-                                    thread_state.set_stream_error(true);
-                                    return;
-                                }
-                                let rate = qbz_dsd::native_u32_rate(info.dsd_rate);
-                                let duration = (info.sample_count / 32) / (rate.max(1) as u64);
-
-                                if let Some(engine) = current_engine.take() {
-                                    engine.stop();
-                                    std::thread::sleep(Duration::from_millis(50));
-                                }
-                                drop(stream_opt.take());
-                                std::thread::sleep(Duration::from_millis(50));
-
-                                let device = thread_settings
-                                    .lock()
-                                    .ok()
-                                    .and_then(|s| s.output_device.clone());
-                                let Some(device) = device else {
-                                    log::error!("Native DSD: no output device configured");
-                                    thread_state.set_stream_error(true);
-                                    return;
-                                };
-                                let (stream, little_endian) =
-                                    match qbz_audio::alsa_backend::create_native_dsd_stream(
-                                        &device,
-                                        info.dsd_rate,
-                                        2,
-                                    ) {
-                                        Ok(pair) => pair,
-                                        Err(e) => {
-                                            log::error!("Native DSD: stream open failed: {}", e);
-                                            thread_state.set_stream_error(true);
-                                            thread_state.set_current_device(None);
-                                            return;
-                                        }
-                                    };
-                                let stream = Arc::new(stream);
-                                let native_src = match qbz_dsd::open_dsd(&path)
-                                    .map_err(|e| e.to_string())
-                                    .and_then(|d| {
-                                        qbz_dsd::NativeDsdStream::new(d, little_endian)
-                                            .map_err(|e| e.to_string())
-                                    }) {
-                                    Ok(n) => n,
-                                    Err(e) => {
-                                        log::error!("Native DSD: source build failed: {}", e);
-                                        thread_state.set_stream_error(true);
-                                        return;
-                                    }
-                                };
-                                log::info!(
-                                    "Native DSD: {} locked at {} Hz U32 ({}) on {}",
-                                    qbz_dsd::dsd_label(info.dsd_rate),
-                                    rate,
-                                    if little_endian { "LE" } else { "BE" },
-                                    device
-                                );
-                                *stream_opt = Some(StreamType::AlsaDirect(stream.clone()));
-                                thread_state.set_current_device(Some(device));
-                                *current_track_sample_rate = Some(rate);
-                                *current_track_channels = Some(2);
-                                *current_audio_data = None;
-                                *current_audio_file = None;
-                                release_streaming_source(current_streaming_source);
-
-                                let mut engine = PlaybackEngine::new_alsa_dop(stream, true);
-                                if let Err(e) = engine.append_dop(Box::new(DsdErrorReport::new(
-                                    native_src,
-                                    thread_state.clone(),
-                                ))) {
-                                    log::error!("Native DSD: append failed: {}", e);
-                                    thread_state.set_stream_error(true);
-                                    return;
-                                }
-                                *current_engine = Some(engine);
-                                thread_state.set_loaded_audio(true);
-                                thread_state.set_stream_error(false);
-                                thread_state.set_stream_quality(info.dsd_rate, 1);
-                                thread_state.duration.store(duration, Ordering::SeqCst);
-                                thread_state.set_dsd_mode(if little_endian { 3 } else { 2 });
-                                thread_state.is_playing.store(true, Ordering::SeqCst);
-                                thread_state.position.store(0, Ordering::SeqCst);
-                                thread_state
-                                    .current_track_id
-                                    .store(track_id, Ordering::SeqCst);
-                                thread_state.start_playback_timer(0);
-                                log::info!("Audio thread: native DSD playback STARTED");
-                            }
-                            #[cfg(not(target_os = "linux"))]
-                            {
-                                let _ = (path, track_id);
-                                log::error!("Native DSD playback is Linux-only");
-                                thread_state.set_stream_error(true);
-                            }
-                        }
-                        AudioCommand::PlayNextDsdDop { path, track_id } => {
-                            #[cfg(target_os = "linux")]
-                            {
-                                let Some(engine) = current_engine.as_mut() else {
-                                    thread_state.set_gapless_ready(false);
-                                    return;
-                                };
-                                if !engine.is_dop() {
-                                    log::info!("Gapless DoP: engine is not DoP, ignoring");
-                                    thread_state.set_gapless_ready(false);
-                                    return;
-                                }
-                                // Build the packing matching the ACTIVE
-                                // direct mode (1 = DoP, 2/3 = native BE/LE).
-                                let mode = thread_state.dsd_mode();
-                                let built: Result<
-                                    (Box<dyn Iterator<Item = i32> + Send>, u32, u64),
-                                    String,
-                                > = qbz_dsd::open_dsd(&path)
-                                    .map_err(|e| e.to_string())
-                                    .and_then(|d| match mode {
-                                        1 => qbz_dsd::DopStream::new(d)
-                                            .map_err(|e| e.to_string())
-                                            .map(|st| {
-                                                let rate = st.carrier_rate();
-                                                let frames = st.total_frames();
-                                                (
-                                                    Box::new(DsdErrorReport::new(
-                                                        st,
-                                                        thread_state.clone(),
-                                                    ))
-                                                        as Box<dyn Iterator<Item = i32> + Send>,
-                                                    rate,
-                                                    frames,
-                                                )
-                                            }),
-                                        2 | 3 => qbz_dsd::NativeDsdStream::new(d, mode == 3)
-                                            .map_err(|e| e.to_string())
-                                            .map(|st| {
-                                                let rate = st.rate();
-                                                let frames = st.total_frames();
-                                                (
-                                                    Box::new(DsdErrorReport::new(
-                                                        st,
-                                                        thread_state.clone(),
-                                                    ))
-                                                        as Box<dyn Iterator<Item = i32> + Send>,
-                                                    rate,
-                                                    frames,
-                                                )
-                                            }),
-                                        _ => Err("no DSD-direct mode active".to_string()),
-                                    });
-                                let (src, rate, total_frames) = match built {
-                                    Ok(v) => v,
-                                    Err(e) => {
-                                        log::warn!("Gapless DSD: cannot open next track: {}", e);
-                                        thread_state.set_gapless_ready(false);
-                                        return;
-                                    }
-                                };
-                                if *current_track_sample_rate != Some(rate) {
-                                    log::info!(
-                                        "Gapless DSD: rate mismatch ({:?} vs {}), ignoring",
-                                        *current_track_sample_rate,
-                                        rate
-                                    );
-                                    thread_state.set_gapless_ready(false);
-                                    return;
-                                }
-                                let duration = total_frames / (rate.max(1) as u64);
-                                match engine.append_dop(src) {
-                                    Ok(()) => {
-                                        // data stays empty: the DoP engine never
-                                        // resumes from current_audio_data (the
-                                        // pause-suspend teardown is gated off in
-                                        // DoP mode).
-                                        *gapless_pending = Some(GaplessPending {
-                                            track_id,
-                                            duration_secs: duration,
-                                            audio: TrackAudio::Memory(TrackBytes::default()),
-                                            normalization_gain: None,
-                                            // Never re-queued: seeking is
-                                            // refused outright during DoP, and
-                                            // the audio here is deliberately
-                                            // empty anyway.
-                                            sample_rate: rate,
-                                            channels: 2,
-                                        });
-                                        thread_state.set_gapless_next_track_id(track_id);
-                                        thread_state.set_gapless_ready(false);
-                                        log::info!(
-                                            "Gapless DoP: queued track {} for seamless DSD transition",
-                                            track_id
-                                        );
-                                    }
-                                    Err(e) => {
-                                        log::warn!("Gapless DoP: append failed: {}", e);
-                                        thread_state.set_gapless_ready(false);
-                                    }
-                                }
-                            }
-                            #[cfg(not(target_os = "linux"))]
-                            {
-                                let _ = (path, track_id);
-                                thread_state.set_gapless_ready(false);
-                            }
                         }
                         AudioCommand::Pause => {
                             if let Some(ref engine) = *current_engine {
@@ -3833,12 +3444,6 @@ impl Player {
                             log::debug!("Audio thread: volume set to {}", volume);
                         }
                         AudioCommand::Seek(position_secs) => {
-                            if current_engine.as_ref().map(|e| e.is_dop()).unwrap_or(false) {
-                                // v1 limitation: no seek inside a DoP stream
-                                // (demuxer-level seek + marker re-phase later).
-                                log::info!("Seek ignored during DoP playback ({}s)", position_secs);
-                                return;
-                            }
                             *pause_suspend_deadline = None;
                             // A seek builds a NEW engine, so the hand-off queued
                             // into the old one is gone and this state has to be
@@ -3857,7 +3462,6 @@ impl Player {
                             // was not enough time left to prepare it again at
                             // all.
                             //
-                            // DoP is not a concern: a seek is refused above.
 
                             // Four cases reach this handler:
                             //   * full-file playback (current_audio_data set)
@@ -4805,12 +4409,7 @@ impl Player {
                     }
                 } else {
                     if let Some(deadline) = pause_suspend_deadline {
-                        // DoP streams are NEVER suspended on pause: the writer
-                        // keeps the DAC locked in DSD mode with 0x69 silence,
-                        // and there is no current_audio_data to resume from.
-                        let dop_active =
-                            current_engine.as_ref().map(|e| e.is_dop()).unwrap_or(false);
-                        if stream_opt.is_some() && !dop_active {
+                        if stream_opt.is_some() {
                             let now = Instant::now();
                             if now >= deadline {
                                 if let Some(engine) = current_engine.take() {
@@ -5915,183 +5514,6 @@ impl Player {
             })
     }
 
-    /// Play a local DSD file (.dsf/.dff) by converting it on the fly to
-    /// 176.4 kHz / 24-bit PCM (qbz-dsd, Phase 1 of the DSD plan — see
-    /// qbz-nix-docs/dsd-support/). The converted stream rides the existing
-    /// `play_streaming` path as an ordinary finite WAV: a background thread
-    /// demuxes + decimates and pushes into the BufferWriter, so the whole
-    /// PCM pipeline (engines, bit-perfect ALSA at 176.4 kHz, volume,
-    /// normalization, seek-in-buffer) behaves exactly as for any hi-res
-    /// track. DST-compressed DFF and >2ch files are rejected with a
-    /// readable error before anything starts.
-    pub fn play_dsd_file(&self, path: std::path::PathBuf, track_id: u64) -> Result<(), String> {
-        let _gen = self.begin_play();
-        let demux = qbz_dsd::open_dsd(&path).map_err(|e| e.to_string())?;
-        let dsd_rate = demux.info().dsd_rate;
-
-        // DoP resolution (Phase 2): user opt-in + ALSA direct backend +
-        // stereo + carrier rate supported by the device. Anything else falls
-        // through to the universal DSD→PCM conversion below.
-        #[cfg(target_os = "linux")]
-        {
-            let info = demux.info().clone();
-            let resolved = self
-                .audio_settings
-                .lock()
-                .ok()
-                .map(|s| {
-                    (
-                        s.dsd_mode.clone(),
-                        matches!(s.backend_type, Some(qbz_audio::AudioBackendType::Alsa)),
-                        s.output_device.clone(),
-                    )
-                })
-                .unwrap_or(("convert".to_string(), false, None));
-            if let (mode, true, Some(device)) = resolved {
-                if info.channels == 2 && mode != "convert" {
-                    if mode == "native" {
-                        // The open itself validates (kernel quirk / rates);
-                        // failure surfaces as a stream error toast.
-                        log::info!(
-                            "Player: DSD track {} — {} via NATIVE DSD",
-                            track_id,
-                            qbz_dsd::dsd_label(info.dsd_rate)
-                        );
-                        drop(demux);
-                        return self
-                            .tx
-                            .send(AudioCommand::PlayDsdNative { path, track_id })
-                            .map_err(|e| format!("Failed to send native DSD play command: {}", e));
-                    }
-                    let carrier = qbz_dsd::dop_carrier_rate(info.dsd_rate);
-                    let rate_ok = qbz_audio::alsa_backend::get_device_supported_rates(&device)
-                        .map(|r| r.contains(&carrier))
-                        .unwrap_or(true);
-                    if rate_ok {
-                        log::info!(
-                            "Player: DSD track {} — {} via DoP ({} Hz carrier)",
-                            track_id,
-                            qbz_dsd::dsd_label(info.dsd_rate),
-                            carrier
-                        );
-                        drop(demux);
-                        return self
-                            .tx
-                            .send(AudioCommand::PlayDsdDop { path, track_id })
-                            .map_err(|e| format!("Failed to send DoP play command: {}", e));
-                    }
-                    log::info!(
-                        "Player: DoP selected but device lacks the {} Hz carrier — converting to PCM",
-                        carrier
-                    );
-                } else if info.channels != 2 && mode != "convert" {
-                    log::info!(
-                        "Player: {} selected but track has {} channels — downmix-converting to PCM",
-                        mode,
-                        info.channels
-                    );
-                }
-            }
-        }
-        let mut conv = qbz_dsd::DsdPcmConverter::new(demux, qbz_dsd::DEFAULT_GAIN_DB)
-            .map_err(|e| e.to_string())?;
-        let channels = conv.channels();
-        let rate = conv.output_rate();
-        let total_frames = conv.total_frames();
-        let duration_secs = total_frames / rate as u64;
-        let content_length = qbz_dsd::wav_total_size(total_frames, channels);
-        log::info!(
-            "Player: DSD track {} — {} ({} Hz) → PCM {} Hz/24-bit, {}s, {} bytes WAV",
-            track_id,
-            qbz_dsd::dsd_label(dsd_rate),
-            dsd_rate,
-            rate,
-            duration_secs,
-            content_length
-        );
-        self.state.set_stream_quality(rate, 24);
-
-        let writer = self.apply_play_streaming(
-            track_id,
-            rate,
-            channels,
-            content_length,
-            3,
-            duration_secs,
-            0,
-        )?;
-
-        std::thread::spawn(move || {
-            if writer
-                .push_chunk(&qbz_dsd::wav_header(total_frames, channels, rate))
-                .is_err()
-            {
-                return;
-            }
-            let mut pcm = Vec::new();
-            loop {
-                match conv.next_block() {
-                    Ok(Some(frames)) => {
-                        pcm.clear();
-                        qbz_dsd::frames_to_pcm24(&frames, &mut pcm);
-                        if writer.push_chunk(&pcm).is_err() {
-                            // Reader gone (track changed/stopped) — just stop.
-                            return;
-                        }
-                    }
-                    Ok(None) => {
-                        let _ = writer.complete();
-                        return;
-                    }
-                    Err(e) => {
-                        log::error!("Player: DSD conversion failed mid-track: {}", e);
-                        let _ = writer.error(format!("DSD conversion failed: {}", e));
-                        return;
-                    }
-                }
-            }
-        });
-        Ok(())
-    }
-
-    /// Whole-file DSD→PCM conversion into an in-memory WAV, for the gapless
-    /// prefetch path: the result feeds `play_next` like any cached track, so
-    /// consecutive converted-DSD tracks hand off seamlessly. CPU-bound
-    /// (~10-30x realtime) — call from a blocking context.
-    pub fn prepare_dsd_gapless_wav(path: &std::path::Path) -> Result<Vec<u8>, String> {
-        let demux = qbz_dsd::open_dsd(path).map_err(|e| e.to_string())?;
-        let mut conv = qbz_dsd::DsdPcmConverter::new(demux, qbz_dsd::DEFAULT_GAIN_DB)
-            .map_err(|e| e.to_string())?;
-        let channels = conv.channels();
-        let rate = conv.output_rate();
-        let total = conv.total_frames();
-        let mut out = qbz_dsd::wav_header(total, channels, rate);
-        out.reserve(total as usize * channels as usize * 3);
-        while let Some(frames) = conv.next_block().map_err(|e| e.to_string())? {
-            qbz_dsd::frames_to_pcm24(&frames, &mut out);
-        }
-        Ok(out)
-    }
-
-    /// Queue the next DSD track for a gapless transition: appends to the DoP
-    /// engine when one is active (seamless native DSD), otherwise converts to
-    /// an in-memory WAV and rides the normal `play_next` gapless path.
-    pub fn play_next_dsd(&self, path: std::path::PathBuf, track_id: u64) -> Result<(), String> {
-        if self.state.is_dsd_direct() {
-            return self
-                .tx
-                .send(AudioCommand::PlayNextDsdDop { path, track_id })
-                .map_err(|e| format!("Failed to send DoP gapless command: {}", e));
-        }
-        let wav = Self::prepare_dsd_gapless_wav(&path)?;
-        self.play_next(wav, track_id)
-    }
-
-    /// True while a DoP stream is active (volume fixed, seek unsupported).
-    pub fn is_dsd_direct_active(&self) -> bool {
-        self.state.is_dsd_direct()
-    }
-
     /// Play from streaming source (starts playback before full download).
     /// Returns the BufferWriter so caller can push data as it downloads.
     /// `start_position_secs` > 0 turns this into a session-resume play
@@ -6121,7 +5543,7 @@ impl Player {
 
     /// `play_streaming` without bumping generation (used by play paths that
     /// already did their own `begin_play` + supersede checks, like
-    /// `play_dsd_file`; a mid-intent bump here would invalidate a strictly
+    /// a mid-intent bump here would invalidate a strictly
     /// newer play that started in the meantime).
     fn apply_play_streaming(
         &self,
@@ -6177,7 +5599,7 @@ impl Player {
     /// range requests (see `BufferWriter::next_plan`): that is what lets a
     /// resume or a seek fetch from the offset instead of downloading
     /// everything before it. A feeder that assembles its bytes in order —
-    /// CMAF segments, DSD-to-WAV — must pass
+    /// CMAF segments — must pass
     /// [`StreamSeekMode::Sequential`].
     #[allow(clippy::too_many_arguments)]
     pub fn play_streaming_dynamic(
@@ -6470,103 +5892,9 @@ pub struct PlaybackState {
     pub volume: f32,
 }
 
-/// Surfaces a DSD stream's mid-file demux I/O error as a stream error when
-/// the stream runs out. The DoP writer consumes these streams as boxed
-/// `Iterator<Item = i32>`, which can only say "no more words", so without
-/// this wrapper a read failure is indistinguishable from a clean end of
-/// track and the user gets a silent early stop.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-struct DsdErrorReport<S: qbz_dsd::DsdWordSource> {
-    inner: S,
-    // SharedState is a #[derive(Clone)] handle of Arc<Atomic..> fields, so a
-    // clone already shares the same state — no extra Arc wrapper (that is also
-    // the type `thread_state` is passed around as at the call sites).
-    state: SharedState,
-    reported: bool,
-}
-
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-impl<S: qbz_dsd::DsdWordSource> DsdErrorReport<S> {
-    fn new(inner: S, state: SharedState) -> Self {
-        Self {
-            inner,
-            state,
-            reported: false,
-        }
-    }
-}
-
-impl<S: qbz_dsd::DsdWordSource> Iterator for DsdErrorReport<S> {
-    type Item = i32;
-    fn next(&mut self) -> Option<i32> {
-        let item = self.inner.next();
-        if item.is_none() && !self.reported {
-            self.reported = true;
-            if let Some(e) = self.inner.io_error() {
-                self.state
-                    .record_stream_error(format!("DSD playback failed: {e}"));
-            }
-        }
-        item
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::compute_needs_new_stream;
-    use super::{DsdErrorReport, SharedState};
-
-    struct FakeDsdSource {
-        words: std::vec::IntoIter<i32>,
-        error: Option<String>,
-    }
-
-    impl Iterator for FakeDsdSource {
-        type Item = i32;
-        fn next(&mut self) -> Option<i32> {
-            self.words.next()
-        }
-    }
-
-    impl qbz_dsd::DsdWordSource for FakeDsdSource {
-        fn io_error(&self) -> Option<&str> {
-            self.error.as_deref()
-        }
-    }
-
-    #[test]
-    fn dsd_error_report_surfaces_io_error_at_stream_end() {
-        let state = SharedState::new();
-        let source = FakeDsdSource {
-            words: vec![1, 2].into_iter(),
-            error: Some("read failed".to_string()),
-        };
-        let mut wrapped = DsdErrorReport::new(source, state.clone());
-        assert_eq!(wrapped.next(), Some(1));
-        assert!(!state.has_stream_error());
-        assert_eq!(wrapped.next(), Some(2));
-        assert_eq!(wrapped.next(), None);
-        assert!(state.has_stream_error());
-        let msg = state.take_stream_error_message().unwrap();
-        assert!(msg.contains("read failed"));
-        // Repeated polls after exhaustion must not re-record the message.
-        assert_eq!(wrapped.next(), None);
-        assert_eq!(state.take_stream_error_message(), None);
-    }
-
-    #[test]
-    fn dsd_error_report_clean_eof_is_not_an_error() {
-        let state = SharedState::new();
-        let source = FakeDsdSource {
-            words: vec![1].into_iter(),
-            error: None,
-        };
-        let mut wrapped = DsdErrorReport::new(source, state.clone());
-        assert_eq!(wrapped.next(), Some(1));
-        assert_eq!(wrapped.next(), None);
-        assert!(!state.has_stream_error());
-        assert_eq!(state.take_stream_error_message(), None);
-    }
 
     #[test]
     fn no_stream_always_needs_new() {

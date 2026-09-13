@@ -264,8 +264,6 @@ enum SettingsCmd {
         #[arg(long)]
         include_auth: bool,
         #[arg(long)]
-        trust_dsd: bool,
-        #[arg(long)]
         remap: Vec<String>, // OLD=NEW, repeatable
         #[arg(long)]
         dry_run: bool,
@@ -445,13 +443,9 @@ async fn main() {
                 SettingsCmd::Import {
                     file,
                     include_auth,
-                    trust_dsd,
                     remap,
                     dry_run,
-                } => {
-                    cli::settings::import(&roots, &file, include_auth, trust_dsd, &remap, dry_run)
-                        .await
-                }
+                } => cli::settings::import(&roots, &file, include_auth, &remap, dry_run).await,
             }
         }
         Cmd::Qconnect { cmd } => {

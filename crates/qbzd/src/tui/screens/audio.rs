@@ -31,7 +31,6 @@ pub struct StagedAudio {
     pub output_device: Option<String>,
     pub alsa_plugin: AlsaPlugin,
     pub alsa_hardware_volume: bool,
-    pub dsd_mode: String,
     pub exclusive_mode: bool,
     pub reserve_dac: bool,
     pub dac_passthrough: bool,
@@ -52,7 +51,6 @@ impl StagedAudio {
             output_device: a.output_device.clone(),
             alsa_plugin: a.alsa_plugin.unwrap_or_default(),
             alsa_hardware_volume: a.alsa_hardware_volume,
-            dsd_mode: a.dsd_mode.clone(),
             exclusive_mode: a.exclusive_mode,
             reserve_dac: a.reserve_dac_while_running,
             dac_passthrough: a.dac_passthrough,
@@ -74,7 +72,6 @@ pub enum AField {
     Device,
     AlsaPlugin,
     HwVolume,
-    Dsd,
     Exclusive,
     Reserve,
     Passthrough,
@@ -100,7 +97,6 @@ pub fn row_state(field: AField, a: &StagedAudio) -> (bool, bool, Option<&'static
             true,
             None,
         ),
-        Dsd => (alsa, true, None),
         Exclusive => (true, alsa, if alsa { None } else { Some(s::R_ALSA_ONLY) }),
         Reserve => (true, true, None),
         Passthrough => (
@@ -138,7 +134,6 @@ pub fn visible_fields(a: &StagedAudio) -> Vec<AField> {
         Device,
         AlsaPlugin,
         HwVolume,
-        Dsd,
         Exclusive,
         Reserve,
         Passthrough,
@@ -303,12 +298,6 @@ enum Editor {
     Backend(SelectPopup),
     Device(SelectPopup),
     AlsaPlugin(SelectPopup),
-    Dsd(SelectPopup),
-    /// The §3.2.4 DSD guard: `prev` is restored on Esc.
-    DsdConfirm {
-        new: String,
-        prev: String,
-    },
 }
 
 pub struct AudioState {
@@ -359,14 +348,12 @@ impl AudioState {
         self.editor.is_some()
     }
 
-    /// The breadcrumb's level-2 node when a field editor/picker is active (the
-    /// DSD guard counts — it is still editing the DSD field).
+    /// The breadcrumb's level-2 node when a field editor/picker is active.
     pub fn editing_label(&self) -> Option<&'static str> {
         match &self.editor {
             Some(Editor::Backend(_)) => Some(s::A_BACKEND),
             Some(Editor::Device(_)) => Some(s::A_DEVICE),
             Some(Editor::AlsaPlugin(_)) => Some(s::A_ALSA_PLUGIN),
-            Some(Editor::Dsd(_)) | Some(Editor::DsdConfirm { .. }) => Some(s::A_DSD),
             None => None,
         }
     }
@@ -403,9 +390,6 @@ impl AudioState {
         }
         if a.alsa_hardware_volume != b.alsa_hardware_volume {
             push("alsa_hardware_volume", a.alsa_hardware_volume.to_string());
-        }
-        if a.dsd_mode != b.dsd_mode {
-            push("dsd_mode", a.dsd_mode.clone());
         }
         if a.exclusive_mode != b.exclusive_mode {
             push("exclusive_mode", a.exclusive_mode.to_string());
@@ -517,7 +501,6 @@ impl AudioState {
             AField::Backend => self.open_backend_picker(),
             AField::Device => self.open_device_picker(false),
             AField::AlsaPlugin => self.open_alsa_plugin_picker(),
-            AField::Dsd => self.open_dsd_picker(),
             AField::HwVolume => self.staged.alsa_hardware_volume ^= true,
             AField::Reserve => self.staged.reserve_dac ^= true,
             AField::Exclusive => self.staged.exclusive_mode ^= true,
@@ -599,42 +582,7 @@ impl AudioState {
         )));
     }
 
-    fn open_dsd_picker(&mut self) {
-        let opts = vec![
-            s::DSD_CONVERT.to_string(),
-            s::DSD_DOP.to_string(),
-            s::DSD_NATIVE.to_string(),
-        ];
-        let sel = match self.staged.dsd_mode.as_str() {
-            "dop" => 1,
-            "native" => 2,
-            _ => 0,
-        };
-        self.editor = Some(Editor::Dsd(SelectPopup::new(s::A_DSD, opts, sel, false)));
-    }
-
     fn handle_editor_key(&mut self, key: KeyEvent) -> ScreenAction {
-        // DSD confirm modal is not a popup. Clone the values out first so the
-        // borrow of self.editor ends before we mutate it.
-        if matches!(self.editor, Some(Editor::DsdConfirm { .. })) {
-            let (new, prev) = match &self.editor {
-                Some(Editor::DsdConfirm { new, prev }) => (new.clone(), prev.clone()),
-                _ => unreachable!(),
-            };
-            match key.code {
-                KeyCode::Enter => {
-                    self.staged.dsd_mode = new; // keep — user confirmed
-                    self.editor = None;
-                }
-                KeyCode::Esc => {
-                    self.staged.dsd_mode = prev; // revert (§3.2.4)
-                    self.editor = None;
-                }
-                _ => {}
-            }
-            return ScreenAction::Consumed;
-        }
-
         let editor = self.editor.take().unwrap();
         match editor {
             Editor::Backend(mut p) => match p.handle_key(key) {
@@ -688,32 +636,6 @@ impl AudioState {
                     ScreenAction::Consumed
                 }
             },
-            Editor::Dsd(mut p) => match p.handle_key(key) {
-                SelectOutcome::Chosen(i) => {
-                    let new = match i {
-                        1 => "dop",
-                        2 => "native",
-                        _ => "convert",
-                    }
-                    .to_string();
-                    if new == "convert" || new == self.staged.dsd_mode {
-                        self.staged.dsd_mode = new; // safe on every DAC — no confirm
-                    } else {
-                        // §3.2.4 guard for dop/native.
-                        self.editor = Some(Editor::DsdConfirm {
-                            new,
-                            prev: self.staged.dsd_mode.clone(),
-                        });
-                    }
-                    ScreenAction::Consumed
-                }
-                SelectOutcome::Cancelled => ScreenAction::Consumed,
-                SelectOutcome::Pending => {
-                    self.editor = Some(Editor::Dsd(p));
-                    ScreenAction::Consumed
-                }
-            },
-            Editor::DsdConfirm { .. } => unreachable!("handled above"),
         }
     }
 
@@ -736,7 +658,7 @@ impl AudioState {
         let mut secs: Vec<widgets::Section> = Vec::new();
         let mut anchor: Option<widgets::FocusAnchor> = None;
 
-        let out_members: &[AField] = &[Backend, Device, AlsaPlugin, HwVolume, Dsd];
+        let out_members: &[AField] = &[Backend, Device, AlsaPlugin, HwVolume];
         let (mut out_lines, out_a) =
             self.group_block(&fields, out_members, focused_field, ctrl_col, width);
         if self.staged.backend == AudioBackendType::Jack {
@@ -785,9 +707,7 @@ impl AudioState {
 
         // Overlays.
         match &self.editor {
-            Some(Editor::Backend(p)) | Some(Editor::AlsaPlugin(p)) | Some(Editor::Dsd(p)) => {
-                p.draw(f, area)
-            }
+            Some(Editor::Backend(p)) | Some(Editor::AlsaPlugin(p)) => p.draw(f, area),
             Some(Editor::Device(p)) => {
                 if self.scanning {
                     widgets::busy_overlay(f, area, s::AUDIO_SCANNING, 0);
@@ -803,15 +723,6 @@ impl AudioState {
                 } else {
                     p.draw(f, area);
                 }
-            }
-            Some(Editor::DsdConfirm { .. }) => {
-                widgets::modal(
-                    f,
-                    area,
-                    s::DSD_GUARD_TITLE,
-                    s::DSD_GUARD_BODY,
-                    s::DSD_GUARD_HINT,
-                );
             }
             None => {}
         }
@@ -890,7 +801,6 @@ impl AudioState {
                 "[select]",
             ),
             AField::HwVolume => (s::A_HW_VOLUME, on_off(a.alsa_hardware_volume), "[toggle]"),
-            AField::Dsd => (s::A_DSD, dsd_label(&a.dsd_mode).to_string(), "[select]"),
             AField::Exclusive => (s::A_EXCLUSIVE, on_off(a.exclusive_mode), "[toggle]"),
             AField::Reserve => (s::A_RESERVE, on_off(a.reserve_dac), "[toggle]"),
             AField::Passthrough => (s::A_PASSTHROUGH, on_off(a.dac_passthrough), "[toggle]"),
@@ -964,14 +874,6 @@ fn alsa_plugin_value(p: AlsaPlugin) -> &'static str {
         AlsaPlugin::Hw => "hw",
         AlsaPlugin::PlugHw => "plughw",
         AlsaPlugin::Pcm => "pcm",
-    }
-}
-
-fn dsd_label(mode: &str) -> &'static str {
-    match mode {
-        "dop" => s::DSD_DOP,
-        "native" => s::DSD_NATIVE,
-        _ => s::DSD_CONVERT,
     }
 }
 

@@ -15,7 +15,6 @@ qbz-audio = { path = "../qbz-audio" }
 ringbuf = "0.4"
 qbz-qobuz = { path = "../qbz-qobuz" }
 qbz-cmaf = { path = "../qbz-cmaf" }
-qbz-dsd = { path = "../qbz-dsd" }
 qbz-cache = { path = "../qbz-cache" }
 
 # Serialization

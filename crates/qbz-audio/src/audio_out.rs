@@ -20,11 +20,6 @@
 //! next to the format conversion inside it. This is deliberately NOT a
 //! per-sample interface.
 //!
-//! # What it does not cover
-//!
-//! The DoP and native-DSD writer keeps the concrete type. Its words are packed
-//! by `qbz-dsd` and written verbatim, it shares none of the PCM path's
-//! accounting, and nothing is gained by faking a DSD DAC.
 
 use std::sync::atomic::AtomicBool;
 
@@ -59,8 +54,7 @@ pub trait AudioOut: Send + Sync {
     fn write_f32(&self, samples: &[f32], cancel: &AtomicBool) -> Result<usize, String>;
 
     /// Top the device up to `target_ms` of queued SILENCE, returning the frames
-    /// written. Zero when the device already holds that much, or when silence
-    /// would be meaningless (a DSD carrier).
+    /// written. Zero when the device already holds that much.
     fn write_silence_to_depth(&self, target_ms: u32, cancel: &AtomicBool) -> Result<usize, String>;
 
     /// Frames handed over that have not been played yet.
