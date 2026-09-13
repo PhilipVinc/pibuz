@@ -711,6 +711,7 @@ fn plan_audio(
                     | "alsa_buffer_ms"
                     | "dac_keepalive_ms"
                     | "pcm_ring_ms"
+                    | "stream_window_seconds"
                     | "writer_rt_priority"
                     | "cache_to_disk"
             )
@@ -924,6 +925,12 @@ fn plan_audio_machine(
     // reason as alsa_buffer_ms: it describes how much slack this host's network
     // and storage need, not which DAC is plugged into it. `auto` on the far end
     // simply re-derives from that box's own memory profile.
+    // stream_window_seconds — how far the downloader may run ahead of
+    // playback. Portable for the same reason pcm_ring_ms is: it is a figure in
+    // seconds, not a device identity.
+    if let Some(v) = map.get("stream_window_seconds") {
+        applied_line(plan, "audio.stream_window_seconds", v, "");
+    }
     if let Some(v) = map.get("pcm_ring_ms") {
         applied_line(plan, "audio.pcm_ring_ms", v, "");
     }
@@ -1193,6 +1200,9 @@ fn apply_audio_writes(data_root: &Path, writes: &[(&str, &Value)]) -> Result<(),
             "stream_first_track" => store.set_stream_first_track(as_bool(value))?,
             "stream_buffer_seconds" => {
                 store.set_stream_buffer_seconds(value.as_u64().unwrap_or(2) as u8)?
+            }
+            "stream_window_seconds" => {
+                store.set_stream_window_seconds(value.as_u64().unwrap_or(8) as u8)?
             }
             "streaming_only" => store.set_streaming_only(as_bool(value))?,
             "limit_quality_to_device" => store.set_limit_quality_to_device(as_bool(value))?,

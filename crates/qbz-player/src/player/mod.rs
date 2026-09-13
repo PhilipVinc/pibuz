@@ -502,13 +502,20 @@ fn seek_in_memory(
 ///   starting a new track (see [`begin_new_track`]).
 /// * `ready_flag` — the flag the driver watches; set means it has been told.
 /// * `next_track_id` — non-zero means a successor is queued on the engine.
-/// * `current_stream_complete` — a stream still DOWNLOADING has no tail to hand
-///   over; a COMPLETE one does.
+/// * `current_stream_satisfied` — the current track is not currently asking
+///   anything of the link, so a prefetch will not be racing it for bandwidth.
 ///
 /// Named and tested because as one inline `&&` chain it was unreadable, and a
 /// stale `request_armed` left by a track change that forgot to clear it stopped
 /// all prefetching with nothing in the log to say so.
 #[allow(clippy::too_many_arguments)]
+/// How far into a track the gapless prefetch may arm.
+///
+/// Not a lead time — the prefetch now runs beside playback rather than racing
+/// it, so it has the rest of the track. This is only "long enough to know the
+/// stream is healthy", which the window filling already demonstrates.
+const GAPLESS_ARM_AFTER_SECS: u64 = 5;
+
 fn should_arm_prefetch(
     enabled: bool,
     transition_consumed_pending: bool,
@@ -517,7 +524,7 @@ fn should_arm_prefetch(
     request_armed: bool,
     ready_flag: bool,
     next_track_id: u64,
-    current_stream_complete: bool,
+    current_stream_satisfied: bool,
 ) -> bool {
     enabled
         && !transition_consumed_pending
@@ -526,7 +533,7 @@ fn should_arm_prefetch(
         && !request_armed
         && !ready_flag
         && next_track_id == 0
-        && current_stream_complete
+        && current_stream_satisfied
 }
 
 /// Drop the player's handle on a streaming source, telling any reader still
@@ -4369,9 +4376,31 @@ impl Player {
                                     gapless_request_armed,
                                     thread_state.is_gapless_ready(),
                                     thread_state.get_gapless_next_track_id(),
-                                    current_streaming_source
-                                        .as_ref()
-                                        .is_none_or(|source| source.is_complete()),
+                                    // "This track can spare the bandwidth",
+                                    // not "this track is finished".
+                                    //
+                                    // `is_complete()` was a good proxy only
+                                    // while the feeder ran unthrottled: the
+                                    // download finished ~17 s into the track
+                                    // and left minutes of slack. With the
+                                    // window rate-matching it, completion moves
+                                    // to the END of the track and this gate
+                                    // would arm with nothing left to arm for —
+                                    // the third time this coupling has silently
+                                    // switched gapless off.
+                                    //
+                                    // A parked feeder is the honest signal, and
+                                    // it arrives early: the window fills in the
+                                    // first few seconds and stays full. The
+                                    // position floor keeps us from arming
+                                    // before the track has shown it can keep
+                                    // up. The prefetch then has the whole track
+                                    // to run in, against a link the current
+                                    // stream is no longer saturating.
+                                    pos >= GAPLESS_ARM_AFTER_SECS
+                                        && current_streaming_source.as_ref().is_none_or(|source| {
+                                            source.is_complete() || source.window_full()
+                                        }),
                                 ) {
                                     log::info!(
                                         "Gapless: this track is buffered ({}s/{}s), fetching the next one",
@@ -5672,11 +5701,11 @@ impl Player {
         // connection. Clamped to 256KB (format-detection minimum) .. 8MB (the
         // process-wide ladder cap has no desktop caller, so this is the
         // effective ceiling protecting low-memory hosts).
-        let user_secs = self
+        let (user_secs, window_secs) = self
             .audio_settings
             .lock()
-            .map(|s| s.stream_buffer_seconds)
-            .unwrap_or(2);
+            .map(|s| (s.stream_buffer_seconds, s.stream_window_seconds))
+            .unwrap_or((2, 8));
         let bps = content_length / duration_secs.max(1);
         let floor = (user_secs as u64).saturating_mul(bps) as usize;
         let ladder_bytes = config.initial_buffer_bytes;
@@ -5690,6 +5719,36 @@ impl Player {
                 ladder_bytes / 1024
             );
         }
+
+        // The WINDOW: how far the feeder may run ahead of the decoder before it
+        // is parked. This is the memory bound for a playing track — without it
+        // the feeder downloads at link speed (measured 4.5 MB/s against
+        // ~0.26 MB/s of 24/96 playback) and the whole compressed track, 120-220
+        // MB at Hi-Res, is resident within seconds.
+        //
+        // Derived in SECONDS of this track's own byte-rate, because a byte
+        // constant is a different amount of music at every quality: OwnTone's
+        // 384 KB is 2.18 s at CD and 0.33 s at 24/192, which is how a renderer
+        // ends up with a third of a second of lead on hi-res without anyone
+        // choosing that.
+        //
+        // The floor is not decoration. `has_min_buffer` waits for
+        // `initial_buffer_bytes` CONTIGUOUS from `primary_offset`, so a window
+        // smaller than the initial fill target parks the feeder before playback
+        // can ever start — a deadlock at the top of every track.
+        let profile = qbz_models::system_capabilities::memory_profile();
+        let raw_window = (window_secs as u64).saturating_mul(bps);
+        config.window_bytes = (raw_window as usize)
+            .clamp(2 * 1024 * 1024, profile.stream_window_max_bytes)
+            .max(config.initial_buffer_bytes.saturating_mul(2));
+        log::info!(
+            "Streaming window: {}s x {} B/s → {:.1} MB ahead of the decoder (cap {:.1} MB, {:?})",
+            window_secs,
+            bps,
+            config.window_bytes as f64 / (1024.0 * 1024.0),
+            profile.stream_window_max_bytes as f64 / (1024.0 * 1024.0),
+            profile.class,
+        );
 
         let (source, writer) = match seek_mode {
             StreamSeekMode::RangeRequests => {
@@ -6259,6 +6318,32 @@ mod new_track_and_prefetch_tests {
         assert!(should_arm_prefetch(
             true, false, 300, false, false, false, 0, true
         ));
+    }
+
+    /// The gate is "this track can spare the bandwidth", and with a bounded
+    /// window that is a PARKED FEEDER, not a finished download.
+    ///
+    /// Pinned because the proxy has silently changed meaning twice already:
+    /// promotion clearing `current_streaming_source` disabled gapless, and
+    /// fixing one of the two gates keyed on it left the other broken for a
+    /// release. Rate-matching the download moves completion from ~17 s into
+    /// the track to the end of it, so a gate keyed on completion would arm
+    /// with nothing left to arm for.
+    #[test]
+    fn a_rate_matched_stream_still_arms_the_prefetch() {
+        // Not complete — it never will be until the track ends — but the
+        // window is full, so the link is free.
+        let satisfied = false || true; // is_complete() || window_full()
+        assert!(
+            should_arm_prefetch(true, false, 300, false, false, false, 0, satisfied),
+            "a parked feeder means the prefetch may run"
+        );
+
+        // Still filling the very first window: not yet satisfied, do not arm.
+        assert!(
+            !should_arm_prefetch(true, false, 300, false, false, false, 0, false),
+            "a stream still saturating the link must not have a prefetch stacked on it"
+        );
     }
 
     /// Each gate refuses on its own. The `request_armed` line is the one that

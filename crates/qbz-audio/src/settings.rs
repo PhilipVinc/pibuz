@@ -34,6 +34,19 @@ pub struct AudioSettings {
     pub stream_first_track: bool,
     /// Initial buffer size in seconds before starting streaming playback (1-10, default 3)
     pub stream_buffer_seconds: u8,
+    /// Seconds of COMPRESSED audio the downloader may run ahead of playback
+    /// before it is parked until the decoder catches up.
+    ///
+    /// This is the memory bound for a playing track. Without it the feeder
+    /// downloads at link speed — measured at 4.5 MB/s against ~0.26 MB/s of
+    /// 24/96 playback — and the whole compressed track, 120-220 MB at Hi-Res,
+    /// is resident within seconds.
+    ///
+    /// In seconds rather than bytes because a byte constant means a different
+    /// amount of music at every quality: OwnTone's 384 KB is 2.18 s at CD and
+    /// 0.33 s at 24/192. `0` takes the default.
+    #[serde(default = "default_stream_window_seconds")]
+    pub stream_window_seconds: u8,
     /// When true, skip L1+L2 cache writes (streaming-only mode). Offline cache still works.
     pub streaming_only: bool,
     /// Hard budget for the L1 (in-memory) audio cache, in megabytes.
@@ -185,6 +198,13 @@ fn default_cache_to_disk() -> bool {
 /// degrades to a single info line where it is absent, so defaulting it on costs
 /// nothing on a host that cannot use it and is the right answer on every host
 /// that can. See [`crate::rt`].
+/// See [`AudioSettings::stream_window_seconds`]. Eight seconds is ~4.8 MB at
+/// 24/192 and ~2.1 MB at 24/96 — the same order as ohPipeline's 1.5 MB
+/// reservoir, which is a shipping renderer against this same CDN.
+fn default_stream_window_seconds() -> u8 {
+    8
+}
+
 fn default_writer_rt_priority() -> u8 {
     crate::rt::DEFAULT_WRITER_RT_PRIORITY
 }
@@ -219,6 +239,7 @@ impl Default for AudioSettings {
             alsa_mixer_device: String::new(),  // Empty = derive from output_device
             stream_first_track: true,          // On by default (opt-out)
             stream_buffer_seconds: 2,          // 2 seconds initial buffer
+            stream_window_seconds: default_stream_window_seconds(),
             streaming_only: false, // Disabled by default (cache tracks for instant replay)
             memory_cache_mb: 0,    // 0 = auto-size from host RAM
             volume_curve: default_volume_curve(),
@@ -374,6 +395,10 @@ impl AudioSettingsStore {
             [],
         );
         let _ = conn.execute(
+            "ALTER TABLE audio_settings ADD COLUMN stream_window_seconds INTEGER DEFAULT 8",
+            [],
+        );
+        let _ = conn.execute(
             "ALTER TABLE audio_settings ADD COLUMN writer_rt_priority INTEGER DEFAULT 5",
             [],
         );
@@ -442,7 +467,7 @@ impl AudioSettingsStore {
     pub fn get_settings(&self) -> Result<AudioSettings, String> {
         self.conn
             .query_row(
-                "SELECT output_device, exclusive_mode, dac_passthrough, preferred_sample_rate, backend_type, alsa_plugin, alsa_hardware_volume, stream_first_track, stream_buffer_seconds, streaming_only, limit_quality_to_device, device_max_sample_rate, normalization_enabled, normalization_target_lufs, gapless_enabled, device_sample_rate_limits, pw_force_bitperfect, sync_audio_on_startup, quality_fallback_behavior, skip_sink_switch, allow_quality_fallback, reserve_dac_while_running, memory_cache_mb, alsa_mixer_device, volume_curve, alsa_buffer_ms, cache_to_disk, dac_keepalive_ms, pcm_ring_ms, writer_rt_priority FROM audio_settings WHERE id = 1",
+                "SELECT output_device, exclusive_mode, dac_passthrough, preferred_sample_rate, backend_type, alsa_plugin, alsa_hardware_volume, stream_first_track, stream_buffer_seconds, streaming_only, limit_quality_to_device, device_max_sample_rate, normalization_enabled, normalization_target_lufs, gapless_enabled, device_sample_rate_limits, pw_force_bitperfect, sync_audio_on_startup, quality_fallback_behavior, skip_sink_switch, allow_quality_fallback, reserve_dac_while_running, memory_cache_mb, alsa_mixer_device, volume_curve, alsa_buffer_ms, cache_to_disk, dac_keepalive_ms, pcm_ring_ms, writer_rt_priority, stream_window_seconds FROM audio_settings WHERE id = 1",
                 [],
                 |row| {
                     // Parse backend_type from JSON string
@@ -499,6 +524,7 @@ impl AudioSettingsStore {
                         cache_to_disk: row.get::<_, Option<i64>>(26)?.unwrap_or(1) != 0,
                         dac_keepalive_ms: row.get::<_, Option<i64>>(27)?.unwrap_or(0) as u16,
                         pcm_ring_ms: row.get::<_, Option<i64>>(28)?.unwrap_or(0) as u32,
+                        stream_window_seconds: row.get::<_, Option<i64>>(30)?.unwrap_or(8) as u8,
                         writer_rt_priority: row.get::<_, Option<i64>>(29)?.unwrap_or_else(
                             || i64::from(default_writer_rt_priority()),
                         ) as u8,
@@ -661,6 +687,19 @@ impl AudioSettingsStore {
     /// Set the decoded-audio ring depth in ms; `0` restores the host memory
     /// profile's figure. Read when a stream opens, so it applies to the next
     /// track.
+    /// Clamped 2..=60. Below two seconds a single WiFi hiccup empties the
+    /// window; above a minute it stops being a window.
+    pub fn set_stream_window_seconds(&self, seconds: u8) -> Result<(), String> {
+        let seconds = seconds.clamp(2, 60);
+        self.conn
+            .execute(
+                "UPDATE audio_settings SET stream_window_seconds = ?1 WHERE id = 1",
+                params![seconds as i64],
+            )
+            .map_err(|e| format!("Failed to set stream window seconds: {}", e))?;
+        Ok(())
+    }
+
     pub fn set_pcm_ring_ms(&self, ms: u32) -> Result<(), String> {
         self.conn
             .execute(
@@ -975,7 +1014,8 @@ impl AudioSettingsStore {
                     cache_to_disk = ?26,
                     dac_keepalive_ms = ?27,
                     pcm_ring_ms = ?28,
-                    writer_rt_priority = ?29
+                    writer_rt_priority = ?29,
+                    stream_window_seconds = ?30
                 WHERE id = 1",
                 params![
                     defaults.output_device,
@@ -1007,6 +1047,7 @@ impl AudioSettingsStore {
                     defaults.dac_keepalive_ms as i64,
                     defaults.pcm_ring_ms as i64,
                     defaults.writer_rt_priority as i64,
+                    defaults.stream_window_seconds as i64,
                 ],
             )
             .map_err(|e| format!("Failed to reset audio settings: {}", e))?;

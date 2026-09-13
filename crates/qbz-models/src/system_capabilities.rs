@@ -71,6 +71,19 @@ pub struct MemoryProfile {
     /// outage. Reference points: squeezelite's output buffer is ~10 s of CD
     /// audio, MPD's decoded-chunk pipe a few seconds.
     pub pcm_ring_seconds: u8,
+    /// Ceiling for the COMPRESSED streaming window, in bytes.
+    ///
+    /// The window is normally derived from the track's own byte-rate in
+    /// seconds (`audio.stream_window_seconds`), which is the only denomination
+    /// that means the same thing at 16/44 and 24/192. This caps what that
+    /// derivation may ask for on a small board, where a long window on a
+    /// high-bitrate track would reintroduce the problem it exists to solve.
+    ///
+    /// Unlike `pcm_ring_seconds` this is a ceiling rather than a target: it
+    /// binds only when the track's bitrate is high enough for the requested
+    /// seconds to exceed it. At 8 s, 24/192 asks for ~4.8 MB and never reaches
+    /// even the low-memory cap.
+    pub stream_window_max_bytes: usize,
 }
 
 /// Least RAM a host needs before it may hold a second whole track.
@@ -142,6 +155,16 @@ pub fn l1_cache_bytes_for_total_kb(mem_total_kb: u64) -> usize {
 const PCM_RING_SECONDS_NORMAL: u8 = 6;
 const PCM_RING_SECONDS_LOW_MEMORY: u8 = 2;
 
+/// Compressed-window ceilings per class. See
+/// [`MemoryProfile::stream_window_max_bytes`].
+///
+/// For scale: ohPipeline — Linn's shipping renderer, against this same CDN,
+/// on embedded hardware over WiFi — runs a 1.5 MB encoded reservoir. Eight MB
+/// on a 512 MB board is already generous; 32 MB where RAM allows buys a longer
+/// ride through a WiFi dropout at a cost that board will not notice.
+const STREAM_WINDOW_MAX_NORMAL: usize = 32 * 1024 * 1024;
+const STREAM_WINDOW_MAX_LOW_MEMORY: usize = 8 * 1024 * 1024;
+
 impl MemoryProfile {
     /// Derive the profile from a total-memory figure (KB).
     fn from_total_kb(mem_total_kb: u64) -> Self {
@@ -166,6 +189,7 @@ impl MemoryProfile {
                 audio_cache_l1_max_bytes: l1_cache_bytes_for_total_kb(mem_total_kb),
                 allow_gapless_prefetch: mem_total_kb >= GAPLESS_MIN_TOTAL_KB,
                 pcm_ring_seconds: PCM_RING_SECONDS_NORMAL,
+                stream_window_max_bytes: STREAM_WINDOW_MAX_NORMAL,
             }
         } else {
             Self {
@@ -178,6 +202,7 @@ impl MemoryProfile {
                 audio_cache_l1_max_bytes: l1_cache_bytes_for_total_kb(mem_total_kb),
                 allow_gapless_prefetch: mem_total_kb >= GAPLESS_MIN_TOTAL_KB,
                 pcm_ring_seconds: PCM_RING_SECONDS_LOW_MEMORY,
+                stream_window_max_bytes: STREAM_WINDOW_MAX_LOW_MEMORY,
             }
         }
     }

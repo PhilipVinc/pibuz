@@ -46,8 +46,17 @@ use tokio::sync::Notify;
 pub struct StreamingConfig {
     /// Minimum bytes to buffer before allowing reads (for format detection)
     pub initial_buffer_bytes: usize,
-    /// Maximum buffer size before backpressure (not enforced, just for info)
-    pub max_buffer_bytes: usize,
+    /// How far the feeder may run ahead of the consuming reader, in bytes,
+    /// before it is parked until the reader catches up.
+    ///
+    /// This is the memory bound for a playing stream, and it is the ONLY one:
+    /// the look-behind trim frees what is already played, but without a bound
+    /// on arrival the held buffer is `total - reader_pos` no matter what any
+    /// cap says. Derived per track from the real byte-rate — see
+    /// `Player::apply_play_streaming_dynamic` — because a byte constant means
+    /// a different number of seconds at every quality, which is how OwnTone's
+    /// 384 KB became 0.33 s of lead at 24/192.
+    pub window_bytes: usize,
 }
 
 impl Default for StreamingConfig {
@@ -58,7 +67,7 @@ impl Default for StreamingConfig {
             // buffer to handle network jitter
             initial_buffer_bytes: 512 * 1024,
             // 100MB max buffer
-            max_buffer_bytes: 100 * 1024 * 1024,
+            window_bytes: DEFAULT_WINDOW_BYTES,
         }
     }
 }
@@ -73,7 +82,7 @@ impl StreamingConfig {
         let bytes = ((seconds as usize) * 1024 * 1024).max(256 * 1024);
         Self {
             initial_buffer_bytes: bytes,
-            max_buffer_bytes: 100 * 1024 * 1024,
+            window_bytes: DEFAULT_WINDOW_BYTES,
         }
     }
 
@@ -122,7 +131,7 @@ impl StreamingConfig {
         let raw_initial_buffer = raw_initial_buffer_for_speed(speed_mbps);
         Self {
             initial_buffer_bytes: raw_initial_buffer.min(cap),
-            max_buffer_bytes: 100 * 1024 * 1024,
+            window_bytes: DEFAULT_WINDOW_BYTES,
         }
     }
 }
@@ -225,16 +234,80 @@ const FORWARD_WAIT_BYTES: u64 = 2 * 1024 * 1024;
 /// hi-res.
 const SEEK_LOOKBEHIND_BYTES: u64 = 1024 * 1024;
 
+/// How much of the file's head the window may never discard.
+///
+/// Symphonia re-reads the container header when it resets a decoder, the
+/// ReplayGain probe wants the first few KB, and the ranged-resume gate waits
+/// on `HEADER_PROBE_BYTES` of it. A window anchored only on the reader would
+/// throw all of that away the moment the reader moved on, so the head is kept
+/// as its own snapshot rather than as part of the sliding run — the same
+/// anchor MPD keeps in `RewindInputStream`.
+///
+/// 256 KiB to match `HEADER_PROBE_BYTES` at the resume call site. A Qobuz FLAC
+/// carries STREAMINFO and nothing else, so the real need is ~42 bytes; the
+/// margin covers tagged files and costs a quarter of a megabyte once.
+const HEADER_PIN_BYTES: u64 = 256 * 1024;
+
+/// Fallback window for a stream whose byte-rate is not known at setup.
+///
+/// Every production caller replaces this with a figure derived from
+/// `content_length / duration`. It is deliberately generous: a window that is
+/// too small stalls playback, while one that is too large merely holds memory
+/// we meant to save.
+const DEFAULT_WINDOW_BYTES: usize = 8 * 1024 * 1024;
+
 /// One contiguous run of downloaded bytes, covering
-/// `[offset, offset + data.len())` of the source file.
+/// `[offset, offset + len())` of the source file.
+///
+/// `data` may carry a prefix the window has already discarded. Dropping bytes
+/// from the front is then `start += n` rather than a memmove of everything
+/// that stays — which matters because the drop happens on the decoder thread,
+/// under the lock the feeder needs, once per read.
 struct BufferSegment {
+    /// File offset of `data[start]`.
     offset: u64,
+    /// Discarded prefix. Never read; reclaimed lazily by [`Self::compact`].
+    start: usize,
     data: Vec<u8>,
 }
 
 impl BufferSegment {
+    fn new(offset: u64, chunk: &[u8]) -> Self {
+        Self {
+            offset,
+            start: 0,
+            data: chunk.to_vec(),
+        }
+    }
+
+    /// Live bytes, excluding the discarded prefix.
+    fn bytes(&self) -> &[u8] {
+        &self.data[self.start..]
+    }
+
+    fn len(&self) -> usize {
+        self.data.len() - self.start
+    }
+
     fn end(&self) -> u64 {
-        self.offset + self.data.len() as u64
+        self.offset + self.len() as u64
+    }
+
+    /// Drop `n` bytes from the front. O(1).
+    fn advance(&mut self, n: usize) {
+        self.start += n.min(self.len());
+        self.compact();
+    }
+
+    /// Give the discarded prefix back to the allocator once it is more than
+    /// half the allocation. Amortised O(1) per byte: each byte is moved at
+    /// most once per doubling, and against a windowed buffer the occasional
+    /// copy is megabytes, not the whole track.
+    fn compact(&mut self) {
+        if self.start > self.data.len() / 2 && self.start > 64 * 1024 {
+            self.data.drain(..self.start);
+            self.start = 0;
+        }
     }
 }
 
@@ -283,10 +356,26 @@ struct BufferState {
     /// from and never reads a byte itself, so counting it would anchor any
     /// window measurement at offset 0 and nothing keyed on it would ever fire.
     ///
-    /// Nothing reads this yet — it is the anchor the bounded streaming window
-    /// needs, kept from the reverted `max_buffer_bytes` trim so the next change
-    /// does not have to rediscover the distinction above.
+    /// The anchor the bounded window measures from. See [`BufferState::ahead_bytes`].
     reader_positions: std::collections::HashMap<u64, u64>,
+    /// Park the feeder once this many buffered bytes sit ahead of the reader.
+    window_bytes: u64,
+    /// Let it go again once the figure falls below this. A band, not a point,
+    /// so a feeder cannot thrash between parked and running once per chunk.
+    resume_bytes: u64,
+    /// Whether the feeder is currently parked. Held here rather than inferred
+    /// so the hysteresis has exactly one place to live.
+    feeder_parked: bool,
+    /// Bytes below this offset were DISCARDED on purpose by the look-behind
+    /// trim, and are not a hole to be refilled.
+    ///
+    /// Without this distinction `first_gap` reports a trimmed prefix as
+    /// missing, `next_plan` hands it back to the feeder, the reader trims it
+    /// again, and the loop never converges — the whole track's worth of
+    /// re-download that made the previous attempt at a cap unusable.
+    trimmed_below: u64,
+    /// The file's first [`HEADER_PIN_BYTES`], kept whatever the window does.
+    header: Vec<u8>,
 }
 
 impl BufferState {
@@ -307,7 +396,7 @@ impl BufferState {
 
     /// Total bytes held, across every run.
     fn downloaded(&self) -> u64 {
-        self.segments.iter().map(|seg| seg.data.len() as u64).sum()
+        self.segments.iter().map(|seg| seg.len() as u64).sum()
     }
 
     /// First byte range still missing, as `(start, exclusive end)`. The end
@@ -316,7 +405,9 @@ impl BufferState {
     /// when it is done.
     fn first_gap(&self) -> Option<(u64, Option<u64>)> {
         let total = self.total_size?;
-        let mut cursor = 0u64;
+        // Start above anything the window threw away on purpose. A byte we
+        // chose to drop is not a byte we are missing.
+        let mut cursor = self.trimmed_below;
         for seg in &self.segments {
             if seg.offset > cursor {
                 return Some((cursor, Some(seg.offset)));
@@ -367,11 +458,103 @@ impl BufferState {
         self.write_pos = offset;
     }
 
+    /// Buffered bytes sitting ahead of the reader that is actually consuming.
+    ///
+    /// Anchored on the NEWEST reader, not the slowest. A seek builds a second
+    /// decoder over the same buffer and the outgoing one can still take a read
+    /// or two before it is dropped; anchoring on the minimum would let that
+    /// corpse hold the window open at an offset nobody is playing from.
+    /// Before any reader has read, `primary_offset` stands in, which is what
+    /// makes the initial fill work.
+    ///
+    /// Measured as the CONTIGUOUS run from the anchor, not `write_pos - anchor`:
+    /// during a gap backfill the write head is behind the reader, and the
+    /// subtraction would say "nothing buffered" while megabytes sit ahead.
+    fn ahead_bytes(&self) -> u64 {
+        let anchor = self
+            .reader_positions
+            .get(&self.reader_epoch)
+            .copied()
+            .unwrap_or(self.primary_offset);
+        self.contiguous_from(anchor)
+    }
+
+    /// Should the feeder stop reading its body? Hysteresis lives here and
+    /// nowhere else.
+    fn should_park(&mut self) -> bool {
+        let ahead = self.ahead_bytes();
+        if self.feeder_parked {
+            if ahead < self.resume_bytes {
+                self.feeder_parked = false;
+            }
+        } else if ahead >= self.window_bytes {
+            self.feeder_parked = true;
+        }
+        self.feeder_parked
+    }
+
+    /// Drop buffered bytes every live reader has moved well past.
+    ///
+    /// The window bounds what is AHEAD of the reader; this reclaims what is
+    /// behind it. Both are needed: without the first the buffer is unbounded,
+    /// and without the second it still grows by everything already played.
+    ///
+    /// `SEEK_LOOKBEHIND_BYTES` of slack stays behind the SLOWEST reader — the
+    /// opposite anchor to `ahead_bytes`, deliberately: a decoder bisecting
+    /// backwards must find its own bytes, and an outgoing reader is still
+    /// entitled to the ones under its cursor.
+    ///
+    /// Only under `RangeRequests`. A `Sequential` feeder (CMAF) cannot re-fetch
+    /// what it discards, so it is never trimmed.
+    fn trim_behind_readers(&mut self) {
+        if self.seek_mode != StreamSeekMode::RangeRequests {
+            return;
+        }
+        let Some(slowest) = self.reader_positions.values().copied().min() else {
+            return;
+        };
+        let keep_from = slowest.saturating_sub(SEEK_LOOKBEHIND_BYTES);
+        if keep_from <= self.trimmed_below {
+            return;
+        }
+        self.segments.retain_mut(|seg| {
+            if seg.end() <= keep_from {
+                return false;
+            }
+            if seg.offset < keep_from {
+                let cut = (keep_from - seg.offset) as usize;
+                seg.advance(cut);
+                seg.offset = keep_from;
+            }
+            true
+        });
+        self.trimmed_below = keep_from;
+    }
+
+    /// Take whatever of `chunk` extends the pinned header.
+    ///
+    /// Only ever grows, and only from bytes that continue it, so an
+    /// out-of-order range fill cannot corrupt it.
+    fn absorb_header(&mut self, offset: u64, chunk: &[u8]) {
+        let have = self.header.len() as u64;
+        if have >= HEADER_PIN_BYTES || offset > have {
+            return;
+        }
+        let skip = (have - offset) as usize;
+        if skip >= chunk.len() {
+            return;
+        }
+        let room = (HEADER_PIN_BYTES - have) as usize;
+        let take = room.min(chunk.len() - skip);
+        self.header.extend_from_slice(&chunk[skip..skip + take]);
+    }
+
     /// Merge `chunk` in at `offset`, keeping runs sorted and disjoint.
     fn insert(&mut self, offset: u64, chunk: &[u8]) {
         if chunk.is_empty() {
             return;
         }
+        self.absorb_header(offset, chunk);
         // By far the common case: the feeder appending to the run it fills.
         if let Some(seg) = self.segments.iter_mut().find(|seg| seg.end() == offset) {
             seg.data.extend_from_slice(chunk);
@@ -381,13 +564,7 @@ impl BufferState {
                 .iter()
                 .position(|seg| seg.offset > offset)
                 .unwrap_or(self.segments.len());
-            self.segments.insert(
-                at,
-                BufferSegment {
-                    offset,
-                    data: chunk.to_vec(),
-                },
-            );
+            self.segments.insert(at, BufferSegment::new(offset, chunk));
         }
         self.coalesce();
     }
@@ -403,8 +580,9 @@ impl BufferState {
             if self.segments[i + 1].offset <= cur_end {
                 let next = self.segments.remove(i + 1);
                 let skip = (cur_end - next.offset) as usize;
-                if skip < next.data.len() {
-                    self.segments[i].data.extend_from_slice(&next.data[skip..]);
+                if skip < next.len() {
+                    let tail = next.bytes()[skip..].to_vec();
+                    self.segments[i].data.extend_from_slice(&tail);
                 }
             } else {
                 i += 1;
@@ -426,6 +604,10 @@ struct SharedBuffer {
     state: Mutex<BufferState>,
     ready: Condvar,
     wanted: Notify,
+    /// Woken when the reader has consumed enough that a parked feeder may run
+    /// again, or when parking has stopped making sense (no readers, an error,
+    /// a pending range request).
+    space: Notify,
     /// Set when nobody is going to listen to this stream again.
     ///
     /// A blocking read waits for bytes that a live download will eventually
@@ -543,9 +725,15 @@ impl BufferedMediaSource {
                 readers: 1,
                 reader_epoch: 0,
                 reader_positions: std::collections::HashMap::new(),
+                window_bytes: config.window_bytes as u64,
+                resume_bytes: (config.window_bytes as u64) * 3 / 4,
+                feeder_parked: false,
+                trimmed_below: 0,
+                header: Vec::new(),
             }),
             ready: Condvar::new(),
             wanted: Notify::new(),
+            space: Notify::new(),
             abandoned: std::sync::atomic::AtomicBool::new(false),
         });
 
@@ -602,6 +790,7 @@ impl BufferedMediaSource {
         self.shared
             .abandoned
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.shared.space.notify_one();
         self.shared.ready.notify_all();
     }
 
@@ -611,6 +800,22 @@ impl BufferedMediaSource {
         } else {
             false
         }
+    }
+
+    /// True when this stream is not currently asking anything of the link:
+    /// either the window is full and the feeder is parked, or the download has
+    /// finished.
+    ///
+    /// This is what "the current track can spare the bandwidth" means once the
+    /// download is rate-matched to playback. `is_complete()` used to serve that
+    /// purpose and no longer can: with a bounded window a track completes at
+    /// the END of itself rather than seventeen seconds in.
+    pub fn window_full(&self) -> bool {
+        self.shared
+            .state
+            .lock()
+            .map(|state| state.feeder_parked || state.download_complete)
+            .unwrap_or(false)
     }
 
     /// Get total buffered bytes, across every downloaded run.
@@ -628,7 +833,7 @@ impl BufferedMediaSource {
     /// playback is about to start.
     pub fn head_bytes(&self) -> u64 {
         if let Ok(state) = self.shared.state.lock() {
-            state.contiguous_from(0)
+            state.contiguous_from(0).max(state.header.len() as u64)
         } else {
             0
         }
@@ -677,9 +882,7 @@ impl BufferedMediaSource {
             // the cache or replay in memory.
             return None;
         }
-        state
-            .head_run()
-            .map(|seg| TrackBytes::from(seg.data.as_slice()))
+        state.head_run().map(|seg| TrackBytes::from(seg.bytes()))
     }
 
     /// Get a copy of the buffered file header (for metadata extraction).
@@ -691,8 +894,9 @@ impl BufferedMediaSource {
         let state = self.shared.state.lock().ok()?;
         state
             .head_run()
-            .filter(|seg| !seg.data.is_empty())
-            .map(|seg| seg.data.clone())
+            .filter(|seg| seg.len() > 0)
+            .map(|seg| seg.bytes().to_vec())
+            .or_else(|| (!state.header.is_empty()).then(|| state.header.clone()))
     }
 
     /// Get download progress as a fraction (0.0 to 1.0)
@@ -768,6 +972,8 @@ impl BufferedMediaSource {
         state.primary_offset = pos;
         state.pending_request = Some(fetch_from);
         self.shared.wanted.notify_one();
+        // A parked feeder is the one that must service this.
+        self.shared.space.notify_one();
     }
 }
 
@@ -776,6 +982,7 @@ impl Drop for BufferedMediaSource {
         if let Ok(mut state) = self.shared.state.lock() {
             state.readers = state.readers.saturating_sub(1);
             state.reader_positions.remove(&self.reader_id);
+            self.shared.space.notify_one();
             if state.readers == 0 {
                 // Let a feeder parked on `next_plan` notice it has nobody
                 // left to serve and stop backfilling.
@@ -802,11 +1009,17 @@ impl Read for BufferedMediaSource {
             if let Some(idx) = state.segment_at(read_pos) {
                 let seg = &state.segments[idx];
                 let from = (read_pos - seg.offset) as usize;
-                let to_read = buf.len().min(seg.data.len() - from);
-                buf[..to_read].copy_from_slice(&seg.data[from..from + to_read]);
+                let to_read = buf.len().min(seg.len() - from);
+                buf[..to_read].copy_from_slice(&seg.bytes()[from..from + to_read]);
                 let next = read_pos + to_read as u64;
                 self.read_pos.store(next, Ordering::SeqCst);
                 state.reader_positions.insert(self.reader_id, next);
+                state.trim_behind_readers();
+                // Only when the band is actually crossed, so this is one wake
+                // per park cycle rather than one per read.
+                if state.feeder_parked && !state.should_park() {
+                    self.shared.space.notify_one();
+                }
                 return Ok(to_read);
             }
 
@@ -1019,6 +1232,49 @@ impl BufferWriter {
         None
     }
 
+    /// Park until the reader has consumed enough for the feeder to run again.
+    ///
+    /// Returns immediately unless the buffered run ahead of the consuming
+    /// reader has reached `window_bytes`, and then returns once it falls below
+    /// `resume_bytes`. This is the memory bound for a playing stream: with it,
+    /// the held buffer is the window; without it, the feeder runs at line
+    /// speed — measured at 4.5 MB/s against ~0.26 MB/s of playback — and the
+    /// whole compressed track is resident within seconds.
+    ///
+    /// The body stays open while parked; TCP's receive window closes and the
+    /// CDN throttles itself. That is deliberate. Closing and re-opening at the
+    /// new offset instead would charge this CDN's cold-offset
+    /// time-to-first-byte — measured at ~5 s, against 150 ms for a warm one —
+    /// once per window, which is a stall per cycle rather than a saving.
+    /// ohPipeline (`BlockIfFull`) and MPD (`CURL_WRITEFUNC_PAUSE`) both hold
+    /// the connection for the same reason.
+    ///
+    /// Three conditions mean "do not park" regardless of fill: nobody is
+    /// listening any more, a reader has posted a range request that only the
+    /// feeder can service, or the download has already failed.
+    pub async fn wait_for_space(&self) {
+        loop {
+            // Registered BEFORE the check: a wake that lands in between is
+            // held as a permit rather than lost.
+            let notified = self.shared.space.notified();
+            {
+                let Ok(mut state) = self.shared.state.lock() else {
+                    return;
+                };
+                if state.readers == 0
+                    || state.pending_request.is_some()
+                    || state.download_error.is_some()
+                {
+                    return;
+                }
+                if !state.should_park() {
+                    return;
+                }
+            }
+            notified.await;
+        }
+    }
+
     /// Resolves when a reader posts a range request, or when the last
     /// reader goes away. A feeder awaiting its next chunk selects on this
     /// so a jump is honored immediately instead of after the next chunk —
@@ -1062,6 +1318,7 @@ impl BufferWriter {
         }
         self.shared.ready.notify_all();
         self.shared.wanted.notify_one();
+        self.shared.space.notify_one();
 
         Ok(())
     }
@@ -1733,18 +1990,19 @@ mod tests {
     }
 
     #[test]
-    fn from_speed_mbps_with_cap_max_buffer_unchanged() {
-        // Whatever the cap, the secondary max_buffer_bytes stays at its
-        // module default; we are only clamping the initial fill target.
+    fn from_speed_mbps_with_cap_leaves_the_window_alone() {
+        // The speed ladder sizes the INITIAL fill target only. The window is
+        // a different decision, made per track from the real byte-rate, and
+        // must not be perturbed by a cap that is about start-up latency.
         let cfg = StreamingConfig::from_speed_mbps_with_cap(0.5, 64 * 1024);
-        assert_eq!(cfg.max_buffer_bytes, 100 * 1024 * 1024);
+        assert_eq!(cfg.window_bytes, DEFAULT_WINDOW_BYTES);
     }
 
     #[test]
     fn test_basic_read_write() {
         let config = StreamingConfig {
             initial_buffer_bytes: 10,
-            max_buffer_bytes: 100,
+            window_bytes: 100,
         };
         let (mut source, writer) = BufferedMediaSource::new(config, Some(20));
 
@@ -1765,7 +2023,7 @@ mod tests {
     fn test_seek_within_buffer() {
         let config = StreamingConfig {
             initial_buffer_bytes: 5,
-            max_buffer_bytes: 100,
+            window_bytes: 100,
         };
         let (mut source, writer) = BufferedMediaSource::new(config, Some(10));
 
@@ -1792,7 +2050,7 @@ mod tests {
     fn test_complete_data_retrieval() {
         let config = StreamingConfig {
             initial_buffer_bytes: 5,
-            max_buffer_bytes: 100,
+            window_bytes: 100,
         };
         let (source, writer) = BufferedMediaSource::new(config, Some(10));
 
@@ -1810,7 +2068,7 @@ mod tests {
     fn test_blocking_read() {
         let config = StreamingConfig {
             initial_buffer_bytes: 5,
-            max_buffer_bytes: 100,
+            window_bytes: 100,
         };
         let (mut source, writer) = BufferedMediaSource::new(config, None);
 
@@ -1833,7 +2091,7 @@ mod tests {
         use std::io::ErrorKind;
         let config = StreamingConfig {
             initial_buffer_bytes: 5,
-            max_buffer_bytes: 100,
+            window_bytes: 100,
         };
         let (mut source, writer) = BufferedMediaSource::new(config, None);
         writer.error("cdn failed".into()).unwrap();
@@ -1862,7 +2120,7 @@ mod tests {
     fn sequential_source_never_asks_for_a_range() {
         let config = StreamingConfig {
             initial_buffer_bytes: 4,
-            max_buffer_bytes: 100,
+            window_bytes: 100,
         };
         let (source, writer) = BufferedMediaSource::new(config, Some(100));
         assert!(!source.supports_range_requests());
@@ -1877,7 +2135,7 @@ mod tests {
     fn read_far_ahead_asks_the_feeder_to_re_open_there() {
         let config = StreamingConfig {
             initial_buffer_bytes: 4,
-            max_buffer_bytes: 8 * 1024 * 1024,
+            window_bytes: 8 * 1024 * 1024,
         };
         let (source, writer) = BufferedMediaSource::new_seekable(config, Some(64 * 1024 * 1024));
         assert!(source.supports_range_requests());
@@ -1908,15 +2166,23 @@ mod tests {
         assert_eq!(&handle.join().unwrap(), b"jump");
         // Reads are measured from the resume point now, not from byte 0.
         assert_eq!(source.primary_offset(), target);
+        // The header survives the jump even though its run does not: the
+        // window trims everything the reader has left 1 MB behind, and 32 MB
+        // back is well past that, but `HEADER_PIN_BYTES` is kept as its own
+        // snapshot so a decoder reset can still find STREAMINFO.
         assert_eq!(source.head_bytes(), 1024);
-        assert_eq!(source.buffer_size(), 1024 + 4);
+        assert_eq!(
+            source.buffer_size(),
+            4,
+            "the run at byte 0 is 32 MB behind the reader and is not held"
+        );
     }
 
     #[test]
     fn short_forward_hop_waits_instead_of_re_opening() {
         let config = StreamingConfig {
             initial_buffer_bytes: 4,
-            max_buffer_bytes: 8 * 1024 * 1024,
+            window_bytes: 8 * 1024 * 1024,
         };
         let (source, writer) = BufferedMediaSource::new_seekable(config, Some(4 * 1024 * 1024));
         writer.push_chunk(&[1u8; 1024]).unwrap();
@@ -1952,7 +2218,7 @@ mod tests {
         // this hop has to be waited out.
         let config = StreamingConfig {
             initial_buffer_bytes: 4,
-            max_buffer_bytes: 100 * 1024 * 1024,
+            window_bytes: DEFAULT_WINDOW_BYTES,
         };
         let (source, writer) = BufferedMediaSource::new_seekable(config, Some(72_332_363));
         feed(&writer, to_eof(34_165_359), &[9u8; 15_619]);
@@ -1990,7 +2256,7 @@ mod tests {
         // next one in a hole of its own.
         let config = StreamingConfig {
             initial_buffer_bytes: 4,
-            max_buffer_bytes: 200 * 1024 * 1024,
+            window_bytes: 200 * 1024 * 1024,
         };
         let (source, writer) = BufferedMediaSource::new_seekable(config, Some(108_323_214));
         feed(&writer, to_eof(32_311_596), &[9u8; 19_801]);
@@ -2031,7 +2297,7 @@ mod tests {
     fn holes_are_backfilled_before_the_stream_reports_complete() {
         let config = StreamingConfig {
             initial_buffer_bytes: 4,
-            max_buffer_bytes: 100,
+            window_bytes: 100,
         };
         let (source, writer) = BufferedMediaSource::new_seekable(config, Some(30));
 
@@ -2067,7 +2333,7 @@ mod tests {
         const MB: u64 = 1024 * 1024;
         let config = StreamingConfig {
             initial_buffer_bytes: 4,
-            max_buffer_bytes: 16 * MB as usize,
+            window_bytes: 16 * MB as usize,
         };
         let (source, writer) = BufferedMediaSource::new_seekable(config, Some(8 * MB));
         // Header plus a jumped-to tail: 1 MB .. 6 MB is the hole waiting to
@@ -2101,7 +2367,7 @@ mod tests {
     fn overlapping_refetch_does_not_duplicate_bytes() {
         let config = StreamingConfig {
             initial_buffer_bytes: 4,
-            max_buffer_bytes: 100,
+            window_bytes: 100,
         };
         let (source, writer) = BufferedMediaSource::new_seekable(config, Some(20));
         writer.push_chunk(b"0123456789").unwrap();
@@ -2119,7 +2385,7 @@ mod tests {
     fn feeder_stops_once_the_last_reader_is_gone() {
         let config = StreamingConfig {
             initial_buffer_bytes: 4,
-            max_buffer_bytes: 100,
+            window_bytes: 100,
         };
         let (source, writer) = BufferedMediaSource::new_seekable(config, Some(30));
         writer.push_chunk(b"0123456789").unwrap();
@@ -2135,7 +2401,7 @@ mod tests {
     fn min_buffer_is_measured_from_the_resume_point() {
         let config = StreamingConfig {
             initial_buffer_bytes: 8,
-            max_buffer_bytes: 8 * 1024 * 1024,
+            window_bytes: 8 * 1024 * 1024,
         };
         let (source, writer) = BufferedMediaSource::new_seekable(config, Some(64 * 1024 * 1024));
         writer.push_chunk(&[0u8; 1024]).unwrap();
@@ -2279,6 +2545,13 @@ mod buffer_behaviour_tests {
             let mut pos = plan.offset;
 
             while pos < end {
+                // The real feeder parks here too, in the same `select!` that
+                // honours a range request.
+                writer.wait_for_space().await;
+                if let Some(next) = writer.take_request() {
+                    plan = next;
+                    continue 'bodies;
+                }
                 let n = chunk.min((end - pos) as usize);
                 if writer.push_chunk(&track_bytes(pos, n)).is_err() {
                     return;
@@ -2335,7 +2608,7 @@ mod buffer_behaviour_tests {
     fn config(initial: usize) -> StreamingConfig {
         StreamingConfig {
             initial_buffer_bytes: initial,
-            max_buffer_bytes: 100 * MB,
+            window_bytes: 100 * MB,
         }
     }
 
@@ -2368,21 +2641,28 @@ mod buffer_behaviour_tests {
         assert_eq!(log.bodies(), 1, "one body, no seeks");
     }
 
-    /// CHARACTERISATION, not an endorsement: today the buffer holds the whole
-    /// track.
+    /// THE BOUND. A feeder running flat out against a reader that has barely
+    /// started holds the window, not the track.
     ///
-    /// The feeder runs flat out while the reader is paced, which is the real
-    /// ratio (measured 4.5 MB/s of link against ~0.26 MB/s of 24/96 playback).
-    /// Nothing bounds the distance between them, so everything the feeder
-    /// fetched is still resident when the reader is barely started.
+    /// This is the ratio that matters on a Pi: the link measured 4.5 MB/s
+    /// against ~0.26 MB/s of 24/96 playback, so without a bound on arrival the
+    /// whole compressed track — 120-220 MB at Hi-Res — is resident within
+    /// seconds. This test used to assert exactly that, as a characterisation
+    /// of the unbounded buffer; it now asserts the opposite.
     ///
-    /// This test is expected to CHANGE when the bounded window lands — it is
-    /// here so that change is visible in a diff rather than silent.
+    /// The slack above the window is the header pin plus one chunk: the feeder
+    /// checks before pushing, so it may always overshoot by the chunk it was
+    /// already committed to.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn today_the_buffer_grows_to_the_whole_track() {
-        const TOTAL: u64 = 4 * MB as u64;
+    async fn the_buffer_holds_the_window_not_the_track() {
+        const TOTAL: u64 = 16 * MB as u64;
+        const WINDOW: usize = MB;
         let log = Arc::new(FeedLog::default());
-        let (source, writer) = BufferedMediaSource::new_seekable(config(64 * KB), Some(TOTAL));
+        let cfg = StreamingConfig {
+            initial_buffer_bytes: 64 * KB,
+            window_bytes: WINDOW,
+        };
+        let (source, writer) = BufferedMediaSource::new_seekable(cfg, Some(TOTAL));
         let source = Arc::new(source);
         let mut reader = source.create_reader();
 
@@ -2395,13 +2675,19 @@ mod buffer_behaviour_tests {
         })
         .await
         .expect("reader thread");
-        feeder.await.expect("feeder task");
+
+        // Give a runaway feeder every chance to prove it is one.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let held = log.peak_held();
+        feeder.abort();
 
         assert!(
-            log.peak_held() > TOTAL * 3 / 4,
-            "held {} of a {} byte track — the buffer is unbounded today",
-            log.peak_held(),
-            TOTAL
+            held <= (WINDOW as u64) + HEADER_PIN_BYTES + 64 * KB as u64,
+            "held {held} against a {WINDOW} byte window — the feeder did not park"
+        );
+        assert!(
+            held < TOTAL / 4,
+            "held {held} of a {TOTAL} byte track — this is the unbounded case"
         );
     }
 

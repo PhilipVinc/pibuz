@@ -72,6 +72,7 @@ const KEY_TABLE: &[(&str, ApplyClass)] = &[
     // --- audio (Reload) -----------------------------------------------------
     ("audio.stream_first_track", ApplyClass::Reload),
     ("audio.stream_buffer_seconds", ApplyClass::Reload),
+    ("audio.stream_window_seconds", ApplyClass::Reload),
     ("audio.streaming_only", ApplyClass::Reload),
     // Read once when the player builds its cache, so neither Reinit nor Reload
     // picks it up — it takes effect on the next daemon start.
@@ -424,6 +425,22 @@ fn parse_memory_cache_mb(v: &str) -> Result<u16, String> {
     Ok(n)
 }
 
+/// Seconds of compressed audio the downloader may run ahead of playback.
+///
+/// Floor of 2 because a single WiFi hiccup empties anything shorter; ceiling
+/// of 60 because past a minute it is not a window, it is the old unbounded
+/// buffer with extra steps.
+fn parse_stream_window_seconds(v: &str) -> Result<u8, String> {
+    let n: u8 = v
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid window '{v}' — expected 2-60"))?;
+    if !(2..=60).contains(&n) {
+        return Err(format!("invalid window '{n}' — expected 2-60"));
+    }
+    Ok(n)
+}
+
 fn parse_stream_buffer_seconds(v: &str) -> Result<u8, String> {
     let n: u8 = v
         .trim()
@@ -502,6 +519,7 @@ fn read_all(roots: &ProfileRoots) -> Result<Vec<(&'static str, String)>, String>
             "audio.device_max_sample_rate" => render_opt_u32(audio.device_max_sample_rate),
             "audio.stream_first_track" => render_bool(audio.stream_first_track),
             "audio.stream_buffer_seconds" => audio.stream_buffer_seconds.to_string(),
+            "audio.stream_window_seconds" => audio.stream_window_seconds.to_string(),
             "audio.streaming_only" => render_bool(audio.streaming_only),
             "audio.memory_cache_mb" => {
                 if audio.memory_cache_mb == 0 {
@@ -693,6 +711,13 @@ pub(crate) fn write_one(
             open_audio(roots)
                 .map_err(SetError::Io)?
                 .set_stream_buffer_seconds(v)
+                .map_err(SetError::Io)?
+        }
+        "audio.stream_window_seconds" => {
+            let v = parse_stream_window_seconds(raw).map_err(SetError::Usage)?;
+            open_audio(roots)
+                .map_err(SetError::Io)?
+                .set_stream_window_seconds(v)
                 .map_err(SetError::Io)?
         }
         "audio.streaming_only" => {
@@ -1815,6 +1840,14 @@ mod tests {
         assert_eq!(parse_opt_u32("none"), Ok(None));
         assert_eq!(parse_opt_u32("192000"), Ok(Some(192_000)));
         assert!(parse_opt_u32("loud").is_err());
+    }
+
+    #[test]
+    fn parse_stream_window_seconds_enforces_2_to_60() {
+        assert_eq!(parse_stream_window_seconds("8"), Ok(8));
+        assert_eq!(parse_stream_window_seconds("60"), Ok(60));
+        assert!(parse_stream_window_seconds("1").is_err());
+        assert!(parse_stream_window_seconds("61").is_err());
     }
 
     #[test]

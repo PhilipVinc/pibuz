@@ -266,9 +266,14 @@ pub async fn download_and_stream_remote_track(
     };
     let writer = &guard.writer;
 
+    // `read_timeout`, NOT `timeout`. reqwest's `timeout` is a TOTAL deadline
+    // covering the streamed body, and the buffer window now rate-matches the
+    // download to playback — so a five-minute track takes five minutes and a
+    // total deadline severs every one of them. What we actually want to catch
+    // is a stall, which is what a read timeout measures.
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(300))
+        .read_timeout(Duration::from_secs(60))
         .build()
         .map_err(|err| format!("create remote streaming client: {err}"))?;
 
@@ -346,6 +351,22 @@ pub async fn download_and_stream_remote_track(
         let mut stream = response.bytes_stream();
 
         let body_end = loop {
+            // Park while the window is full. The body stays open and TCP's
+            // receive window closes, so the CDN throttles itself — holding the
+            // connection rather than re-opening at the new offset, because a
+            // cold offset on this CDN has measured ~5 s of time-to-first-byte
+            // against 150 ms for a warm connection. A seek still wins: it is
+            // the biased branch.
+            tokio::select! {
+                biased;
+                _ = writer.request_notified() => {
+                    if let Some(next) = writer.take_request() {
+                        break BodyEnd::Restart(next);
+                    }
+                }
+                _ = writer.wait_for_space() => {}
+            }
+
             let chunk = tokio::select! {
                 biased;
                 // A reader jumped. Honor it now rather than after the next
