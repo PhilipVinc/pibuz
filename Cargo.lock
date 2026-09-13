@@ -2857,6 +2857,7 @@ dependencies = [
  "dirs 6.0.0",
  "log",
  "qbz-audio",
+ "qbz-cache",
  "qbz-core",
  "qbz-models",
  "qbz-player",

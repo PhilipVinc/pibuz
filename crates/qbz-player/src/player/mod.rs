@@ -599,6 +599,69 @@ fn release_streaming_source(slot: &mut Option<Arc<BufferedMediaSource>>) {
     }
 }
 
+/// Whether a fully-buffered streaming track should be COPIED out of its
+/// streaming buffer into an owned `TrackBytes` for the cached-transition path.
+///
+/// The copy buys an instant seek and an instant gapless hand-off, at the price
+/// of holding both copies of the track for the seconds it takes. That is a fair
+/// trade on a desktop and a fatal one on a 1 GB Pi, where both copies of a
+/// 200 MB+ Hi-Res track are resident at once — and the buffer already held
+/// serves resume and seek perfectly well.
+///
+/// A named function rather than an expression inline in the audio thread, for
+/// the same reason `release_finished_track_on` takes its class: the decision is
+/// a policy worth stating and asserting, and inside the thread it is reachable
+/// only by running the thread on a host with the right amount of RAM.
+fn should_promote_streaming_buffer(class: qbz_models::system_capabilities::MemoryClass) -> bool {
+    class != qbz_models::system_capabilities::MemoryClass::LowMemory
+}
+
+/// Whether to prefetch the next track for a gapless hand-off.
+///
+/// Two independent answers have to agree, and they mean different things. The
+/// USER's `gapless_enabled` is a preference. The HOST's `allow_gapless_prefetch`
+/// is a floor, and it is not overridable by the preference: a prefetch is a
+/// whole extra track allocated in RAM beside the one playing, and a board that
+/// cannot afford one does not get slow, it dies. See `GAPLESS_MIN_TOTAL_KB`.
+///
+/// Both halves are well covered on their own — `MemoryProfile::from_total_kb`
+/// pins the floor per board size, and `should_arm_prefetch` takes the result as
+/// a parameter — but their composition lived inline in the audio thread, where
+/// the only way to reach it was to run the thread on a host with the right
+/// amount of RAM. Which direction the AND falls is exactly the thing worth
+/// getting right: the wrong one silently turns gapless off for everybody, or
+/// silently turns it on for the boards it kills.
+fn gapless_prefetch_allowed(user_enabled: bool, host_allows: bool) -> bool {
+    user_enabled && host_allows
+}
+
+/// The finished-track release policy, over a cache rather than over a `Player`.
+///
+/// Separated from [`Player::release_finished_track_on`] so the policy can be
+/// driven over a real [`qbz_cache::AudioCache`] without constructing a `Player`
+/// — which spawns an audio thread and needs a real output device, and so cannot
+/// appear in a test of what stays resident across a playlist.
+///
+/// On a **low-memory** host the bytes go at the transition: the track just
+/// finished (~100 MB at Hi-Res) would otherwise sit beside the one now playing
+/// AND the gapless prefetch, which is the shape that had qbzd at 465 MB RSS on
+/// a 905 MB box. It is quality-neutral — the bytes land in the L2 disk cache, so
+/// a back-skip re-reads them from there instead of the network.
+///
+/// On a **normal** host there is nothing to gain: keeping them means an instant
+/// back-skip, and LRU evicts them the moment something else needs the room.
+pub fn release_finished_track_from(
+    cache: &qbz_cache::AudioCache,
+    track_id: u64,
+    class: qbz_models::system_capabilities::MemoryClass,
+) -> bool {
+    if class != qbz_models::system_capabilities::MemoryClass::LowMemory {
+        log::debug!("Keeping finished track {track_id} in the memory cache ({class:?} host)");
+        return false;
+    }
+    cache.release(track_id)
+}
+
 fn begin_new_track(
     thread_state: &SharedState,
     gapless_pending: &mut Option<GaplessPending>,
@@ -4210,10 +4273,9 @@ impl Player {
                                         // The buffer we already hold serves resume and
                                         // seek perfectly well, so on a low-memory host
                                         // we keep it and skip the copy entirely.
-                                        let profile =
-                                            qbz_models::system_capabilities::memory_profile();
-                                        let promote = profile.class
-                                            != qbz_models::system_capabilities::MemoryClass::LowMemory;
+                                        let promote = should_promote_streaming_buffer(
+                                            qbz_models::system_capabilities::memory_profile().class,
+                                        );
                                         if promote {
                                             // Only drop the buffer once something
                                             // has replaced it.
@@ -4489,13 +4551,15 @@ impl Player {
                                 // whole extra track allocated in RAM, and a
                                 // board that cannot afford one is not slow, it
                                 // is dead. See `GAPLESS_MIN_TOTAL_KB`.
-                                let gapless_enabled = thread_settings
-                                    .lock()
-                                    .ok()
-                                    .map(|s| s.gapless_enabled)
-                                    .unwrap_or(false)
-                                    && qbz_models::system_capabilities::memory_profile()
-                                        .allow_gapless_prefetch;
+                                let gapless_enabled = gapless_prefetch_allowed(
+                                    thread_settings
+                                        .lock()
+                                        .ok()
+                                        .map(|s| s.gapless_enabled)
+                                        .unwrap_or(false),
+                                    qbz_models::system_capabilities::memory_profile()
+                                        .allow_gapless_prefetch,
+                                );
                                 if should_arm_prefetch(
                                     gapless_enabled,
                                     transition_consumed_pending,
@@ -5256,16 +5320,26 @@ impl Player {
 
         // Try CMAF full download first (Akamai CDN), legacy full download
         // as fallback (nginx CDN).
-        let result = match qbz_qobuz::cmaf::download_full(client, track_id, quality).await {
-            Ok(data) => Ok(data),
-            Err(e) => {
-                log::warn!("[PREFETCH] CMAF failed for track {track_id}: {e}, trying legacy");
-                match client.get_stream_url_with_fallback(track_id, quality).await {
-                    Ok(stream_url) => self.download_audio(&stream_url.url).await,
-                    Err(e) => Err(format!("Failed to get stream URL: {e}")),
+        let result: Result<TrackBytes, String> =
+            match qbz_qobuz::cmaf::download_full(client, track_id, quality).await {
+                // Already the allocation the cache will share — assembled there
+                // segment by segment, so the track is never resident twice.
+                Ok(data) => Ok(data),
+                Err(e) => {
+                    log::warn!("[PREFETCH] CMAF failed for track {track_id}: {e}, trying legacy");
+                    match client.get_stream_url_with_fallback(track_id, quality).await {
+                        // The legacy nginx path streams into a `Vec` without
+                        // knowing the length up front, so this one still pays
+                        // for a copy on the way into the cache. It is the
+                        // fallback, not the path a healthy prefetch takes.
+                        Ok(stream_url) => self
+                            .download_audio(&stream_url.url)
+                            .await
+                            .map(TrackBytes::from),
+                        Err(e) => Err(format!("Failed to get stream URL: {e}")),
+                    }
                 }
-            }
-        };
+            };
 
         match result {
             Ok(data) => {
@@ -5310,16 +5384,26 @@ impl Player {
     /// Returns whether the bytes were actually released.
     pub fn release_finished_track(&self, track_id: u64) -> bool {
         let profile = qbz_models::system_capabilities::memory_profile();
-        if profile.class != qbz_models::system_capabilities::MemoryClass::LowMemory {
-            log::debug!(
-                "Keeping finished track {} in the memory cache ({:?} host, {} MB RAM)",
-                track_id,
-                profile.class,
-                profile.mem_total_kb / 1024
-            );
-            return false;
-        }
-        self.audio_cache.release(track_id)
+        self.release_finished_track_on(track_id, profile.class)
+    }
+
+    /// [`Self::release_finished_track`] with the host class stated instead of
+    /// detected.
+    ///
+    /// The class is an argument rather than a lookup because
+    /// [`qbz_models::system_capabilities::memory_profile`] is a process-wide
+    /// `OnceLock` resolved from the host's RAM. Every dev machine and every CI
+    /// runner resolves to `Normal`, so a test calling the detecting version
+    /// exercises the branch that does NOTHING — and the branch the Pi actually
+    /// runs, the one this whole function exists for, is unreachable. A settable
+    /// global would not fix that either: the cases run in one process, so
+    /// whichever test set it first would decide for all of them.
+    pub fn release_finished_track_on(
+        &self,
+        track_id: u64,
+        class: qbz_models::system_capabilities::MemoryClass,
+    ) -> bool {
+        release_finished_track_from(&self.audio_cache, track_id, class)
     }
 
     /// Fetch a track's audio bytes for a gapless handoff: L1 memory →
@@ -5397,7 +5481,9 @@ impl Player {
                 };
             }
             Ok(qbz_qobuz::DownloadedTrack::Memory(data)) => {
-                let bytes: TrackBytes = data.into();
+                // No conversion: the download assembled the track in the very
+                // allocation the cache and the audio thread go on to share.
+                let bytes: TrackBytes = data;
                 log::info!(
                     "[GAPLESS] Track {track_id} downloaded for gapless ({} bytes)",
                     bytes.len()
@@ -6922,5 +7008,48 @@ mod new_track_and_prefetch_tests {
             state.get_gapless_next_track_id(),
             true
         ));
+    }
+}
+
+/// The three memory policies that used to be inline lookups of a process-wide
+/// singleton, and so could only ever run one way in a test.
+///
+/// Each is a small boolean, and each decides something with no audible symptom
+/// when it goes the wrong way — which is exactly why they are worth pinning.
+#[cfg(test)]
+mod memory_policy_tests {
+    use qbz_models::system_capabilities::MemoryClass;
+
+    use super::{gapless_prefetch_allowed, should_promote_streaming_buffer};
+
+    /// The user's preference cannot switch the host floor off.
+    ///
+    /// A prefetch is a whole extra track in RAM beside the one playing. On a
+    /// board below the floor, honouring the preference does not make playback
+    /// worse, it makes it stop — so the AND has to fall this way and not the
+    /// other.
+    #[test]
+    fn gapless_needs_both_the_user_and_the_host_to_agree() {
+        assert!(gapless_prefetch_allowed(true, true));
+        assert!(
+            !gapless_prefetch_allowed(true, false),
+            "a small board must win over the setting"
+        );
+        assert!(
+            !gapless_prefetch_allowed(false, true),
+            "a host that CAN prefetch must still respect the user turning it off"
+        );
+        assert!(!gapless_prefetch_allowed(false, false));
+    }
+
+    /// Copying a fully-buffered track out of its streaming buffer buys an
+    /// instant seek, at the price of holding both copies while it happens. That
+    /// is a fair trade on a desktop and a fatal one on a 1 GB Pi, where a
+    /// Hi-Res track is 200 MB+ and the buffer already held serves seek and
+    /// resume perfectly well.
+    #[test]
+    fn the_streaming_buffer_is_promoted_only_where_a_second_copy_is_affordable() {
+        assert!(should_promote_streaming_buffer(MemoryClass::Normal));
+        assert!(!should_promote_streaming_buffer(MemoryClass::LowMemory));
     }
 }

@@ -136,6 +136,101 @@ fails the track loudly, by comparing each decrypted segment against the length
 the table declared; a silent mismatch would serve audio at offsets it does not
 belong to, which decodes as noise rather than as an error.
 
+## The controller-sync tests
+
+`crates/qconnect-app/src/controller_harness.rs` puts a scripted phone in a test.
+A `VirtualController` expands gestures (`tap_pause`, `drag_seek`,
+`push_queue_and_play`) into the exact inbound frames the cloud sends for them; a
+`FakeCloud` relays them, folds the renderer's reports into the screen it would
+push back, and ECHOES each state report at the renderer the way the real cloud
+does; a `ControllerView` models the screen, where `Buffering` is a spinner and
+`total_ms: None` is a blanked progress bar. Under it runs the real `QconnectApp`,
+the real `qconnect_app::renderer` orchestration, and a `FakeEngine` that MODELS
+the player rather than canning answers. Cases live in `controller_sync_tests.rs`;
+the suite is 0.01 s: `cargo test -p qconnect-app controller_sync`.
+
+**Same discipline as the audio tests: a bug seen on a phone gets a case here
+BEFORE it is fixed.** Assert against the SCREEN, not against protocol fields —
+the screen is what was wrong every time. The shared invariants in
+`assert_invariants` (the progress display never blanks, the echo never reaches
+the player, the cursor names the audible track, one gesture is not a report
+storm) are checked by every case, so a rule added for one bug catches the next
+one for free.
+
+Three traps, each of which silently walked the happy path until a mutation
+exposed it:
+- **Call `let_the_load_windows_expire()`** unless the case is about those
+  windows. The 5 s load-dedup and 1.5 s handoff-echo windows both hang off one
+  wall-clock `Instant`, so a microsecond-long test sits inside BOTH: every pause
+  is swallowed as a peer echo and every load is deduped away.
+- **`make_the_audio_thread_lag()`** for anything about a load in flight. By
+  default the fake adopts a track the instant the stream opens; the real audio
+  thread adopts it only once it has samples, and several guards exist ONLY for
+  that gap.
+- The fake's queue must hold the REAL tracks. `align_queue_cursor` looks the
+  target up in it, so placeholder ids send it down the "not in queue" fallback
+  every time and hide every cursor bug behind harness noise.
+
+What it cannot reach: the daemon's own report loop (`qbzd::qconnect::report`),
+which is where `buffer_state` is decided and where the periodic position reports
+come from — so spinner LIFETIMES are out of scope. It is monomorphic on
+`NativeWsTransport` + `AppRuntime` (`DaemonQconnectApp`, `DaemonEventSink`,
+`DaemonRendererEngine`); making those generic over transport and engine is what
+would let this harness mount the daemon's own sink instead of a copy of its
+shape. The daemon-side volume policy (`VolumeMode::Locked`) is in the same
+position: its arithmetic is unit-tested, its behaviour is not reachable here.
+
+## The residency tests, and the profile trap
+
+`crates/qbz-app/src/playback_driver.rs` → `mod residency_session_tests` drives
+the real `plan_tick`/`advance_state` over a real `qbz_cache::AudioCache` for a
+twenty-track gapless playlist and samples residency at EVERY tick. It exists
+because the two unit tests either side of it — `plan_tick` emits
+`ReleaseCachedTrack`, `AudioCache::release` frees one track — both pass while the
+daemon still swaps: the question the Pi asks is how many tracks are resident at
+once, twenty tracks in, and that is a property of the two composed over time.
+
+**`memory_profile()` is a process-wide `OnceLock` resolved from the host's RAM,
+and it gates four production behaviours.** Anything that calls it in a test gets
+`Normal` on every dev machine and every CI runner — so the branch the Pi actually
+runs is the one that never executes. Do not reach for a settable global: the
+cases share a process, so whichever test set it first would decide for all of
+them. Pass the class instead, as `release_finished_track_on` /
+`release_finished_track_from` and `should_promote_streaming_buffer` now do.
+
+The ring depth is NOT one of these, despite reading the same singleton: the
+sizing lives in the pure `qbz_audio::pcm_ring::ring_capacity_frames`, which takes
+both the override and the profile's seconds as arguments, and
+`auto_takes_the_hosts_profile` already pins 6 s for a Normal board and 2 s for a
+low-memory one. Running the ENGINE at 2 s would test no new logic — the fill,
+drain and boundary handling are depth-independent; what a shallower ring changes
+is how long the decoder may stall before the ring runs dry, and no test can
+settle that honestly, because it depends on real decode speed and real I/O.
+Both remaining singleton reads are named functions now — `gapless_prefetch_allowed`
+and `should_promote_streaming_buffer` — so the policies are tested even though the
+lookup still happens at the call site.
+
+Assert `Arc::strong_count`, not just byte totals. A residency leak here IS one
+extra live `TrackBytes` clone, so "the release dropped the last reference" is a
+discrete assertion where "peak bytes ≤ budget" is an inequality with slack that
+mutations walk straight through.
+
+What was deliberately NOT built, after an adversarial review of the design:
+- **A counting `#[global_allocator]`.** It cannot be isolated — the target that
+  would host it (`crates/qbz-player/tests/`) cannot see `playback_engine`, which
+  is a private module — it perturbs what it measures through `realloc`, and its
+  size-class histogram cannot establish provenance: on the CMAF path the
+  prefetch `Vec` and the cache `Arc` are the same size class, 16 bytes apart.
+- **A manually-advanced `VirtualAudioOut`.** "Settle until the device holds `n`
+  frames" is unsatisfiable above `buffer_frames` (`accept` blocks there), hangs
+  `drain`'s 5 s deadline at every track boundary, and has no observable
+  termination condition. It would not buy determinism anyway while the engine's
+  five wall-clock timeouts (`WRITER_START_ON_IDLE`, `WRITER_PRIME_DEADLINE`,
+  `DECODER_SPACE_WAIT`, the 100 ms source wait, `EXIT_GRACE`) still run on real
+  time. Making those test-settable is the cheaper change if flaky underrun
+  assertions become a problem.
+
+
 ## Formatting and lints
 
 Run `cargo fmt --all`; the tree is rustfmt-clean and CI checks it.

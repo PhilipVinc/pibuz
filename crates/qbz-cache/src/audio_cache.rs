@@ -369,3 +369,70 @@ mod tests {
         assert_eq!(cache.stats().current_size_bytes, 0);
     }
 }
+
+#[cfg(test)]
+mod residency_tests {
+    use super::*;
+
+    /// Handing the cache a `Vec` COPIES it, so for an instant both copies of a
+    /// Hi-Res FLAC are resident.
+    ///
+    /// `TrackBytes` is `Arc<[u8]>`, which carries a refcount header ahead of the
+    /// bytes, so it cannot adopt a `Vec`'s allocation — `Arc::from(vec)` always
+    /// allocates and copies. A 60-170 MB track handed over as a `Vec` therefore
+    /// costs 2x for the length of the copy, on boards with 512-905 MB of RAM,
+    /// while the track now playing is also resident.
+    ///
+    /// This is why the CMAF download assembles straight into an `Arc` (see
+    /// `qbz_qobuz::cmaf::ArcSlab`) instead of growing a `Vec` and converting.
+    /// The remaining `Vec` caller is the legacy nginx fallback, which streams
+    /// without knowing the length up front.
+    ///
+    /// Asserted as a POINTER inequality rather than measured with a counting
+    /// allocator on purpose: the fact is discrete and the test is exact, where a
+    /// peak-bytes measurement would be at the mercy of the allocator's `realloc`
+    /// behaviour and of whatever else the test binary is doing on another
+    /// thread.
+    #[test]
+    fn handing_the_cache_a_vec_copies_it_rather_than_adopting_the_buffer() {
+        let cache = AudioCache::new(64 * 1024 * 1024);
+
+        let downloaded = vec![7u8; 4 * 1024 * 1024];
+        let downloaded_ptr = downloaded.as_ptr();
+        cache.insert(42, downloaded);
+
+        let cached = cache.get(42).expect("just inserted").data;
+        assert_ne!(
+            cached.as_ptr(),
+            downloaded_ptr,
+            "if these ever match, Arc has learned to adopt a Vec's allocation \
+             and the transient double is gone — update the comment above"
+        );
+        assert_eq!(cached.len(), 4 * 1024 * 1024);
+        assert_eq!(cached[0], 7);
+    }
+
+    /// A track already held as `TrackBytes` is inserted by refcount bump, with
+    /// no copy at all.
+    ///
+    /// This is the other half of the story and the reason the type exists: the
+    /// gapless path hands the SAME `Arc` to the cache, the audio thread and the
+    /// decoder, and only the first of those ever paid for a copy. A change that
+    /// made `insert` take bytes by value would silently reintroduce three
+    /// resident copies of every track — the shape that put a 1 GB Pi into swap.
+    #[test]
+    fn inserting_bytes_already_shared_costs_no_copy() {
+        let cache = AudioCache::new(64 * 1024 * 1024);
+
+        let shared: TrackBytes = Arc::from(vec![3u8; 1024 * 1024]);
+        let shared_ptr = shared.as_ptr();
+        cache.insert(99, shared.clone());
+
+        let cached = cache.get(99).expect("just inserted").data;
+        assert_eq!(
+            cached.as_ptr(),
+            shared_ptr,
+            "handing the cache an Arc it can share must not copy the track"
+        );
+    }
+}

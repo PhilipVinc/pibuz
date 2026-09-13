@@ -7,6 +7,7 @@ repository.workspace = true
 
 [dependencies]
 qbz-models = { path = "../qbz-models" }
+qbz-cache = { path = "../qbz-cache" }
 qbz-audio = { path = "../qbz-audio" }
 qbz-player = { path = "../qbz-player" }
 qbz-core = { path = "../qbz-core" }

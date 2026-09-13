@@ -576,6 +576,29 @@ pub async fn apply_renderer_command(
                 let position_is_for_another_track = current_track
                     .as_ref()
                     .is_some_and(|cmd_track| cmd_track.track_id != playback_state.track_id);
+                // ...with one exception, and it is the same mistake one level
+                // down. A state-only frame that names no position either (a bare
+                // pause or resume) has its position filled in from the cloud's
+                // CACHED renderer state — and that cached pair, position and
+                // track, describes whatever the cloud last heard about. A
+                // gapless hand-off happens inside the player with no command and
+                // no report around it, so for the ~450 ms until the driver's
+                // track-change ReportEdge lands, the cache names the track that
+                // just FINISHED. Seeking the new track to the old one's position
+                // throws the listener to a spot in the song they never chose —
+                // near its end if the previous track ran out, back to the start
+                // if it did not.
+                //
+                // The `> 2` margin below cannot absorb this the way it absorbs
+                // the ordinary ~1.8 s report cadence: at a hand-off the cached
+                // position and the live one are a whole track apart.
+                let position_came_from_the_cache =
+                    current_position_ms.is_none() && current_track.is_none();
+                let cached_position_is_for_another_track = position_came_from_the_cache
+                    && renderer_state
+                        .current_track
+                        .as_ref()
+                        .is_some_and(|cached| cached.track_id != playback_state.track_id);
                 if redundant_after_load {
                     log::info!(
                         "[QConnect] SetState seek skipped: stream already started at {target_secs}s"
@@ -584,6 +607,16 @@ pub async fn apply_renderer_command(
                     log::info!(
                         "[QConnect] SetState seek skipped: target {target_secs}s belongs to track {}, engine is on {} at {current_pos_secs}s",
                         current_track.as_ref().map(|t| t.track_id).unwrap_or(0),
+                        playback_state.track_id
+                    );
+                } else if cached_position_is_for_another_track {
+                    log::info!(
+                        "[QConnect] SetState seek skipped: cached {target_secs}s belongs to track {}, engine is on {} at {current_pos_secs}s",
+                        renderer_state
+                            .current_track
+                            .as_ref()
+                            .map(|t| t.track_id)
+                            .unwrap_or(0),
                         playback_state.track_id
                     );
                 } else if !is_echo_reset && current_pos_secs.abs_diff(target_secs) > 2 {

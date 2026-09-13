@@ -2210,6 +2210,96 @@ mod tests {
         assert!(msg.contains("cdn failed"), "{msg}");
     }
 
+    /// `abandon` wakes a reader that is blocked waiting for bytes, and does it
+    /// as a clean EOF rather than an error.
+    ///
+    /// This is the mechanism behind `release_streaming_source`, which is called
+    /// from eleven places in the audio thread and, until now, from no test at
+    /// all. A decoder abandoned by a stop that timed out otherwise sits in this
+    /// wait for as long as the download takes, holding the boxed source and the
+    /// whole track's buffer — 120-220 MB at Hi-Res — for the life of the
+    /// process. Clearing the slot cannot do it: the `Arc` is shared, and the
+    /// last reference is the wedged thread's.
+    ///
+    /// EOF and not an error is the load-bearing part. Symphonia turns a
+    /// zero-length read into end-of-stream, the decode loop marks itself
+    /// finished and unwinds; an `Err` would surface to the user as a playback
+    /// failure for a track they had already moved on from.
+    #[test]
+    fn abandon_wakes_a_blocked_reader_with_eof_so_its_thread_can_exit() {
+        let config = StreamingConfig {
+            initial_buffer_bytes: 4,
+            window_bytes: DEFAULT_WINDOW_BYTES,
+        };
+        // A total size well past what is ever fed, so the reader cannot reach
+        // EOF on its own and must be woken.
+        let (source, writer) = BufferedMediaSource::new(config, Some(4096));
+        writer.push_chunk(b"head").unwrap();
+
+        // Mint the reader the way the audio thread does — `create_reader` is
+        // what symphonia is handed — and keep the original as the handle the
+        // slot holds, so the wake goes through the real `abandon`.
+        //
+        // The result comes back over a channel rather than from `join`, because
+        // the failure this guards against is a reader that never wakes: a
+        // `join` would hang the test binary for ever instead of failing it, and
+        // a suite that hangs on a regression is barely better than one that
+        // misses it.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let mut reader_source = source.create_reader();
+        let reader = thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            // Consume what is there, then block for bytes that never come.
+            let first = reader_source.read(&mut buf).unwrap();
+            let second = reader_source.read(&mut buf).unwrap();
+            let _ = done_tx.send((first, second));
+        });
+
+        // Give the reader time to get into the wait, and confirm it really is
+        // stuck: a test that abandoned before the reader blocked would pass
+        // without ever exercising the wake.
+        thread::sleep(Duration::from_millis(100));
+        assert!(
+            !reader.is_finished(),
+            "the reader should still be waiting for bytes at this point"
+        );
+
+        source.abandon();
+
+        let (first, second) = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("abandon must wake the blocked reader — it is still waiting");
+        reader.join().expect("the reader thread must unwind");
+        assert_eq!(first, 4, "the buffered head is read normally");
+        assert_eq!(
+            second, 0,
+            "the blocked read must come back as EOF, not as an error and not \
+             at all"
+        );
+    }
+
+    /// The same wake, through the public door the audio thread uses.
+    #[test]
+    fn release_of_a_streaming_source_abandons_it() {
+        let config = StreamingConfig {
+            initial_buffer_bytes: 4,
+            window_bytes: DEFAULT_WINDOW_BYTES,
+        };
+        let (source, writer) = BufferedMediaSource::new(config, Some(4096));
+        writer.push_chunk(b"head").unwrap();
+        let source = Arc::new(source);
+
+        let mut slot = Some(Arc::clone(&source));
+        crate::player::release_streaming_source(&mut slot);
+
+        assert!(slot.is_none(), "the slot is cleared");
+        assert!(
+            source.shared.abandoned.load(Ordering::SeqCst),
+            "and the source is marked abandoned, so any reader blocked on it \
+             wakes instead of holding the track's buffer for ever"
+        );
+    }
+
     // --- Range requests -----------------------------------------------------
 
     /// An open-ended plan, the shape a live body always has.
