@@ -455,14 +455,38 @@ impl QconnectRendererEngine for DaemonRendererEngine {
         // the card. The L2 directory on the test Pi was empty for exactly this
         // reason.
         //
-        // Done before `abort_current_feeder` and before the buffering latch is
-        // armed: a cache hit is audible almost immediately and has no feeder,
-        // so neither is needed. `Loading` has already been emitted above, which
-        // is what frees the card on moOde, and that must still happen.
+        // `Loading` has already been emitted above, which is what frees the card
+        // on moOde, and that must still happen before either path.
         {
             let player = self.core().player();
             if player.play_cached_if_present(track_id, quality, start_position_secs) {
                 self.abort_current_feeder();
+
+                // Arm the latch here TOO, not just on the streaming path.
+                //
+                // An earlier version of this skipped it, reasoning that a cache
+                // hit is audible almost immediately and has no feeder to wait
+                // for. Both are true and neither is what the latch is for: it
+                // stops the report scheduler publishing the state of the track
+                // we are leaving while the audio thread is still changing over.
+                // Without it, a correct report naming the new track was followed
+                // 27 ms later by a stale one naming the OLD track as stopped —
+                //
+                //   21:37:37.223  Track 74936706 served from the cache
+                //   21:37:37.223  report: track=(74936706, 7)
+                //   21:37:37.250  report: track=(208204223, 0) playing=Some(0)
+                //
+                // — so the controller drew the previous track's cover over the
+                // new one and corrected itself a moment later. Reported as
+                // artwork flicking to the wrong song when jumping back a few
+                // tracks in the queue, which is exactly when the cache hits.
+                //
+                // It clears on the audible edge like any other, which for a
+                // cache hit is the next few milliseconds.
+                self.buffering
+                    .begin(track_id, start_position_secs, duration_secs);
+                self.report_notify.notify_one();
+
                 log::info!("[QConnect] Track {track_id} served from the cache — no stream needed");
                 return Ok(());
             }
@@ -611,6 +635,65 @@ async fn download_remote_audio(url: &str) -> Result<Vec<u8>, String> {
 // two enforcement points of the software|locked contract.
 #[cfg(test)]
 mod tests {
+
+    /// THE ARTWORK FLICKER. While a track change is in progress the audio
+    /// thread still reports the track being LEFT, and the latch is what stops
+    /// that reaching the controller as the current state.
+    ///
+    /// Observed after a cache hit, where the latch had not been armed: a
+    /// correct report naming the new track, then 27 ms later a stale one
+    /// naming the old track as stopped, so the controller drew the previous
+    /// cover over the new one.
+    ///
+    ///   21:37:37.223  Track 74936706 served from the cache
+    ///   21:37:37.223  report: track=(74936706, 7)
+    ///   21:37:37.250  report: track=(208204223, 0) playing=Some(0)
+    #[test]
+    fn the_outgoing_tracks_state_does_not_clear_the_latch() {
+        const LEAVING: u64 = 208204223;
+        const ARRIVING: u64 = 74936706;
+
+        let latch = BufferingLatch::default();
+        latch.begin(ARRIVING, 0, 300);
+
+        // What the audio thread reports mid-changeover: still the old track,
+        // stopped, at zero.
+        let held = latch.in_flight_with_state(LEAVING, 0, false);
+        assert_eq!(
+            held.map(|(id, _, _)| id),
+            Some(ARRIVING),
+            "a report for the track being left must not be taken for arrival"
+        );
+    }
+
+    /// And it must let go the moment the new track is actually audible, or the
+    /// latch becomes the 90-second spinner it was once blamed for.
+    #[test]
+    fn the_latch_clears_when_the_new_track_is_audible() {
+        const ARRIVING: u64 = 74936706;
+        let latch = BufferingLatch::default();
+        latch.begin(ARRIVING, 0, 300);
+        assert!(
+            latch.in_flight_with_state(ARRIVING, 1_000, true).is_none(),
+            "audio on the new track is arrival"
+        );
+    }
+
+    /// A load into a pause arrives too: a stopped clock can never climb past
+    /// its own offset, so without this the latch would hold until the backstop.
+    #[test]
+    fn a_load_that_arrives_into_a_pause_clears_the_latch() {
+        const ARRIVING: u64 = 74936706;
+        let latch = BufferingLatch::default();
+        latch.begin(ARRIVING, 51, 300);
+        assert!(
+            latch
+                .in_flight_with_state(ARRIVING, 51_000, false)
+                .is_none(),
+            "arriving into a pause at the requested offset is arrival"
+        );
+    }
+
     use super::*;
 
     #[test]
