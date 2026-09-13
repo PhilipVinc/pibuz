@@ -445,8 +445,18 @@ impl BufferState {
             // again. The feeder stays parked for exactly this.
             return self.segment_at(pos).is_none();
         }
+        // "Inbound" means the bytes are on their way: either still ahead of the
+        // write head, or behind it but delivered by the body in hand. The
+        // second half stops being true once the window starts discarding, and
+        // `trimmed_below` is where that line is — below it this body's output
+        // was thrown away and is never coming again, however close the head
+        // looks. Without the `max` a backward seek past the look-behind slack
+        // is read as "wait for it": no request is posted, the feeder is parked
+        // because the reader still appears to be ahead of it, and the two sit
+        // there. That is a HANG on a live seek, not a slow path.
+        let arriving_from = self.range_start.max(self.trimmed_below);
         let inbound =
-            pos >= self.range_start && pos <= self.write_pos.saturating_add(FORWARD_WAIT_BYTES);
+            pos >= arriving_from && pos <= self.write_pos.saturating_add(FORWARD_WAIT_BYTES);
         !inbound
     }
 
@@ -473,9 +483,18 @@ impl BufferState {
 
     /// Point the write head at `offset`: the feeder is about to push the
     /// body it opened there.
+    ///
+    /// Starting below the discard line moves that line down with it. Only a
+    /// reader's own range request can send a feeder there — `first_gap` never
+    /// looks below it — and once the feeder is on its way back for those bytes
+    /// they are no longer discarded, so leaving the line stale would keep
+    /// `should_request` posting the same request over a body already serving
+    /// it. The anti-refetch-loop property the line exists for is untouched:
+    /// nothing here lowers it on its own.
     fn begin(&mut self, offset: u64) {
         self.range_start = offset;
         self.write_pos = offset;
+        self.trimmed_below = self.trimmed_below.min(offset);
     }
 
     /// Buffered bytes sitting ahead of the reader that is actually consuming.
@@ -616,6 +635,25 @@ impl BufferState {
     fn head_run(&self) -> Option<&BufferSegment> {
         self.segments.first().filter(|seg| seg.offset == 0)
     }
+}
+
+/// Take the reader's pending request, unless the bytes it asked for have
+/// landed since it was posted.
+///
+/// A reader posts because it could not read. By the time a feeder polls, the
+/// byte may have arrived in the ordinary course of the download — the request
+/// was overtaken by the chunk that answered it — and honouring it would
+/// abandon a live body to go back for what is already held. Dropping it costs
+/// nothing: a reader that still cannot read asks again on its next wake.
+///
+/// This is the difference between "already produced" and "still there", and
+/// only the buffer knows it. A feeder trying to work it out from its own
+/// progress gets it wrong in exactly the case that matters: a window has
+/// discarded the bytes it produced earlier, so a request for them is a real
+/// re-fetch and not a stale echo.
+fn take_unsatisfied(state: &mut BufferState) -> Option<u64> {
+    let offset = state.pending_request.take()?;
+    state.segment_at(offset).is_none().then_some(offset)
 }
 
 /// Buffer plus the two wake-ups around it: `ready` for the synchronous
@@ -1236,7 +1274,7 @@ impl BufferWriter {
     /// already registered as the write head, so readers stop asking.
     pub fn take_request(&self) -> Option<FetchPlan> {
         let mut state = self.shared.state.lock().ok()?;
-        let offset = state.pending_request.take()?;
+        let offset = take_unsatisfied(&mut state)?;
         state.begin(offset);
         Some(FetchPlan { offset, end: None })
     }
@@ -1254,7 +1292,7 @@ impl BufferWriter {
         if state.readers == 0 || state.download_error.is_some() {
             return None;
         }
-        if let Some(offset) = state.pending_request.take() {
+        if let Some(offset) = take_unsatisfied(&mut state) {
             state.begin(offset);
             return Some(FetchPlan { offset, end: None });
         }
@@ -1335,7 +1373,7 @@ impl BufferWriter {
                 if state.readers == 0 || state.download_error.is_some() {
                     return None;
                 }
-                if let Some(offset) = state.pending_request.take() {
+                if let Some(offset) = take_unsatisfied(&mut state) {
                     state.begin(offset);
                     state.download_complete = false;
                     return Some(FetchPlan { offset, end: None });
@@ -3010,8 +3048,7 @@ mod buffer_behaviour_tests {
 
             let mut seg = resume.first_segment;
             while seg <= map.segment_count() {
-                let served = resume.first_segment..=seg;
-                match crate::player::cmaf_take_request(&writer, &map, served.clone(), at) {
+                match crate::player::cmaf_take_request(&writer, &map, seg, at) {
                     Ok(Some(next)) => {
                         plan = next;
                         continue 'plans;
@@ -3020,7 +3057,7 @@ mod buffer_behaviour_tests {
                     Err(_) => return,
                 }
                 writer.wait_for_space().await;
-                match crate::player::cmaf_take_request(&writer, &map, served, at) {
+                match crate::player::cmaf_take_request(&writer, &map, seg, at) {
                     Ok(Some(next)) => {
                         plan = next;
                         continue 'plans;
@@ -3053,7 +3090,13 @@ mod buffer_behaviour_tests {
 
             match writer.next_plan() {
                 Some(next) => plan = next,
-                None => return,
+                // Nothing left to fetch is not nothing left to serve: the
+                // window keeps a sliding piece, so the real feeder stays up to
+                // re-fetch a segment a reader jumps back into.
+                None => match writer.wait_for_request().await {
+                    Some(next) => plan = next,
+                    None => return,
+                },
             }
         }
     }
@@ -3081,6 +3124,11 @@ mod buffer_behaviour_tests {
         let read = tokio::task::spawn_blocking(move || drain_verifying(&mut reader, 0))
             .await
             .expect("reader thread");
+        // The feeder stays up to serve seeks while ANY reader lives, and the
+        // handle the readers were minted from counts. Releasing it is what the
+        // player does when the track is over, and it is what lets the feeder
+        // exit.
+        drop(source);
         feeder.await.expect("feeder task finished on its own");
 
         assert_eq!(read, total, "reader saw the whole assembled track");
@@ -3227,6 +3275,8 @@ mod buffer_behaviour_tests {
         })
         .await
         .expect("reader thread");
+        // See the baseline test: the feeder outlives the reader on purpose.
+        drop(source);
         feeder.await.expect("feeder task finished on its own");
 
         assert_eq!(read, total - TARGET, "the rest of the track was readable");
@@ -3241,5 +3291,71 @@ mod buffer_behaviour_tests {
             "fetched {} of a {total} byte track — the segment in flight was fetched twice",
             log.fetched()
         );
+    }
+
+    /// A backward seek into a region the window threw away is served, even
+    /// after every segment has already been fetched once.
+    ///
+    /// Two things have to hold for this, and neither is obvious. The feeder
+    /// must still be alive — `next_plan` saying "nothing left to fetch" is not
+    /// "nothing left to serve" once the buffer only keeps a sliding piece of
+    /// the track. And it has to come back at the SEGMENT boundary, because
+    /// that is the smallest thing it can decrypt; the byte feeder would simply
+    /// re-open at the offset.
+    ///
+    /// Bounded by a timeout, for the reason the header case is: the failure is
+    /// a hang on the condvar, waiting for bytes that nobody is going to send.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_backward_seek_into_a_trimmed_region_is_re_fetched() {
+        const SEG: usize = 128 * KB;
+        let map = segment_map(SEG, 64);
+        let total = map.total_len();
+        let log = Arc::new(FeedLog::default());
+        let cfg = StreamingConfig {
+            initial_buffer_bytes: 32 * KB,
+            window_bytes: 512 * KB,
+        };
+        let (source, writer) = BufferedMediaSource::new_seekable(cfg, Some(total));
+        let source = Arc::new(source);
+        let mut reader = source.create_reader();
+
+        let feeder = tokio::spawn(feed_cmaf(writer, map, None, log.clone()));
+
+        // Far enough that the trim has certainly dropped the early segments,
+        // and past the header pin so the target is a real re-fetch rather than
+        // the pinned head being served back.
+        let back_to = HEADER_PIN_BYTES + 64 * KB as u64;
+        let walked = (HEADER_PIN_BYTES + SEEK_LOOKBEHIND_BYTES + MB as u64) as usize;
+        let replay = tokio::task::spawn_blocking(move || {
+            let mut buf = vec![0u8; 64 * KB];
+            let mut done = 0usize;
+            while done < walked {
+                let n = reader.read(&mut buf).expect("walk forward");
+                assert!(n > 0, "stream ended early at {done}");
+                done += n;
+            }
+            reader.seek(SeekFrom::Start(back_to)).expect("seek back");
+            let mut back = vec![0u8; 32 * KB];
+            reader
+                .read_exact(&mut back)
+                .expect("read the trimmed region");
+            for (i, got) in back.iter().enumerate() {
+                assert_eq!(*got, byte_at(back_to + i as u64), "wrong byte after replay");
+            }
+        });
+
+        let outcome = tokio::time::timeout(Duration::from_secs(10), replay).await;
+        if outcome.is_err() {
+            // A timeout alone is not enough to FAIL: the reader is a blocking
+            // task parked on the condvar, and the runtime's shutdown waits for
+            // it, so the panic below would hang the test binary instead of
+            // reporting. `abandon` turns its next read into EOF, which is what
+            // lets it exit and the failure be seen.
+            source.abandon();
+        }
+        outcome
+            .expect("the backward seek blocked — nobody was left to re-fetch it")
+            .expect("reader thread");
+        feeder.abort();
     }
 }

@@ -617,40 +617,40 @@ pub(crate) fn spill_to_disk(total: usize, budget: usize) -> bool {
     total.saturating_mul(2) > budget
 }
 
-/// A reader's range request for the CMAF feeder, unless it asks for a byte the
-/// run of segments in hand has already produced or is producing.
+/// A reader's range request for the CMAF feeder, unless it asks for a byte
+/// inside the segment already being fetched.
 ///
-/// `served` is the inclusive range of segment indices this body has covered so
-/// far, `write_head` the offset the next push belongs at.
+/// The two sides measure in different units, and that is a spin waiting to
+/// happen. A reader asks for a BYTE and treats anything more than
+/// `FORWARD_WAIT_BYTES` — 2 MB — beyond the write head as worth a fresh
+/// request; the feeder answers in SEGMENTS, and a Hi-Res segment is nearly
+/// 4 MB. So a decoder sitting past the halfway point of the very segment on
+/// its way DOES ask, and honouring it would abandon the fetch in flight to
+/// start the same one over — forever, since the answer never changes.
 ///
-/// The distinction matters because the two sides measure in different units. A
-/// reader asks for a BYTE and treats anything more than `FORWARD_WAIT_BYTES`
-/// ahead of the write head as worth a fresh request; the feeder answers in
-/// SEGMENTS, and a Hi-Res segment is nearly 4 MB against that 2 MB threshold.
-/// So a decoder sitting at the far end of the very segment being fetched does
-/// ask — and honouring it would throw away the fetch in flight to ask for the
-/// same segment again. Likewise a request that arrived while a segment was
-/// landing is still pending after the reader has been unblocked by it: taking
-/// that one re-fetches a segment already in the buffer.
-///
-/// Neither is a seek. Both are spins. A request for anything else — earlier
-/// than this body started, or further ahead than it has reached — is a real
-/// jump and is handed back.
+/// This is the one case the buffer cannot rule out for itself: the bytes do
+/// not exist yet, so it cannot see that they are coming. Everything else —
+/// including a request answered by a segment that has since landed — is
+/// settled in `take_request`, which drops a request the buffer can already
+/// satisfy. Deciding that here from the feeder's own progress would be wrong
+/// in exactly the case that matters, because a segment this run produced may
+/// have been discarded by the window since, and a request for it is then a
+/// real re-fetch rather than a stale echo.
 ///
 /// `take_request` has already pointed the write head at the offset it returned,
 /// so a dropped request has to put it back where the next push belongs.
 fn cmaf_take_request(
     writer: &BufferWriter,
     map: &qbz_cmaf::SegmentMap,
-    served: std::ops::RangeInclusive<usize>,
+    in_flight: usize,
     write_head: u64,
 ) -> Result<Option<FetchPlan>, String> {
     let Some(next) = writer.take_request() else {
         return Ok(None);
     };
-    if served.contains(&map.resume_at(next.offset).first_segment) {
+    if map.resume_at(next.offset).first_segment == in_flight {
         log::debug!(
-            "[CMAF-STREAM] byte {} is in a segment this run already has in hand — not re-opening",
+            "[CMAF-STREAM] byte {} is inside segment {in_flight}, already being fetched",
             next.offset
         );
         writer
@@ -5482,6 +5482,10 @@ impl Player {
         // Stage to L2 as the bytes go past. The windowed buffer will not be
         // holding them at the end.
         let mut tee = DiskTee::open(disk_cache, track_id, map.total_len());
+        // Set once every segment has been walked, so the completion work
+        // (publish the staged file, disarm the fail-guard) happens exactly once
+        // even though the feeder stays up afterwards to serve seeks.
+        let mut completed = false;
 
         // One reusable scratch buffer for the decrypted frames of the segment
         // in hand, rather than a `to_vec()` per FLAC frame.
@@ -5534,8 +5538,7 @@ impl Player {
 
             let mut seg = resume.first_segment;
             while seg <= n_segments as usize {
-                let served = resume.first_segment..=seg;
-                if let Some(next) = cmaf_take_request(writer, &map, served.clone(), at)? {
+                if let Some(next) = cmaf_take_request(writer, &map, seg, at)? {
                     plan = next;
                     continue 'plans;
                 }
@@ -5543,7 +5546,7 @@ impl Player {
                 // full, so the segment below is not even fetched — the whole
                 // point of holding a window instead of a track.
                 writer.wait_for_space().await;
-                if let Some(next) = cmaf_take_request(writer, &map, served, at)? {
+                if let Some(next) = cmaf_take_request(writer, &map, seg, at)? {
                     plan = next;
                     continue 'plans;
                 }
@@ -5648,8 +5651,40 @@ impl Player {
 
             match writer.next_plan() {
                 Some(next) => plan = next,
-                // Nothing left to fetch, or no reader left to fetch it for.
-                None => break 'plans,
+                // Nothing left to FETCH — but not necessarily nothing left to
+                // SERVE. The window keeps only a sliding piece of the track, so
+                // a reader that jumps backwards into a discarded region still
+                // needs this feeder alive to fetch that segment again. Finish
+                // the completion work once, then park until someone asks or the
+                // last reader goes.
+                None => {
+                    if !completed {
+                        completed = true;
+                        guard.armed = false;
+                        // The `.part` is renamed into place only after the last
+                        // segment has been written and synced.
+                        if let Some(t) = tee.take() {
+                            t.finish();
+                        }
+                        log::info!(
+                            "[CMAF-STREAM] Complete: {:.2} MB pushed in {:.1}s for track {} ({} of \
+                             {} segments fetched, {:.2} MB declared) — staying up to serve seeks",
+                            pushed as f64 / (1024.0 * 1024.0),
+                            start.elapsed().as_secs_f64(),
+                            track_id,
+                            segments_done,
+                            n_segments,
+                            map.total_len() as f64 / (1024.0 * 1024.0),
+                        );
+                    }
+                    match writer.wait_for_request().await {
+                        Some(next) => {
+                            plan = next;
+                            continue 'plans;
+                        }
+                        None => break 'plans,
+                    }
+                }
             }
         }
 
@@ -5666,14 +5701,11 @@ impl Player {
         }
 
         log::info!(
-            "[CMAF-STREAM] Complete: {:.2} MB pushed in {:.1}s for track {} ({} of {} segments \
-             fetched, {:.2} MB declared)",
+            "[CMAF-STREAM] Track {} feeder done: {:.2} MB pushed in {:.1}s, {} segment fetches",
+            track_id,
             pushed as f64 / (1024.0 * 1024.0),
             start.elapsed().as_secs_f64(),
-            track_id,
             segments_done,
-            n_segments,
-            map.total_len() as f64 / (1024.0 * 1024.0),
         );
 
         Ok(())
