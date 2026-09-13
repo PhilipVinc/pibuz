@@ -4987,6 +4987,7 @@ impl Player {
                         track_id,
                         cache,
                         skip_cache,
+                        total_flac_size,
                     )
                     .await
                     {
@@ -5324,6 +5325,7 @@ impl Player {
         track_id: u64,
         cache: Arc<qbz_cache::AudioCache>,
         skip_cache: bool,
+        declared_total: u64,
     ) -> Result<(), String> {
         struct FailGuard {
             writer: BufferWriter,
@@ -5436,6 +5438,33 @@ impl Player {
             track_id,
             n_segments - 1
         );
+
+        // Is the segment table's byte_len sum EXACTLY the assembled size, or
+        // only an estimate?
+        //
+        // This decides whether the CMAF path can become range-seekable. Doing
+        // so means marking it `RangeRequests`, and `at_eof` then trusts
+        // `total_size` absolutely — so an over-estimate cuts every track short
+        // and an under-estimate turns the tail into EOF. `at_eof`'s own doc
+        // calls the CMAF total an estimate, which is exactly the reason the
+        // switch has not been made. Nothing in the tree had ever compared the
+        // two, and no open-source client implements a segmented Qobuz path to
+        // check against.
+        //
+        // One line per track, and a warning when they differ, so a few plays on
+        // hardware settle it either way.
+        if total_written == declared_total {
+            log::info!(
+                "[CMAF-STREAM] Segment table is byte-exact for track {track_id}: {total_written} bytes as declared"
+            );
+        } else {
+            log::warn!(
+                "[CMAF-STREAM] Segment table is NOT byte-exact for track {track_id}: wrote \
+                 {total_written}, table declared {declared_total} (delta {}). The CMAF path \
+                 cannot be made range-seekable while this differs.",
+                total_written as i64 - declared_total as i64
+            );
+        }
 
         // Cache the assembled FLAC for instant replay, read back from the
         // buffer that already holds it. Building it here rather than
