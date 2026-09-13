@@ -7,12 +7,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use qbz_models::{
-    Album, Artist, ArtistAlbums, ArtistStoryResponse, CoreEvent, DiscoverAlbum, DiscoverData,
-    DiscoverPlaylistsResponse, DiscoverResponse, ExternalStreamAsset, FrontendAdapter, GenreInfo,
-    LabelExploreResponse, LabelGetListResponse, LabelListPage, LabelPageData, LabelStoryResponse,
-    MostPopularItem, PageArtistResponse, Playlist, PlaylistDuplicateResult, PlaylistTag, Quality,
-    QueueState, QueueTrack, ReleasesGridResponse, RepeatMode, SearchAllResults, SearchResultsPage,
-    StreamUrl, Track, TrackToAnalyse, TracksContainer, UserSession,
+    Album, CoreEvent, DiscoverAlbum, FrontendAdapter, Playlist, Quality, QueueState, QueueTrack,
+    RepeatMode, StreamUrl, Track, TrackToAnalyse, TracksContainer, UserSession,
 };
 use qbz_player::{PlaybackState, Player, QueueManager};
 use qbz_qobuz::QobuzClient;
@@ -28,77 +24,6 @@ pub type BlacklistFilter = std::collections::HashSet<u64>;
 /// its OWN id regardless of artist — the surgical fix for Qobuz same-name
 /// artist merges. Empty under fail-open.
 pub type AlbumBlacklistFilter = std::collections::HashSet<String>;
-
-fn parse_page<T: serde::de::DeserializeOwned>(
-    value: &serde_json::Value,
-    key: &str,
-) -> SearchResultsPage<T> {
-    // Scalars keep the old fallback semantics (missing/odd-shaped → 0, per
-    // the serde defaults on SearchResultsPage), but the items array is parsed
-    // PER ITEM: the previous whole-page `from_value(...).ok()` was
-    // all-or-nothing, so one malformed entry blanked the entire search tab
-    // (same class as favorites #556).
-    let scalar = |name: &str| {
-        value
-            .get(key)
-            .and_then(|p| p.get(name))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32
-    };
-    SearchResultsPage {
-        items: qbz_models::lenient::parse_items_array(value, key, key),
-        total: scalar("total"),
-        offset: scalar("offset"),
-        limit: scalar("limit"),
-    }
-}
-
-/// Pick the first `most_popular` entry that survives the blacklist.
-fn pick_most_popular(
-    value: &serde_json::Value,
-    blacklist: &BlacklistFilter,
-    album_bl: &AlbumBlacklistFilter,
-) -> Option<MostPopularItem> {
-    let items = value.get("most_popular")?.get("items")?.as_array()?;
-    for entry in items {
-        let Some(kind) = entry.get("type").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        let Some(content) = entry.get("content") else {
-            continue;
-        };
-        match kind {
-            "artists" => {
-                // Artists have no album id — artist axis only.
-                if let Ok(a) = serde_json::from_value::<Artist>(content.clone()) {
-                    if !blacklist.contains(&a.id) {
-                        return Some(MostPopularItem::Artists(a));
-                    }
-                }
-            }
-            "albums" => {
-                if let Ok(al) = serde_json::from_value::<Album>(content.clone()) {
-                    if !album_bl.contains(&al.id) && !blacklist.contains(&al.artist.id) {
-                        return Some(MostPopularItem::Albums(al));
-                    }
-                }
-            }
-            "tracks" => {
-                if let Ok(t) = serde_json::from_value::<Track>(content.clone()) {
-                    let blocked = t.album.as_ref().is_some_and(|a| album_bl.contains(&a.id))
-                        || t.performer
-                            .as_ref()
-                            .is_some_and(|p| blacklist.contains(&p.id));
-                    if !blocked {
-                        return Some(MostPopularItem::Tracks(t));
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
 
 /// D-FEAT: returns true if the album should be hidden by the blacklist.
 ///
@@ -182,50 +107,6 @@ pub fn discover_album_blacklisted(
     album.artists.iter().any(|a| bl.contains(&a.id))
 }
 
-/// Parse a `catalog_search` JSON payload into typed category pages,
-/// dropping any item whose artist id is blacklisted and adjusting totals.
-pub(crate) fn parse_search_all(
-    value: &serde_json::Value,
-    blacklist: &BlacklistFilter,
-    album_bl: &AlbumBlacklistFilter,
-) -> SearchAllResults {
-    let mut albums = parse_page::<Album>(value, "albums");
-    let mut tracks = parse_page::<Track>(value, "tracks");
-    let mut artists = parse_page::<Artist>(value, "artists");
-    let playlists = parse_page::<Playlist>(value, "playlists");
-
-    // Artists have no album id — artist axis only.
-    let before = artists.items.len();
-    artists.items.retain(|a| !blacklist.contains(&a.id));
-    artists.total = artists
-        .total
-        .saturating_sub((before - artists.items.len()) as u32);
-
-    let before = albums.items.len();
-    albums
-        .items
-        .retain(|al| !album_blacklisted(al, blacklist, album_bl));
-    albums.total = albums
-        .total
-        .saturating_sub((before - albums.items.len()) as u32);
-
-    let before = tracks.items.len();
-    tracks
-        .items
-        .retain(|track| !track_blacklisted(track, blacklist, album_bl));
-    tracks.total = tracks
-        .total
-        .saturating_sub((before - tracks.items.len()) as u32);
-
-    SearchAllResults {
-        albums,
-        tracks,
-        artists,
-        playlists,
-        most_popular: pick_most_popular(value, blacklist, album_bl),
-    }
-}
-
 /// Core orchestrator for QBZ
 ///
 /// This is the main entry point for any frontend (Tauri, Slint, Iced, CLI, etc.)
@@ -268,6 +149,11 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
 
     /// Mark (or unmark) the current queue as built from an OFFLINE-ONLY local
     /// playlist (D8). Call right after the `set_queue` that loaded it.
+    ///
+    /// Every caller in this tree passes `false`; the local/offline library
+    /// that set it `true` went with the desktop app. Kept because the
+    /// resetting calls are real and `queue_is_offline_only` is still read by
+    /// qconnect/publish.rs — collapsing the pair is a separate change.
     pub fn set_queue_offline_only(&self, on: bool) {
         self.queue_offline_only
             .store(on, std::sync::atomic::Ordering::Relaxed);
@@ -373,55 +259,6 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
                 Err(CoreError::AuthFailed(e.to_string()))
             }
         }
-    }
-
-    /// Restore a session from a saved OAuth user_auth_token.
-    pub async fn login_with_token(&self, token: &str) -> Result<UserSession, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-
-        match client.login_with_token(token).await {
-            Ok(session) => {
-                self.emit(CoreEvent::LoggedIn {
-                    session: session.clone(),
-                })
-                .await;
-                Ok(session)
-            }
-            Err(e) => {
-                self.emit(CoreEvent::Error {
-                    code: "OAUTH_TOKEN_FAILED".to_string(),
-                    message: e.to_string(),
-                    recoverable: true,
-                })
-                .await;
-                // Preserve the typed ApiError: callers must distinguish an
-                // explicit auth rejection (clear the saved token) from a
-                // network-class failure (keep it) — stringifying here made
-                // that impossible and caused the token-clearing-on-boot bug.
-                Err(CoreError::Api(e))
-            }
-        }
-    }
-
-    /// Inject an already-authenticated session (e.g. from OAuth flow).
-    /// Emits a LoggedIn event so the rest of the system knows auth state changed.
-    pub async fn set_session(&self, session: UserSession) -> Result<(), CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-        client.set_session(session.clone()).await;
-        self.emit(CoreEvent::LoggedIn { session }).await;
-        Ok(())
-    }
-
-    /// Logout the current user
-    pub async fn logout(&self) -> Result<(), CoreError> {
-        let client = self.client.read().await;
-        if let Some(c) = client.as_ref() {
-            c.logout().await;
-            self.emit(CoreEvent::LoggedOut).await;
-        }
-        Ok(())
     }
 
     // ==================== Queue Operations ====================
@@ -670,22 +507,6 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
             .await
     }
 
-    /// Resolve a fully-materialized audio asset (bytes + MIME + quality) for an
-    /// EXTERNAL renderer (Chromecast / DLNA), L1/L2 → network. On a cache hit
-    /// the precise delivered quality isn't known here — the Cast service derives
-    /// the quality label from the track's catalog metadata.
-    pub async fn fetch_for_external_stream_resolved(
-        &self,
-        track_id: u64,
-        quality: Quality,
-    ) -> Option<ExternalStreamAsset> {
-        let guard = self.client.read().await;
-        let client = guard.as_ref()?;
-        self.player
-            .fetch_for_external_stream(client, track_id, quality)
-            .await
-    }
-
     /// Advance to next track in queue
     pub async fn next_track(&self) -> Option<QueueTrack> {
         let queue = self.queue.write().await;
@@ -712,12 +533,6 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
     pub async fn peek_upcoming(&self, count: usize) -> Vec<QueueTrack> {
         let queue = self.queue.read().await;
         queue.peek_upcoming(count)
-    }
-
-    /// The current queue track, if any (source-aware playback routing).
-    pub async fn current_track(&self) -> Option<QueueTrack> {
-        let queue = self.queue.read().await;
-        queue.current()
     }
 
     /// Set the "stop after this song" marker on a queue track id. Replaces any
@@ -768,110 +583,7 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
         result
     }
 
-    /// Patch the cached quality of any queued Plex track whose `rating_key`
-    /// matches one of `updates` (`(rating_key, bit_depth, sample_rate_khz)`).
-    /// Frontend-agnostic hook for the Plex quality-hydration path: a track
-    /// hydrated while it is already enqueued/playing carries a frozen quality
-    /// snapshot, so this upgrades it in place. Returns true if the CURRENT
-    /// track was patched — the caller then re-pushes the now-playing stamp.
-    pub async fn patch_plex_queue_quality(
-        &self,
-        updates: &[(String, Option<u32>, Option<f64>)],
-    ) -> bool {
-        let queue = self.queue.write().await;
-        let current_patched = queue.patch_plex_quality(updates);
-        if current_patched {
-            self.emit(CoreEvent::QueueUpdated {
-                state: queue.get_state(),
-            })
-            .await;
-        }
-        current_patched
-    }
-
     // ==================== Search & Catalog ====================
-
-    /// Search for albums
-    pub async fn search_albums(
-        &self,
-        query: &str,
-        limit: u32,
-        offset: u32,
-        search_type: Option<&str>,
-    ) -> Result<SearchResultsPage<Album>, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-
-        client
-            .search_albums(query, limit, offset, search_type)
-            .await
-            .map_err(CoreError::Api)
-    }
-
-    /// Search for tracks
-    pub async fn search_tracks(
-        &self,
-        query: &str,
-        limit: u32,
-        offset: u32,
-        search_type: Option<&str>,
-    ) -> Result<SearchResultsPage<Track>, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-
-        client
-            .search_tracks(query, limit, offset, search_type)
-            .await
-            .map_err(CoreError::Api)
-    }
-
-    /// Search for artists
-    pub async fn search_artists(
-        &self,
-        query: &str,
-        limit: u32,
-        offset: u32,
-        search_type: Option<&str>,
-    ) -> Result<SearchResultsPage<Artist>, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-
-        client
-            .search_artists(query, limit, offset, search_type)
-            .await
-            .map_err(CoreError::Api)
-    }
-
-    /// Catalog search (combined: albums, tracks, artists, playlists, most_popular).
-    /// Returns raw JSON for the caller to parse.
-    pub async fn catalog_search(
-        &self,
-        query: &str,
-        limit: u32,
-        offset: u32,
-    ) -> Result<serde_json::Value, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-
-        client
-            .catalog_search(query, limit, offset)
-            .await
-            .map_err(CoreError::Api)
-    }
-
-    /// Combined search: `catalog_search` plus parsing of the four category
-    /// pages and the `most_popular` hero, with blacklist filtering applied.
-    /// The blacklist is a parameter so Search does not depend on the
-    /// un-migrated `artist_blacklist` module.
-    pub async fn search_all(
-        &self,
-        query: &str,
-        blacklist: &BlacklistFilter,
-        album_blacklist: &AlbumBlacklistFilter,
-    ) -> Result<SearchAllResults, CoreError> {
-        let json = self.catalog_search(query, 30, 0).await?;
-        Ok(parse_search_all(&json, blacklist, album_blacklist))
-    }
 
     /// Get album by ID
     pub async fn get_album(&self, album_id: &str) -> Result<Album, CoreError> {
@@ -887,34 +599,6 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
         let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
 
         client.get_track(track_id).await.map_err(CoreError::Api)
-    }
-
-    /// Get a track's lyrics document (synced/unsynced), or `None` if the track
-    /// has none. Thin wrapper over `QobuzClient::get_lyrics` so headless callers
-    /// (qbzd) avoid the `client()` escape hatch. Original-only fetch (no
-    /// translation target — the headless surface has no translation toggle).
-    pub async fn get_lyrics(
-        &self,
-        track_id: u64,
-    ) -> Result<Option<qbz_qobuz::lyrics::QobuzLyricsDocument>, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-
-        client
-            .get_lyrics(track_id, None)
-            .await
-            .map_err(CoreError::Api)
-    }
-
-    /// Get artist by ID
-    pub async fn get_artist(&self, artist_id: u64) -> Result<Artist, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-
-        client
-            .get_artist_basic(artist_id)
-            .await
-            .map_err(CoreError::Api)
     }
 
     // ==================== Streaming ====================
@@ -980,140 +664,7 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
 
     // ==================== Favorites ====================
 
-    /// Get favorites (albums, tracks, or artists)
-    pub async fn get_favorites(
-        &self,
-        fav_type: &str,
-        limit: u32,
-        offset: u32,
-    ) -> Result<serde_json::Value, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-
-        client
-            .get_favorites(fav_type, limit, offset)
-            .await
-            .map_err(CoreError::Api)
-    }
-
-    /// Add item to favorites
-    pub async fn add_favorite(&self, fav_type: &str, item_id: &str) -> Result<(), CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-
-        client
-            .add_favorite(fav_type, item_id)
-            .await
-            .map_err(CoreError::Api)
-    }
-
-    /// Remove item from favorites
-    pub async fn remove_favorite(&self, fav_type: &str, item_id: &str) -> Result<(), CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-
-        client
-            .remove_favorite(fav_type, item_id)
-            .await
-            .map_err(CoreError::Api)
-    }
-
-    /// Fetch the set of the user's favorite track IDs. Pages through the
-    /// favorites endpoint until exhausted. Used by clients that need to
-    /// reflect favorite state on individual tracks (e.g. the Queue
-    /// sidebar's now-playing heart).
-    pub async fn favorite_track_ids(&self) -> Result<std::collections::HashSet<u64>, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-
-        let mut ids = std::collections::HashSet::new();
-        let page_size: u32 = 500;
-        let mut offset: u32 = 0;
-        loop {
-            let value = client
-                .get_favorites("tracks", page_size, offset)
-                .await
-                .map_err(CoreError::Api)?;
-            let items = value
-                .get("tracks")
-                .and_then(|t| t.get("items"))
-                .and_then(|i| i.as_array())
-                .cloned()
-                .unwrap_or_default();
-            let count = items.len() as u32;
-            for item in &items {
-                if let Some(id) = item.get("id").and_then(|v| v.as_u64()) {
-                    ids.insert(id);
-                }
-            }
-            if count < page_size {
-                break;
-            }
-            offset += page_size;
-        }
-        Ok(ids)
-    }
-
-    /// Fetch the set of the user's favorite (followed) artist IDs. Pages
-    /// through the favorites endpoint until exhausted. Used to reflect
-    /// follow state on artist cards.
-    pub async fn favorite_artist_ids(&self) -> Result<std::collections::HashSet<u64>, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-
-        let mut ids = std::collections::HashSet::new();
-        let page_size: u32 = 500;
-        let mut offset: u32 = 0;
-        loop {
-            let value = client
-                .get_favorites("artists", page_size, offset)
-                .await
-                .map_err(CoreError::Api)?;
-            let items = value
-                .get("artists")
-                .and_then(|a| a.get("items"))
-                .and_then(|i| i.as_array())
-                .cloned()
-                .unwrap_or_default();
-            let count = items.len() as u32;
-            for item in &items {
-                if let Some(id) = item.get("id").and_then(|v| v.as_u64()) {
-                    ids.insert(id);
-                }
-            }
-            if count < page_size {
-                break;
-            }
-            offset += page_size;
-        }
-        Ok(ids)
-    }
-
-    /// Toggle the favorite state of a track. `make_favorite = true` adds it,
-    /// `false` removes it. Thin convenience over `add_favorite` /
-    /// `remove_favorite` so callers do not duplicate the type string.
-    pub async fn set_track_favorite(
-        &self,
-        track_id: u64,
-        make_favorite: bool,
-    ) -> Result<(), CoreError> {
-        let id = track_id.to_string();
-        if make_favorite {
-            self.add_favorite("track", &id).await
-        } else {
-            self.remove_favorite("track", &id).await
-        }
-    }
-
     // ==================== Playlists ====================
-
-    /// Get user playlists
-    pub async fn get_user_playlists(&self) -> Result<Vec<Playlist>, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-
-        client.get_user_playlists().await.map_err(CoreError::Api)
-    }
 
     /// Get playlist by ID
     pub async fn get_playlist(&self, playlist_id: u64) -> Result<Playlist, CoreError> {
@@ -1126,140 +677,6 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
             .map_err(CoreError::Api)
     }
 
-    /// Add tracks to playlist
-    pub async fn add_tracks_to_playlist(
-        &self,
-        playlist_id: u64,
-        track_ids: &[u64],
-    ) -> Result<(), CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-
-        client
-            .add_tracks_to_playlist(playlist_id, track_ids)
-            .await
-            .map_err(CoreError::Api)
-    }
-
-    /// Check how many of `track_ids` are already in the Qobuz playlist
-    /// `playlist_id`. Mirrors Tauri's `v2_check_playlist_duplicates`
-    /// (commands_v2/playlists.rs): fetch the playlist's existing track ids and
-    /// set-intersect with the input. This is Qobuz-tracks-into-Qobuz-playlist
-    /// only — callers gate out local / Plex / local-playlist targets before
-    /// calling (those never duplicate-check, mirroring the Tauri flow).
-    pub async fn check_playlist_duplicates(
-        &self,
-        playlist_id: u64,
-        track_ids: &[u64],
-    ) -> Result<PlaylistDuplicateResult, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-
-        let playlist = client
-            .get_playlist_track_ids(playlist_id)
-            .await
-            .map_err(CoreError::Api)?;
-        Ok(compute_playlist_duplicates(&playlist.track_ids, track_ids))
-    }
-
-    /// Remove tracks from playlist
-    pub async fn remove_tracks_from_playlist(
-        &self,
-        playlist_id: u64,
-        playlist_track_ids: &[u64],
-    ) -> Result<(), CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-
-        client
-            .remove_tracks_from_playlist(playlist_id, playlist_track_ids)
-            .await
-            .map_err(CoreError::Api)
-    }
-
-    /// Create a new playlist
-    pub async fn create_playlist(
-        &self,
-        name: &str,
-        description: Option<&str>,
-        is_public: bool,
-    ) -> Result<Playlist, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-
-        client
-            .create_playlist(name, description, is_public)
-            .await
-            .map_err(CoreError::Api)
-    }
-
-    /// Follow (subscribe to) a Qobuz playlist so it appears in the user's Qobuz
-    /// account across every Qobuz client (and in their user-playlists list).
-    pub async fn subscribe_playlist(&self, playlist_id: u64) -> Result<(), CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-
-        client
-            .subscribe_playlist(playlist_id)
-            .await
-            .map_err(CoreError::Api)
-    }
-
-    /// Unfollow (unsubscribe from) a Qobuz playlist.
-    pub async fn unsubscribe_playlist(&self, playlist_id: u64) -> Result<(), CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-
-        client
-            .unsubscribe_playlist(playlist_id)
-            .await
-            .map_err(CoreError::Api)
-    }
-
-    /// Delete a playlist
-    pub async fn delete_playlist(&self, playlist_id: u64) -> Result<(), CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-
-        client
-            .delete_playlist(playlist_id)
-            .await
-            .map_err(CoreError::Api)
-    }
-
-    /// Update a playlist
-    pub async fn update_playlist(
-        &self,
-        playlist_id: u64,
-        name: Option<&str>,
-        description: Option<&str>,
-        is_public: Option<bool>,
-    ) -> Result<Playlist, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-
-        client
-            .update_playlist(playlist_id, name, description, is_public)
-            .await
-            .map_err(CoreError::Api)
-    }
-
-    /// Search playlists
-    pub async fn search_playlists(
-        &self,
-        query: &str,
-        limit: u32,
-        offset: u32,
-    ) -> Result<SearchResultsPage<Playlist>, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-
-        client
-            .search_playlists(query, limit, offset)
-            .await
-            .map_err(CoreError::Api)
-    }
-
     /// Get tracks batch by IDs
     pub async fn get_tracks_batch(&self, track_ids: &[u64]) -> Result<Vec<Track>, CoreError> {
         let client = self.client.read().await;
@@ -1267,202 +684,6 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
 
         client
             .get_tracks_batch(track_ids)
-            .await
-            .map_err(CoreError::Api)
-    }
-
-    /// Get genres
-    pub async fn get_genres(&self, parent_id: Option<u64>) -> Result<Vec<GenreInfo>, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-
-        client.get_genres(parent_id).await.map_err(CoreError::Api)
-    }
-
-    /// Get discover index
-    pub async fn get_discover_index(
-        &self,
-        genre_ids: Option<Vec<u64>>,
-    ) -> Result<DiscoverResponse, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-
-        client
-            .get_discover_index(genre_ids)
-            .await
-            .map_err(CoreError::Api)
-    }
-
-    /// Get discover playlists
-    pub async fn get_discover_playlists(
-        &self,
-        tag: Option<String>,
-        genre_ids: Option<Vec<u64>>,
-        limit: Option<u32>,
-        offset: Option<u32>,
-    ) -> Result<DiscoverPlaylistsResponse, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-
-        client
-            .get_discover_playlists(tag, genre_ids, limit, offset)
-            .await
-            .map_err(CoreError::Api)
-    }
-
-    /// Get playlist tags
-    pub async fn get_playlist_tags(&self) -> Result<Vec<PlaylistTag>, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-
-        client.get_playlist_tags().await.map_err(CoreError::Api)
-    }
-
-    /// Get discover albums from a specific browse endpoint
-    pub async fn get_discover_albums(
-        &self,
-        endpoint: &str,
-        genre_ids: Option<Vec<u64>>,
-        offset: u32,
-        limit: u32,
-    ) -> Result<DiscoverData<DiscoverAlbum>, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-
-        client
-            .get_discover_albums(endpoint, genre_ids, offset, limit)
-            .await
-            .map_err(CoreError::Api)
-    }
-
-    /// Get featured albums
-    pub async fn get_featured_albums(
-        &self,
-        featured_type: &str,
-        limit: u32,
-        offset: u32,
-        genre_id: Option<u64>,
-    ) -> Result<SearchResultsPage<Album>, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-
-        client
-            .get_featured_albums(featured_type, limit, offset, genre_id)
-            .await
-            .map_err(CoreError::Api)
-    }
-
-    /// Get Release Watch — new releases from followed artists/labels/awards.
-    /// `release_type` must be one of "artists" | "labels" | "awards".
-    pub async fn get_release_watch(
-        &self,
-        release_type: &str,
-        limit: u32,
-        offset: u32,
-    ) -> Result<SearchResultsPage<Album>, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-
-        client
-            .get_release_watch(release_type, limit, offset)
-            .await
-            .map_err(CoreError::Api)
-    }
-
-    /// Get artist page (full artist details with albums, tracks, similar)
-    pub async fn get_artist_page(
-        &self,
-        artist_id: u64,
-        sort: Option<&str>,
-    ) -> Result<PageArtistResponse, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-
-        client
-            .get_artist_page(artist_id, sort)
-            .await
-            .map_err(CoreError::Api)
-    }
-
-    /// Get similar artists
-    pub async fn get_similar_artists(
-        &self,
-        artist_id: u64,
-        limit: u32,
-        offset: u32,
-    ) -> Result<SearchResultsPage<Artist>, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-
-        client
-            .get_similar_artists(artist_id, limit, offset)
-            .await
-            .map_err(CoreError::Api)
-    }
-
-    /// Albums similar to a seed album (`/album/suggest`).
-    pub async fn get_album_suggest(
-        &self,
-        album_id: &str,
-    ) -> Result<qbz_models::AlbumSuggestResponse, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-        client
-            .get_album_suggest(album_id)
-            .await
-            .map_err(CoreError::Api)
-    }
-
-    /// Qobuz artist radio (`/radio/artist`) — a generated track list.
-    pub async fn get_radio_artist(
-        &self,
-        artist_id: &str,
-    ) -> Result<qbz_models::RadioResponse, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-        client
-            .get_radio_artist(artist_id)
-            .await
-            .map_err(CoreError::Api)
-    }
-
-    /// Qobuz album radio (`/radio/album`).
-    pub async fn get_radio_album(
-        &self,
-        album_id: &str,
-    ) -> Result<qbz_models::RadioResponse, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-        client
-            .get_radio_album(album_id)
-            .await
-            .map_err(CoreError::Api)
-    }
-
-    /// Qobuz track radio (`/radio/track`).
-    pub async fn get_radio_track(
-        &self,
-        track_id: &str,
-    ) -> Result<qbz_models::RadioResponse, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-        client
-            .get_radio_track(track_id)
-            .await
-            .map_err(CoreError::Api)
-    }
-
-    /// Dynamic mix suggestions (`/dynamic/suggest`) seeded from
-    /// recently-listened track ids. Returns the suggested tracks.
-    pub async fn get_dynamic_suggest(
-        &self,
-        listened_track_ids: &[u64],
-        limit: u32,
-    ) -> Result<Vec<Track>, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-        client
-            .get_dynamic_suggest(listened_track_ids, limit)
             .await
             .map_err(CoreError::Api)
     }
@@ -1483,67 +704,6 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
             .map_err(CoreError::Api)
     }
 
-    /// Get artist with albums (for album pagination)
-    pub async fn get_artist_with_albums(
-        &self,
-        artist_id: u64,
-        limit: Option<u32>,
-        offset: Option<u32>,
-    ) -> Result<Artist, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-
-        client
-            .get_artist_with_pagination(artist_id, true, limit, offset)
-            .await
-            .map_err(CoreError::Api)
-    }
-
-    /// Get an artist's albums collection (paginated `ArtistAlbums` only).
-    ///
-    /// Equivalent to `get_artist_with_albums` but projects only the `albums`
-    /// field for callers that don't need the full artist envelope.
-    pub async fn get_artist_albums(
-        &self,
-        artist_id: u64,
-        limit: Option<u32>,
-        offset: Option<u32>,
-    ) -> Result<ArtistAlbums, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-
-        let artist = client
-            .get_artist_with_pagination(artist_id, true, limit, offset)
-            .await
-            .map_err(CoreError::Api)?;
-
-        artist.albums.ok_or_else(|| {
-            CoreError::Api(qbz_qobuz::ApiError::ApiResponse(
-                "No albums in artist response".to_string(),
-            ))
-        })
-    }
-
-    /// Get artist detail with albums, playlists and appears-on tracks.
-    ///
-    /// Backs the suggestions panel: requests `extra=albums,tracks_appears_on,playlists`
-    /// from `/artist/get` so callers can read `playlists` and `tracks_appears_on`
-    /// without a second round-trip.
-    pub async fn get_artist_detail(
-        &self,
-        artist_id: u64,
-        limit: Option<u32>,
-        offset: Option<u32>,
-    ) -> Result<Artist, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-
-        client
-            .get_artist_detail(artist_id, limit, offset)
-            .await
-            .map_err(CoreError::Api)
-    }
-
     /// Get an artist's popular/top tracks (`/artist/get?extra=tracks`).
     pub async fn get_artist_tracks(
         &self,
@@ -1560,237 +720,6 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
             .map_err(CoreError::Api)
     }
 
-    /// Get an artist's releases grid (paginated by `release_type`).
-    pub async fn get_releases_grid(
-        &self,
-        artist_id: u64,
-        release_type: &str,
-        limit: u32,
-        offset: u32,
-        sort: Option<&str>,
-    ) -> Result<ReleasesGridResponse, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-
-        client
-            .get_releases_grid(artist_id, release_type, limit, offset, sort)
-            .await
-            .map_err(CoreError::Api)
-    }
-
-    /// Get an artist's Magazine stories (editorial articles). Web client: offset=0 limit=2.
-    pub async fn get_artist_story(
-        &self,
-        artist_id: u64,
-        offset: u32,
-        limit: u32,
-    ) -> Result<ArtistStoryResponse, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-
-        client
-            .get_artist_story(artist_id, offset, limit)
-            .await
-            .map_err(CoreError::Api)
-    }
-
-    /// Get label page (aggregated: top tracks, releases, playlists, artists)
-    pub async fn get_label_page(&self, label_id: u64) -> Result<LabelPageData, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-
-        client
-            .get_label_page(label_id)
-            .await
-            .map_err(CoreError::Api)
-    }
-
-    /// Enumerate award catalog (/award/explore).
-    pub async fn get_award_explore(
-        &self,
-        limit: u32,
-        offset: u32,
-    ) -> Result<serde_json::Value, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-        client
-            .get_award_explore(limit, offset)
-            .await
-            .map_err(CoreError::Api)
-    }
-
-    /// Get award page — hero info + award-winning releases.
-    pub async fn get_award_page(
-        &self,
-        award_id: &str,
-    ) -> Result<qbz_models::AwardPageData, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-        client
-            .get_award_page(award_id)
-            .await
-            .map_err(CoreError::Api)
-    }
-
-    /// Get paginated albums for an award (/award/getAlbums).
-    pub async fn get_award_albums(
-        &self,
-        award_id: &str,
-        limit: u32,
-        offset: u32,
-    ) -> Result<SearchResultsPage<Album>, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-        client
-            .get_award_albums(award_id, limit, offset)
-            .await
-            .map_err(CoreError::Api)
-    }
-
-    /// Get label explore (discover more labels)
-    pub async fn get_label_explore(
-        &self,
-        limit: u32,
-        offset: u32,
-    ) -> Result<LabelExploreResponse, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-
-        client
-            .get_label_explore(limit, offset)
-            .await
-            .map_err(CoreError::Api)
-    }
-
-    /// Get a label's album catalog (paginated, replaces legacy /label/get).
-    #[allow(clippy::too_many_arguments)]
-    pub async fn get_label_albums(
-        &self,
-        label_id: u64,
-        limit: u32,
-        offset: u32,
-        sort: Option<String>,
-        order: Option<String>,
-        genre_ids: Option<String>,
-        from_date: Option<String>,
-        to_date: Option<String>,
-    ) -> Result<LabelListPage<Album>, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-        client
-            .get_label_albums(
-                label_id,
-                limit,
-                offset,
-                sort.as_deref(),
-                order.as_deref(),
-                genre_ids.as_deref(),
-                from_date.as_deref(),
-                to_date.as_deref(),
-            )
-            .await
-            .map_err(CoreError::Api)
-    }
-
-    /// Get a label's upcoming releases.
-    pub async fn get_label_next_releases(
-        &self,
-        label_id: u64,
-        limit: u32,
-        offset: u32,
-        genre_ids: Option<String>,
-    ) -> Result<LabelListPage<Album>, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-        client
-            .get_label_next_releases(label_id, limit, offset, genre_ids.as_deref())
-            .await
-            .map_err(CoreError::Api)
-    }
-
-    /// Get a label's press-awarded releases.
-    pub async fn get_label_awarded_releases(
-        &self,
-        label_id: u64,
-        limit: u32,
-        offset: u32,
-        sort: Option<String>,
-        order: Option<String>,
-        genre_ids: Option<String>,
-    ) -> Result<LabelListPage<Album>, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-        client
-            .get_label_awarded_releases(
-                label_id,
-                limit,
-                offset,
-                sort.as_deref(),
-                order.as_deref(),
-                genre_ids.as_deref(),
-            )
-            .await
-            .map_err(CoreError::Api)
-    }
-
-    /// Get a label's curated playlists.
-    pub async fn get_label_playlists(
-        &self,
-        label_id: u64,
-        limit: u32,
-        offset: u32,
-    ) -> Result<LabelListPage<Playlist>, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-        client
-            .get_label_playlists(label_id, limit, offset)
-            .await
-            .map_err(CoreError::Api)
-    }
-
-    /// Get a label's top artists.
-    pub async fn get_label_top_artists(
-        &self,
-        label_id: u64,
-        limit: u32,
-        offset: u32,
-    ) -> Result<LabelListPage<Artist>, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-        client
-            .get_label_top_artists(label_id, limit, offset)
-            .await
-            .map_err(CoreError::Api)
-    }
-
-    /// Get a label's editorial story.
-    pub async fn get_label_story(
-        &self,
-        label_id: u64,
-        limit: u32,
-        offset: u32,
-    ) -> Result<LabelStoryResponse, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-        client
-            .get_label_story(label_id, limit, offset)
-            .await
-            .map_err(CoreError::Api)
-    }
-
-    /// Bulk hydrate labels by ID list.
-    pub async fn get_label_list(
-        &self,
-        label_ids: Vec<u64>,
-    ) -> Result<LabelGetListResponse, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-        client
-            .get_label_list(&label_ids)
-            .await
-            .map_err(CoreError::Api)
-    }
-
     // ==================== Event Emission ====================
 
     /// Emit an event to the frontend adapter
@@ -1798,19 +727,9 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
         self.adapter.on_event(event).await;
     }
 
-    /// Get the frontend adapter (for external event emission)
-    pub fn adapter(&self) -> Arc<A> {
-        Arc::clone(&self.adapter)
-    }
-
     /// Get the Qobuz client (for advanced usage)
     pub fn client(&self) -> Arc<RwLock<Option<QobuzClient>>> {
         Arc::clone(&self.client)
-    }
-
-    /// Get the queue manager (for advanced usage)
-    pub fn queue(&self) -> Arc<RwLock<QueueManager>> {
-        Arc::clone(&self.queue)
     }
 }
 
@@ -1825,75 +744,10 @@ pub fn normalize_artist_name(name: &str) -> String {
         .join(" ")
 }
 
-/// Pure set-intersection behind [`QbzCore::check_playlist_duplicates`] — split
-/// out so the duplicate logic is unit-testable without a live Qobuz client.
-/// `existing` = the playlist's current track ids; `track_ids` = the ids the
-/// user wants to add. Returns the Tauri-shaped result (total checked, how many
-/// are already present, and the set of those duplicate ids).
-pub(crate) fn compute_playlist_duplicates(
-    existing: &[u64],
-    track_ids: &[u64],
-) -> PlaylistDuplicateResult {
-    let existing_set: std::collections::HashSet<u64> = existing.iter().copied().collect();
-    let duplicate_track_ids: std::collections::HashSet<u64> = track_ids
-        .iter()
-        .copied()
-        .filter(|id| existing_set.contains(id))
-        .collect();
-    PlaylistDuplicateResult {
-        total_tracks: track_ids.len(),
-        duplicate_count: duplicate_track_ids.len(),
-        duplicate_track_ids,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_search_all_filters_blacklisted_artist() {
-        let json = serde_json::json!({
-            "albums":  { "items": [], "total": 0, "offset": 0, "limit": 30 },
-            "tracks":  { "items": [], "total": 0, "offset": 0, "limit": 30 },
-            "artists": {
-                "items": [
-                    { "id": 1, "name": "Keep" },
-                    { "id": 999, "name": "Blocked" }
-                ],
-                "total": 2, "offset": 0, "limit": 30
-            },
-            "playlists": { "items": [], "total": 0, "offset": 0, "limit": 30 }
-        });
-        let blocked: BlacklistFilter = [999].into_iter().collect();
-        let out = parse_search_all(&json, &blocked, &no_albums());
-        assert_eq!(out.artists.items.len(), 1);
-        assert_eq!(out.artists.items[0].name, "Keep");
-        assert_eq!(out.artists.total, 1);
-        assert!(out.most_popular.is_none());
-    }
-
-    #[test]
-    fn parse_page_skips_poisoned_item_keeps_rest() {
-        // One malformed entry (id is a string where Artist.id: u64) must NOT
-        // blank the page — the old whole-page from_value did exactly that.
-        let json = serde_json::json!({
-            "artists": {
-                "items": [
-                    { "id": 1, "name": "Keep" },
-                    { "id": "poisoned", "name": "Bad" },
-                    { "id": 2, "name": "AlsoKeep" }
-                ],
-                "total": 3, "offset": 0, "limit": 30
-            }
-        });
-        let page = parse_page::<Artist>(&json, "artists");
-        assert_eq!(page.items.len(), 2);
-        assert_eq!(page.items[0].name, "Keep");
-        assert_eq!(page.items[1].name, "AlsoKeep");
-        assert_eq!(page.total, 3);
-        assert_eq!(page.limit, 30);
-    }
+    use qbz_models::Artist;
 
     // --- D-FEAT featured-aware blacklist helpers ---
 
@@ -2190,55 +1044,5 @@ mod tests {
             &BlacklistFilter::new(),
             &abl
         ));
-    }
-
-    #[test]
-    fn parse_search_all_filters_blocked_album() {
-        let json = serde_json::json!({
-            "albums": {
-                "items": [
-                    { "id": "keep", "title": "Keep", "artist": { "id": 1, "name": "A" } },
-                    { "id": "blk",  "title": "Bogus", "artist": { "id": 1, "name": "A" } }
-                ],
-                "total": 2, "offset": 0, "limit": 30
-            },
-            "tracks":  { "items": [], "total": 0, "offset": 0, "limit": 30 },
-            "artists": { "items": [], "total": 0, "offset": 0, "limit": 30 },
-            "playlists": { "items": [], "total": 0, "offset": 0, "limit": 30 }
-        });
-        let abl: AlbumBlacklistFilter = ["blk".to_string()].into_iter().collect();
-        let out = parse_search_all(&json, &BlacklistFilter::new(), &abl);
-        assert_eq!(out.albums.items.len(), 1);
-        assert_eq!(out.albums.items[0].id, "keep");
-        assert_eq!(out.albums.total, 1);
-    }
-
-    #[test]
-    fn compute_playlist_duplicates_intersects_input_with_existing() {
-        // Existing playlist has 10, 20, 30. Adding 20, 30, 40, 50:
-        // 20 and 30 are duplicates; 40 and 50 are new.
-        let existing = [10u64, 20, 30];
-        let to_add = [20u64, 30, 40, 50];
-        let r = compute_playlist_duplicates(&existing, &to_add);
-        assert_eq!(r.total_tracks, 4);
-        assert_eq!(r.duplicate_count, 2);
-        assert!(r.duplicate_track_ids.contains(&20));
-        assert!(r.duplicate_track_ids.contains(&30));
-        assert!(!r.duplicate_track_ids.contains(&40));
-    }
-
-    #[test]
-    fn compute_playlist_duplicates_none_when_disjoint() {
-        let r = compute_playlist_duplicates(&[1u64, 2, 3], &[4u64, 5]);
-        assert_eq!(r.total_tracks, 2);
-        assert_eq!(r.duplicate_count, 0);
-        assert!(r.duplicate_track_ids.is_empty());
-    }
-
-    #[test]
-    fn compute_playlist_duplicates_empty_input() {
-        let r = compute_playlist_duplicates(&[1u64, 2, 3], &[]);
-        assert_eq!(r.total_tracks, 0);
-        assert_eq!(r.duplicate_count, 0);
     }
 }

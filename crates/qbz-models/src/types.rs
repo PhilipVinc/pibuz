@@ -7,7 +7,6 @@
 //! - Image and metadata types
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 
 // ============ Dynamic-suggest (DailyQ/WeeklyQ) ============
 
@@ -88,27 +87,6 @@ impl Quality {
     pub fn min_tier(a: Quality, b: Quality) -> Quality {
         a.min(b)
     }
-}
-
-/// Why a delivered stream is (or may be) below the track's catalog maximum.
-/// Shared by the local badge, the local device cap, and the cast surfaces
-/// (#638 fixes 1-4). Mirrored to Slint as a plain `int` property carrying the
-/// same discriminant — no string enum crosses the FFI.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum QualityLimit {
-    /// No constraint identified (or no downgrade).
-    #[default]
-    None = 0,
-    /// The user's streaming-quality preference capped the request.
-    Preference = 1,
-    /// The local output device's cap lowered the request (fix 3).
-    /// NEVER applicable while casting — the local DAC is not in a cast's
-    /// signal path (precedence rule, owner decision 2026-07-20).
-    LocalDeviceCap = 2,
-    /// The manual per-renderer cap lowered the request (fix 4). Cast only.
-    RendererCap = 3,
-    /// Qobuz did not offer a higher tier for this track.
-    CatalogAvailability = 4,
 }
 
 // ============ User Session ============
@@ -210,15 +188,6 @@ impl StreamQualityInfo {
     pub fn tier_label(&self) -> &'static str {
         self.quality().map(|q| q.label()).unwrap_or("Unknown")
     }
-}
-
-/// Measured stream parameters read from the head of an audio buffer
-/// (FLAC STREAMINFO). `sample_rate` is in Hz.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AudioParams {
-    pub sample_rate: u32,
-    pub bits_per_sample: u32,
-    pub channels: u16,
 }
 
 /// Parse a FLAC STREAMINFO block from the head of a stream. Returns `None`
@@ -509,25 +478,6 @@ pub struct AlbumArtist {
     pub roles: Option<Vec<String>>,
 }
 
-/// A downloadable extra bundled with an album (e.g. PDF booklet)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Goody {
-    #[serde(default)]
-    pub id: u64,
-    #[serde(default)]
-    pub name: String,
-    #[serde(default)]
-    pub url: String,
-    /// Original (full-size) URL
-    #[serde(default)]
-    pub original_url: String,
-    /// File format id (e.g. 21 for PDF)
-    #[serde(default)]
-    pub file_format_id: Option<u32>,
-    #[serde(default)]
-    pub description: Option<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TracksContainer {
     pub items: Vec<Track>,
@@ -558,25 +508,6 @@ pub struct Artist {
     pub playlists: Option<Vec<Playlist>>,
 }
 
-/// Artist biography content
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ArtistBiography {
-    pub summary: Option<String>,
-    pub content: Option<String>,
-    pub source: Option<String>,
-}
-
-/// Artist albums container
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ArtistAlbums {
-    pub items: Vec<Album>,
-    pub total: u32,
-    #[serde(default)]
-    pub offset: u32,
-    #[serde(default)]
-    pub limit: u32,
-}
-
 /// Playlist model
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Playlist {
@@ -603,55 +534,6 @@ pub struct Playlist {
     pub users_count: Option<u32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct PlaylistOwner {
-    #[serde(default)]
-    pub id: u64,
-    #[serde(default)]
-    pub name: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PlaylistGenre {
-    pub id: u64,
-    pub name: String,
-    pub slug: Option<String>,
-}
-
-/// Lightweight playlist response with track IDs only
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PlaylistWithTrackIds {
-    #[serde(default)]
-    pub id: u64,
-    #[serde(default)]
-    pub name: String,
-    pub description: Option<String>,
-    #[serde(default)]
-    pub owner: PlaylistOwner,
-    pub images: Option<Vec<String>>,
-    #[serde(default)]
-    pub tracks_count: u32,
-    #[serde(default)]
-    pub duration: u32,
-    #[serde(default)]
-    pub is_public: bool,
-    #[serde(default)]
-    pub track_ids: Vec<u64>,
-    pub genres: Option<Vec<PlaylistGenre>>,
-    pub images150: Option<Vec<String>>,
-    pub images300: Option<Vec<String>>,
-    pub slug: Option<String>,
-    pub users_count: Option<u32>,
-}
-
-/// Result of checking for duplicate tracks in a playlist
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PlaylistDuplicateResult {
-    pub total_tracks: usize,
-    pub duplicate_count: usize,
-    pub duplicate_track_ids: HashSet<u64>,
-}
-
 // ============ Metadata Types ============
 
 /// Label model
@@ -663,104 +545,7 @@ pub struct Label {
 
 // ============ Label Page Types (/label/page) ============
 
-/// Top-level response from /label/page
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LabelPageData {
-    pub id: u64,
-    pub name: String,
-    pub description: Option<String>,
-    #[serde(default)]
-    pub image: Option<serde_json::Value>,
-    #[serde(default)]
-    pub releases: Option<Vec<LabelPageContainer>>,
-    #[serde(default)]
-    pub playlists: Option<LabelPageGenericList>,
-    #[serde(default)]
-    pub top_tracks: Option<Vec<serde_json::Value>>,
-    #[serde(default)]
-    pub top_artists: Option<LabelPageGenericList>,
-}
-
-/// A container within label page (e.g. releases category)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LabelPageContainer {
-    pub id: Option<String>,
-    pub data: Option<LabelPageGenericList>,
-}
-
-/// Generic list with has_more and items
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LabelPageGenericList {
-    pub has_more: Option<bool>,
-    pub items: Option<Vec<serde_json::Value>>,
-}
-
 // ============ Award Page Types (/award/page) ============
-
-/// Magazine/publisher behind a press award.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AwardMagazine {
-    #[serde(default, deserialize_with = "deserialize_string_or_int")]
-    pub id: Option<String>,
-    #[serde(default)]
-    pub name: Option<String>,
-    #[serde(default)]
-    pub image: Option<String>,
-}
-
-/// Top-level response from /award/page. Fields all Optional because
-/// Android's AwardDto marks everything nullable and Qobuz is loose
-/// about which ones come back on any given request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AwardPageData {
-    #[serde(default, deserialize_with = "deserialize_string_or_int")]
-    pub id: Option<String>,
-    #[serde(default)]
-    pub name: Option<String>,
-    #[serde(default)]
-    pub image: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_string_or_int")]
-    pub awarded_at: Option<String>,
-    #[serde(default)]
-    pub magazine: Option<AwardMagazine>,
-    /// Categorized containers of award-winning releases (matches
-    /// Android's `releases: List<GenericContainerDto<AlbumDto>>`).
-    #[serde(default)]
-    pub releases: Option<Vec<AwardPageContainer>>,
-    #[serde(default)]
-    pub playlists: Option<AwardPageGenericList>,
-}
-
-fn deserialize_string_or_int<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
-    Ok(match value {
-        Some(serde_json::Value::String(s)) => Some(s),
-        Some(serde_json::Value::Number(n)) => Some(n.to_string()),
-        _ => None,
-    })
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AwardPageContainer {
-    pub id: Option<String>,
-    pub data: Option<AwardPageGenericList>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AwardPageGenericList {
-    pub has_more: Option<bool>,
-    pub items: Option<Vec<serde_json::Value>>,
-}
-
-/// Response from /label/explore
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LabelExploreResponse {
-    pub has_more: Option<bool>,
-    pub items: Option<Vec<serde_json::Value>>,
-}
 
 // ============ Label Sub-resource Types (v9.7.0.3 API) ============
 //
@@ -771,93 +556,6 @@ pub struct LabelExploreResponse {
 // { has_more, items: [...] }. Deserialized shapes are best-effort: if
 // the server wraps items in e.g. { albums: { items: ... } }, the
 // Optional fallbacks still keep the call non-fatal.
-
-/// Generic paginated response from /label/get* endpoints.
-///
-/// `T` is typed (`Album`, `Playlist`, `Artist`) but all fields are
-/// tolerant so the same struct works if the server returns a bare
-/// items list or a nested one.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct LabelListPage<T> {
-    #[serde(default)]
-    pub has_more: Option<bool>,
-    #[serde(default = "Vec::new")]
-    pub items: Vec<T>,
-    #[serde(default)]
-    pub total: Option<u32>,
-    #[serde(default)]
-    pub offset: Option<u32>,
-    #[serde(default)]
-    pub limit: Option<u32>,
-}
-
-/// Response from /label/story.
-///
-/// Shape inferred from `c30/b.java` — returns editorial / story content
-/// for a label. Actual fields beyond the label identity are not fully
-/// known; everything past `id` / `name` / `description` is kept open.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LabelStoryResponse {
-    pub id: Option<u64>,
-    pub name: Option<String>,
-    #[serde(default)]
-    pub description: Option<String>,
-    #[serde(default)]
-    pub story: Option<String>,
-    #[serde(default)]
-    pub image: Option<serde_json::Value>,
-    #[serde(default)]
-    pub has_more: Option<bool>,
-    #[serde(default)]
-    pub items: Option<Vec<serde_json::Value>>,
-}
-
-/// Response from /label/getList (POST). Bulk lookup that hydrates
-/// label metadata for a set of label IDs.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct LabelGetListResponse {
-    #[serde(default = "Vec::new")]
-    pub labels: Vec<Label>,
-    /// Fallback for unknown envelope shape — preserved as raw JSON if
-    /// the server wraps differently than expected.
-    #[serde(default)]
-    pub extra: Option<serde_json::Value>,
-}
-
-/// Genre model
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Genre {
-    pub id: u64,
-    pub name: String,
-    /// Full ancestor id chain (top-level first, self last) as sent by the
-    /// discover endpoints. Absent on older cached payloads → None.
-    #[serde(default)]
-    pub path: Option<Vec<u64>>,
-}
-
-/// Genre info with full details
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GenreInfo {
-    pub id: u64,
-    pub name: String,
-    #[serde(default)]
-    pub color: Option<String>,
-    #[serde(default)]
-    pub slug: Option<String>,
-    #[serde(default)]
-    pub path: Option<Vec<u64>>,
-}
-
-/// Genre list response
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GenreListResponse {
-    pub genres: GenreListContainer,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GenreListContainer {
-    pub items: Vec<GenreInfo>,
-}
 
 // ============ Search Types ============
 
@@ -995,27 +693,6 @@ pub struct PurchaseTrack {
     pub purchased_at: Option<i64>,
 }
 
-/// A downloadable format option synthesized client-side from an `Album`
-/// (command #6). `id` feeds `getFileUrl`'s `format_id`; `label` (with `/`→`-`)
-/// becomes the `qualityDir` subfolder. The synthesis table lives in the
-/// orchestration service (Slice 4); this struct is just the wire/UI shape.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PurchaseFormatOption {
-    pub id: u32,
-    pub label: String,
-    pub bit_depth: Option<u32>,
-    pub sampling_rate: Option<f64>,
-}
-
-/// Response from `/album/suggest` — albums similar to a seed album.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AlbumSuggestResponse {
-    #[serde(default)]
-    pub algorithm: Option<String>,
-    #[serde(default)]
-    pub albums: Option<SearchResultsPage<Album>>,
-}
-
 /// Response from the `/radio/*` endpoints — a generated track list.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RadioResponse {
@@ -1030,28 +707,6 @@ pub struct RadioResponse {
     pub tracks: SearchResultsPage<Track>,
 }
 
-/// One entry of the Qobuz `most_popular` block in a combined search.
-/// Serde tagging matches the legacy `V2MostPopularItem` so the Tauri
-/// command's response shape is unchanged.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", content = "content", rename_all = "lowercase")]
-pub enum MostPopularItem {
-    Tracks(Track),
-    Albums(Album),
-    Artists(Artist),
-}
-
-/// Combined search result: the four category pages plus an optional
-/// "most popular" hero entry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SearchAllResults {
-    pub albums: SearchResultsPage<Album>,
-    pub tracks: SearchResultsPage<Track>,
-    pub artists: SearchResultsPage<Artist>,
-    pub playlists: SearchResultsPage<Playlist>,
-    pub most_popular: Option<MostPopularItem>,
-}
-
 /// Favorites container
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Favorites {
@@ -1061,91 +716,6 @@ pub struct Favorites {
 }
 
 // ============ Discover API Types ============
-
-/// Discover index response
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DiscoverResponse {
-    pub containers: DiscoverContainers,
-}
-
-/// All discover containers
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DiscoverContainers {
-    pub playlists: Option<DiscoverContainer<DiscoverPlaylist>>,
-    pub ideal_discography: Option<DiscoverContainer<DiscoverAlbum>>,
-    pub playlists_tags: Option<DiscoverContainer<PlaylistTag>>,
-    pub new_releases: Option<DiscoverContainer<DiscoverAlbum>>,
-    pub qobuzissims: Option<DiscoverContainer<DiscoverAlbum>>,
-    pub most_streamed: Option<DiscoverContainer<DiscoverAlbum>>,
-    pub press_awards: Option<DiscoverContainer<DiscoverAlbum>>,
-    pub album_of_the_week: Option<DiscoverContainer<DiscoverAlbum>>,
-}
-
-/// Generic discover container
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DiscoverContainer<T> {
-    pub id: String,
-    pub data: DiscoverData<T>,
-}
-
-/// Generic discover data with items
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DiscoverData<T> {
-    pub has_more: bool,
-    pub items: Vec<T>,
-}
-
-/// Playlist from discover endpoint
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DiscoverPlaylist {
-    pub id: u64,
-    pub name: String,
-    pub owner: PlaylistOwner,
-    pub image: DiscoverPlaylistImage,
-    pub description: Option<String>,
-    pub duration: u32,
-    pub tracks_count: u32,
-    pub genres: Option<Vec<PlaylistGenre>>,
-    pub tags: Option<Vec<PlaylistTag>>,
-}
-
-/// Playlist image from discover
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DiscoverPlaylistImage {
-    pub rectangle: Option<String>,
-    pub covers: Option<Vec<String>>,
-}
-
-/// Playlist tag (for filtering)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PlaylistTag {
-    pub id: u64,
-    pub slug: String,
-    pub name: String,
-}
-
-/// Raw playlist tag from /playlist/getTags
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RawPlaylistTag {
-    pub slug: String,
-    pub name_json: String,
-    pub position: Option<String>,
-    pub is_discover: Option<String>,
-    pub featured_tag_id: Option<String>,
-}
-
-/// Response from /playlist/getTags
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PlaylistTagsResponse {
-    pub tags: Vec<RawPlaylistTag>,
-}
-
-/// Response from discover/playlists endpoint
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DiscoverPlaylistsResponse {
-    pub has_more: bool,
-    pub items: Vec<DiscoverPlaylist>,
-}
 
 /// Album from discover endpoint
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1184,167 +754,7 @@ pub struct DiscoverArtist {
     pub roles: Option<Vec<String>>,
 }
 
-/// Album dates from discover
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DiscoverAlbumDates {
-    pub download: Option<String>,
-    pub original: Option<String>,
-    pub stream: Option<String>,
-}
-
-/// Audio info from discover album
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DiscoverAudioInfo {
-    pub maximum_sampling_rate: Option<f64>,
-    pub maximum_bit_depth: Option<u32>,
-    pub maximum_channel_count: Option<u32>,
-}
-
 // ============ Artist Page Types (/artist/page) ============
-
-/// Top-level response from /artist/page
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PageArtistResponse {
-    pub id: u64,
-    pub name: PageArtistName,
-    pub artist_category: Option<String>,
-    pub biography: Option<PageArtistBiography>,
-    pub images: Option<PageArtistImages>,
-    pub similar_artists: Option<PageArtistSimilar>,
-    pub top_tracks: Option<Vec<PageArtistTrack>>,
-    pub last_release: Option<PageArtistRelease>,
-    pub releases: Option<Vec<PageArtistReleaseGroup>>,
-    pub tracks_appears_on: Option<Vec<PageArtistTrack>>,
-    pub playlists: Option<PageArtistPlaylists>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PageArtistName {
-    pub display: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PageArtistBiography {
-    pub content: Option<String>,
-    pub source: Option<serde_json::Value>,
-    pub language: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PageArtistImages {
-    pub portrait: Option<PageArtistPortrait>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PageArtistPortrait {
-    pub hash: String,
-    pub format: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PageArtistSimilar {
-    pub has_more: bool,
-    pub items: Vec<PageArtistSimilarItem>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PageArtistSimilarItem {
-    pub id: u64,
-    pub name: PageArtistName,
-    pub images: Option<PageArtistImages>,
-}
-
-/// A group of releases by type
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PageArtistReleaseGroup {
-    #[serde(rename = "type")]
-    pub release_type: String,
-    pub has_more: bool,
-    pub items: Vec<PageArtistRelease>,
-}
-
-/// A release item from /artist/page
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PageArtistRelease {
-    pub id: String,
-    pub title: String,
-    pub version: Option<String>,
-    pub tracks_count: Option<u32>,
-    pub artist: Option<PageArtistReleaseArtist>,
-    pub artists: Option<Vec<PageArtistReleaseContributor>>,
-    pub image: Option<ImageSet>,
-    pub label: Option<Label>,
-    pub genre: Option<Genre>,
-    pub release_type: Option<String>,
-    pub release_tags: Option<Vec<String>>,
-    pub duration: Option<u32>,
-    pub dates: Option<DiscoverAlbumDates>,
-    pub parental_warning: Option<bool>,
-    pub audio_info: Option<DiscoverAudioInfo>,
-    pub rights: Option<PageArtistRights>,
-    pub awards: Option<Vec<PageArtistAward>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PageArtistReleaseArtist {
-    pub id: u64,
-    pub name: PageArtistName,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PageArtistReleaseContributor {
-    pub id: u64,
-    pub name: String,
-    pub roles: Option<Vec<String>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PageArtistRights {
-    pub streamable: Option<bool>,
-    pub hires_streamable: Option<bool>,
-    pub hires_purchasable: Option<bool>,
-    pub purchasable: Option<bool>,
-    pub downloadable: Option<bool>,
-    pub previewable: Option<bool>,
-    pub sampleable: Option<bool>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PageArtistAward {
-    pub id: u64,
-    pub name: String,
-    pub awarded_at: Option<String>,
-}
-
-/// Award attached to an album. Shape is intentionally lenient because
-/// Qobuz uses three different embedded shapes across endpoints:
-/// - `/discover/index` — {id: int, name, awarded_at: "YYYY-MM-DD"}
-/// - `/album/get`      — LegacyAwardDto {awardId: string, name,
-///   publicationId, publicationName, awardSlug,
-///   awardedAt: long, …}
-/// - `/artist/page`    — PageArtistAward {id: int, name, awarded_at}
-///   id is emitted as String downstream so the frontend has a single
-///   type to carry into /award/page and /award/getAlbums. The `alias`
-///   list covers the LegacyAwardDto field name the web app never sees
-///   but the mobile API uses.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct AlbumAward {
-    #[serde(
-        default,
-        alias = "awardId",
-        alias = "award_id",
-        deserialize_with = "deserialize_award_id"
-    )]
-    pub id: Option<String>,
-    #[serde(default)]
-    pub name: String,
-    #[serde(
-        default,
-        alias = "awardedAt",
-        deserialize_with = "deserialize_award_awarded_at"
-    )]
-    pub awarded_at: Option<String>,
-}
 
 fn deserialize_award_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
@@ -1370,120 +780,7 @@ where
     })
 }
 
-/// Track from /artist/page
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PageArtistTrack {
-    pub id: u64,
-    pub title: String,
-    pub version: Option<String>,
-    pub duration: Option<u32>,
-    pub isrc: Option<String>,
-    pub parental_warning: Option<bool>,
-    pub artist: Option<PageArtistReleaseArtist>,
-    pub composer: Option<serde_json::Value>,
-    pub audio_info: Option<DiscoverAudioInfo>,
-    pub rights: Option<PageArtistRights>,
-    pub physical_support: Option<PageArtistPhysicalSupport>,
-    pub album: Option<PageArtistTrackAlbum>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PageArtistPhysicalSupport {
-    pub media_number: Option<u32>,
-    pub track_number: Option<u32>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PageArtistTrackAlbum {
-    pub id: String,
-    pub title: String,
-    pub version: Option<String>,
-    pub image: Option<ImageSet>,
-    pub label: Option<Label>,
-    pub genre: Option<Genre>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PageArtistPlaylists {
-    pub has_more: bool,
-    pub items: Vec<PageArtistPlaylist>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PageArtistPlaylist {
-    pub id: u64,
-    pub title: Option<String>,
-    pub description: Option<String>,
-    pub owner: Option<PageArtistPlaylistOwner>,
-    pub tracks_count: Option<u32>,
-    pub duration: Option<u32>,
-    pub images: Option<PageArtistPlaylistImages>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PageArtistPlaylistOwner {
-    pub id: u64,
-    pub name: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PageArtistPlaylistImages {
-    pub rectangle: Option<Vec<String>>,
-}
-
-/// Response from /artist/getReleasesGrid
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReleasesGridResponse {
-    pub has_more: bool,
-    pub items: Vec<PageArtistRelease>,
-}
-
 // ============ Artist Story Types (/artist/story) ============
-
-/// Response from /artist/story (Magazine / editorial articles about the artist).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ArtistStoryResponse {
-    pub has_more: bool,
-    #[serde(default)]
-    pub items: Vec<ArtistStoryItem>,
-}
-
-/// A single Magazine story. `image`/`images[].url` are ready-to-use signed
-/// arc-cdn URLs — do NOT run them through the portrait hash/format builder.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ArtistStoryItem {
-    pub id: String,
-    pub title: String,
-    /// Epoch SECONDS, not an ISO string.
-    #[serde(default)]
-    pub display_date: Option<i64>,
-    #[serde(default)]
-    pub image: Option<String>,
-    #[serde(default)]
-    pub images: Option<Vec<ArtistStoryImage>>,
-    #[serde(default)]
-    pub description_short: Option<String>,
-    #[serde(default)]
-    pub authors: Option<Vec<ArtistStoryAuthor>>,
-    #[serde(default)]
-    pub section_slugs: Option<Vec<String>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ArtistStoryImage {
-    #[serde(default)]
-    pub format: Option<String>,
-    pub url: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ArtistStoryAuthor {
-    pub name: String,
-    #[serde(default)]
-    pub id: Option<String>,
-    #[serde(default)]
-    pub slug: Option<String>,
-}
 
 #[cfg(test)]
 mod tests {
@@ -1526,4 +823,123 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();
         assert_eq!(back.language_code.as_deref(), Some("fr"));
     }
+}
+
+/// Award attached to an album. Shape is intentionally lenient because
+/// Qobuz uses three different embedded shapes across endpoints:
+/// - `/discover/index` — {id: int, name, awarded_at: "YYYY-MM-DD"}
+/// - `/album/get`      — LegacyAwardDto {awardId: string, name,
+///   publicationId, publicationName, awardSlug,
+///   awardedAt: long, …}
+/// - `/artist/page`    — PageArtistAward {id: int, name, awarded_at}
+///   id is emitted as String downstream so the frontend has a single
+///   type to carry into /award/page and /award/getAlbums. The `alias`
+///   list covers the LegacyAwardDto field name the web app never sees
+///   but the mobile API uses.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AlbumAward {
+    #[serde(
+        default,
+        alias = "awardId",
+        alias = "award_id",
+        deserialize_with = "deserialize_award_id"
+    )]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub name: String,
+    #[serde(
+        default,
+        alias = "awardedAt",
+        deserialize_with = "deserialize_award_awarded_at"
+    )]
+    pub awarded_at: Option<String>,
+}
+
+/// Artist albums container
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtistAlbums {
+    pub items: Vec<Album>,
+    pub total: u32,
+    #[serde(default)]
+    pub offset: u32,
+    #[serde(default)]
+    pub limit: u32,
+}
+
+/// Artist biography content
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtistBiography {
+    pub summary: Option<String>,
+    pub content: Option<String>,
+    pub source: Option<String>,
+}
+
+/// Measured stream parameters read from the head of an audio buffer
+/// (FLAC STREAMINFO). `sample_rate` is in Hz.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioParams {
+    pub sample_rate: u32,
+    pub bits_per_sample: u32,
+    pub channels: u16,
+}
+
+/// Album dates from discover
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoverAlbumDates {
+    pub download: Option<String>,
+    pub original: Option<String>,
+    pub stream: Option<String>,
+}
+
+/// Audio info from discover album
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoverAudioInfo {
+    pub maximum_sampling_rate: Option<f64>,
+    pub maximum_bit_depth: Option<u32>,
+    pub maximum_channel_count: Option<u32>,
+}
+
+/// Genre model
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Genre {
+    pub id: u64,
+    pub name: String,
+    /// Full ancestor id chain (top-level first, self last) as sent by the
+    /// discover endpoints. Absent on older cached payloads → None.
+    #[serde(default)]
+    pub path: Option<Vec<u64>>,
+}
+
+/// A downloadable extra bundled with an album (e.g. PDF booklet)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Goody {
+    #[serde(default)]
+    pub id: u64,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub url: String,
+    /// Original (full-size) URL
+    #[serde(default)]
+    pub original_url: String,
+    /// File format id (e.g. 21 for PDF)
+    #[serde(default)]
+    pub file_format_id: Option<u32>,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlaylistGenre {
+    pub id: u64,
+    pub name: String,
+    pub slug: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PlaylistOwner {
+    #[serde(default)]
+    pub id: u64,
+    #[serde(default)]
+    pub name: String,
 }
