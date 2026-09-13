@@ -5287,14 +5287,12 @@ impl Player {
         }
 
         let mut total_written: u64 = flac_header.len() as u64;
-        // Accumulate the assembled FLAC (header + decrypted frames) so the
-        // finished track can be cached for instant replay. Empty when
-        // `skip_cache` (streaming_only) is set.
-        let mut cache_data: Vec<u8> = if skip_cache {
-            Vec::new()
-        } else {
-            flac_header.clone()
-        };
+        // One reusable scratch buffer for the decrypted frames of the segment
+        // in hand, rather than a `to_vec()` per FLAC frame. The cache copy that
+        // used to be accumulated here in parallel is gone: the buffer already
+        // holds the assembled track, so it is read back once at the end
+        // instead of being built twice as it arrives.
+        let mut scratch: Vec<u8> = Vec::new();
         let start = Instant::now();
 
         for seg_idx in 1..=n_segments {
@@ -5309,46 +5307,28 @@ impl Player {
                 .await
                 .map_err(|e| format!("CMAF segment {} read: {}", seg_idx, e))?;
 
-            let crypto = qbz_cmaf::parse_segment_crypto(&seg_data)
-                .map_err(|e| format!("CMAF segment {} parse: {}", seg_idx, e))?;
-
-            let mut data_pos = crypto.data_offset;
-            for entry in &crypto.entries {
-                let frame_end = data_pos + entry.size as usize;
-                if frame_end > seg_data.len() {
-                    let _ = writer.error(format!("CMAF segment {} frame overflow", seg_idx));
-                    return Err(format!("CMAF segment {} frame overflow", seg_idx));
-                }
-                let mut frame = seg_data[data_pos..frame_end].to_vec();
-                if entry.flags != 0 {
-                    qbz_cmaf::decrypt_frame(&content_key, &entry.iv, &mut frame);
-                }
-                // Write decrypted frame to the streaming buffer.
-                if let Err(e) = writer.push_chunk(&frame) {
-                    let msg = format!("Failed to push frame: {e}");
-                    let _ = writer.error(msg.clone());
-                    return Err(msg);
-                }
-                if !skip_cache {
-                    cache_data.extend_from_slice(&frame);
-                }
-                total_written += frame.len() as u64;
-                data_pos = frame_end;
+            // Decrypt the whole segment into the scratch buffer in one pass.
+            // This is `qbz_qobuz::cmaf::decrypt_segment_into`, which exists for
+            // exactly this and whose own doc records "one copy instead of
+            // three, zero per-frame allocations" — the live path had been
+            // open-coding a worse version of it.
+            scratch.clear();
+            if let Err(e) = qbz_qobuz::cmaf::decrypt_segment_into(
+                &seg_data,
+                seg_idx as usize,
+                &content_key,
+                &mut scratch,
+            ) {
+                let msg = format!("CMAF segment {} decrypt: {e}", seg_idx);
+                let _ = writer.error(msg.clone());
+                return Err(msg);
             }
-
-            // Trailing unencrypted data after all frame entries.
-            if data_pos < crypto.mdat_end && crypto.mdat_end <= seg_data.len() {
-                let trailing = &seg_data[data_pos..crypto.mdat_end];
-                if let Err(e) = writer.push_chunk(trailing) {
-                    let msg = format!("Failed to push trailing data: {e}");
-                    let _ = writer.error(msg.clone());
-                    return Err(msg);
-                }
-                if !skip_cache {
-                    cache_data.extend_from_slice(trailing);
-                }
-                total_written += trailing.len() as u64;
+            if let Err(e) = writer.push_chunk(&scratch) {
+                let msg = format!("Failed to push segment {seg_idx}: {e}");
+                let _ = writer.error(msg.clone());
+                return Err(msg);
             }
+            total_written += scratch.len() as u64;
 
             // Progress logging every 5 segments or on the last segment.
             if seg_idx % 5 == 0 || seg_idx == n_segments {
@@ -5388,12 +5368,23 @@ impl Player {
             n_segments - 1
         );
 
-        // Cache the assembled FLAC (header + decrypted frames) for instant
-        // replay on the next play of this track.
-        if !skip_cache && !cache_data.is_empty() {
-            let bytes = cache_data.len();
-            cache.insert(track_id, cache_data);
-            log::info!("[CMAF-STREAM] Track {} cached ({} bytes)", track_id, bytes);
+        // Cache the assembled FLAC for instant replay, read back from the
+        // buffer that already holds it. Building it here rather than
+        // accumulating a parallel `Vec` as the segments arrived removes a
+        // whole second copy of the track — 120-220 MB at Hi-Res, resident for
+        // the length of the track rather than for the instant of the insert.
+        if !skip_cache {
+            match writer.complete_track_bytes() {
+                Some(bytes) => {
+                    let len = bytes.len();
+                    cache.insert(track_id, bytes);
+                    log::info!("[CMAF-STREAM] Track {} cached ({} bytes)", track_id, len);
+                }
+                None => log::debug!(
+                    "[CMAF-STREAM] Track {} not cached: the buffer is not one complete run",
+                    track_id
+                ),
+            }
         }
 
         Ok(())

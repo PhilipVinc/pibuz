@@ -1284,6 +1284,24 @@ impl BufferWriter {
         self.shared.wanted.notified().await;
     }
 
+    /// The whole track's bytes, once the feeder has reported itself done.
+    ///
+    /// The writer-side twin of [`BufferedMediaSource::take_complete_data`],
+    /// for a feeder that assembles a track it also wants cached. Without it
+    /// such a feeder has to keep its own parallel `Vec` of everything it
+    /// pushed — a second full copy of a 120-220 MB track, live at the same
+    /// time as the buffer, for the whole track rather than for an instant.
+    ///
+    /// `None` unless the buffer is one complete run from byte 0, which is the
+    /// same condition the source-side method requires and for the same reason.
+    pub fn complete_track_bytes(&self) -> Option<TrackBytes> {
+        let state = self.shared.state.lock().ok()?;
+        if !state.download_complete || state.download_error.is_some() || state.segments.len() != 1 {
+            return None;
+        }
+        state.head_run().map(|seg| TrackBytes::from(seg.bytes()))
+    }
+
     /// Mark download as complete
     ///
     /// After this is called, readers will receive EOF after reading all buffered data.
