@@ -560,6 +560,42 @@ mod report_decision_tests {
         }
     }
 
+    /// THE FLICKER, the other way round. While a load is in flight the report
+    /// must name the track being LOADED, never the one being left — the player
+    /// is still on the outgoing track (or on nothing) until audio starts.
+    ///
+    /// Reported as the now-playing cover flicking to the previous song when
+    /// jumping back a few tracks in the queue. Backwards jumps land on cached
+    /// tracks, and the cache-hit path was the one that armed no latch, so the
+    /// scheduler fell through to the player's own state and published the
+    /// outgoing track as current.
+    #[test]
+    fn a_load_in_flight_reports_the_arriving_track_not_the_departing_one() {
+        const LEAVING: u64 = 208204223;
+        const ARRIVING: u64 = 74936706;
+
+        let latch = BufferingLatch::default();
+        latch.begin(ARRIVING, 0, 300);
+
+        // Mid-changeover: the audio thread is still reporting the old track.
+        let d = tick(&latch, on(LEAVING, 0, false), false);
+        assert_eq!(
+            d.track_id, ARRIVING,
+            "the controller must be told what is arriving, not what is leaving"
+        );
+        assert_eq!(d.buffer_state, BUFFER_STATE_BUFFERING);
+    }
+
+    /// And with no load in flight the player is authoritative — otherwise a
+    /// stale latch would pin the report to a track that already finished.
+    #[test]
+    fn with_nothing_in_flight_the_player_is_authoritative() {
+        let latch = BufferingLatch::default();
+        let d = tick(&latch, on(74936706, 12, true), false);
+        assert_eq!(d.track_id, 74936706);
+        assert_eq!(d.buffer_state, BUFFER_STATE_OK);
+    }
+
     /// THE INVARIANT. A player that has arrived on the loading track and is
     /// not going anywhere must stop being reported as BUFFERING — promptly,
     /// and without help from the 90 s backstop.
