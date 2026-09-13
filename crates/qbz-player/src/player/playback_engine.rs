@@ -1052,13 +1052,21 @@ fn alsa_writer_thread(
             } else {
                 pending.resize(chunk_samples, 0.0);
                 let popped = consumer.pop_slice(&mut pending);
-                // How full the ring was when we got here, in frames. Two
-                // relaxed atomic stores; the real-time thread may not log, so
-                // somebody else decides whether this is worth complaining
-                // about. It is the figure that PREDICTS a glitch — an xrun
-                // counter only records one after it has been heard, and a stall
-                // the ring absorbed leaves no trace at all.
-                link.record_fill((popped / channels) as u64, popped == 0);
+                // How full the ring WAS, not how much this read took.
+                //
+                // `pop_slice` returns at most one chunk, so recording its
+                // result measured the chunk size and nothing else — a constant,
+                // reported every tick, that said the same thing about a ring
+                // brimming and a ring one frame from empty. The occupancy is
+                // produced-minus-handed, which is the figure that predicts a
+                // glitch; an xrun counter only records one after it has been
+                // heard.
+                //
+                // Two relaxed atomic stores. The real-time thread may not log,
+                // so somebody else decides whether this is worth complaining
+                // about.
+                let fill = link.frames_produced().saturating_sub(link.frames_handed());
+                link.record_fill(fill, popped == 0);
                 pending.truncate(popped);
                 pending_is_replay = false;
             }
