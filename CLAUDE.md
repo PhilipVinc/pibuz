@@ -162,8 +162,9 @@ low-memory one. Running the ENGINE at 2 s would test no new logic — the fill,
 drain and boundary handling are depth-independent; what a shallower ring changes
 is how long the decoder may stall before the ring runs dry, and no test can
 settle that honestly, because it depends on real decode speed and real I/O.
-`allow_gapless_prefetch` is the one behaviour still gated on the singleton with
-no coverage.
+Both remaining singleton reads are named functions now — `gapless_prefetch_allowed`
+and `should_promote_streaming_buffer` — so the policies are tested even though the
+lookup still happens at the call site.
 
 Assert `Arc::strong_count`, not just byte totals. A residency leak here IS one
 extra live `TrackBytes` clone, so "the release dropped the last reference" is a
