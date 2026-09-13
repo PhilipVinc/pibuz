@@ -136,6 +136,47 @@ would let this harness mount the daemon's own sink instead of a copy of its
 shape. The daemon-side volume policy (`VolumeMode::Locked`) is in the same
 position: its arithmetic is unit-tested, its behaviour is not reachable here.
 
+## The residency tests, and the profile trap
+
+`crates/qbz-app/src/playback_driver.rs` → `mod residency_session_tests` drives
+the real `plan_tick`/`advance_state` over a real `qbz_cache::AudioCache` for a
+twenty-track gapless playlist and samples residency at EVERY tick. It exists
+because the two unit tests either side of it — `plan_tick` emits
+`ReleaseCachedTrack`, `AudioCache::release` frees one track — both pass while the
+daemon still swaps: the question the Pi asks is how many tracks are resident at
+once, twenty tracks in, and that is a property of the two composed over time.
+
+**`memory_profile()` is a process-wide `OnceLock` resolved from the host's RAM,
+and it gates four production behaviours.** Anything that calls it in a test gets
+`Normal` on every dev machine and every CI runner — so the branch the Pi actually
+runs is the one that never executes. Do not reach for a settable global: the
+cases share a process, so whichever test set it first would decide for all of
+them. Pass the class instead, as `release_finished_track_on` /
+`release_finished_track_from` and `should_promote_streaming_buffer` now do. Two
+behaviours still read the singleton directly and have no coverage for that
+reason: `allow_gapless_prefetch` and the engine's `pcm_ring_seconds` (so even the
+audio behaviour tests build a 6 s ring, never the Pi's 2 s one).
+
+Assert `Arc::strong_count`, not just byte totals. A residency leak here IS one
+extra live `TrackBytes` clone, so "the release dropped the last reference" is a
+discrete assertion where "peak bytes ≤ budget" is an inequality with slack that
+mutations walk straight through.
+
+What was deliberately NOT built, after an adversarial review of the design:
+- **A counting `#[global_allocator]`.** It cannot be isolated — the target that
+  would host it (`crates/qbz-player/tests/`) cannot see `playback_engine`, which
+  is a private module — it perturbs what it measures through `realloc`, and its
+  size-class histogram cannot establish provenance: on the CMAF path the
+  prefetch `Vec` and the cache `Arc` are the same size class, 16 bytes apart.
+- **A manually-advanced `VirtualAudioOut`.** "Settle until the device holds `n`
+  frames" is unsatisfiable above `buffer_frames` (`accept` blocks there), hangs
+  `drain`'s 5 s deadline at every track boundary, and has no observable
+  termination condition. It would not buy determinism anyway while the engine's
+  five wall-clock timeouts (`WRITER_START_ON_IDLE`, `WRITER_PRIME_DEADLINE`,
+  `DECODER_SPACE_WAIT`, the 100 ms source wait, `EXIT_GRACE`) still run on real
+  time. Making those test-settable is the cheaper change if flaky underrun
+  assertions become a problem.
+
 ## Formatting and lints
 
 Run `cargo fmt --all`; the tree is rustfmt-clean and CI checks it. (Older
