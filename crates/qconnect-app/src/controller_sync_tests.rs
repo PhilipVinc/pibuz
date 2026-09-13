@@ -1037,3 +1037,82 @@ async fn the_announced_quality_ceiling_is_what_the_stream_opens_at() {
     );
     harness.assert_invariants();
 }
+
+// ================================================ the same intent, three ways
+
+/// "Play track 101 from the start" reaches this renderer by at least three
+/// different routes, and all three must end in the same place.
+///
+/// The cloud does not have one way of saying things. A tap in an album is a
+/// queue push followed by a SetState; a takeback is a SetActive followed by a
+/// SetState; a track change inside an existing queue is a bare SetState. The
+/// renderer's job is to end up playing the same track at the same position
+/// whichever arrives, and the screen has to agree — but each route runs through
+/// a different arm of the orchestration, so "it works" on one says nothing about
+/// the others. Every bug in this file was a bug on exactly one route.
+#[tokio::test]
+async fn the_same_intent_lands_the_same_way_whichever_route_it_arrives_by() {
+    /// What both the speakers and the screen ended up showing.
+    async fn outcome(harness: &ControllerHarness) -> (u64, u64, bool, Transport, Option<u64>) {
+        harness.report_tick().await;
+        let player = harness.engine().snapshot();
+        (
+            player.track_id,
+            player.position,
+            player.is_playing,
+            harness.view().transport,
+            harness.view().total_ms,
+        )
+    }
+
+    // Route 1: tap a track in an album — queue push, then SetState.
+    let by_tapping_an_album = {
+        let harness = ControllerHarness::new().await;
+        harness.become_active_renderer().await;
+        harness.controller().push_queue_and_play(&TRACKS, 0).await;
+        let out = outcome(&harness).await;
+        harness.assert_invariants();
+        out
+    };
+
+    // Route 2: take the render from a peer — SetActive, then the cloud's
+    // authoritative SetState.
+    let by_taking_the_render = {
+        let harness = ControllerHarness::new().await;
+        harness.become_active_renderer().await;
+        harness.controller().push_queue(&TRACKS, 0).await;
+        harness.peer_takes_the_render().await;
+        harness.let_the_load_windows_expire();
+        harness.controller().take_renderer().await;
+        harness.controller().resume_at(101, 0).await;
+        let out = outcome(&harness).await;
+        harness.assert_invariants();
+        out
+    };
+
+    // Route 3: a bare SetState inside a queue the renderer already holds.
+    let by_a_bare_setstate = {
+        let harness = ControllerHarness::new().await;
+        harness.become_active_renderer().await;
+        harness.controller().push_queue(&TRACKS, 0).await;
+        harness.let_the_load_windows_expire();
+        harness.controller().tap_next_track(101, Some(102)).await;
+        let out = outcome(&harness).await;
+        harness.assert_invariants();
+        out
+    };
+
+    assert_eq!(
+        by_tapping_an_album, by_taking_the_render,
+        "tapping an album and taking the render must land identically"
+    );
+    assert_eq!(
+        by_tapping_an_album, by_a_bare_setstate,
+        "tapping an album and a bare SetState must land identically"
+    );
+    assert_eq!(
+        by_tapping_an_album,
+        (101, 0, true, Transport::Playing, Some(TRACK_DURATION_MS)),
+        "and all three must land on track 101, playing, at its start"
+    );
+}
