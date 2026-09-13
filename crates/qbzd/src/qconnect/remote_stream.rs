@@ -84,6 +84,10 @@ pub async fn stream_remote_track_into_player(
             // the decoder may seek anywhere in the track for the cost of one
             // request.
             StreamSeekMode::RangeRequests,
+            // No window floor: this feeder pushes whatever the socket hands it,
+            // ~64 KB at a time, so it can always deliver into a lead however
+            // short. Only a feeder with a coarser unit needs one.
+            0,
         )
         .map_err(|err| format!("start streaming remote track {track_id}: {err}"))?;
 

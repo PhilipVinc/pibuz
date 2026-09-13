@@ -5066,6 +5066,13 @@ impl Player {
                     // costs one segment fetch instead of a download of
                     // everything before it — and the buffer can be windowed.
                     seek_mode,
+                    // A segment is also the smallest thing it can push, so the
+                    // window has to leave room to fetch a whole one while the
+                    // lead runs down. Three of the largest.
+                    3 * (1..=map.segment_count())
+                        .filter_map(|s| map.segment_len(s))
+                        .max()
+                        .unwrap_or(0),
                 )?;
 
                 // Spawn the background task that fetches + decrypts + pushes
@@ -5926,9 +5933,12 @@ impl Player {
     /// [`StreamSeekMode::RangeRequests`] only when it honors the buffer's
     /// range requests (see `BufferWriter::next_plan`): that is what lets a
     /// resume or a seek fetch from the offset instead of downloading
-    /// everything before it. A feeder that assembles its bytes in order —
-    /// CMAF segments — must pass
-    /// [`StreamSeekMode::Sequential`].
+    /// everything before it. A feeder that can only produce bytes in the order
+    /// it generates them must pass [`StreamSeekMode::Sequential`].
+    ///
+    /// `min_window_bytes` is a floor under the buffer's window, for a feeder
+    /// that pushes in units bigger than a chunk — pass a few times that unit,
+    /// or 0 when the unit is small enough not to matter.
     #[allow(clippy::too_many_arguments)]
     pub fn play_streaming_dynamic(
         &self,
@@ -5941,6 +5951,7 @@ impl Player {
         duration_secs: u64,
         start_position_secs: u64,
         seek_mode: StreamSeekMode,
+        min_window_bytes: u64,
     ) -> Result<BufferWriter, String> {
         let _gen = self.begin_play();
         self.apply_play_streaming_dynamic(
@@ -5953,6 +5964,7 @@ impl Player {
             duration_secs,
             start_position_secs,
             seek_mode,
+            min_window_bytes,
         )
     }
 
@@ -5972,6 +5984,7 @@ impl Player {
         duration_secs: u64,
         start_position_secs: u64,
         seek_mode: StreamSeekMode,
+        min_window_bytes: u64,
     ) -> Result<BufferWriter, String> {
         log::info!(
             "Player: Starting dynamic streaming for track {} ({}Hz, {}ch, {}-bit, {:.2} MB, {:.1} MB/s, {}s, start={}s, {:?})",
@@ -6031,21 +6044,41 @@ impl Player {
         // ends up with a third of a second of lead on hi-res without anyone
         // choosing that.
         //
-        // The floor is not decoration. `has_min_buffer` waits for
-        // `initial_buffer_bytes` CONTIGUOUS from `primary_offset`, so a window
-        // smaller than the initial fill target parks the feeder before playback
-        // can ever start — a deadlock at the top of every track.
+        // Two floors, neither of them decoration.
+        //
+        // `has_min_buffer` waits for `initial_buffer_bytes` CONTIGUOUS from
+        // `primary_offset`, so a window smaller than the initial fill target
+        // parks the feeder before playback can ever start — a deadlock at the
+        // top of every track.
+        //
+        // And a window has to be several times whatever the feeder pushes at
+        // once, because the feeder is parked until the lead falls to
+        // three-quarters of it and then has to deliver a whole unit before that
+        // lead runs out. A byte-stream feeder pushes 64 KB and this never
+        // binds; the CMAF feeder pushes a whole segment — ~3.3 MB, ten seconds
+        // of 24/96 — and an 8-second window would leave it six seconds to fetch
+        // ten, which needs a link 1.6x faster than the track's own bitrate
+        // before anything plays smoothly. `min_window_bytes` is that unit
+        // times three: enough lead to cover one fetch with the band to spare,
+        // and still ~10 MB against the 120-220 MB this path used to hold.
+        //
+        // That floor stays UNDER the memory profile's ceiling, unlike the
+        // deadlock floor above it: a window that cannot start playback is
+        // broken, while one that merely leaves a thin margin is only tight. A
+        // low-memory board's 8 MB ceiling is still more than two segments.
         let profile = qbz_models::system_capabilities::memory_profile();
         let raw_window = (window_secs as u64).saturating_mul(bps);
         config.window_bytes = (raw_window as usize)
             .clamp(2 * 1024 * 1024, profile.stream_window_max_bytes)
-            .max(config.initial_buffer_bytes.saturating_mul(2));
+            .max(config.initial_buffer_bytes.saturating_mul(2))
+            .max((min_window_bytes as usize).min(profile.stream_window_max_bytes));
         log::info!(
-            "Streaming window: {}s x {} B/s → {:.1} MB ahead of the decoder (cap {:.1} MB, {:?})",
+            "Streaming window: {}s x {} B/s → {:.1} MB ahead of the decoder (cap {:.1} MB, floor {:.1} MB, {:?})",
             window_secs,
             bps,
             config.window_bytes as f64 / (1024.0 * 1024.0),
             profile.stream_window_max_bytes as f64 / (1024.0 * 1024.0),
+            min_window_bytes as f64 / (1024.0 * 1024.0),
             profile.class,
         );
 
