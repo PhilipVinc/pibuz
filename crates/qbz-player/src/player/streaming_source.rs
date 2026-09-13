@@ -2937,8 +2937,16 @@ mod buffer_behaviour_tests {
         // a trimmed region with no way to re-request it waits on the condvar
         // for bytes that are never coming. A hung CI job is a worse regression
         // signal than a failed assertion.
-        tokio::time::timeout(Duration::from_secs(10), probe)
-            .await
+        let outcome = tokio::time::timeout(Duration::from_secs(10), probe).await;
+        if outcome.is_err() {
+            // The timeout alone does not make the failure visible: the reader
+            // is a blocking task parked on the condvar, and the runtime's
+            // shutdown waits for it, so the panic below would hang the test
+            // binary rather than report. `abandon` turns its next read into
+            // EOF so it can exit and the failure can be seen.
+            source.abandon();
+        }
+        outcome
             .expect("probing from byte 0 blocked — the header is not readable")
             .expect("reader thread");
         feeder.abort();
