@@ -259,10 +259,6 @@ pub async fn run_report_scheduler(
     runtime: Arc<AppRuntime<DaemonAdapter>>,
     buffering: Arc<super::engine::BufferingLatch>,
 ) {
-    use qconnect_app::renderer::{
-        PLAYING_STATE_PAUSED, PLAYING_STATE_PLAYING, PLAYING_STATE_STOPPED,
-    };
-
     // The periodic floor. It tightens to LOADING_FLOOR while a stream is
     // filling, because the two things that end a load — audio becoming audible,
     // and the real position/duration replacing the blank ones in the shared
@@ -307,7 +303,11 @@ pub async fn run_report_scheduler(
         // load window and only noticed once audio had started. The MILLISECOND
         // clock is what makes the audible edge prompt — see `in_flight`.
         let player = runtime.core().player();
-        let in_flight = buffering.in_flight(ev.track_id, player.state.current_position_ms());
+        let in_flight = buffering.in_flight_with_state(
+            ev.track_id,
+            player.state.current_position_ms(),
+            ev.is_playing,
+        );
         // Between tracks. The clock has reached the end of the track and the
         // next one has not started, which is a load in progress that the latch
         // never hears about: a gapless prefetch runs inside the player, with no
@@ -377,57 +377,26 @@ pub async fn run_report_scheduler(
             }
         };
 
-        // While buffering, report PLAYING + BUFFERING — the pair the official
-        // client itself sends. Observed from the desktop app's own renderer
-        // reports while IT buffers: playing_state 2, buffer_state 1, position
-        // and duration populated, repeated for the whole load.
-        //
-        // UNKNOWN was tried (StreamCore32 uses it) and is worse here: for a
-        // fresh track the position is 0, which the wire omits, so an UNKNOWN
-        // report carries neither a state nor a position and the controller drew
-        // nothing at all during a next-track load. The loading state comes from
-        // buffer_state; the playing state's job is to say we intend to play.
-        let playing_state = if ev.is_playing || is_buffering {
-            PLAYING_STATE_PLAYING
-        } else if ev.track_id == 0 {
-            // Nothing loaded at all — only reachable on the falling edge of a
-            // load that failed, where PAUSED would invite the controller to
-            // offer a resume for audio that was never there.
-            PLAYING_STATE_STOPPED
-        } else {
-            PLAYING_STATE_PAUSED
-        };
-        let buffer_state = if is_buffering {
-            BUFFER_STATE_BUFFERING
-        } else {
-            BUFFER_STATE_OK
-        };
-        // While a load is in flight the report must describe the track being
-        // loaded, taken from the latch — the player is still on the OUTGOING
-        // track (or on nothing at all, freshly after a hand-off, where it has
-        // neither a duration nor a track id). Reporting `ev` there named the
-        // previous song during a next-track load, and showed "0:00 of 0:00"
-        // for the whole wait when switching output from another device.
-        //
-        // The offset the stream opened at is the honest position: on a resume
-        // at 2:19 the controller should draw the scrubber there while it fills,
-        // not at zero.
-        let (report_track_id, position_secs, duration_secs) = match in_flight {
-            Some((track_id, start_secs, duration_secs)) => (track_id, start_secs, duration_secs),
-            None => (ev.track_id, ev.position, ev.duration),
-        };
+        let decision = decide_report(
+            PlayerSnapshot {
+                track_id: ev.track_id,
+                position_secs: ev.position,
+                duration_secs: ev.duration,
+                is_playing: ev.is_playing,
+            },
+            in_flight,
+            awaiting_next,
+        );
         // `report_playback_state` wants MILLISECONDS; the player reports seconds.
-        let position_ms = (position_secs as i64) * 1000;
-        let duration_ms = (duration_secs as i64) * 1000;
         report_playback_state(
             &app,
             &sync_state,
             &runtime,
-            playing_state,
-            position_ms,
-            duration_ms,
-            report_track_id,
-            buffer_state,
+            decision.playing_state,
+            (decision.position_secs as i64) * 1000,
+            (decision.duration_secs as i64) * 1000,
+            decision.track_id,
+            decision.buffer_state,
         )
         .await;
 
@@ -442,12 +411,327 @@ pub async fn run_report_scheduler(
         // time and total length flick to 0:00 and stay there until our next
         // report. That echo lands a few milliseconds AFTER ours, so being fast
         // is not enough; the fix is to speak again right behind it.
-        let signature = (playing_state, buffer_state, report_track_id);
+        let signature = (
+            decision.playing_state,
+            decision.buffer_state,
+            decision.track_id,
+        );
         if last_signature != Some(signature) {
             last_signature = Some(signature);
             floor = LOADING_FLOOR;
             interval = period_from(floor);
         }
+    }
+}
+
+use qconnect_app::renderer::{PLAYING_STATE_PAUSED, PLAYING_STATE_PLAYING, PLAYING_STATE_STOPPED};
+
+/// What the controller will be told this tick.
+///
+/// # Why this is a function and not four `let`s inside the loop
+///
+/// This decision used to live inline in the report loop, which needs a live
+/// `AppRuntime`, a connected QConnect session and a real player. Nothing could
+/// assert it, so the only way to learn what a controller would see was to cast
+/// to a Pi and watch. Two spinner bugs shipped through that gap — a seek whose
+/// clock was reported source-relative, and a track that loaded straight into a
+/// pause — and neither was a fault in any single component. Both were this
+/// triple being wrong.
+///
+/// Plain values in, plain values out: every combination of player state, load
+/// state and hand-off timing runs in microseconds. See `report_decision_tests`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReportDecision {
+    pub playing_state: i32,
+    pub buffer_state: i32,
+    pub track_id: u64,
+    pub position_secs: u64,
+    pub duration_secs: u64,
+}
+
+/// The slice of player state the decision reads — a trimmed `PlaybackEvent`, so
+/// a test need not build one.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PlayerSnapshot {
+    pub track_id: u64,
+    pub position_secs: u64,
+    pub duration_secs: u64,
+    pub is_playing: bool,
+}
+
+/// `in_flight` is the latch's answer — `(track_id, start_secs, duration_secs)`
+/// while a load is in flight. `awaiting_next` is the clock having run to the end
+/// with the next track not yet started, a gapless prefetch the latch never hears
+/// about.
+pub(crate) fn decide_report(
+    player: PlayerSnapshot,
+    in_flight: Option<(u64, u64, u64)>,
+    awaiting_next: bool,
+) -> ReportDecision {
+    let is_buffering = in_flight.is_some() || awaiting_next;
+
+    // While buffering, report PLAYING + BUFFERING — the pair the official
+    // client itself sends. Observed from the desktop app's own renderer reports
+    // while IT buffers: playing_state 2, buffer_state 1, position and duration
+    // populated, repeated for the whole load.
+    //
+    // UNKNOWN was tried (StreamCore32 uses it) and is worse here: for a fresh
+    // track the position is 0, which the wire omits, so an UNKNOWN report
+    // carries neither a state nor a position and the controller drew nothing at
+    // all during a next-track load. The loading state comes from buffer_state;
+    // the playing state's job is to say we intend to play.
+    let playing_state = if player.is_playing || is_buffering {
+        PLAYING_STATE_PLAYING
+    } else if player.track_id == 0 {
+        // Nothing loaded at all — only reachable on the falling edge of a load
+        // that failed, where PAUSED would invite the controller to offer a
+        // resume for audio that was never there.
+        PLAYING_STATE_STOPPED
+    } else {
+        PLAYING_STATE_PAUSED
+    };
+    let buffer_state = if is_buffering {
+        BUFFER_STATE_BUFFERING
+    } else {
+        BUFFER_STATE_OK
+    };
+    // While a load is in flight the report must describe the track being
+    // loaded, taken from the latch — the player is still on the OUTGOING track
+    // (or on nothing at all, freshly after a hand-off, where it has neither a
+    // duration nor a track id). Reporting the player's own state there named
+    // the previous song during a next-track load, and showed "0:00 of 0:00" for
+    // the whole wait when switching output from another device.
+    //
+    // The offset the stream opened at is the honest position: on a resume at
+    // 2:19 the controller should draw the scrubber there while it fills, not at
+    // zero.
+    let (track_id, position_secs, duration_secs) = match in_flight {
+        Some((track_id, start_secs, duration_secs)) => (track_id, start_secs, duration_secs),
+        None => (player.track_id, player.position_secs, player.duration_secs),
+    };
+    ReportDecision {
+        playing_state,
+        buffer_state,
+        track_id,
+        position_secs,
+        duration_secs,
+    }
+}
+
+/// What a CONTROLLER sees, driven through the real latch.
+///
+/// # Why these are not more unit tests of `BufferingLatch`
+///
+/// Both spinner bugs this renderer has shipped passed every unit test that
+/// existed. Neither was a fault in the latch or in the report assembly; each
+/// was the PAIR disagreeing — the latch waiting for a clock edge the player
+/// was never going to deliver, and the report faithfully turning that into
+/// BUFFERING forever. So these drive `BufferingLatch` and `decide_report`
+/// together and assert the triple that reaches the Qobuz app.
+///
+/// # The rule for adding here
+///
+/// Prefer an invariant over an anecdote. `a_settled_player_always_reaches_a_
+/// settled_report` is the one that matters: it sweeps the state space and
+/// would have caught both shipped bugs before either reached hardware. A named
+/// scenario is for pinning a specific wire shape a controller depends on.
+#[cfg(test)]
+mod report_decision_tests {
+    use super::super::transport::{BUFFER_STATE_BUFFERING, BUFFER_STATE_OK};
+    use super::*;
+    use crate::qconnect::engine::BufferingLatch;
+
+    /// One tick of the real pipeline: ask the latch, then decide the report.
+    fn tick(latch: &BufferingLatch, player: PlayerSnapshot, awaiting_next: bool) -> ReportDecision {
+        let in_flight = latch.in_flight_with_state(
+            player.track_id,
+            player.position_secs.saturating_mul(1000),
+            player.is_playing,
+        );
+        decide_report(player, in_flight, awaiting_next)
+    }
+
+    fn on(track_id: u64, position_secs: u64, is_playing: bool) -> PlayerSnapshot {
+        PlayerSnapshot {
+            track_id,
+            position_secs,
+            duration_secs: 341,
+            is_playing,
+        }
+    }
+
+    /// THE INVARIANT. A player that has arrived on the loading track and is
+    /// not going anywhere must stop being reported as BUFFERING — promptly,
+    /// and without help from the 90 s backstop.
+    ///
+    /// Both shipped spinner bugs are instances of this being false:
+    ///
+    /// - the seek bug: arrived, clock reported source-relative, sat below the
+    ///   offset forever;
+    /// - the pause bug: arrived at exactly the offset with the clock stopped,
+    ///   so `position > start` could never become true.
+    ///
+    /// "Arrived and settled" means the player reports the loading track AND
+    /// either its clock has moved past where the stream opened, or it is not
+    /// playing. The one cell that is deliberately NOT here — playing, clock
+    /// still exactly on the offset — is the honest "started, no audio yet";
+    /// `the_instant_before_the_first_sample_is_the_only_arrived_spinner` pins
+    /// that it is transient rather than a state you can sit in.
+    #[test]
+    fn a_settled_player_always_reaches_a_settled_report() {
+        const TRACK: u64 = 62_589_633;
+        for start_secs in [0_u64, 7, 166, 340] {
+            for extra in [0_u64, 1, 30] {
+                for is_playing in [true, false] {
+                    if is_playing && extra == 0 {
+                        continue; // the transient cell; see the test below
+                    }
+                    let latch = BufferingLatch::default();
+                    latch.begin(TRACK, start_secs, 341);
+                    let player = on(TRACK, start_secs + extra, is_playing);
+
+                    // Hold that state. Nothing changes, so nothing may keep
+                    // claiming a load is in flight.
+                    let mut last = tick(&latch, player, false);
+                    for _ in 0..50 {
+                        last = tick(&latch, player, false);
+                    }
+                    assert_eq!(
+                        last.buffer_state,
+                        BUFFER_STATE_OK,
+                        "a player sitting on track {TRACK} at {}s (opened at {start_secs}s, \
+                         playing={is_playing}) still reports BUFFERING after 50 ticks. The \
+                         controller shows a spinner on a session that has arrived and is not \
+                         moving; the only thing that ends it is the 90 s backstop.",
+                        start_secs + extra
+                    );
+                    assert_eq!(
+                        last.track_id, TRACK,
+                        "a settled report must name the track the player is on"
+                    );
+                    // A settled PAUSED report must say so — a controller shown
+                    // PLAYING on a paused renderer draws a pause button that
+                    // does nothing.
+                    if !is_playing {
+                        assert_eq!(last.playing_state, PLAYING_STATE_PAUSED);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The one arrived-but-still-buffering cell, and proof it is a moment
+    /// rather than a state: a playing track whose clock has not yet left the
+    /// offset has not produced audio, so the spinner is honest — and the very
+    /// next millisecond of clock ends it.
+    #[test]
+    fn the_instant_before_the_first_sample_is_the_only_arrived_spinner() {
+        const TRACK: u64 = 62_589_633;
+        let latch = BufferingLatch::default();
+        latch.begin(TRACK, 7, 341);
+        assert_eq!(
+            tick(&latch, on(TRACK, 7, true), false).buffer_state,
+            BUFFER_STATE_BUFFERING,
+            "playing, but the clock has not moved off the offset: no audio has flowed yet"
+        );
+        assert_eq!(
+            tick(&latch, on(TRACK, 8, true), false).buffer_state,
+            BUFFER_STATE_OK,
+            "and one second of clock is all it takes to clear it"
+        );
+    }
+
+    /// The exclusion that keeps the invariant honest: until the new stream
+    /// produces audio the player still reports the OUTGOING track, and THAT is
+    /// a real load in flight. The spinner belongs there.
+    #[test]
+    fn a_load_that_has_not_arrived_keeps_its_spinner() {
+        let latch = BufferingLatch::default();
+        latch.begin(62_589_633, 0, 341);
+        for player in [on(0, 0, false), on(62_589_600, 240, true)] {
+            let d = tick(&latch, player, false);
+            assert_eq!(
+                d.buffer_state, BUFFER_STATE_BUFFERING,
+                "the player is on {} — not the loading track — so the load really is in flight",
+                player.track_id
+            );
+            assert_eq!(
+                d.track_id, 62_589_633,
+                "and the report must name the track being LOADED, not the outgoing one"
+            );
+        }
+    }
+
+    /// FROM HARDWARE (2026-09-13). Cast, pause, restart the daemon. The
+    /// controller re-attaches with `SetState { playing_state: PAUSED,
+    /// current_position_ms: 7000 }`; the renderer opens at 7 s, arrives, and
+    /// pauses as asked — then reported PLAYING + BUFFERING for 90 seconds,
+    /// position frozen, until the backstop fired.
+    #[test]
+    fn a_session_reattached_into_a_pause_reports_paused_not_buffering() {
+        const TRACK: u64 = 62_589_633;
+        let latch = BufferingLatch::default();
+        latch.begin(TRACK, 7, 341);
+
+        // Opening the stream: not there yet, spinner is correct.
+        assert_eq!(
+            tick(&latch, on(0, 0, false), false).buffer_state,
+            BUFFER_STATE_BUFFERING
+        );
+
+        // Arrived at 7 s and paused, exactly as instructed.
+        let d = tick(&latch, on(TRACK, 7, false), false);
+        assert_eq!(
+            d.buffer_state, BUFFER_STATE_OK,
+            "a paused track sitting on its own start offset has ARRIVED"
+        );
+        assert_eq!(
+            d.playing_state, PLAYING_STATE_PAUSED,
+            "and the controller must be told PAUSED, so its play button is a play button"
+        );
+        assert_eq!(d.position_secs, 7, "with the position it is actually at");
+    }
+
+    /// FROM HARDWARE (the seek spinner). The latch cannot fix a clock reported
+    /// relative to the current source — it is downstream of the clock — so this
+    /// pins the honest reading: keep reporting the load. The fix lives in the
+    /// writer, and `a_seeked_source_reports_its_position_within_the_track` in
+    /// qbz-player is what holds it there.
+    #[test]
+    fn a_source_relative_clock_after_a_seek_still_reads_as_a_load() {
+        const TRACK: u64 = 9;
+        let latch = BufferingLatch::default();
+        latch.begin(TRACK, 166, 372);
+        for since_seek in [0_u64, 1, 2, 60] {
+            assert_eq!(
+                tick(&latch, on(TRACK, since_seek, true), false).buffer_state,
+                BUFFER_STATE_BUFFERING,
+                "a clock at {since_seek}s is BELOW the 166 s this stream opened at; the latch \
+                 can only believe the player"
+            );
+        }
+    }
+
+    /// A gapless hand-off has no latch around it — the prefetch runs inside the
+    /// player — so `awaiting_next` is the only thing that puts a spinner up
+    /// between tracks. The report must still name the outgoing track.
+    #[test]
+    fn awaiting_the_next_track_buffers_without_a_latch() {
+        let latch = BufferingLatch::default();
+        let d = tick(&latch, on(77, 258, true), true);
+        assert_eq!(d.buffer_state, BUFFER_STATE_BUFFERING);
+        assert_eq!(d.playing_state, PLAYING_STATE_PLAYING);
+        assert_eq!(d.track_id, 77, "the player is still on the outgoing track");
+    }
+
+    /// Nothing loaded is STOPPED, not PAUSED: PAUSED invites the controller to
+    /// offer a resume for audio that was never there.
+    #[test]
+    fn nothing_loaded_reports_stopped() {
+        let latch = BufferingLatch::default();
+        let d = tick(&latch, on(0, 0, false), false);
+        assert_eq!(d.playing_state, PLAYING_STATE_STOPPED);
+        assert_eq!(d.buffer_state, BUFFER_STATE_OK);
     }
 }
 

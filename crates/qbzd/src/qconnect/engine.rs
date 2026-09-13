@@ -168,13 +168,36 @@ impl BufferingLatch {
     /// audible, so the controller kept a spinner up for a second of music it
     /// was already playing.
     pub fn in_flight(&self, player_track_id: u64, position_ms: u64) -> Option<(u64, u64, u64)> {
+        self.in_flight_with_state(player_track_id, position_ms, true)
+    }
+
+    /// As [`Self::in_flight`], but told whether the player is actually running.
+    ///
+    /// `is_playing == false` on the LOADING track is the second way a load
+    /// ends: it arrived, and the controller had asked for a pause. See
+    /// `a_track_that_loads_straight_into_a_pause_is_not_buffering`.
+    pub fn in_flight_with_state(
+        &self,
+        player_track_id: u64,
+        position_ms: u64,
+        is_playing: bool,
+    ) -> Option<(u64, u64, u64)> {
         let Ok(mut guard) = self.0.lock() else {
             return None;
         };
         let b = guard.as_ref()?;
-        let audible = player_track_id == b.track_id
-            && position_ms > b.start_position_secs.saturating_mul(1000);
-        if audible || b.since.elapsed() > BUFFERING_MAX {
+        let on_track = player_track_id == b.track_id;
+        let start_ms = b.start_position_secs.saturating_mul(1000);
+        // Audio flowed: the clock climbed past where the stream opened.
+        let audible = on_track && position_ms > start_ms;
+        // Or it arrived into a pause. A stopped clock can never climb past its
+        // own offset, so without this a paused load reports BUFFERING until the
+        // 90 s backstop — a spinner, and a suppressed position, on a session
+        // that is doing exactly what it was told. `on_track` is what keeps this
+        // off a cold load: until the new stream produces audio the player still
+        // reports the OUTGOING track, so it never looks like arrival.
+        let arrived_paused = on_track && !is_playing && position_ms >= start_ms;
+        if audible || arrived_paused || b.since.elapsed() > BUFFERING_MAX {
             *guard = None;
             return None;
         }
@@ -673,6 +696,54 @@ mod tests {
             latch.in_flight(9, 166_500).is_none(),
             "a track-relative clock one half-second past the seek must release the latch"
         );
+    }
+
+    /// FROM HARDWARE. Cast to a Pi, pause, restart the daemon, let the
+    /// controller re-attach: it sends `SetState { playing_state: PAUSED,
+    /// current_position_ms: 7000 }`. The renderer opens the stream at 7 s,
+    /// arrives, and pauses exactly as asked — and then reported BUFFERING for
+    /// a minute and a half, because the audible edge is `position > start` and
+    /// a paused clock sits AT 7000, never past it. The controller showed a
+    /// spinner on a track that was doing precisely what it had been told.
+    ///
+    /// The 90 s backstop did eventually fire, which is how the log ends. A
+    /// backstop is not an answer: for those 90 seconds the report also
+    /// suppresses the position, so the session looks hung.
+    ///
+    /// Arrival is the edge when the player is not playing BY REQUEST. Landing
+    /// on the track at or past the offset with the clock stopped is not a load
+    /// still in flight; it is a load that finished into a pause.
+    #[test]
+    fn a_track_that_loads_straight_into_a_pause_is_not_buffering() {
+        let latch = BufferingLatch::default();
+        latch.begin(9, 7, 341);
+
+        // Still loading: the player has not adopted the track yet.
+        assert!(
+            latch.in_flight_with_state(0, 0, true).is_some(),
+            "before the player arrives, the load really is in flight"
+        );
+        // Arrived, paused, clock sitting exactly on the offset. Not buffering.
+        assert!(
+            latch.in_flight_with_state(9, 7_000, false).is_none(),
+            "a paused track sitting on the offset it opened at has ARRIVED — reporting it as \
+             buffering is a spinner on a session that is behaving correctly"
+        );
+    }
+
+    /// The pause release must not swallow a genuine cold load. A player that
+    /// is not yet playing because the stream has not produced audio still
+    /// reports the OUTGOING track (or none), so it never looks like arrival.
+    #[test]
+    fn a_cold_load_still_reports_buffering_while_it_is_not_playing() {
+        let latch = BufferingLatch::default();
+        latch.begin(9, 0, 341);
+        for (track, pos) in [(0u64, 0u64), (8, 240_000)] {
+            assert!(
+                latch.in_flight_with_state(track, pos, false).is_some(),
+                "track {track} at {pos} ms is not the loading track — the load is still in flight"
+            );
+        }
     }
 
     #[test]

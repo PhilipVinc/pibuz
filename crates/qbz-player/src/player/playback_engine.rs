@@ -1950,7 +1950,20 @@ mod engine_behaviour_tests {
     }
 
     fn device() -> Arc<VirtualAudioOut> {
-        Arc::new(VirtualAudioOut::new(RATE, CHANNELS, RING_MS, SPEED))
+        device_at(SPEED)
+    }
+
+    /// A device on a slower virtual clock.
+    ///
+    /// `SPEED` is 100x, which asks the decoder thread to sustain a hundred
+    /// times real-time decode. That is fine for a state-machine assertion and
+    /// wrong for an UNDERRUN assertion: on a loaded box — the whole suite
+    /// running in parallel — a 10 ms scheduling gap eats a full second of
+    /// virtual audio and the ring legitimately runs dry. The dryness is the
+    /// harness being honest about a starved writer, not the engine misbehaving,
+    /// so a test that counts underruns runs somewhere the decoder can keep up.
+    fn device_at(speed: f64) -> Arc<VirtualAudioOut> {
+        Arc::new(VirtualAudioOut::new(RATE, CHANNELS, RING_MS, speed))
     }
 
     /// Poll until `f` holds or the deadline passes. Returns whether it held.
@@ -2150,7 +2163,8 @@ mod engine_behaviour_tests {
     /// engine idle rather than wedged.
     #[test]
     fn the_end_of_the_queue_is_reported_and_leaves_the_engine_idle() {
-        let out = device();
+        // 10x, not the usual 100x — this test counts underruns; see `device_at`.
+        let out = device_at(10.0);
         let mut engine = PlaybackEngine::new_alsa_direct(out.clone(), false);
         engine.append(tone(1.0, 0.25), 0).expect("append");
 
