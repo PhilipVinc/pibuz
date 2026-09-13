@@ -3942,23 +3942,31 @@ impl Player {
                                 }
                             }
 
-                            // Don't queue while the current track is still
-                            // DOWNLOADING — its tail is not in memory, so there is
-                            // nothing to hand the writer thread after it.
+                            // The THIRD gate that was keyed on `is_complete()`.
                             //
-                            // A COMPLETE source is fine: its buffer holds the whole
-                            // track, which is precisely what promotion used to copy
-                            // out before clearing it. On a low-memory host promotion
-                            // is skipped (the copy is what puts a 1 GB Pi in swap),
-                            // so this is the only path left to gapless there —
-                            // refusing it outright silently traded gapless for
-                            // memory. The transition clears the source, freeing the
-                            // finished track's buffer.
+                            // It refused to queue the next track while the current
+                            // one was still downloading, on the reasoning that its
+                            // tail was not in memory and so there was nothing to
+                            // hand the writer thread afterwards. That held while the
+                            // feeder ran unthrottled and a track finished
+                            // downloading seconds in. With the download rate-matched
+                            // to playback it is false for almost the whole track,
+                            // and this gate refused EVERY hand-off — observed on the
+                            // Pi as "streaming source still downloading, ignoring
+                            // PlayNext" 24 s into a 256 s track whose successor was
+                            // already staged on disk.
+                            //
+                            // Completeness was never the real precondition. This
+                            // runs at APPEND time, but the writer does not pop the
+                            // queued source until the current one returns EOF — by
+                            // which point the current stream has completed by
+                            // definition. The only thing that stops it getting there
+                            // is a download error, so that is what is checked.
                             if current_streaming_source
                                 .as_ref()
-                                .is_some_and(|source| !source.is_complete())
+                                .is_some_and(|source| source.download_error().is_some())
                             {
-                                log::info!("Gapless: streaming source still downloading, ignoring PlayNext for track {}", track_id);
+                                log::info!("Gapless: the current stream has failed, ignoring PlayNext for track {}", track_id);
                                 thread_state.set_gapless_ready(false);
                                 return;
                             }

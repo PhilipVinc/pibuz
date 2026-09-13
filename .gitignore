@@ -47,3 +47,6 @@ test-results/
 
 # Isolated cargo test target dir (scripts / agents)
 /target-test/
+
+# Agent worktrees (transient; the agent owns its own checkout)
+.claude/worktrees/
