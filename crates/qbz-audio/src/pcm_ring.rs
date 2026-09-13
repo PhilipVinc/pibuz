@@ -103,6 +103,10 @@ pub struct RingLink {
     boundaries: Mutex<VecDeque<Boundary>>,
     /// Set at shutdown to wake both sides out of any wait.
     closed: AtomicBool,
+    /// Lowest ring fill any read has seen since the last drain of this figure.
+    min_fill_frames: AtomicU64,
+    /// Reads that found the ring empty when they wanted frames.
+    starved_reads: AtomicU64,
     /// Wake channel for the decoder. The mutex guards nothing but the condvar's
     /// own requirement; every wait has a timeout, so a lost notification costs
     /// a little latency and never a hang.
@@ -124,6 +128,8 @@ impl RingLink {
             next_boundary_at: AtomicU64::new(u64::MAX),
             boundaries: Mutex::new(VecDeque::new()),
             closed: AtomicBool::new(false),
+            min_fill_frames: AtomicU64::new(u64::MAX),
+            starved_reads: AtomicU64::new(0),
             space_lock: Mutex::new(()),
             space: Condvar::new(),
         }
@@ -137,6 +143,33 @@ impl RingLink {
     /// Consumer: record `frames` more handed to the device.
     pub fn add_handed(&self, frames: u64) {
         self.frames_handed.fetch_add(frames, Ordering::Release);
+    }
+
+    /// Consumer: note how full the ring was when this read found it.
+    ///
+    /// Two relaxed atomic stores, no allocation, no lock, no I/O — the writer
+    /// thread runs `SCHED_FIFO` and may not do any of those. Somebody else
+    /// reads the result and decides whether to complain about it.
+    ///
+    /// This is the number that PREDICTS a glitch. An xrun counter only records
+    /// one after it has been heard, and a stall that the ring absorbed leaves
+    /// no trace at all — which is exactly the state we were in when an audible
+    /// artifact was reported with nothing whatsoever in the log.
+    pub fn record_fill(&self, frames: u64, starved: bool) {
+        self.min_fill_frames.fetch_min(frames, Ordering::Relaxed);
+        if starved {
+            self.starved_reads.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Take the lowest fill seen and the starved-read count, resetting both.
+    ///
+    /// `None` until at least one read has been recorded, so a stream that has
+    /// not started yet does not report a low-water mark of zero.
+    pub fn take_low_water(&self) -> Option<(u64, u64)> {
+        let min = self.min_fill_frames.swap(u64::MAX, Ordering::Relaxed);
+        let starved = self.starved_reads.swap(0, Ordering::Relaxed);
+        (min != u64::MAX).then_some((min, starved))
     }
 
     pub fn frames_produced(&self) -> u64 {

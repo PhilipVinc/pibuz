@@ -607,6 +607,27 @@ impl PlaybackEngine {
     /// minus `snd_pcm_delay` — so it is what the listener is hearing, not what
     /// the writer has written. The two differ by the whole hardware ring, which
     /// is up to a second on the buffer a Pi is told to use.
+    /// Lowest decoded-ring fill since this was last asked, in frames, with the
+    /// number of reads that found it empty.
+    ///
+    /// Drains the figure, so the caller sees the worst case in ITS interval
+    /// rather than the worst since the stream opened. `None` on a backend
+    /// without the ring, or before any read.
+    ///
+    /// Exists because an audible artifact was reported with nothing at all in
+    /// the log: no xrun, no PCM recovery, no error on any path. A stall the
+    /// ring absorbs leaves no trace, and one it only just absorbs leaves the
+    /// same trace as one it did not. This is the number that distinguishes
+    /// them, and it has to be read from a thread that is allowed to log —
+    /// never from the writer, which is real-time.
+    pub fn take_ring_low_water(&self) -> Option<(u64, u64)> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::AlsaDirect { link, .. } => link.take_low_water(),
+            _ => None,
+        }
+    }
+
     pub fn position_secs(&self) -> Option<u64> {
         match self {
             Self::Rodio { .. } => None,
@@ -1062,6 +1083,13 @@ fn alsa_writer_thread(
             } else {
                 pending.resize(chunk_samples, 0.0);
                 let popped = consumer.pop_slice(&mut pending);
+                // How full the ring was when we got here, in frames. Two
+                // relaxed atomic stores; the real-time thread may not log, so
+                // somebody else decides whether this is worth complaining
+                // about. It is the figure that PREDICTS a glitch — an xrun
+                // counter only records one after it has been heard, and a stall
+                // the ring absorbed leaves no trace at all.
+                link.record_fill((popped / channels) as u64, popped == 0);
                 pending.truncate(popped);
                 pending_is_replay = false;
             }

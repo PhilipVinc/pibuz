@@ -562,6 +562,13 @@ fn seek_in_memory(
 /// stream is healthy", which the window filling already demonstrates.
 const GAPLESS_ARM_AFTER_SECS: u64 = 5;
 
+/// Decoded-ring fill below which the margin is worth a line in the log.
+///
+/// 12,000 frames is 125 ms at 96 kHz and 272 ms at 44.1 kHz — well under the
+/// 2-3 s the ring is sized for, so a healthy stream never trips it, and a
+/// stream that does is one scheduling hiccup from an audible gap.
+const RING_LOW_WATER_FRAMES: u64 = 12_000;
+
 fn should_arm_prefetch(
     enabled: bool,
     transition_consumed_pending: bool,
@@ -4282,6 +4289,34 @@ impl Player {
                                     .and_then(|engine| engine.position_secs())
                                 {
                                     thread_state.sync_to_audio_clock(audio_secs);
+                                }
+
+                                // How close the decoded ring came to running dry
+                                // since the last tick.
+                                //
+                                // The writer records this because it cannot log —
+                                // it is real-time — and nothing else was watching
+                                // it at all. That gap is why an audible artifact
+                                // could be reported with an empty log: no xrun, no
+                                // PCM recovery, no error on any path, because a
+                                // stall the ring absorbs leaves exactly the same
+                                // trace as one it does not, which is none.
+                                //
+                                // Reported at WARN only when the margin is
+                                // actually thin, so a healthy stream stays silent.
+                                if let Some((min_fill, starved)) = current_engine
+                                    .as_ref()
+                                    .and_then(|engine| engine.take_ring_low_water())
+                                {
+                                    if starved > 0 {
+                                        log::warn!(
+                                            "[Audio] decoded ring ran DRY {starved}x since the last tick                                              (lowest fill {min_fill} frames) — this is what a dropout sounds like"
+                                        );
+                                    } else if min_fill < RING_LOW_WATER_FRAMES {
+                                        log::warn!(
+                                            "[Audio] decoded ring fell to {min_fill} frames — thin margin,                                              a longer stall here would be audible"
+                                        );
+                                    }
                                 }
                                 let pos = thread_state.current_position();
                                 let dur = thread_state.duration.load(Ordering::SeqCst);
