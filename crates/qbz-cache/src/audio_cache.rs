@@ -374,28 +374,27 @@ mod tests {
 mod residency_tests {
     use super::*;
 
-    /// Inserting a downloaded track COPIES it, so for an instant both copies of
-    /// a Hi-Res FLAC are resident.
+    /// Handing the cache a `Vec` COPIES it, so for an instant both copies of a
+    /// Hi-Res FLAC are resident.
     ///
     /// `TrackBytes` is `Arc<[u8]>`, which carries a refcount header ahead of the
     /// bytes, so it cannot adopt a `Vec`'s allocation — `Arc::from(vec)` always
-    /// allocates and copies. Every prefetch arrives as a `Vec<u8>` (the CMAF and
-    /// legacy download paths both return one) and is handed straight to
-    /// `insert`, so completing a prefetch briefly holds 2x the track: 240 MB+
-    /// for a Hi-Res track, on boards with 512-905 MB of RAM, while the track
-    /// now playing is also resident.
+    /// allocates and copies. A 60-170 MB track handed over as a `Vec` therefore
+    /// costs 2x for the length of the copy, on boards with 512-905 MB of RAM,
+    /// while the track now playing is also resident.
     ///
-    /// This is asserted as a POINTER inequality rather than measured with a
-    /// counting allocator on purpose. The fact is discrete and the test is
-    /// exact; a peak-bytes measurement of the same thing would be at the mercy
-    /// of the allocator's `realloc` behaviour and of whatever else the test
-    /// binary is doing on another thread.
+    /// This is why the CMAF download assembles straight into an `Arc` (see
+    /// `qbz_qobuz::cmaf::ArcSlab`) instead of growing a `Vec` and converting.
+    /// The remaining `Vec` caller is the legacy nginx fallback, which streams
+    /// without knowing the length up front.
     ///
-    /// Nothing here is a bug to be fixed by this test — it is a cost to be
-    /// known, and pinned so that a future change that removes it (building the
-    /// download into an `Arc` buffer directly) is visibly a change.
+    /// Asserted as a POINTER inequality rather than measured with a counting
+    /// allocator on purpose: the fact is discrete and the test is exact, where a
+    /// peak-bytes measurement would be at the mercy of the allocator's `realloc`
+    /// behaviour and of whatever else the test binary is doing on another
+    /// thread.
     #[test]
-    fn inserting_a_downloaded_track_copies_it_rather_than_adopting_the_buffer() {
+    fn handing_the_cache_a_vec_copies_it_rather_than_adopting_the_buffer() {
         let cache = AudioCache::new(64 * 1024 * 1024);
 
         let downloaded = vec![7u8; 4 * 1024 * 1024];

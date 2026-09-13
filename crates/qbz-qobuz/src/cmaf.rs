@@ -26,8 +26,10 @@
 //!
 //! # Why two variants
 //!
-//! - [`download_full`] — returns the fully decrypted FLAC as `Vec<u8>`. Used
-//!   by the playback pipeline for in-memory cache writes and eager downloads.
+//! - [`download_full`] — returns the fully decrypted FLAC as `Arc<[u8]>`,
+//!   assembled directly in the allocation the cache and the audio thread go on
+//!   to share (see [`ArcSlab`]). Used by the playback pipeline for in-memory
+//!   cache writes and eager downloads.
 //! - [`download_raw`] — returns a [`CmafRawBundle`] of **encrypted** segments
 //!   plus key material. Used by the offline cache so we can persist
 //!   bit-identical bytes to what Qobuz delivered, and decrypt only at
@@ -197,8 +199,129 @@ pub enum TrackDestination {
 
 /// What [`download_full_sized`] produced.
 pub enum DownloadedTrack {
-    Memory(Vec<u8>),
+    Memory(std::sync::Arc<[u8]>),
     File(std::path::PathBuf),
+}
+
+/// Somewhere decrypted frames get appended.
+///
+/// A trait rather than a bare `&mut Vec<u8>` so a track can be assembled
+/// DIRECTLY into the allocation it will finally be shared from. See [`ArcSlab`]
+/// for why that is worth a trait.
+pub trait TrackSink {
+    fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// Append `src`, or fail if there is no room. Fallible because a fixed-size
+    /// sink has a real end: a segment table that disagrees with the bytes that
+    /// arrive must surface as an error, never as a silently truncated track.
+    fn append(&mut self, src: &[u8]) -> std::result::Result<(), String>;
+    /// The bytes from `from` to the current end, for decrypting a frame in
+    /// place immediately after it was appended.
+    fn tail_from(&mut self, from: usize) -> &mut [u8];
+}
+
+impl TrackSink for Vec<u8> {
+    fn len(&self) -> usize {
+        Vec::len(self)
+    }
+    fn append(&mut self, src: &[u8]) -> std::result::Result<(), String> {
+        self.extend_from_slice(src);
+        Ok(())
+    }
+    fn tail_from(&mut self, from: usize) -> &mut [u8] {
+        &mut self[from..]
+    }
+}
+
+/// A track assembled straight into the `Arc` it will be shared from.
+///
+/// # Why this exists
+///
+/// `TrackBytes` is `Arc<[u8]>` so that the cache, the audio thread and the
+/// decoder share ONE copy of a track instead of holding three. The catch is at
+/// the seam: an `Arc` keeps its refcount immediately BEFORE the bytes, and a
+/// `Vec`'s allocation has no room for that header, so `Arc::from(vec)` cannot
+/// adopt the buffer — it allocates again and copies. Building a 60-170 MB track
+/// into a `Vec` and then handing it to the cache therefore holds BOTH copies for
+/// the length of the copy: 240 MB+ at Hi-Res, on boards with 512-905 MB of RAM,
+/// while the track now playing is also resident.
+///
+/// The size is known before any audio is fetched — the init segment's table
+/// gives the exact decrypted byte count — so there is no reason to grow into a
+/// `Vec` first. Fill the final allocation directly and the second copy never
+/// exists.
+pub struct ArcSlab {
+    bytes: std::sync::Arc<[u8]>,
+    len: usize,
+}
+
+impl ArcSlab {
+    /// A slab of exactly `capacity` bytes, ready to be filled.
+    pub fn with_capacity(capacity: usize) -> Self {
+        // ZEROED rather than uninitialised on purpose: every byte is then a
+        // valid `u8` the moment the allocation exists, so `assume_init` is
+        // sound however much of the slab the download goes on to write, and a
+        // short download is caught by `into_arc` rather than by UB. For a
+        // track-sized block the zeroing is close to free — the allocator serves
+        // it from fresh zero pages it never has to touch.
+        let bytes = unsafe { std::sync::Arc::new_zeroed_slice(capacity).assume_init() };
+        Self { bytes, len: 0 }
+    }
+
+    fn writable(&mut self) -> &mut [u8] {
+        std::sync::Arc::get_mut(&mut self.bytes)
+            .expect("the slab is never shared while it is being filled")
+    }
+
+    /// The bytes written so far. The slab is sized from the segment table, so
+    /// in production this is the whole thing by the time anyone asks; it is
+    /// separate from [`Self::into_arc`] for tests that fill a generous slab and
+    /// only care about what came out.
+    pub fn filled(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+
+    /// The finished track, or an error when the bytes that arrived disagree
+    /// with the segment table that sized the slab.
+    ///
+    /// Refusing a short track is the same discipline the straight-to-disk path
+    /// applies: whatever comes out of here is treated as a complete track for
+    /// ever after, and a short one decodes as garbage on every later play.
+    pub fn into_arc(self) -> std::result::Result<std::sync::Arc<[u8]>, String> {
+        if self.len != self.bytes.len() {
+            return Err(format!(
+                "assembled {} bytes, segment table said {} — refusing a short track",
+                self.len,
+                self.bytes.len()
+            ));
+        }
+        Ok(self.bytes)
+    }
+}
+
+impl TrackSink for ArcSlab {
+    fn len(&self) -> usize {
+        self.len
+    }
+    fn append(&mut self, src: &[u8]) -> std::result::Result<(), String> {
+        let start = self.len;
+        let end = start + src.len();
+        if end > self.bytes.len() {
+            return Err(format!(
+                "segment data overruns the slab: {end} bytes into a {}-byte track",
+                self.bytes.len()
+            ));
+        }
+        self.writable()[start..end].copy_from_slice(src);
+        self.len = end;
+        Ok(())
+    }
+    fn tail_from(&mut self, from: usize) -> &mut [u8] {
+        let end = self.len;
+        &mut self.writable()[from..end]
+    }
 }
 
 /// Download a track, letting the caller choose in-memory or straight-to-disk
@@ -236,8 +359,8 @@ pub async fn download_full_sized(
 
     match choose(total_size) {
         TrackDestination::Memory => {
-            let mut output = Vec::with_capacity(total_size);
-            output.extend_from_slice(&setup.flac_header);
+            let mut output = ArcSlab::with_capacity(total_size);
+            output.append(&setup.flac_header)?;
             fetch_decrypt_in_order(
                 &http,
                 &setup.url_template,
@@ -254,7 +377,7 @@ pub async fn download_full_sized(
                 output.len() as f64 / (1024.0 * 1024.0),
                 total_size as f64 / (1024.0 * 1024.0),
             );
-            Ok(DownloadedTrack::Memory(output))
+            Ok(DownloadedTrack::Memory(output.into_arc()?))
         }
         TrackDestination::File(path) => {
             // The writer lives on a BLOCKING thread with a bounded channel in
@@ -451,7 +574,7 @@ fn finish_writeback(_writer: &std::io::BufWriter<std::fs::File>, _offset: usize,
 
 /// Where [`fetch_decrypt_in_order`] puts each decrypted segment.
 enum Sink<'a> {
-    Memory(&'a mut Vec<u8>),
+    Memory(&'a mut ArcSlab),
     /// Hands segments to the blocking writer. Bounded, so a card slower than
     /// the network throttles the download rather than piling up dirty pages.
     File {
@@ -471,7 +594,7 @@ impl Sink<'_> {
     ) -> std::result::Result<(), String> {
         match self {
             // Decrypts straight into the output; no intermediate copy.
-            Sink::Memory(out) => decrypt_segment_into(seg_data, seg_number, content_key, out),
+            Sink::Memory(out) => decrypt_segment_into(seg_data, seg_number, content_key, *out),
             Sink::File { tx } => {
                 // One buffer per segment, handed to the writer and freed there.
                 // A shared scratch would have to be copied out to send anyway.
@@ -493,7 +616,7 @@ pub async fn download_full(
     client: &QobuzClient,
     track_id: u64,
     quality: Quality,
-) -> std::result::Result<Vec<u8>, String> {
+) -> std::result::Result<Arc<[u8]>, String> {
     download_full_with_progress(client, track_id, quality, None).await
 }
 
@@ -504,7 +627,7 @@ pub async fn download_full_with_progress(
     track_id: u64,
     quality: Quality,
     on_progress: Option<CmafProgressCallback>,
-) -> std::result::Result<Vec<u8>, String> {
+) -> std::result::Result<Arc<[u8]>, String> {
     download_full_with_quality_progress(client, track_id, quality, on_progress)
         .await
         .map(|(bytes, _quality)| bytes)
@@ -519,7 +642,7 @@ pub async fn download_full_with_quality(
     client: &QobuzClient,
     track_id: u64,
     quality: Quality,
-) -> std::result::Result<(Vec<u8>, StreamQualityInfo), String> {
+) -> std::result::Result<(Arc<[u8]>, StreamQualityInfo), String> {
     download_full_with_quality_progress(client, track_id, quality, None).await
 }
 
@@ -529,7 +652,7 @@ pub async fn download_full_with_quality_progress(
     track_id: u64,
     quality: Quality,
     on_progress: Option<CmafProgressCallback>,
-) -> std::result::Result<(Vec<u8>, StreamQualityInfo), String> {
+) -> std::result::Result<(Arc<[u8]>, StreamQualityInfo), String> {
     let setup = setup_streaming(client, track_id, quality).await?;
     let http = build_cdn_client()?;
 
@@ -542,8 +665,8 @@ pub async fn download_full_with_quality_progress(
 
     // Pre-sized so the decrypted track never reallocates, and filled segment by
     // segment so the encrypted copy is never resident as a whole.
-    let mut output = Vec::with_capacity(total_size);
-    output.extend_from_slice(&setup.flac_header);
+    let mut output = ArcSlab::with_capacity(total_size);
+    output.append(&setup.flac_header)?;
     fetch_decrypt_in_order(
         &http,
         &setup.url_template,
@@ -568,7 +691,7 @@ pub async fn download_full_with_quality_progress(
         setup.sampling_rate.map(|v| v as f64),
         setup.bit_depth,
     );
-    Ok((output, quality_info))
+    Ok((output.into_arc()?, quality_info))
 }
 
 /// Download a track's complete CMAF stream and return it as a raw (still
@@ -906,7 +1029,7 @@ async fn fetch_decrypt_in_order(
 pub fn decrypt_segments_into(
     segments: &[Vec<u8>],
     content_key: &[u8; 16],
-    output: &mut Vec<u8>,
+    output: &mut impl TrackSink,
 ) -> std::result::Result<(), String> {
     for (seg_idx, seg_data) in segments.iter().enumerate() {
         // seg_idx is 0-based here but the original segment number is idx+1
@@ -925,7 +1048,7 @@ pub fn decrypt_segment_into(
     seg_data: &[u8],
     seg_number: usize,
     content_key: &[u8; 16],
-    output: &mut Vec<u8>,
+    output: &mut impl TrackSink,
 ) -> std::result::Result<(), String> {
     let crypto = qbz_cmaf::parse_segment_crypto(seg_data)
         .map_err(|e| format!("CMAF seg {} parse: {}", seg_number, e))?;
@@ -937,14 +1060,14 @@ pub fn decrypt_segment_into(
             return Err(format!("CMAF seg {} frame overflow", seg_number));
         }
         let output_start = output.len();
-        output.extend_from_slice(&seg_data[data_pos..frame_end]);
+        output.append(&seg_data[data_pos..frame_end])?;
         if entry.flags != 0 {
-            qbz_cmaf::decrypt_frame(content_key, &entry.iv, &mut output[output_start..]);
+            qbz_cmaf::decrypt_frame(content_key, &entry.iv, output.tail_from(output_start));
         }
         data_pos = frame_end;
     }
     if data_pos < crypto.mdat_end && crypto.mdat_end <= seg_data.len() {
-        output.extend_from_slice(&seg_data[data_pos..crypto.mdat_end]);
+        output.append(&seg_data[data_pos..crypto.mdat_end])?;
     }
     Ok(())
 }
@@ -1077,7 +1200,9 @@ mod segment_assembly_tests {
         let key = [7u8; 16];
         let segments = fixture();
 
-        let mut in_memory = Vec::new();
+        // Sized generously: this test is about the two sinks AGREEING, not about
+        // the segment table, so it fills what it fills and compares that.
+        let mut in_memory = super::ArcSlab::with_capacity(64 * 1024);
         {
             let mut sink = Sink::Memory(&mut in_memory);
             for (i, seg) in segments.iter().enumerate() {
@@ -1111,8 +1236,12 @@ mod segment_assembly_tests {
         let on_disk = std::fs::read(&path).unwrap();
         std::fs::remove_dir_all(&dir).ok();
 
-        assert!(!in_memory.is_empty(), "fixture produced no audio");
-        assert_eq!(in_memory, on_disk, "disk and memory assembly diverged");
+        assert!(!in_memory.filled().is_empty(), "fixture produced no audio");
+        assert_eq!(
+            in_memory.filled(),
+            on_disk,
+            "disk and memory assembly diverged"
+        );
         assert_eq!(
             written,
             on_disk.len(),
@@ -1136,5 +1265,81 @@ mod segment_assembly_tests {
             decrypt_segment_into(seg, i + 1, &key, &mut reversed).expect("rev");
         }
         assert_ne!(forward, reversed);
+    }
+}
+
+#[cfg(test)]
+mod arc_slab_tests {
+    use super::{ArcSlab, TrackSink};
+
+    /// The whole point: what comes out of the slab IS the allocation that was
+    /// filled, so handing it on costs a refcount bump and not a copy of the
+    /// track.
+    #[test]
+    fn the_track_leaves_in_the_allocation_it_was_assembled_in() {
+        let mut slab = ArcSlab::with_capacity(6);
+        slab.append(b"abc").unwrap();
+        let filled_ptr = slab.filled().as_ptr();
+        slab.append(b"def").unwrap();
+
+        let bytes = slab.into_arc().expect("filled exactly");
+        assert_eq!(&bytes[..], b"abcdef");
+        assert_eq!(
+            bytes.as_ptr(),
+            filled_ptr,
+            "into_arc must hand back the same allocation, not a copy of it"
+        );
+
+        // And sharing it is free, which is the reason for `Arc<[u8]>` at all.
+        let shared = bytes.clone();
+        assert_eq!(shared.as_ptr(), bytes.as_ptr());
+    }
+
+    /// A frame decrypted in place lands in the slab, not in a scratch copy.
+    #[test]
+    fn a_frame_can_be_rewritten_in_place_after_it_is_appended() {
+        let mut slab = ArcSlab::with_capacity(8);
+        slab.append(b"head").unwrap();
+        let frame_start = slab.len();
+        slab.append(b"ENCR").unwrap();
+        slab.tail_from(frame_start).copy_from_slice(b"clea");
+
+        assert_eq!(&slab.into_arc().unwrap()[..], b"headclea");
+    }
+
+    /// A segment table that promises more than arrives must be an error, never
+    /// a short track: whatever leaves here is treated as a complete track for
+    /// ever after, and a short one decodes as garbage on every later play.
+    #[test]
+    fn a_short_track_is_refused_rather_than_published() {
+        let mut slab = ArcSlab::with_capacity(16);
+        slab.append(b"only this").unwrap();
+        let err = slab
+            .into_arc()
+            .expect_err("a short track must not be published");
+        assert!(err.contains("refusing a short track"), "{err}");
+    }
+
+    /// And bytes beyond the promised size are refused too, rather than
+    /// silently truncated.
+    #[test]
+    fn data_that_overruns_the_segment_table_is_refused() {
+        let mut slab = ArcSlab::with_capacity(4);
+        slab.append(b"fits").unwrap();
+        let err = slab
+            .append(b"more")
+            .expect_err("overrun must not be swallowed");
+        assert!(err.contains("overruns the slab"), "{err}");
+    }
+
+    /// The slab starts zeroed, which is what makes `assume_init` sound however
+    /// much of it the download writes — the safety argument, pinned.
+    #[test]
+    fn the_slab_starts_zeroed() {
+        let slab = ArcSlab::with_capacity(32);
+        assert_eq!(slab.len(), 0);
+        assert!(slab.filled().is_empty());
+        let bytes = ArcSlab::with_capacity(32).into_arc().unwrap_err();
+        assert!(bytes.contains("assembled 0 bytes"), "{bytes}");
     }
 }
