@@ -87,8 +87,8 @@ fn map_event(e: MediaControlEvent) -> Option<MediaEvent> {
 
 pub fn spawn(on_event: EventCb) -> Option<PlatformHandle> {
     let config = PlatformConfig {
-        dbus_name: "com.blitzfc.qbz",
-        display_name: "QBZ",
+        dbus_name: "pibuz",
+        display_name: "Pibuz",
         // macOS: unused. Windows SMTC needs the window HWND; not shipped/tested,
         // so left None (init may fail there → None handle, no media controls).
         hwnd: None,

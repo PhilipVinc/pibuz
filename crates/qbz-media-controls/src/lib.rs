@@ -1,7 +1,7 @@
 //! Frontend-agnostic system media controls (ADR-006).
 //!
 //! - **Linux:** `mpris-server` — publishes the full MPRIS interface INCLUDING
-//!   `org.mpris.MediaPlayer2.DesktopEntry = "com.blitzfc.qbz"`, the only way
+//!   `org.mpris.MediaPlayer2.DesktopEntry = "pibuz"`, the only way
 //!   GNOME Shell resolves the application icon for its media widget. (souvlaki,
 //!   the cross-platform crate, never sets it, so GNOME shows no app icon.)
 //! - **macOS / Windows:** `souvlaki` — MediaRemote / SMTC, where there is no

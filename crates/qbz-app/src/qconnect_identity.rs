@@ -2,8 +2,8 @@
 //!
 //! The QConnect device UUID must be stable across runs. It is persisted in a
 //! small SQLite settings database (key `device_uuid`) whose path the CALLER
-//! supplies — `qbzd` points it at the daemon root so the daemon keeps its own
-//! identity. See `qbzd::qconnect::transport::resolve_qconnect_device_uuid`,
+//! supplies — `pibuz` points it at the daemon root so the daemon keeps its own
+//! identity. See `pibuz::qconnect::transport::resolve_qconnect_device_uuid`,
 //! which owns the path resolution and the `QBZ_QCONNECT_DEVICE_UUID` override.
 
 use uuid::Uuid;

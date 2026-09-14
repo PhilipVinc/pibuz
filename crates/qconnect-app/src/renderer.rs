@@ -1030,7 +1030,7 @@ pub async fn materialize_remote_queue(
     // `autoplay_reset` and `queue_position: null`, and every SetState that
     // follows is state-only (`current_track: null`) while the cloud keeps
     // reporting the OUTGOING track's position. The cursor move above re-points
-    // the queue, `qbzd status` and the overlay read that cursor — and the engine
+    // the queue, `pibuz status` and the overlay read that cursor — and the engine
     // plays on. That is the "app shows the track I picked, speakers play the
     // previous one" report, in its sticky form (the reconciler in `report.rs`
     // cannot heal it: the audible track is no longer IN the queue).

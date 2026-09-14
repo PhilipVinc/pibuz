@@ -534,7 +534,7 @@ async fn an_identical_queue_push_is_not_materialized_twice() {
 }
 
 /// When the cloud names a track, the player's CURSOR follows it — not just the
-/// audio. The cursor is what names the now-playing title in `qbzd status` and
+/// audio. The cursor is what names the now-playing title in `pibuz status` and
 /// in the moOde overlay, so a cursor left behind shows one song's title over
 /// another song's audio.
 #[tokio::test]

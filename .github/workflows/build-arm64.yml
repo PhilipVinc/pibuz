@@ -1,4 +1,4 @@
-# Helper: build the qbzd binary for aarch64 from any ref, for on-device
+# Helper: build the pibuz binary for aarch64 from any ref, for on-device
 # testing. Manual dispatch only — it publishes nothing.
 name: build-arm64
 on:
@@ -9,7 +9,7 @@ on:
         required: true
         type: string
 jobs:
-  build-qbzd:
+  build-pibuz:
     runs-on: ubuntu-22.04-arm
     timeout-minutes: 30
     steps:
@@ -19,13 +19,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: system deps
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libjack-jackd2-dev libdbus-1-dev libssl-dev
-      - name: tests (qbzd + models + daemon prefs)
+      - name: tests (pibuz + models + daemon prefs)
         # qbz-app's shell::tests hit a long-standing reqwest TLS-provider
         # panic that predates this tree, so scope qbz-app to its settings tests.
         run: |
-          cargo test -p qbzd -p qbz-models
+          cargo test -p pibuz -p qbz-models
           cargo test -p qbz-app settings::
       - name: build
-        run: cargo build --release -p qbzd
+        run: cargo build --release -p pibuz
       - uses: actions/upload-artifact@v4
-        with: { name: muqbzd-aarch64-testbuild, path: target/release/qbzd }
+        with: { name: pibuz-aarch64-testbuild, path: target/release/pibuz }

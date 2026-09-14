@@ -385,17 +385,17 @@ pub fn quality_from_key(key: &str) -> Quality {
 // ─────────────────────────── IO shell ───────────────────────────
 
 /// Host-supplied side channels the shell drives on each relevant action. Kept
-/// as trait objects so qbzd can wire daemon-shared latching / tick timestamping
-/// / the QConnect report signal without this module depending on qbzd.
+/// as trait objects so pibuz can wire daemon-shared latching / tick timestamping
+/// / the QConnect report signal without this module depending on pibuz.
 #[derive(Clone)]
 pub struct DriverDeps {
-    /// Resolve the streaming quality at play time (qbzd passes the daemon prefs).
+    /// Resolve the streaming quality at play time (pibuz passes the daemon prefs).
     pub quality: Arc<dyn Fn() -> Quality + Send + Sync>,
     /// Report-edge signal (T10 wires the QConnect renderer report).
     pub on_edge: Arc<dyn Fn() + Send + Sync>,
     /// Latch a drained error under a category ("stream" | "transport" | "auth").
     pub on_latch: Arc<dyn Fn(&str, String) + Send + Sync>,
-    /// Called at the end of every tick (qbzd timestamps `driver_last_tick`).
+    /// Called at the end of every tick (pibuz timestamps `driver_last_tick`).
     pub on_tick: Arc<dyn Fn() + Send + Sync>,
 }
 
@@ -458,7 +458,7 @@ pub async fn run_driver<A: FrontendAdapter + Send + Sync + 'static>(
                         // Stale. Queueing it would play a track the listener
                         // has already moved past — see the function's docs.
                         log::info!(
-                            "[qbzd] driver: dropping the gapless fetch of {id} — it was armed \
+                            "[pibuz] driver: dropping the gapless fetch of {id} — it was armed \
                              while {armed_against} played and the player is now on {now_playing}"
                         );
                         continue;
@@ -466,12 +466,12 @@ pub async fn run_driver<A: FrontendAdapter + Send + Sync + 'static>(
                     match fetched {
                         Some(qbz_player::TrackAudio::File(path)) => {
                             if let Err(e) = player.play_next_file(path, *id) {
-                                log::warn!("[qbzd] driver: gapless from disk failed: {e}");
+                                log::warn!("[pibuz] driver: gapless from disk failed: {e}");
                             }
                         }
                         Some(qbz_player::TrackAudio::Memory(bytes)) => {
                             if let Err(e) = player.play_next(bytes, *id) {
-                                log::warn!("[qbzd] driver: gapless play_next failed: {e}");
+                                log::warn!("[pibuz] driver: gapless play_next failed: {e}");
                             }
                         }
                         None => {}
@@ -485,7 +485,7 @@ pub async fn run_driver<A: FrontendAdapter + Send + Sync + 'static>(
                     if let Err(e) =
                         tokio::task::spawn_blocking(move || player.release_finished_track(id)).await
                     {
-                        log::warn!("[qbzd] driver: release task failed: {e}");
+                        log::warn!("[pibuz] driver: release task failed: {e}");
                     }
                 }
                 DriverAction::PauseStopAfter => {
@@ -493,7 +493,7 @@ pub async fn run_driver<A: FrontendAdapter + Send + Sync + 'static>(
                     let finished = queue.current;
                     if finished != 0 && core.consume_stop_after_if(finished).await {
                         if let Err(e) = core.pause() {
-                            log::warn!("[qbzd] driver: stop-after pause failed: {e}");
+                            log::warn!("[pibuz] driver: stop-after pause failed: {e}");
                         }
                     } else {
                         // Marker cleared between the snapshot and the consume — fall
@@ -514,13 +514,13 @@ pub async fn run_driver<A: FrontendAdapter + Send + Sync + 'static>(
                 DriverAction::QueueFinished => {
                     if queue.autoplay_infinite {
                         log::info!(
-                            "[qbzd] driver: autoplay 'infinite' unsupported on qbzd v1, \
+                            "[pibuz] driver: autoplay 'infinite' unsupported on pibuz v1, \
                              treated as queue-finished"
                         );
                     }
-                    log::info!("[qbzd] driver: queue finished");
+                    log::info!("[pibuz] driver: queue finished");
                     if let Err(e) = core.stop() {
-                        log::warn!("[qbzd] driver: stop on queue-finished failed: {e}");
+                        log::warn!("[pibuz] driver: stop on queue-finished failed: {e}");
                     }
                 }
             }
@@ -529,13 +529,13 @@ pub async fn run_driver<A: FrontendAdapter + Send + Sync + 'static>(
         state = advance_state(&state, &ev, &actions);
         (deps.on_tick)();
     }
-    log::info!("[qbzd] driver: shutting down");
+    log::info!("[pibuz] driver: shutting down");
 }
 
 /// Run the advance ritual and log its outcome (queue-finished on `Ok(None)`, the
 /// error on `Err`). The daemon stops on a genuine queue edge just like the
 /// pure-decision `QueueFinished` branch does. Always forward — the driver's
-/// auto-advance on track-end never walks backward (reverse is the `qbzd prev`
+/// auto-advance on track-end never walks backward (reverse is the `pibuz prev`
 /// route's concern, wired directly through `advance_and_play(..., false)`).
 async fn advance_and_play_logged<A: FrontendAdapter + Send + Sync + 'static>(
     runtime: &Arc<AppRuntime<A>>,
@@ -544,12 +544,12 @@ async fn advance_and_play_logged<A: FrontendAdapter + Send + Sync + 'static>(
     match advance_and_play(runtime, quality, true).await {
         Ok(Some(_)) => {}
         Ok(None) => {
-            log::info!("[qbzd] driver: advance found nothing playable — queue finished");
+            log::info!("[pibuz] driver: advance found nothing playable — queue finished");
             if let Err(e) = runtime.core().stop() {
-                log::warn!("[qbzd] driver: stop after empty advance failed: {e}");
+                log::warn!("[pibuz] driver: stop after empty advance failed: {e}");
             }
         }
-        Err(e) => log::warn!("[qbzd] driver: advance failed: {e}"),
+        Err(e) => log::warn!("[pibuz] driver: advance failed: {e}"),
     }
 }
 
@@ -558,7 +558,7 @@ async fn advance_and_play_logged<A: FrontendAdapter + Send + Sync + 'static>(
 /// the successors for gapless → persist the session. Never a bare cursor move
 /// (02 §2.2). The skip-walk mirrors `playback.rs::advance_to_playable` (capped
 /// at `MAX_OFFLINE_SKIPS`); `next_track()`/`previous_track()` are the atomic
-/// cursor movers — `forward` selects which one, so `qbzd next` and `qbzd prev`
+/// cursor movers — `forward` selects which one, so `pibuz next` and `pibuz prev`
 /// share this one ritual instead of duplicating the play → prefetch → persist
 /// tail.
 pub async fn advance_and_play<A: FrontendAdapter + Send + Sync + 'static>(
@@ -585,7 +585,7 @@ pub async fn advance_and_play<A: FrontendAdapter + Send + Sync + 'static>(
         }
         skips += 1;
         log::info!(
-            "[qbzd] driver: skipping unavailable track {} ({skips}/{MAX_OFFLINE_SKIPS})",
+            "[pibuz] driver: skipping unavailable track {} ({skips}/{MAX_OFFLINE_SKIPS})",
             track.id
         );
         if skips >= MAX_OFFLINE_SKIPS {
@@ -628,7 +628,7 @@ async fn prefetch_successors<A: FrontendAdapter + Send + Sync + 'static>(
         return;
     };
     if let Err(e) = player.prefetch_into_cache(client, next.id, quality).await {
-        log::debug!("[qbzd] driver: prefetch track {} failed: {e}", next.id);
+        log::debug!("[pibuz] driver: prefetch track {} failed: {e}", next.id);
     }
 }
 
@@ -914,7 +914,7 @@ mod tests {
 /// track. Both pass while the daemon still swaps, because neither asks the
 /// question the Pi asks — *how many tracks are resident at once, twenty tracks
 /// in*. That is a property of the two composed, over time, and it is the shape
-/// that had qbzd at 465 MB RSS on a 905 MB box: the track just finished sitting
+/// that had pibuz at 465 MB RSS on a 905 MB box: the track just finished sitting
 /// beside the one now playing AND the gapless prefetch.
 ///
 /// So this drives the REAL `plan_tick`/`advance_state` over a REAL `AudioCache`

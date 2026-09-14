@@ -3,12 +3,56 @@
 Notable changes per release. Versions are plain semver; releases are `vX.Y.Z`
 tags on `main`.
 
-## 2.3.2 — unreleased
+## 2.4.0 — unreleased
 
-Bounded streaming. Verified on a 905 MB Pi 3B against a live Qobuz Connect
+**The project is now Pibuz and the binary is `pibuz`** — see *Renamed* below
+for what an upgrade has to touch (little: the unit file) and what it keeps (the
+profile, the device identity, every `QBZ_*` hook variable).
+
+Also bounded streaming, verified on a 905 MB Pi 3B against a live Qobuz Connect
 session: the held buffer stays at 2.9 MB where it used to grow to the whole
 track, RSS while playing 24/96 went from ~125 MB to ~40 MB, and the download
 is paced at the track's own byte-rate instead of the link's.
+
+### Renamed
+
+The daemon shipped as `μqbzd`/`muqbzd` with a `qbzd` binary. Both names were
+unpronounceable, had two spellings between them, and `qbzd` collided with the
+binary of the desktop project this tree forked from — installing both put two
+different programs at the same path. The project is **Pibuz** and the binary is
+**`pibuz`**.
+
+- **Binary, crate and unit file** are `pibuz` / `pibuz.service`. Release assets
+  are `pibuz-<version>-linux-<arch>.tar.gz`, unpacking to a directory of the
+  same name holding `pibuz`. Update `ExecStart=` to the new path, and the unit
+  name you enable.
+- **Profile directories** are `~/.config/pibuz`, `~/.local/share/pibuz`,
+  `~/.cache/pibuz`, with the config file `pibuz.toml`. **An existing `qbzd`
+  profile keeps being used as-is** when the `pibuz` one is absent — that
+  directory holds the persisted QConnect `device_uuid` and the audio settings,
+  so an upgrade stays the same device in the Qobuz app and keeps its
+  bit-perfect configuration. Nothing is copied or moved; rename the directory
+  yourself whenever you want to, with the daemon stopped.
+- **Every `QBZ_*` and `QBZD_*` environment variable is unchanged** — hook
+  scripts written against `QBZ_EVENT`, `QBZ_ARTIST` and friends keep working
+  untouched, and so do `QBZD_HOST`, `QBZD_TOKEN`, `QBZD_HOOK` and `QBZD_MPRIS`.
+- **MPRIS** now publishes `org.mpris.MediaPlayer2.pibuz`. It used to claim the
+  desktop application's `com.blitzfc.qbz` bus name, which meant the two could
+  not be on one session bus and a controller could not tell which had answered.
+  Anything that addressed the daemon by the old name needs the new one.
+- **The Connect device** advertises brand and model `Pibuz`, and a box that
+  never set a custom device name is now `Pibuz (<hostname>)` instead of
+  `QBZ (<hostname>)`. The device identity is the `device_uuid`, not the name,
+  so this renames the existing endpoint rather than creating a second one.
+  `QBZ_QCONNECT_DEVICE_BRAND` / `_MODEL` / `_NAME` still override all three.
+
+### Fixed (release)
+
+- **Tagging a release actually publishes one.** The publish job was gated on
+  `refs/tags/qbzd-v*` while the workflow triggers on `v*` and the version
+  parser strips a bare `v` — so every `vX.Y.Z` tag built both architectures,
+  uploaded the artifacts, and then skipped the Release. It is gated on
+  `refs/tags/v*` now, matching the trigger and `CONTRIBUTING.md`.
 
 ### Changed
 

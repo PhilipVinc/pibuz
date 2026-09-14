@@ -1,0 +1,469 @@
+// crates/pibuz/src/cli/status.rs — the `status` and `ping` verbs (02 §2.2).
+//
+// Both render an already-parsed API payload; neither holds state. `status` also
+// runs the version-skew check (§1.6, from the /api/status payload — it carries
+// `version` + `api_version`, so it needs no /api/info fallback) and, on the
+// daemon box, the linger check (§1.4). Exit codes come from the frozen table
+// (§1.3): 0 healthy · 3 unreachable · 5 device unopenable.
+use serde_json::Value;
+
+use crate::cli::client::ApiClient;
+use crate::cli::copy;
+use crate::paths::ProfileRoots;
+
+/// `pibuz ping` — liveness. Human `pong`; `--json` the raw body. Exit 0 · 3.
+pub async fn ping(host: Option<String>, json: bool, roots: &ProfileRoots) -> i32 {
+    let client = ApiClient::new(host, roots);
+    match client.get("/api/ping").await {
+        Ok(v) => {
+            if json {
+                println!("{}", serde_json::to_string(&v).unwrap_or_default());
+            } else {
+                println!("pong");
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            e.exit_code()
+        }
+    }
+}
+
+/// `pibuz status` — THE diagnostic. Human composite block; `--json` raw payload.
+/// Exit 0 healthy · 3 unreachable · 5 device unopenable.
+pub async fn status(host: Option<String>, json: bool, roots: &ProfileRoots) -> i32 {
+    let client = ApiClient::new(host, roots);
+    let payload = match client.get("/api/status").await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{e}");
+            return e.exit_code();
+        }
+    };
+
+    // Version skew (§1.6): breaking api_version mismatch refuses; a semver-only
+    // mismatch is a warning that does not stop the render.
+    let daemon_api = payload
+        .get("api_version")
+        .and_then(|a| a.as_u64())
+        .unwrap_or(0) as u32;
+    if daemon_api != crate::API_VERSION {
+        eprintln!("{}", copy::api_version_skew(daemon_api, crate::API_VERSION));
+        return 1;
+    }
+    // `crate::VERSION`, NOT `CARGO_PKG_VERSION`: the daemon reports the
+    // former (the release workflow stamps the tag through `QBZD_BUILD_ID`,
+    // and a local Pi build stamps a `2.1.0.local-<sha>`). Comparing against
+    // the bare Cargo version made every stamped build warn that it was skewed
+    // against ITSELF — same binary, same process even, two different strings.
+    let cli_ver = crate::VERSION;
+    if let Some(daemon_ver) = payload.get("version").and_then(|v| v.as_str()) {
+        if !daemon_ver.is_empty() && daemon_ver != cli_ver {
+            eprintln!("{}", copy::version_skew(daemon_ver, cli_ver));
+        }
+    }
+
+    if json {
+        println!("{}", serde_json::to_string(&payload).unwrap_or_default());
+    } else {
+        print!("{}", render(&payload, client.host()));
+    }
+
+    // Linger check on the daemon box only (§1.4) — a warning, never fatal.
+    if client.is_local() {
+        if let Some(w) = linger_warning() {
+            eprintln!("{w}");
+        }
+    }
+
+    exit_from_state(&payload)
+}
+
+/// 5 configured device not present · else 0.
+///
+/// Exit 4 (`needs_auth`) is gone with the account path. It fired whenever the
+/// daemon had no Qobuz login — which, for a renderer that gets its credentials
+/// from a Connect handoff, is ALWAYS. A healthy Pi sitting ready to be cast to
+/// was reporting itself as failed to every script and monitor that checked it.
+fn exit_from_state(p: &Value) -> i32 {
+    let configured = p
+        .pointer("/audio/configured_device")
+        .map(|v| !v.is_null())
+        .unwrap_or(false);
+    let present = p
+        .pointer("/audio/device_present")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    if configured && !present {
+        return 5;
+    }
+    0
+}
+
+/// The §2.2 composite block. `host` is the target (the payload has no `bind`).
+fn render(p: &Value, host: &str) -> String {
+    let version = str_at(p, &["version"]);
+    let api = p.get("api_version").and_then(|a| a.as_u64()).unwrap_or(0);
+    let uptime = fmt_uptime(p.get("uptime_secs").and_then(|u| u.as_u64()).unwrap_or(0));
+    let data_root = str_at(p, &["data_root"]);
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "Pibuz {version} · api v{api} · up {uptime} · {host} · data {data_root}\n"
+    ));
+    out.push_str(&format!("audio     : {}\n", render_audio(p)));
+    out.push_str(&format!("playback  : {}\n", render_playback(p)));
+    out.push_str(&format!("qconnect  : {}\n", render_qconnect(p)));
+    out.push_str(&format!(
+        "network   : {}\n",
+        if p.pointer("/network/online")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            "online"
+        } else {
+            "offline"
+        }
+    ));
+    out.push_str(&format!("last error: {}\n", render_last_error(p)));
+    out
+}
+
+fn render_audio(p: &Value) -> String {
+    let backend = p.pointer("/audio/backend").and_then(|v| v.as_str());
+    let device = p
+        .pointer("/audio/configured_device")
+        .and_then(|v| v.as_str());
+    let present = p
+        .pointer("/audio/device_present")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let bit_perfect = p.pointer("/audio/bit_perfect").and_then(|v| v.as_str());
+    let sr = p.pointer("/audio/sample_rate").and_then(|v| v.as_u64());
+    let bd = p.pointer("/audio/bit_depth").and_then(|v| v.as_u64());
+    let out_sr = p
+        .pointer("/audio/output_sample_rate")
+        .and_then(|v| v.as_u64());
+
+    let mut parts: Vec<String> = Vec::new();
+    let head = match (backend, device) {
+        (Some(b), Some(d)) => format!("{b} {d}"),
+        (Some(b), None) => format!("{b} (system default)"),
+        (None, Some(d)) => d.to_string(),
+        (None, None) => "system default".to_string(),
+    };
+    parts.push(head);
+    parts.push(if present {
+        "present".into()
+    } else {
+        "not present".into()
+    });
+    if let Some(bp) = bit_perfect {
+        // A named PCM is opened directly, but whatever its chain does next is
+        // invisible from here — with CamillaDSP or an equalizer behind the name
+        // the stream is converted before it reaches the DAC. Say so rather than
+        // printing a claim the daemon cannot stand behind.
+        if bp == "DirectNamedDevice" {
+            parts.push("direct to the named device (its chain decides)".into());
+        } else {
+            parts.push(format!("bit-perfect: {bp}"));
+        }
+    }
+    // Two rates, and the interesting case is when they disagree: the stream
+    // is what the file holds, the output is what the device actually runs at,
+    // and anything in between (a shared PipeWire/Pulse/CPAL path, an ALSA
+    // config pinning a rate) resamples silently. Only label them when there
+    // is something to distinguish — with no output rate known yet, the old
+    // bare "96000 Hz / 24-bit" is still the honest rendering.
+    if let (Some(sr), Some(bd)) = (sr, bd) {
+        match out_sr {
+            Some(out) if out != sr => {
+                parts.push(format!("stream {sr} Hz / {bd}-bit"));
+                parts.push(format!("output {out} Hz (resampled)"));
+            }
+            Some(out) => {
+                parts.push(format!("stream {sr} Hz / {bd}-bit"));
+                parts.push(format!("output {out} Hz"));
+            }
+            None => parts.push(format!("{sr} Hz / {bd}-bit")),
+        }
+    } else if let Some(out) = out_sr {
+        parts.push(format!("output {out} Hz"));
+    }
+    parts.join(" · ")
+}
+
+fn render_playback(p: &Value) -> String {
+    let state = str_at(p, &["playback", "state"]);
+    let queue = p
+        .pointer("/playback/queue_len")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    if state == "stopped" {
+        return format!("stopped · queue {queue}");
+    }
+    let title = p.pointer("/playback/title").and_then(|v| v.as_str());
+    let artist = p.pointer("/playback/artist").and_then(|v| v.as_str());
+    let pos = p
+        .pointer("/playback/position")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let dur = p
+        .pointer("/playback/duration")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let vol = p
+        .pointer("/playback/volume")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let muted = p
+        .pointer("/playback/muted")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let track = match (title, artist) {
+        (Some(t), Some(a)) => format!("\"{t}\" — {a}"),
+        (Some(t), None) => format!("\"{t}\""),
+        _ => "(unknown track)".to_string(),
+    };
+    let vol_str = if muted {
+        "muted".to_string()
+    } else {
+        format!("vol {}%", (vol * 100.0).round() as i64)
+    };
+    format!(
+        "{state} · {track} · {} / {} · {vol_str} · queue {queue}",
+        fmt_mmss(pos),
+        fmt_mmss(dur)
+    )
+}
+
+fn render_qconnect(p: &Value) -> String {
+    let enabled = p
+        .pointer("/qconnect/enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !enabled {
+        return "off".to_string();
+    }
+    let state = p
+        .pointer("/qconnect/state")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let session = p
+        .pointer("/qconnect/session_active")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let name = p
+        .pointer("/qconnect/device_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let mut parts = vec![if state.is_empty() {
+        "enabled".to_string()
+    } else {
+        state.to_string()
+    }];
+    if session {
+        parts.push("session active".to_string());
+    }
+    if !name.is_empty() {
+        parts.push(format!("name \"{name}\""));
+    }
+    parts.join(" · ")
+}
+
+fn render_last_error(p: &Value) -> String {
+    for key in ["stream", "auth", "transport"] {
+        if let Some(m) = p
+            .pointer(&format!("/last_errors/{key}"))
+            .and_then(|v| v.as_str())
+        {
+            if !m.is_empty() {
+                return format!("{key}: {m}");
+            }
+        }
+    }
+    "none".to_string()
+}
+
+/// `loginctl show-user $USER -p Linger` → the §1.4 linger warning on `Linger=no`.
+/// Any failure (no loginctl, no session) → no warning.
+fn linger_warning() -> Option<String> {
+    let user = std::env::var("USER").ok().filter(|u| !u.is_empty())?;
+    let out = std::process::Command::new("loginctl")
+        .args(["show-user", &user, "-p", "Linger"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    if text.trim() == "Linger=no" {
+        Some(copy::linger_off(&user))
+    } else {
+        None
+    }
+}
+
+fn str_at(p: &Value, path: &[&str]) -> String {
+    let mut cur = p;
+    for k in path {
+        match cur.get(k) {
+            Some(v) => cur = v,
+            None => return String::new(),
+        }
+    }
+    cur.as_str().unwrap_or("").to_string()
+}
+
+fn fmt_mmss(secs: u64) -> String {
+    format!("{}:{:02}", secs / 60, secs % 60)
+}
+
+fn fmt_uptime(secs: u64) -> String {
+    let days = secs / 86_400;
+    let hours = (secs % 86_400) / 3_600;
+    let mins = (secs % 3_600) / 60;
+    if days > 0 {
+        format!("{days}d {hours}h")
+    } else if hours > 0 {
+        format!("{hours}h {mins}m")
+    } else {
+        format!("{mins}m")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn healthy_payload() -> Value {
+        serde_json::json!({
+            "version": "2.1.0", "api_version": 1, "uptime_secs": 259_200,
+            "data_root": "/home/pi/.local/share/pibuz", "driver_tick_age_ms": 210,
+            "audio": {"backend": "alsa", "configured_device": "hw:CARD=D30,DEV=0",
+                      "device_present": true, "device_open": true,
+                      "bit_perfect": "DirectHardware", "sample_rate": 192000, "bit_depth": 24},
+            "playback": {"state": "playing", "track_id": 176544871, "title": "Spain",
+                         "artist": "Chick Corea", "position": 192, "duration": 581,
+                         "volume": 0.8, "muted": false, "queue_len": 14},
+            "qconnect": {"enabled": true, "state": "connected", "device_name": "Pibuz (kitchen-pi)",
+                         "session_active": true, "last_transport_reconnect": null},
+            "network": {"online": true},
+            "last_errors": {"stream": null, "auth": null, "transport": null}
+        })
+    }
+
+    #[test]
+    fn healthy_status_exits_zero() {
+        assert_eq!(exit_from_state(&healthy_payload()), 0);
+    }
+
+    #[test]
+    fn a_renderer_that_has_not_been_cast_to_is_still_healthy() {
+        // The regression this replaced: `exit_from_state` returned 4 whenever
+        // the daemon had no Qobuz account. A renderer gets its credentials
+        // from a Connect handoff, so that was every healthy Pi, every time —
+        // `pibuz status` reported failure to every script that checked it.
+        let p = healthy_payload();
+        assert!(
+            p.get("auth").is_none(),
+            "there is no account state any more"
+        );
+        assert_eq!(exit_from_state(&p), 0);
+    }
+
+    #[test]
+    fn configured_but_absent_device_exits_five() {
+        let mut p = healthy_payload();
+        p["audio"]["device_present"] = serde_json::json!(false);
+        assert_eq!(exit_from_state(&p), 5);
+        // system default (no configured device) never trips exit 5.
+        let mut sysdef = healthy_payload();
+        sysdef["audio"]["configured_device"] = serde_json::Value::Null;
+        sysdef["audio"]["device_present"] = serde_json::json!(false);
+        assert_eq!(exit_from_state(&sysdef), 0);
+    }
+
+    #[test]
+    fn render_covers_the_composite_block() {
+        let block = render(&healthy_payload(), "127.0.0.1:8182");
+        assert!(
+            block.contains("Pibuz 2.1.0 · api v1 · up 3d 0h · 127.0.0.1:8182"),
+            "{block}"
+        );
+        assert!(
+            !block.contains("auth"),
+            "the block must not carry an account line — there is no account: {block}"
+        );
+        assert!(block.contains("alsa hw:CARD=D30,DEV=0 · present · bit-perfect: DirectHardware · 192000 Hz / 24-bit"), "{block}");
+        assert!(
+            block.contains(
+                "playback  : playing · \"Spain\" — Chick Corea · 3:12 / 9:41 · vol 80% · queue 14"
+            ),
+            "{block}"
+        );
+        assert!(
+            block.contains("qconnect  : connected · session active · name \"Pibuz (kitchen-pi)\""),
+            "{block}"
+        );
+        assert!(block.contains("last error: none"), "{block}");
+    }
+
+    #[test]
+    fn stopped_playback_renders_queue_only() {
+        let mut p = healthy_payload();
+        p["playback"]["state"] = serde_json::json!("stopped");
+        let line = render_playback(&p);
+        assert_eq!(line, "stopped · queue 14");
+    }
+}
+
+#[cfg(test)]
+mod audio_line_tests {
+    use super::render_audio;
+    use serde_json::json;
+
+    fn line(sr: Option<u64>, bd: Option<u64>, out: Option<u64>) -> String {
+        render_audio(&json!({
+            "audio": {
+                "backend": "Alsa",
+                "configured_device": "HiFiBerry DAC+",
+                "device_present": true,
+                "sample_rate": sr,
+                "bit_depth": bd,
+                "output_sample_rate": out,
+            }
+        }))
+    }
+
+    #[test]
+    fn a_resampling_chain_is_called_out() {
+        // The moOde Pi case: a 96 kHz stream landing on a 44.1 kHz device.
+        let l = line(Some(96000), Some(24), Some(44100));
+        assert!(l.contains("stream 96000 Hz / 24-bit"), "{l}");
+        assert!(l.contains("output 44100 Hz (resampled)"), "{l}");
+    }
+
+    #[test]
+    fn matching_rates_are_shown_without_the_warning() {
+        let l = line(Some(96000), Some(24), Some(96000));
+        assert!(l.contains("stream 96000 Hz / 24-bit"), "{l}");
+        assert!(l.contains("output 96000 Hz"), "{l}");
+        assert!(!l.contains("resampled"), "{l}");
+    }
+
+    #[test]
+    fn an_unknown_output_rate_renders_as_before() {
+        // No stream created yet: labelling one rate "stream" and leaving the
+        // other blank would imply we know something we do not.
+        let l = line(Some(96000), Some(24), None);
+        assert!(l.contains("96000 Hz / 24-bit"), "{l}");
+        assert!(!l.contains("stream"), "{l}");
+        assert!(!l.contains("output"), "{l}");
+    }
+
+    #[test]
+    fn output_rate_alone_still_reports() {
+        let l = line(None, None, Some(48000));
+        assert!(l.contains("output 48000 Hz"), "{l}");
+    }
+}

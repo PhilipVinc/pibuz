@@ -44,7 +44,7 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          # qbzd links ALSA / JACK / D-Bus (qbz-audio) and OpenSSL (reqwest).
+          # pibuz links ALSA / JACK / D-Bus (qbz-audio) and OpenSSL (reqwest).
           # mold matches the release linker for faster test-binary link.
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -98,12 +98,12 @@ jobs:
           echo "cargo test wall time: $((END - START))s"
 
       # The UI crates are deleted in this fork; the gate stays so a Slint
-      # dependency can never re-enter qbzd's graph through a crates.io dep.
-      - name: qbzd slint-free dep-graph gate
+      # dependency can never re-enter pibuz's graph through a crates.io dep.
+      - name: pibuz slint-free dep-graph gate
         run: |
           set -euo pipefail
-          hits=$(cargo tree -p qbzd -e normal \
+          hits=$(cargo tree -p pibuz -e normal \
                  | grep -E '\bslint[a-z-]* v' || true)
           if [ -n "$hits" ]; then
-            echo "::error::qbzd graph resolves Slint crates:"; echo "$hits"; exit 1
+            echo "::error::pibuz graph resolves Slint crates:"; echo "$hits"; exit 1
           fi

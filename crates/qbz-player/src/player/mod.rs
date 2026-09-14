@@ -644,7 +644,7 @@ fn gapless_prefetch_allowed(user_enabled: bool, host_allows: bool) -> bool {
 ///
 /// On a **low-memory** host the bytes go at the transition: the track just
 /// finished (~100 MB at Hi-Res) would otherwise sit beside the one now playing
-/// AND the gapless prefetch, which is the shape that had qbzd at 465 MB RSS on
+/// AND the gapless prefetch, which is the shape that had pibuz at 465 MB RSS on
 /// a 905 MB box. It is quality-neutral — the bytes land in the L2 disk cache, so
 /// a back-skip re-reads them from there instead of the network.
 ///
@@ -4715,7 +4715,7 @@ impl Player {
         // Two-level playback cache: L1 in memory, L2 on disk (~800 MB). The
         // L1 budget comes from the host's memory profile rather than a flat
         // 400 MB: that figure is a desktop's, and on a 1 GB Pi it reserved
-        // 40 % of RAM for one subsystem, which is how qbzd ended up swapping
+        // 40 % of RAM for one subsystem, which is how pibuz ended up swapping
         // to the SD card during ordinary playback. A disk-cache failure
         // degrades to L1-only rather than aborting player creation.
         // The dynamic initial-buffer sizing (`StreamingConfig::from_speed_mbps`)

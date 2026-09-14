@@ -16,14 +16,14 @@ members = [
     "crates/qconnect-app",
     "crates/qbz-media-controls",
     "crates/qbz-log",
-    "crates/qbzd",
+    "crates/pibuz",
 ]
 
 [workspace.package]
-version = "2.3.2"
+version = "2.4.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/PhilipVinc/qbz"
+repository = "https://github.com/PhilipVinc/pibuz"
 
 # Lints applied to every crate (each member opts in with `[lints] workspace = true`).
 [workspace.lints.clippy]

@@ -2,7 +2,7 @@
 //! auto-connects when the app launches.
 //!
 //! Pure logic only — no SQLite, no FS. Persistence lives in the host, next to
-//! its `device_name` handling (`qbzd::qconnect::transport`).
+//! its `device_name` handling (`pibuz::qconnect::transport`).
 
 use serde::{Deserialize, Serialize};
 

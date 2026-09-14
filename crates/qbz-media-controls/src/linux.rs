@@ -2,7 +2,7 @@
 //!
 //! The whole reason this exists instead of souvlaki: `mpris-server`'s
 //! `RootInterface::desktop_entry()` lets us publish the
-//! `org.mpris.MediaPlayer2.DesktopEntry` property as `"com.blitzfc.qbz"`,
+//! `org.mpris.MediaPlayer2.DesktopEntry` property as `"pibuz"`,
 //! which is the ONLY mechanism GNOME Shell uses to resolve the application
 //! icon for its media widget (DesktopEntry → `<name>.desktop` → `Icon=`).
 //! souvlaki never sets it, so GNOME shows no icon. (KDE is lenient and works
@@ -26,9 +26,13 @@ use mpris_server::{
 use crate::inhibit::SleepInhibitor;
 use crate::types::{MediaEvent, MediaIntegration, PlaybackStatus, TrackMeta};
 
-const BUS_SUFFIX: &str = "com.blitzfc.qbz";
-const DESKTOP_ENTRY: &str = "com.blitzfc.qbz";
-const IDENTITY: &str = "QBZ";
+// The bus name this daemon owns: `org.mpris.MediaPlayer2.pibuz`. Deliberately
+// NOT the desktop application's reverse-DNS name — two projects publishing the
+// same well-known name cannot both be on the bus, and a controller that finds
+// it has no way to tell which one answered.
+const BUS_SUFFIX: &str = "pibuz";
+const DESKTOP_ENTRY: &str = "pibuz";
+const IDENTITY: &str = "Pibuz";
 
 /// Monotonic counter so each track gets a distinct `mpris:trackid` object path
 /// (helps clients detect track changes).
@@ -89,8 +93,7 @@ fn map_status(s: PlaybackStatus) -> MprisStatus {
 
 fn build_metadata(meta: &TrackMeta) -> Metadata {
     let seq = TRACK_SEQ.fetch_add(1, Ordering::Relaxed);
-    let trackid =
-        TrackId::try_from(format!("/com/blitzfc/qbz/track/{seq}")).unwrap_or(TrackId::NO_TRACK);
+    let trackid = TrackId::try_from(format!("/pibuz/track/{seq}")).unwrap_or(TrackId::NO_TRACK);
 
     let mut b = Metadata::builder()
         .trackid(trackid)

@@ -260,7 +260,7 @@ impl AudioCache {
     /// LRU alone keeps a finished track resident until something else needs the
     /// room. On a 1 GB Pi that means the track just played (~100 MB for Hi-Res)
     /// sits beside the one now playing AND the gapless prefetch — the shape that
-    /// had qbzd at 465 MB RSS on a 905 MB box, swapping to the SD card. Releasing
+    /// had pibuz at 465 MB RSS on a 905 MB box, swapping to the SD card. Releasing
     /// at the transition is quality-neutral: the bytes land in the disk cache, so
     /// a back-skip re-reads them from L2 instead of the network.
     ///

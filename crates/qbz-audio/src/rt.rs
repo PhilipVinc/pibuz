@@ -44,7 +44,7 @@
 //! once, at info, and carry on.
 //!
 //! **`LimitRTPRIO=` in the unit is necessary but, for a USER unit, not
-//! sufficient**, and this is the case that matters because `qbzd` ships as a
+//! sufficient**, and this is the case that matters because `pibuz` ships as a
 //! user unit. An rlimit can only be lowered, never raised, so `LimitRTPRIO=20`
 //! in a user unit is capped by the hard limit the `systemd --user` manager
 //! itself inherited — which is **0 on stock Raspberry Pi OS**. The promotion
@@ -54,7 +54,7 @@
 //!   `systemctl --user daemon-reexec` (or a reboot); or
 //! - an `@audio - rtprio 20` line in `/etc/security/limits.d/` with the user in
 //!   the `audio` group, which is what most audio distributions ship; or
-//! - running qbzd from a SYSTEM unit, where `LimitRTPRIO=` is enough on its own.
+//! - running pibuz from a SYSTEM unit, where `LimitRTPRIO=` is enough on its own.
 //!
 //! The log line below says this, because a feature that silently does nothing
 //! on the hardware it was written for is worse than one that is switched off.
@@ -112,9 +112,9 @@ pub fn clamp_rt_priority(requested: i32, min: i32, max: i32) -> i32 {
 /// Returns `None` on success (including "already high enough"), or the reason
 /// it could not.
 ///
-/// This is what makes the promotion work where qbzd is actually deployed.
+/// This is what makes the promotion work where pibuz is actually deployed.
 /// moOde does not use the shipped systemd unit: `renderer.php` launches
-/// `qbzd run &` as a bare background process, which inherits the invoking
+/// `pibuz run &` as a bare background process, which inherits the invoking
 /// shell's `RLIMIT_RTPRIO` — measured as **0** on the test Pi. With that, the
 /// `LimitRTPRIO=20` in the unit is irrelevant and `pthread_setschedparam`
 /// returns EPERM, so the writer silently stayed on the ordinary scheduler.
@@ -228,7 +228,7 @@ pub fn promote_current_thread(priority: u8) -> RtOutcome {
     }
 }
 
-/// Stub for hosts that are not Linux. `qbzd` is a Linux daemon; this exists so
+/// Stub for hosts that are not Linux. `pibuz` is a Linux daemon; this exists so
 /// the crate still compiles for a developer's `cargo check` on macOS.
 #[cfg(not(target_os = "linux"))]
 pub fn promote_current_thread(_priority: u8) -> RtOutcome {
@@ -260,7 +260,7 @@ pub fn promote_writer_thread_and_log() -> RtOutcome {
                 log::info!(
                     "[Audio RT] writer thread stays at normal priority: {why}. Playback is \
                      unaffected — this only costs resilience to scheduling delay on a busy \
-                     host. qbzd already tried to raise its own RLIMIT_RTPRIO, which works \
+                     host. pibuz already tried to raise its own RLIMIT_RTPRIO, which works \
                      when it has CAP_SYS_RESOURCE (it does when started through sudo, as \
                      moOde does); this message means it does not. Either start the daemon \
                      with that capability, or grant the limit externally: `LimitRTPRIO=20` \

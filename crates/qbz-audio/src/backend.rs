@@ -223,7 +223,7 @@ pub enum BitPerfectMode {
     /// `.asoundrc` chain). The stream reaches ALSA untouched, but what the
     /// chain does with it afterwards is not ours to see: with nothing inserted
     /// this is bit-perfect, and with CamillaDSP or an equalizer behind the name
-    /// it is emphatically not — verified on a Pi where qbzd fed `_audioout`
+    /// it is emphatically not — verified on a Pi where pibuz fed `_audioout`
     /// S24_3LE at 96 kHz and CamillaDSP handed the DAC S32_LE.
     ///
     /// Reporting these as `DirectHardware` was a lie of exactly the kind

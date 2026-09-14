@@ -1,6 +1,6 @@
 # cross (https://github.com/cross-rs/cross) config for cross-compiling the
-# aarch64 `qbzd` binary from an x86-64 Linux host. Used by
-# scripts/build-aarch64-qbzd.sh (CROSS mode).
+# aarch64 `pibuz` binary from an x86-64 Linux host. Used by
+# scripts/build-aarch64-pibuz.sh (CROSS mode).
 #
 # `image` pins a newer Ubuntu (cross 0.2.5's default aarch64 image is Ubuntu
 # 16.04 "xenial" — EOL, archived repos, OpenSSL 1.0.2 — which breaks modern
@@ -8,7 +8,7 @@
 # alternative is a newer cross itself:
 #   cargo install cross --git https://github.com/cross-rs/cross --locked
 #
-# The image ships the aarch64 toolchain but NOT the native dev libs qbzd links
+# The image ships the aarch64 toolchain but NOT the native dev libs pibuz links
 # against, so we add the arm64 multiarch packages in pre-build. PKG_CONFIG_* is
 # set so build scripts resolve the :arm64 .pc files. The list is the DAEMON set
 # (audio + D-Bus + TLS); the font/X11/Wayland/GL packages the deleted Slint

@@ -1,5 +1,5 @@
 // crates/qbz-app/src/settings/bundle.rs — the settings portability engine
-// (04-settings-portability.md). ONE module, shared by `qbzd` (P0 CLI) and the
+// (04-settings-portability.md). ONE module, shared by `pibuz` (P0 CLI) and the
 // desktop Settings modal (P0/OD7, plan T18): `export(source, opts) -> Bundle`,
 // `plan(bundle, target, opts, live) -> ImportPlan`, `apply(plan, target, uid)
 // -> ImportReport`.
@@ -55,7 +55,7 @@ pub struct BundleSource {
 }
 
 /// A profile's config + data roots. For the daemon these are the daemon roots
-/// (`~/.config/qbzd`, `~/.local/share/qbzd`); for the desktop the global roots
+/// (`~/.config/pibuz`, `~/.local/share/pibuz`); for the desktop the global roots
 /// (`~/.config/qbz`, `~/.local/share/qbz`).
 #[derive(Debug, Clone)]
 pub struct ProfilePaths {
@@ -189,7 +189,7 @@ impl std::fmt::Display for BundleError {
             }
             BundleError::VersionTooNew { bundle, supported } => write!(
                 f,
-                "this bundle is schema v{bundle}; this qbzd understands up to v{supported}"
+                "this bundle is schema v{bundle}; this pibuz understands up to v{supported}"
             ),
             BundleError::NoDesktopProfile => write!(f, "no desktop profile found"),
             BundleError::TokenDecryptFailed => {
@@ -1142,7 +1142,7 @@ fn plan_library_folders(value: &Value, plan: &mut ImportPlan) {
         ),
         old: None,
         new: String::new(),
-        why: "no local library on qbzd v1".to_string(),
+        why: "no local library on pibuz v1".to_string(),
     });
 }
 

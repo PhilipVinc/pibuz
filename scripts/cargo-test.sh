@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the qbzd workspace unit/doc tests (crates workspace).
+# Run the pibuz workspace unit/doc tests (crates workspace).
 #
 # Same command CI uses (.github/workflows/test-crates.yml).
 #

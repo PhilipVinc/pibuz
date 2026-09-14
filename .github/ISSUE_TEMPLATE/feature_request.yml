@@ -6,7 +6,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        muqbzd is a headless daemon. Ideas that need a desktop UI are out of scope.
+        Pibuz is a headless daemon. Ideas that need a desktop UI are out of scope.
 
   - type: textarea
     id: problem

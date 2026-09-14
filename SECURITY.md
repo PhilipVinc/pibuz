@@ -6,7 +6,7 @@ Report vulnerabilities privately through GitHub's **Report a vulnerability**
 button on the Security tab, not as a public issue. Please include what an
 attacker can reach and a way to reproduce it.
 
-## What μqbzd exposes
+## What Pibuz exposes
 
 It is a daemon, so it listens. Worth knowing when assessing a report:
 

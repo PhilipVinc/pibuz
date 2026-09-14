@@ -31,7 +31,7 @@
 //!
 //! # What it does not reach
 //!
-//! The daemon's own report loop (`qbzd::qconnect::report`) is where
+//! The daemon's own report loop (`pibuz::qconnect::report`) is where
 //! `buffer_state` is decided and where the periodic position reports come from.
 //! It is monomorphic on `NativeWsTransport` + `AppRuntime`, so it cannot be
 //! mounted here. Everything below sees only the ECHO reports the app itself
@@ -445,7 +445,7 @@ impl QconnectRendererEngine for FakeEngine {
 
 type HarnessApp = QconnectApp<InMemoryWsTransport, HarnessSink>;
 
-/// The renderer-critical arms of `qbzd::qconnect::sink::DaemonEventSink`.
+/// The renderer-critical arms of `pibuz::qconnect::sink::DaemonEventSink`.
 ///
 /// Only four of the daemon sink's arms touch the renderer, and all four are thin
 /// forwards into [`crate::renderer`] — which is why they can be mirrored here
@@ -618,7 +618,7 @@ pub struct Step {
     pub echo_engine_calls: Vec<EngineCall>,
     /// Track ids in the player's queue after this step.
     pub player_queue: Vec<u64>,
-    /// The track the player's CURSOR names — what `qbzd status` and the moOde
+    /// The track the player's CURSOR names — what `pibuz status` and the moOde
     /// overlay would call the now-playing title.
     pub cursor_track: Option<u64>,
     /// The track that is actually AUDIBLE. When this and `cursor_track` disagree
@@ -1403,7 +1403,7 @@ impl ControllerHarness {
                 ));
             }
             // 5. The queue cursor names the track that is actually audible.
-            //    When it does not, `qbzd status` and the moOde overlay show one
+            //    When it does not, `pibuz status` and the moOde overlay show one
             //    song's title over another song's audio — the title said
             //    "Golden Seams" while the 213 s duration belonged to "Pulse".
             //
@@ -1492,7 +1492,7 @@ pub fn render_timeline(timeline: &[Step]) -> String {
 //
 // The daemon's report loop is the OTHER source of renderer reports, and the one
 // that decides `buffer_state` and carries the real position and duration. It
-// cannot be mounted here (`qbzd::qconnect::report` is monomorphic on
+// cannot be mounted here (`pibuz::qconnect::report` is monomorphic on
 // `NativeWsTransport` + `AppRuntime`), so this mirrors the payload it builds.
 //
 // A mirror is weaker than the real thing and this is the seam most worth
@@ -1511,14 +1511,14 @@ pub struct ReportTick {
     pub duration_ms: u64,
 }
 
-/// `buffer_state` wire values (`qbzd::qconnect::transport`).
+/// `buffer_state` wire values (`pibuz::qconnect::transport`).
 pub const BUFFER_STATE_OK: i32 = 0;
 pub const BUFFER_STATE_BUFFERING: i32 = 1;
 
 impl ControllerHarness {
     /// Run one tick of the renderer's own report loop.
     ///
-    /// Mirrors `qbzd::qconnect::report::report_playback_state`: publish the
+    /// Mirrors `pibuz::qconnect::report::report_playback_state`: publish the
     /// position and duration into the app's renderer state (so a later echo can
     /// state them), then send a `RndrSrvrStateUpdated` carrying the same triple
     /// the daemon sends.

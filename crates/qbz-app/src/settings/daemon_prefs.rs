@@ -1,6 +1,6 @@
 // crates/qbz-app/src/settings/daemon_prefs.rs
 //! The daemon's 2 player prefs (01-architecture.md §10.3). Lives in qbz-app so
-//! qbzd AND settings::bundle share one struct (D2). NOT read by the desktop.
+//! pibuz AND settings::bundle share one struct (D2). NOT read by the desktop.
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 

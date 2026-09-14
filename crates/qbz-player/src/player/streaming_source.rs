@@ -2669,7 +2669,7 @@ mod tests {
 ///
 /// There are TWO scripted feeders, because there are two real ones and they
 /// differ in the unit they can restart at. `feed` mirrors
-/// `qbzd/src/qconnect/remote_stream.rs`, whose unit is a byte. `feed_cmaf`
+/// `pibuz/src/qconnect/remote_stream.rs`, whose unit is a byte. `feed_cmaf`
 /// mirrors `Player::cmaf_stream_segments`, whose unit is a whole CMAF segment —
 /// so its seeks land early, its window overshoots by a segment rather than a
 /// chunk, and a reader waiting inside the segment in flight is a case the other

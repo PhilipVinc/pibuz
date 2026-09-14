@@ -58,7 +58,7 @@ mod tests {
         // Building the runtime builds a `reqwest` client, and the workspace
         // pins reqwest's `rustls-tls-webpki-roots-no-provider` feature — so
         // the process-level rustls `CryptoProvider` must already be installed
-        // or the constructor panics with "No provider set". `qbzd` installs it
+        // or the constructor panics with "No provider set". `pibuz` installs it
         // in `main`; a test binary has no `main`, so it happens here.
         // Idempotent, so every test can call it.
         crate::ensure_crypto_provider();

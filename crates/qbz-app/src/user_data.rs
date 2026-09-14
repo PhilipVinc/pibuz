@@ -1,6 +1,6 @@
 //! The desktop install's `last_user_id` marker.
 //!
-//! All that survives of the per-user profile layout: `qbzd settings export
+//! All that survives of the per-user profile layout: `pibuz settings export
 //! --from desktop` reads this marker to decide whose per-user domains to pull
 //! out of a desktop install. The daemon itself is single-profile and stores
 //! everything under its own root, so nothing here is per-user any more.

@@ -1,13 +1,13 @@
-# muqbzd standalone release.
+# pibuz standalone release.
 #
 # This is the only workflow that publishes anything:
 #   - triggers on `v*` tags (`v2.1.0`);
 #   - releases ONLY from `main`: the `guard` job refuses a tag whose commit is
 #     not an ancestor of main, so a tag pushed on a topic branch fails loudly
 #     instead of publishing a release nobody can reproduce from the trunk;
-#   - builds the qbzd binary and ships a stable asset shape consumers pin
-#     against: muqbzd-<version>-linux-<arch>.tar.gz containing
-#     muqbzd-<version>-linux-<arch>/qbzd, with a .sha256 beside it;
+#   - builds the pibuz binary and ships a stable asset shape consumers pin
+#     against: pibuz-<version>-linux-<arch>.tar.gz containing
+#     pibuz-<version>-linux-<arch>/pibuz, with a .sha256 beside it;
 #   - publishes a PRERELEASE GitHub Release on the tag.
 #
 # Tag `v2.1.0` -> version `2.1.0`. Plain semver: no distro suffixes.
@@ -30,7 +30,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Releases are cut from main, and only from main. A `qbzd-v*` tag anywhere
+  # Releases are cut from main, and only from main. A `v*` tag anywhere
   # else (a topic branch, a detached build) stops here before anything is
   # built or published. workflow_dispatch without a tag is a plain test build
   # and is exempt — it publishes nothing.
@@ -92,37 +92,37 @@ jobs:
       - name: system deps
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libjack-jackd2-dev libdbus-1-dev libssl-dev
 
-      # qbzd must never resolve Slint.
+      # pibuz must never resolve Slint.
       - name: slint-free dep-graph gate
         run: |
           set -euo pipefail
-          hits=$(cargo tree -p qbzd -e normal \
+          hits=$(cargo tree -p pibuz -e normal \
                  | grep -E '\bslint[a-z-]* v' || true)
-          [ -z "$hits" ] || { echo "::error::qbzd graph resolves Slint:"; echo "$hits"; exit 1; }
+          [ -z "$hits" ] || { echo "::error::pibuz graph resolves Slint:"; echo "$hits"; exit 1; }
 
       # QBZD_BUILD_ID stamps the release version into the binary, so
-      # `qbzd version`, `--version`, /api/status and the Connect device's
+      # `pibuz version`, `--version`, /api/status and the Connect device's
       # softwareVersion all report the released version instead of the bare Cargo
       # version. A four-part id like that is not valid semver and so cannot live
       # in Cargo.toml.
       - name: build
         env:
           QBZD_BUILD_ID: ${{ steps.release.outputs.version }}
-        run: cargo build --release -p qbzd
+        run: cargo build --release -p pibuz
 
       # Empirical gate: the binary must run on glibc 2.35
       # boxes (Ubuntu 22.04 / Bookworm-era moOde images).
       - name: glibc floor gate (objdump)
         run: |
           set -euo pipefail
-          floor=$(objdump -T target/release/qbzd \
+          floor=$(objdump -T target/release/pibuz \
                   | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -Vu | tail -1)
           echo "glibc floor: $floor"
           highest=$(printf '%s\n' "$floor" "GLIBC_2.35" | sort -V | tail -1)
           [ "$highest" = "GLIBC_2.35" ] || { echo "::error::floor $floor exceeds 2.35"; exit 1; }
 
       # Release asset shape. Consumers pin this, so changing it is a breaking
-      # change for them: muqbzd-<version>-linux-<arch>.tar.gz unpacking to a
+      # change for them: pibuz-<version>-linux-<arch>.tar.gz unpacking to a
       # single versioned directory holding the binary, its unit file, shell
       # completions and a README.
       - name: tarball
@@ -131,16 +131,16 @@ jobs:
           ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
-          cp target/release/qbzd ./qbzd
-          DIR="muqbzd-${VERSION}-linux-${ARCH}"
+          cp target/release/pibuz ./pibuz
+          DIR="pibuz-${VERSION}-linux-${ARCH}"
           mkdir -p "staging/${DIR}/completions"
-          cp qbzd "staging/${DIR}/qbzd"
-          chmod +x "staging/${DIR}/qbzd"
-          cp crates/qbzd/service/qbzd.service "staging/${DIR}/qbzd.service"
-          ./qbzd completions bash > "staging/${DIR}/completions/qbzd.bash"
-          ./qbzd completions zsh  > "staging/${DIR}/completions/qbzd.zsh"
-          ./qbzd completions fish > "staging/${DIR}/completions/qbzd.fish"
-          cp packaging/linux/muqbzd-standalone-README.md "staging/${DIR}/README.md"
+          cp pibuz "staging/${DIR}/pibuz"
+          chmod +x "staging/${DIR}/pibuz"
+          cp crates/pibuz/service/pibuz.service "staging/${DIR}/pibuz.service"
+          ./pibuz completions bash > "staging/${DIR}/completions/pibuz.bash"
+          ./pibuz completions zsh  > "staging/${DIR}/completions/pibuz.zsh"
+          ./pibuz completions fish > "staging/${DIR}/completions/pibuz.fish"
+          cp packaging/linux/pibuz-standalone-README.md "staging/${DIR}/README.md"
           mkdir -p dist
           tar -czf "dist/${DIR}.tar.gz" -C staging "${DIR}"
           ( cd dist && sha256sum "${DIR}.tar.gz" > "${DIR}.tar.gz.sha256" )
@@ -148,20 +148,20 @@ jobs:
 
       - uses: actions/upload-artifact@v7
         with:
-          name: muqbzd-${{ matrix.arch }}
+          name: pibuz-${{ matrix.arch }}
           path: dist/*
 
   # Single publisher so the two matrix legs never race on Release creation.
   release:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/qbzd-v')
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
       - uses: actions/download-artifact@v8
         with:
-          pattern: muqbzd-*
+          pattern: pibuz-*
           merge-multiple: true
           path: dist
 
@@ -172,4 +172,13 @@ jobs:
           prerelease: true
           make_latest: false
           body: |
-            muqbzd standalone qbzd daemon build.
+            Pibuz — standalone headless Qobuz Connect daemon.
+
+            Each asset unpacks to `pibuz-<version>-linux-<arch>/` holding the
+            `pibuz` binary, `pibuz.service`, shell completions and a README.
+            Verify with the `.sha256` beside it.
+
+            Upgrading from a `qbzd` build: the daemon keeps reading an existing
+            `~/.config/qbzd` / `~/.local/share/qbzd` profile, so the Connect
+            device identity and the audio settings carry over. Point your unit
+            file at the new binary name.

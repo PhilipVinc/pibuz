@@ -1,19 +1,24 @@
-# μqbzd — notes for coding agents
+# Pibuz — notes for coding agents
 
-Headless Qobuz Connect daemon. The binary is `qbzd`; the project is `μqbzd`
-(`muqbzd` in ASCII). It began as a fork of vicrodh/qbz and has diverged into a
-daemon-only tree — **there is no desktop UI here and none is planned**. Outside
-`README.md`, the repo does not refer to the project it forked from; keep it that
-way when editing docs and CI.
+Headless Qobuz Connect daemon. The project is `Pibuz` and the binary is
+`pibuz`; the daemon-only tree has **no desktop UI, and none is planned**. It
+began as a fork of vicrodh/qbz, and the `qbz-*` / `qconnect-*` crate names are
+from that history — they stay. Outside the credit in `README.md`, nothing in
+the repo refers to the project it forked from; keep it that way in docs and CI.
+
+The names `qbzd` and `μqbzd`/`muqbzd` are gone from the tree (2.4.0) except
+where the CHANGELOG records history and where `paths.rs` resolves a pre-rename
+profile directory. `QBZ_*` and `QBZD_*` environment variables are deliberately
+NOT renamed: hook scripts on other people's boxes read them.
 
 ## Layout
 
 A standard Cargo workspace: manifest at the repo root, members under `crates/`,
 artifacts in `target/`. Plain `cargo build` / `cargo test` from the root work.
 
-The workspace is `qbzd` plus **exactly** its dependency closure — 15 crates, the
-set `cargo tree -p qbzd` resolves. If you find yourself adding a workspace member,
-check whether `qbzd` really needs it.
+The workspace is `pibuz` plus **exactly** its dependency closure — 15 crates, the
+set `cargo tree -p pibuz` resolves. If you find yourself adding a workspace member,
+check whether `pibuz` really needs it.
 
 A lot of this tree is a desktop app that was never fully unwound, and orphans
 keep turning up: whole crates have gone because their only entry points took an
@@ -49,11 +54,11 @@ dropping it.
 ## Commands
 
 ```bash
-cargo build --release -p qbzd
+cargo build --release -p pibuz
 ./scripts/cargo-test.sh          # whole workspace, same command CI runs
-./scripts/build-aarch64-qbzd.sh  # Pi binary: native on ARM, cross via Docker on x86-64
-./scripts/qbzd-to-pi.sh          # copy to the Pi, restart the service
-./scripts/qbzd-acceptance.sh     # end-to-end against a running daemon
+./scripts/build-aarch64-pibuz.sh  # Pi binary: native on ARM, cross via Docker on x86-64
+./scripts/pibuz-to-pi.sh          # copy to the Pi, restart the service
+./scripts/pibuz-acceptance.sh     # end-to-end against a running daemon
 ```
 
 ## Tests and lints: the suite is GREEN, keep it that way
@@ -109,7 +114,7 @@ loop has no other external symptom.
 
 There are TWO scripted feeders because there are two real ones, and they differ
 in the smallest thing they can restart at. `feed` mirrors
-`qbzd/src/qconnect/remote_stream.rs` and restarts at a byte. `feed_cmaf` mirrors
+`pibuz/src/qconnect/remote_stream.rs` and restarts at a byte. `feed_cmaf` mirrors
 `Player::cmaf_stream_segments` and restarts at a whole CMAF segment, so its
 seeks land up to a segment early, its window overshoots by a segment rather than
 a chunk, and a reader waiting inside the segment in flight is a case the byte
@@ -171,7 +176,7 @@ exposed it:
   target up in it, so placeholder ids send it down the "not in queue" fallback
   every time and hide every cursor bug behind harness noise.
 
-What it cannot reach: the daemon's own report loop (`qbzd::qconnect::report`),
+What it cannot reach: the daemon's own report loop (`pibuz::qconnect::report`),
 which is where `buffer_state` is decided and where the periodic position reports
 come from — so spinner LIFETIMES are out of scope. It is monomorphic on
 `NativeWsTransport` + `AppRuntime` (`DaemonQconnectApp`, `DaemonEventSink`,
@@ -253,14 +258,14 @@ The container is the check:
 
 ```bash
 docker run --rm --platform linux/arm64 \
-  -v "$PWD:/src:ro" -v qbzd-aarch64-target:/target \
-  -v qbzd-aarch64-registry:/usr/local/cargo/registry \
-  -w /src qbzd-aarch64-build:ubuntu22.04 \
+  -v "$PWD:/src:ro" -v pibuz-aarch64-target:/target \
+  -v pibuz-aarch64-registry:/usr/local/cargo/registry \
+  -w /src pibuz-aarch64-build:ubuntu22.04 \
   bash -c 'cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace'
 ```
 
-(Image: `docker build --platform linux/arm64 -t qbzd-aarch64-build:ubuntu22.04 \
--f packaging/docker/qbzd-aarch64.Dockerfile packaging/docker`. On Apple silicon
+(Image: `docker build --platform linux/arm64 -t pibuz-aarch64-build:ubuntu22.04 \
+-f packaging/docker/pibuz-aarch64.Dockerfile packaging/docker`. On Apple silicon
 this runs natively, no QEMU. Needs colima or Docker Desktop up.)
 
 Also treat clippy's suggestions as drafts, not patches: in this tree three were
@@ -274,24 +279,24 @@ adding the import.
   see `crates/qbz-log/src/redact.rs`. Registering after the first log line is too
   late.
 - **Every task holding an `Arc<AppRuntime>` must be abort-and-joined in
-  `QconnectHandle::shutdown()`** before `drop(booted)` — `crates/qbzd/src/qconnect/mod.rs`.
+  `QconnectHandle::shutdown()`** before `drop(booted)` — `crates/pibuz/src/qconnect/mod.rs`.
   This is the #521 clock-release ordering: a surviving clone holds the ALSA device
   open and the next start fails. Adding a task means adding its teardown.
-- **`qbzd` must never resolve Slint.** CI gates on it in both workflows. Nothing in
+- **`pibuz` must never resolve Slint.** CI gates on it in both workflows. Nothing in
   the tree pulls it today; the gate exists so a crates.io dependency cannot
   reintroduce it.
-- **The release asset shape is an API.** `muqbzd-<version>-linux-<arch>.tar.gz`
-  unpacks to one versioned directory holding `qbzd`, `qbzd.service`,
+- **The release asset shape is an API.** `pibuz-<version>-linux-<arch>.tar.gz`
+  unpacks to one versioned directory holding `pibuz`, `pibuz.service`,
   `completions/` and `README.md`, with a `.sha256` beside it. Installers pin
   this; reshaping it breaks them.
 
 ## Versioning
 
 Plain semver, no distro suffixes. `[workspace.package] version` in the root
-`Cargo.toml` is the source of truth (2.1.0) and release tags are `vX.Y.Z` matching
+`Cargo.toml` is the source of truth (2.4.0) and release tags are `vX.Y.Z` matching
 it. The release workflow stamps the tag's version through the `QBZD_BUILD_ID` env
-var at compile time, which `crates/qbzd/src/main.rs` reads into `VERSION` — that is
-what `qbzd version`, `--version` and `/api/status` report. Without it you get the
+var at compile time, which `crates/pibuz/src/main.rs` reads into `VERSION` — that is
+what `pibuz version`, `--version` and `/api/status` report. Without it you get the
 Cargo version, so a plain `cargo build` is unchanged.
 
 ## Branches, CI and releases

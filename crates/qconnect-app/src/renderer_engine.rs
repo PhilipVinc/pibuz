@@ -5,7 +5,7 @@
 //! trait in `qconnect-app` and is written ONLY against these methods plus
 //! `QconnectRemoteSyncState`. It must never be re-derived per host.
 //!
-//! Implemented by `qbzd`'s `DaemonRendererEngine` (one-line forwards to
+//! Implemented by `pibuz`'s `DaemonRendererEngine` (one-line forwards to
 //! `QbzCore` + `Player`), and by a mock in this crate's tests.
 //!
 //! Errors are `String`. The two protected bit-perfect audio seams

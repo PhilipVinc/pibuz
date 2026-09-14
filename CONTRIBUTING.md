@@ -1,10 +1,10 @@
-# Contributing to muqbzd
+# Contributing to Pibuz
 
 This project is actively evolving. Contributions are welcome, but we have a few rules to keep releases stable and avoid regressions (especially around audio output).
 
 ## Where the code lives
 
-muqbzd is **daemon-only**: the Rust workspace under `crates/` carries `qbzd` and
+Pibuz is **daemon-only**: the Rust workspace under `crates/` carries `pibuz` and
 exactly the crates it depends on. There is no desktop UI here, and none is
 planned — a change that needs one is out of scope for this project.
 
@@ -40,7 +40,7 @@ will release from. Work happens on topic branches and merges to `main`.
 
 ```
 feature/xyz ──┐
-bugfix/abc  ──┼──> main ──> tag qbzd-vX.Y.Z ──> release
+bugfix/abc  ──┼──> main ──> tag vX.Y.Z ──> release
 hotfix/123  ──┘
 ```
 
@@ -101,4 +101,4 @@ Prefer:
 ## What not to include
 
 - Large refactors mixed with feature work.
-- Desktop-UI changes — muqbzd is headless by design.
+- Desktop-UI changes — Pibuz is headless by design.
