@@ -86,8 +86,16 @@ pub struct BufferStatus {
     /// starts. The actual figure is chosen per track from measured link speed
     /// and clamped to this.
     pub initial_max_bytes: usize,
-    /// Decoded ring depth. `audio.pcm_ring_ms` when the host set it, else the
-    /// profile's seconds — always the EFFECTIVE value, never the raw `0`.
+    /// Decoded ring depth, as ACTUALLY ALLOCATED when a device is open.
+    ///
+    /// `audio.pcm_ring_ms` (or the profile's seconds) is only a request: the
+    /// ring takes the largest of it, 250 ms, and three times the ALSA hardware
+    /// ring. On a box with `alsa_buffer_ms = 1000` at 96 kHz that last floor
+    /// wins and the ring is 3000 ms however small the profile asked for, so
+    /// reporting the request alone understated a real Pi by 50 %.
+    ///
+    /// With no device open the rate is unknown and the floors cannot be
+    /// applied, so this falls back to the requested value.
     pub pcm_ring_ms: u32,
     /// `audio.alsa_buffer_ms`; `null` when it is the rate-derived default
     /// (500 ms at 192 kHz+, 250 ms from 96 kHz, 125 ms below), which is not
@@ -334,11 +342,30 @@ fn assemble_live(state: &super::ApiState) -> StatusDoc {
             window_seconds: settings.as_ref().map(|s| s.stream_window_seconds),
             window_max_bytes: profile.stream_window_max_bytes,
             initial_max_bytes: qbz_player::player::max_initial_buffer_bytes(),
-            // `0` in the setting means "the profile decides"; resolve it here
-            // rather than making every reader know that.
-            pcm_ring_ms: match settings.as_ref().map(|s| s.pcm_ring_ms).unwrap_or(0) {
-                0 => u32::from(profile.pcm_ring_seconds) * 1000,
-                ms => ms,
+            // `0` in the setting means "the profile decides", and the profile
+            // is in turn only a request — see the field's doc. Resolve the whole
+            // thing here rather than making every reader know the rule, and use
+            // `qbz_audio`'s own function so there is one definition of it.
+            pcm_ring_ms: {
+                let requested = settings.as_ref().map(|s| s.pcm_ring_ms).unwrap_or(0);
+                let alsa_ms = settings
+                    .as_ref()
+                    .map(|s| u32::from(s.alsa_buffer_ms))
+                    .unwrap_or(0);
+                match ev.output_sample_rate.filter(|r| *r > 0) {
+                    // Channels only trims a ring at the byte ceiling, which
+                    // stereo never reaches; the device is stereo on every path
+                    // this daemon opens.
+                    Some(rate) => qbz_audio::ring_depth_ms(
+                        rate,
+                        2,
+                        qbz_audio::alsa_buffer_frames(rate, alsa_ms),
+                        requested,
+                        profile.pcm_ring_seconds,
+                    ),
+                    None if requested > 0 => requested,
+                    None => u32::from(profile.pcm_ring_seconds) * 1000,
+                }
             },
             alsa_buffer_ms: settings
                 .as_ref()

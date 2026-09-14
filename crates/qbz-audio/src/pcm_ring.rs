@@ -107,6 +107,9 @@ pub struct RingLink {
     min_fill_frames: AtomicU64,
     /// Reads that found the ring empty when they wanted frames.
     starved_reads: AtomicU64,
+    /// Whether the decoder has ever filled this ring. Until it has, an empty
+    /// read is the prime window, not a starvation — see [`RingLink::record_fill`].
+    primed: AtomicBool,
     /// Wake channel for the decoder. The mutex guards nothing but the condvar's
     /// own requirement; every wait has a timeout, so a lost notification costs
     /// a little latency and never a hang.
@@ -130,6 +133,7 @@ impl RingLink {
             closed: AtomicBool::new(false),
             min_fill_frames: AtomicU64::new(u64::MAX),
             starved_reads: AtomicU64::new(0),
+            primed: AtomicBool::new(false),
             space_lock: Mutex::new(()),
             space: Condvar::new(),
         }
@@ -155,7 +159,27 @@ impl RingLink {
     /// one after it has been heard, and a stall that the ring absorbed leaves
     /// no trace at all — which is exactly the state we were in when an audible
     /// artifact was reported with nothing whatsoever in the log.
+    ///
+    /// NOTHING is recorded until the decoder has filled the ring once. A ring
+    /// is empty by construction the moment it is built, and the engine rebuilds
+    /// it on every seek and every track change, so the writer reaching for
+    /// frames before the decoder has produced any is the normal prime window —
+    /// `start_threshold` is holding the device precisely so it does not matter.
+    /// Counting it reported ~20 starved reads for every scrub of the progress
+    /// bar, under a message that says "this is what a dropout sounds like".
+    ///
+    /// That is worse than noise. This instrumentation exists because an audible
+    /// artifact once left no trace in the log; a log full of warnings that fire
+    /// on every seek is the same blindness wearing a different hat, because the
+    /// real one is then indistinguishable from the routine ones. After the
+    /// first non-empty read, every empty one is genuine and is counted.
     pub fn record_fill(&self, frames: u64, starved: bool) {
+        if !self.primed.load(Ordering::Relaxed) {
+            if frames == 0 {
+                return;
+            }
+            self.primed.store(true, Ordering::Relaxed);
+        }
         self.min_fill_frames.fetch_min(frames, Ordering::Relaxed);
         if starved {
             self.starved_reads.fetch_add(1, Ordering::Relaxed);
@@ -334,8 +358,187 @@ pub fn ring_capacity_frames(
     frames.min(max_frames.max(1))
 }
 
+/// Frames in the ALSA hardware ring for `sample_rate`, honouring an
+/// `audio.alsa_buffer_ms` override.
+///
+/// The rule lives here, beside [`ring_capacity_frames`], because that function
+/// takes the result as its `alsa_buffer_frames` floor — anyone who wants to
+/// know how deep the decoded ring will actually be has to apply this first,
+/// and the status API is not on Linux-only code paths. `alsa_direct` calls it
+/// for the value it hands the driver, so there is one rule, not two.
+///
+/// `configured_ms` of `0` means the rate-derived default: 500 ms at 192 kHz and
+/// above, 250 ms from 96 kHz, 125 ms below. An override is clamped to
+/// 50..=4000 ms so a typo cannot ask the driver for a 30-second buffer, or a
+/// 1 ms one that would underrun continuously.
+pub fn alsa_buffer_frames(sample_rate: u32, configured_ms: u32) -> usize {
+    if configured_ms > 0 {
+        let ms = u64::from(configured_ms.clamp(50, 4000));
+        return ((u64::from(sample_rate) * ms) / 1000) as usize;
+    }
+    if sample_rate >= 192_000 {
+        (sample_rate / 2) as usize
+    } else if sample_rate >= 96_000 {
+        (sample_rate / 4) as usize
+    } else {
+        (sample_rate / 8) as usize
+    }
+}
+
+/// The decoded ring's depth in MILLISECONDS at `sample_rate` — what
+/// [`ring_capacity_frames`] will actually allocate, expressed the way the
+/// settings and the status API talk about it.
+///
+/// This is the figure to report: `audio.pcm_ring_ms` (or the profile's
+/// seconds) is only a REQUEST, and the floors above routinely beat it. A box
+/// with `alsa_buffer_ms = 1000` at 96 kHz gets a 3000 ms ring however small the
+/// profile asked for, because three times the hardware ring is 3000 ms.
+pub fn ring_depth_ms(
+    sample_rate: u32,
+    channels: u16,
+    alsa_buffer_frames: usize,
+    requested_ms: u32,
+    profile_seconds: u8,
+) -> u32 {
+    let frames = ring_capacity_frames(
+        sample_rate,
+        channels,
+        alsa_buffer_frames,
+        requested_ms,
+        profile_seconds,
+    );
+    ((frames as u64 * 1000) / u64::from(sample_rate.max(1))) as u32
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// The scrub case from the Pi: every seek rebuilds the ring, the writer
+    /// reaches for frames before the decoder has produced any, and that used to
+    /// be reported as "this is what a dropout sounds like" — ~20 times per drag
+    /// of the progress bar.
+    #[test]
+    fn the_prime_window_is_not_a_starvation() {
+        let link = RingLink::new();
+        for _ in 0..20 {
+            link.record_fill(0, true);
+        }
+        assert_eq!(
+            link.take_low_water(),
+            None,
+            "nothing to report while priming"
+        );
+    }
+
+    /// Once the decoder has filled it once, an empty read is real and counted —
+    /// the whole point of the instrumentation still works.
+    #[test]
+    fn a_starvation_after_priming_is_reported() {
+        let link = RingLink::new();
+        link.record_fill(0, true); // prime window, ignored
+        link.record_fill(4096, false); // primed here
+        link.record_fill(0, true); // genuine
+        link.record_fill(0, true);
+
+        let (min_fill, starved) = link.take_low_water().expect("a reading");
+        assert_eq!(starved, 2, "only the two after priming");
+        assert_eq!(min_fill, 0, "and the low-water mark is the real one");
+    }
+
+    /// Priming is per RingLink, and the engine builds a new one for every
+    /// stream, so a seek does not carry the previous stream's primed state.
+    #[test]
+    fn a_rebuilt_ring_primes_again() {
+        let first = RingLink::new();
+        first.record_fill(4096, false);
+        first.record_fill(0, true);
+        assert_eq!(first.take_low_water().expect("a reading").1, 1);
+
+        let after_seek = RingLink::new();
+        after_seek.record_fill(0, true);
+        assert_eq!(
+            after_seek.take_low_water(),
+            None,
+            "fresh ring, fresh prime window"
+        );
+    }
+
+    /// The low-water mark must not be polluted by the prime window either: a
+    /// healthy stream should not report "lowest fill 0 frames" forever because
+    /// of how it started.
+    #[test]
+    fn the_low_water_mark_ignores_the_prime_window() {
+        let link = RingLink::new();
+        link.record_fill(0, false);
+        link.record_fill(8192, false);
+        link.record_fill(6000, false);
+
+        let (min_fill, starved) = link.take_low_water().expect("a reading");
+        assert_eq!(min_fill, 6000, "not the 0 it was built with");
+        assert_eq!(starved, 0);
+    }
+
+    /// The case that made this reachable from the status API: a moOde Pi with
+    /// `alsa_buffer_ms = 1000` at 96 kHz. The LowMemory profile asks for 2 s and
+    /// gets 3 s, because three times a 1000 ms hardware ring is 3000 ms. The
+    /// daemon logged 288000 frames while `/api/status` reported 2000 ms.
+    #[test]
+    fn the_alsa_floor_beats_the_profile_on_a_big_hardware_buffer() {
+        let rate = 96_000;
+        let alsa = alsa_buffer_frames(rate, 1000);
+        assert_eq!(alsa, 96_000, "1000 ms at 96 kHz");
+
+        let frames = ring_capacity_frames(rate, 2, alsa, 0, 2);
+        assert_eq!(
+            frames, 288_000,
+            "3x the hardware ring, not the profile's 2 s"
+        );
+        assert_eq!(ring_depth_ms(rate, 2, alsa, 0, 2), 3000);
+    }
+
+    /// With a small hardware ring the request is what you get, so the floor is
+    /// not silently rewriting every box.
+    #[test]
+    fn the_request_wins_when_the_hardware_ring_is_small() {
+        let rate = 44_100;
+        let alsa = alsa_buffer_frames(rate, 0); // rate-derived: 125 ms
+        assert_eq!(alsa, rate as usize / 8);
+        assert_eq!(
+            ring_depth_ms(rate, 2, alsa, 0, 6),
+            6000,
+            "the profile's 6 s"
+        );
+        assert_eq!(
+            ring_depth_ms(rate, 2, alsa, 1500, 6),
+            1500,
+            "an explicit request"
+        );
+    }
+
+    /// The rate-derived default, which `alsa_direct` used to own privately.
+    #[test]
+    fn the_default_alsa_buffer_scales_with_rate() {
+        assert_eq!(alsa_buffer_frames(192_000, 0), 96_000); // 500 ms
+        assert_eq!(alsa_buffer_frames(96_000, 0), 24_000); // 250 ms
+        assert_eq!(alsa_buffer_frames(44_100, 0), 5_512); // 125 ms
+    }
+
+    /// An override is clamped at both ends: neither a 30-second buffer nor a
+    /// 1 ms one reaches the driver.
+    #[test]
+    fn an_absurd_alsa_override_is_clamped() {
+        assert_eq!(alsa_buffer_frames(48_000, 30_000), 48_000 * 4); // 4000 ms
+        assert_eq!(alsa_buffer_frames(48_000, 1), 48_000 / 20); // 50 ms
+    }
+
+    /// 250 ms is the other floor, and it holds when both the request and the
+    /// hardware ring are tiny.
+    #[test]
+    fn the_250ms_floor_holds_for_a_tiny_request() {
+        let rate = 48_000;
+        assert_eq!(ring_depth_ms(rate, 2, 100, 10, 0), 250);
+    }
+
     use super::*;
 
     #[test]

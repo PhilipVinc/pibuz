@@ -99,20 +99,10 @@ pub fn resolve_keepalive_depth_ms(configured_ms: u32, ring_ms: u32) -> u32 {
 /// 96 kHz, 125 ms below — which is the shape this path has always had.
 #[cfg(target_os = "linux")]
 fn buffer_frames_for(sample_rate: u32) -> Frames {
-    let ms = alsa_buffer_ms();
-    if ms > 0 {
-        // Clamped so a typo cannot ask the driver for a 30-second buffer (or a
-        // 1 ms one, which would underrun continuously).
-        let ms = ms.clamp(50, 4000) as u64;
-        return ((u64::from(sample_rate) * ms) / 1000) as Frames;
-    }
-    if sample_rate >= 192_000 {
-        (sample_rate / 2) as Frames
-    } else if sample_rate >= 96_000 {
-        (sample_rate / 4) as Frames
-    } else {
-        (sample_rate / 8) as Frames
-    }
+    // The rule itself lives in `pcm_ring`, which is not Linux-gated, because
+    // the decoded ring's depth is derived from this figure and the status API
+    // has to be able to say what that depth is.
+    crate::pcm_ring::alsa_buffer_frames(sample_rate, alsa_buffer_ms()) as Frames
 }
 
 /// How many periods make up the ring.

@@ -102,7 +102,9 @@ pub use loudness::{calculate_gain_factor, db_to_linear, extract_replaygain, Repl
 pub use loudness_analyzer::LoudnessAnalyzer;
 pub use loudness_cache::LoudnessCache;
 pub use output_sinks::{list_output_sinks, OutputSinkInfo};
-pub use pcm_ring::{ring_capacity_frames, Boundary, BoundaryKind, RingLink};
+pub use pcm_ring::{
+    alsa_buffer_frames, ring_capacity_frames, ring_depth_ms, Boundary, BoundaryKind, RingLink,
+};
 pub use rt::{promote_writer_thread_and_log, set_writer_rt_priority, RtOutcome};
 pub use settings::AudioSettings;
 pub use virtual_out::VirtualAudioOut;
