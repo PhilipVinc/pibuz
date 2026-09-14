@@ -14,14 +14,22 @@
 
 name: release
 
+# Two tag shapes publish, because two conventions are in use:
+#   v2.4.0                  — the project's own semver releases
+#   pibuz-v2.0.2.moode57    — a build cut for a moOde package, where the version
+#                             string carries a distro suffix Cargo cannot hold
+# Both resolve to the version after the LAST `v`, and both publish. (Before
+# 2.4.0 the trigger said `v*` while the publish job required a `qbzd-v*` ref,
+# which no tag could satisfy at once — so every tag built and none released.)
 on:
   push:
     tags:
       - "v*"
+      - "pibuz-v*"
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to build (e.g. v2.1.0). Empty = build HEAD with the Cargo.toml version, no Release publish."
+        description: "Tag to build (e.g. v2.4.0). Empty = build HEAD with the Cargo.toml version, no Release publish."
         required: false
         type: string
 
@@ -30,7 +38,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Releases are cut from main, and only from main. A `v*` tag anywhere
+  # Releases are cut from main, and only from main. A release tag anywhere
   # else (a topic branch, a detached build) stops here before anything is
   # built or published. workflow_dispatch without a tag is a plain test build
   # and is exempt — it publishes nothing.
@@ -78,10 +86,12 @@ jobs:
         run: |
           VERSION=""
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            VERSION="${GITHUB_REF#refs/tags/v}"
+            # `refs/tags/v2.4.0` and `refs/tags/pibuz-v2.0.2.moode57` alike:
+            # everything after the last `v`.
+            VERSION="${GITHUB_REF##*v}"
           elif [[ -n "${{ inputs.tag }}" ]]; then
             VERSION="${{ inputs.tag }}"
-            VERSION="${VERSION#v}"
+            VERSION="${VERSION##*v}"
           else
             VERSION="$(grep -m1 '^version = ' Cargo.toml | sed 's/version = \"\(.*\)\"/\1/')"
           fi
@@ -154,7 +164,7 @@ jobs:
   # Single publisher so the two matrix legs never race on Release creation.
   release:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/pibuz-v')
     runs-on: ubuntu-24.04
     permissions:
       contents: write

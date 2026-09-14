@@ -48,11 +48,16 @@ different programs at the same path. The project is **Pibuz** and the binary is
 
 ### Fixed (release)
 
-- **Tagging a release actually publishes one.** The publish job was gated on
-  `refs/tags/qbzd-v*` while the workflow triggers on `v*` and the version
-  parser strips a bare `v` — so every `vX.Y.Z` tag built both architectures,
-  uploaded the artifacts, and then skipped the Release. It is gated on
-  `refs/tags/v*` now, matching the trigger and `CONTRIBUTING.md`.
+- **Tagging a release actually publishes one.** Two tag conventions are in use
+  — `vX.Y.Z` for the project's own releases, and `qbzd-v2.0.2.moodeNN` for the
+  builds the moOde installer downloads — and the workflow ended up half on each:
+  it triggered on `v*` while the publish job required a `refs/tags/qbzd-v*`
+  ref, which no single tag can satisfy. So a `vX.Y.Z` tag built both
+  architectures, uploaded the artifacts and skipped the Release, and a
+  `qbzd-v*` tag did not start the workflow at all. It now triggers and
+  publishes on `v*` **and** `pibuz-v*`, and reads the version as everything
+  after the last `v`, so a distro-suffixed `pibuz-v2.0.2.moode58` works
+  alongside a plain `v2.4.0`.
 
 ### Changed
 
