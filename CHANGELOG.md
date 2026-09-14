@@ -3,7 +3,7 @@
 Notable changes per release. Versions are plain semver; releases are `vX.Y.Z`
 tags on `main`.
 
-## 2.4.0-rc.1 — unreleased
+## 2.4.0-rc.2 — unreleased
 
 **The project is now Pibuz and the binary is `pibuz`** — see *Renamed* below
 for what an upgrade has to touch (little: the unit file) and what it keeps (the
@@ -80,8 +80,40 @@ different programs at the same path. The project is **Pibuz** and the binary is
   build-image and volume overrides) take `PIBUZ_*` names too, each still
   accepting its old name as a fallback.
 
+### Removed
+
+- **Six settings keys the daemon never read.** `audio.quality_fallback_behavior`,
+  `audio.allow_quality_fallback`, `audio.limit_quality_to_device`,
+  `audio.device_max_sample_rate`, `audio.sync_audio_on_startup` and
+  `playback.show_context_icon` are gone from `settings show`, `settings set` and
+  the TUI. Every one was a desktop setting that survived the unwind: outside the
+  settings plumbing their only references were in a reload test, so moving them
+  changed nothing audible. There is no tier-retry path in this daemon at all —
+  quality comes straight from `playback.quality` — which is what the first two
+  were gating.
+
+  **A script setting one of these now gets exit 2 and the list of valid keys.**
+  The fields, columns and migrations all stay, and `settings import` still
+  accepts and applies them, so a bundle exported by the desktop round-trips
+  unchanged. The TUI's Playback screen loses four rows with them, and with the
+  retry-on-failure row goes the `ask` rendering rule — so the one documented
+  exception to `settings show --json` round-tripping back into `settings set` is
+  gone too, and that property is now total.
+
 ### Changed
 
+- **`audio.disk_cache_mb` sizes the L2 disk cache.** It was
+  `PlaybackCache::new(800 * 1024 * 1024)` — a literal at the construction site,
+  invisible and unchangeable, and the single number deciding how much of the
+  card this daemon occupies on exactly the small boards that route their cache
+  to disk because they have no RAM for it. `auto` keeps the 800 MB it always
+  had. Refused below 100 MB: under one track's size a cache declines everything
+  it is offered while still writing the card, and the honest way to say "no
+  disk" is `audio.cache_to_disk false`.
+- **`audio.memory_cache_mb` accepts up to 4096 MB**, was 1024. The old cap was
+  under what shipping UIs already offered, so choosing 2 GB failed and left the
+  previous budget in place — silently, for any caller that does not check the
+  exit status.
 - **`pibuz status` is a sectioned block, and it reports what the daemon knows
   about its own memory.** The five `·`-joined lines ran to 95 columns and wrapped
   on a narrow terminal; the block is now labelled rows under `audio`, `playback`
@@ -147,6 +179,27 @@ different programs at the same path. The project is **Pibuz** and the binary is
   switches gapless off.
 
 ### Fixed
+
+- **A fixed-output player no longer ends up quiet with a slider that cannot
+  raise it.** With `qconnect.volume_mode locked` the connect path pins the
+  player to unity — that mode means this renderer does not attenuate — and the
+  join handler then applied `qconnect.initial_volume` straight over the top. The
+  gain landed on the bit-perfect ALSA-direct path (`alsa_hardware_volume false`
+  stores a software gain for the writer thread; the comment calling that a
+  harmless no-op had been wrong since the branch stopped doing nothing), and
+  `Locked` ignores the controller's SetVolume, so nothing could undo it. A moOde
+  player set to Fixed (0dB) output reached this on every connect. The join-time
+  volume is now skipped in `Locked` and logged as skipped.
+- **`settings set` accepts a value starting with `-`.** Every usable loudness
+  target is negative, so `audio.normalization_target_lufs -14` — its own default
+  — was rejected as an unknown short flag. That key could not be written at all,
+  by anyone, since it was added.
+- **`settings import` writes the settings it says it wrote.** Nine audio keys —
+  `cache_to_disk`, `disk_cache_mb`, `memory_cache_mb`, `alsa_mixer_device`,
+  `volume_curve`, `alsa_buffer_ms`, `dac_keepalive_ms`, `pcm_ring_ms`,
+  `writer_rt_priority` — were planned, printed to the operator under *applied*,
+  and then fell through to the unhandled-key warning. An import reported a box's
+  whole storage and buffer configuration as moved and moved none of it.
 
 - The daemon now raises its own `RLIMIT_RTPRIO`, so the ALSA writer actually
   gets `SCHED_FIFO` where it is started without a systemd unit — which is how
