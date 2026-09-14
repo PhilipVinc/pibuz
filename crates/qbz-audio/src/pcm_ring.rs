@@ -553,9 +553,9 @@ mod tests {
         // 0 ms = auto; a Normal-class host says 6 s.
         let frames = ring_capacity_frames(44_100, 2, 5_512, 0, 6);
         assert_eq!(frames, 44_100 * 6);
-        // A LowMemory host says 2 s, and gets exactly that.
-        let frames = ring_capacity_frames(44_100, 2, 5_512, 0, 2);
-        assert_eq!(frames, 44_100 * 2);
+        // A LowMemory host says 4 s, and gets exactly that.
+        let frames = ring_capacity_frames(44_100, 2, 5_512, 0, 4);
+        assert_eq!(frames, 44_100 * 4);
     }
 
     /// The floor that is not about taste: a decoded ring no deeper than the

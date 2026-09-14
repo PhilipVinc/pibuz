@@ -119,6 +119,20 @@ different programs at the same path. The project is **Pibuz** and the binary is
 
 ### Changed
 
+- **A low-memory board's decoded ring is 4 seconds, was 2.** That figure was
+  chosen when a board below the gapless floor never prefetched: nothing else
+  touched the card while a track played, so the only stalls to absorb were the
+  network's. Those boards now stream an oversized successor to the card *during*
+  playback — that is what gapless on 512 MB is — and the ring has to cover an
+  ~85 MB SD write running beside the decode.
+
+  Measured on a Pi 3B forced to a 3A profile (`QBZ_FORCE_MEM_TOTAL_KB=439000`)
+  playing 24/48 with the disk cache on: three `decoded ring fell to 2192 frames`
+  warnings in the first two minutes, two of them inside a successor's spill
+  write, none once the card went idle. No xrun and nothing audible, so this is
+  margin rather than a fix for a symptom — but 46 ms left of a 2 s ring is not
+  the cushion the number is supposed to be. Costs 1.3 MB at CD and 2.9 MB at
+  24/96, against the 73 MB L1 the same board already gets.
 - **`audio.disk_cache_mb` sizes the L2 disk cache.** It was
   `PlaybackCache::new(800 * 1024 * 1024)` — a literal at the construction site,
   invisible and unchangeable, and the single number deciding how much of the

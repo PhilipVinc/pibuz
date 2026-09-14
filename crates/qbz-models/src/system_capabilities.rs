@@ -70,11 +70,26 @@ pub struct MemoryProfile {
     /// the same track already occupies as compressed bytes — a rounding error on
     /// a board that can play Hi-Res at all.
     ///
-    /// Two seconds on a small board rather than six for the same reason
-    /// `allow_hires_prefetch` is false there: a 512 MB Pi has no 9 MB to spare,
-    /// and two seconds still covers every stall short of a genuine network
-    /// outage. Reference points: squeezelite's output buffer is ~10 s of CD
-    /// audio, MPD's decoded-chunk pipe a few seconds.
+    /// Four seconds on a small board rather than six: a 512 MB Pi has no 9 MB
+    /// to spare for a Hi-Res ring, and it does not need one — `allow_hires_prefetch`
+    /// is false there, so 4 s costs 1.3 MB at CD and 2.9 MB at 24/96.
+    ///
+    /// It was TWO, and the reasoning expired. Two seconds was chosen when a
+    /// board below [`GAPLESS_MIN_TOTAL_KB`] never prefetched at all: nothing
+    /// else touched the card while a track played, so the only stalls to absorb
+    /// were the network's. Those boards now stream an oversized successor to the
+    /// card DURING playback — that is what gapless on 512 MB is — and the ring
+    /// has to cover an SD write of ~85 MB running beside the decode.
+    ///
+    /// Measured, on a Pi 3B forced to a 3A profile (`QBZ_FORCE_MEM_TOTAL_KB`)
+    /// playing 24-bit/48 kHz with the disk cache on: three `decoded ring fell
+    /// to 2192 frames` warnings in the first two minutes, two of them squarely
+    /// inside a successor's spill write, and none once the card went idle. No
+    /// xrun and nothing audible — this is margin, not a fix for a symptom — but
+    /// 46 ms left of a 2 s ring is not the cushion the figure is supposed to be.
+    ///
+    /// Reference points: squeezelite's output buffer is ~10 s of CD audio, MPD's
+    /// decoded-chunk pipe a few seconds.
     pub pcm_ring_seconds: u8,
     /// Ceiling for the COMPRESSED streaming window, in bytes.
     ///
@@ -167,7 +182,7 @@ pub fn l1_cache_bytes_for_total_kb(mem_total_kb: u64) -> usize {
 
 /// Decoded-audio ring depth per class. See [`MemoryProfile::pcm_ring_seconds`].
 const PCM_RING_SECONDS_NORMAL: u8 = 6;
-const PCM_RING_SECONDS_LOW_MEMORY: u8 = 2;
+const PCM_RING_SECONDS_LOW_MEMORY: u8 = 4;
 
 /// Compressed-window ceilings per class. See
 /// [`MemoryProfile::stream_window_max_bytes`].
@@ -383,15 +398,24 @@ mod tests {
         assert_eq!(pi3a.class, MemoryClass::LowMemory);
         assert_eq!(pi5.class, MemoryClass::Normal);
         assert!(
-            pi3a.pcm_ring_seconds >= 2,
-            "a small board still needs a cushion"
+            pi3a.pcm_ring_seconds >= 4,
+            "a small board writing a successor to the card needs more than a \
+             token cushion — see pcm_ring_seconds"
         );
         assert!(pi3a.pcm_ring_seconds < pi5.pcm_ring_seconds);
 
         // The worst case the ring is ever asked to hold: 24/192 stereo f32.
+        //
+        // The ceiling was 4 MB, which 4 s exceeds at this rate. Raised rather
+        // than dropped: 5.9 MB is 1.4 % of a 428 MB board, against the 73 MB
+        // (17 %) that same board already gives the L1 cache, and a LowMemory
+        // host has `allow_hires_prefetch` false — so 24/192 is the arithmetic
+        // worst case here, not the expected one. The cap is still doing its
+        // job: it is what would catch someone giving a 512 MB board the
+        // desktop's six seconds.
         let bytes = |secs: u8| usize::from(secs) * 192_000 * 2 * 4;
         assert!(
-            bytes(pi3a.pcm_ring_seconds) <= 4 * 1024 * 1024,
+            bytes(pi3a.pcm_ring_seconds) <= 6 * 1024 * 1024,
             "LowMemory ring is {} bytes at 192 kHz",
             bytes(pi3a.pcm_ring_seconds)
         );
