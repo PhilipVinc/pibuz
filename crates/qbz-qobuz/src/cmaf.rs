@@ -195,12 +195,24 @@ pub enum TrackDestination {
     /// Write straight to this path as the download proceeds. The caller owns
     /// publishing it (rename into place, index it) once this returns.
     File(std::path::PathBuf),
+    /// Do not download this track at all.
+    ///
+    /// The size is the whole point: a caller that has nowhere to put 200 MB —
+    /// a small board with no disk cache — can only find that out here, once the
+    /// segment table has been read and before a single audio byte is fetched.
+    /// Declining is a normal outcome, not an error, so it comes back as
+    /// [`DownloadedTrack::Refused`] rather than as a failure the caller would
+    /// log, retry and back off.
+    Refuse,
 }
 
 /// What [`download_full_sized`] produced.
 pub enum DownloadedTrack {
     Memory(std::sync::Arc<[u8]>),
     File(std::path::PathBuf),
+    /// The caller's `choose` returned [`TrackDestination::Refuse`]. Nothing was
+    /// fetched beyond the init segment and nothing was written.
+    Refused,
 }
 
 /// Somewhere decrypted frames get appended.
@@ -358,6 +370,14 @@ pub async fn download_full_sized(
             .sum::<usize>();
 
     match choose(total_size) {
+        TrackDestination::Refuse => {
+            log::info!(
+                "[CMAF] Track {} declined at {:.2} MB — the caller has nowhere to put it",
+                track_id,
+                total_size as f64 / (1024.0 * 1024.0),
+            );
+            Ok(DownloadedTrack::Refused)
+        }
         TrackDestination::Memory => {
             let mut output = ArcSlab::with_capacity(total_size);
             output.append(&setup.flac_header)?;
@@ -610,8 +630,14 @@ impl Sink<'_> {
 
 /// Download a track's complete CMAF stream and return decrypted FLAC bytes.
 ///
-/// Used by the playback path for in-memory cache writes. Segments are
-/// fetched concurrently with a semaphore cap, decrypted, and concatenated.
+/// Segments are fetched concurrently with a semaphore cap, decrypted, and
+/// concatenated.
+///
+/// Prefer [`download_full_sized`] on any path that runs on a player: this
+/// returns the WHOLE track as an `Arc<[u8]>` with no say in the matter, which
+/// is ~210 MB at 24/192 and an OOM on a 512 MB board. `download_full_sized`
+/// hands the caller the size before the bytes exist so it can send an oversized
+/// track to disk, or decline it.
 pub async fn download_full(
     client: &QobuzClient,
     track_id: u64,

@@ -619,20 +619,50 @@ fn should_promote_streaming_buffer(class: qbz_models::system_capabilities::Memor
 /// Whether to prefetch the next track for a gapless hand-off.
 ///
 /// Two independent answers have to agree, and they mean different things. The
-/// USER's `gapless_enabled` is a preference. The HOST's `allow_gapless_prefetch`
-/// is a floor, and it is not overridable by the preference: a prefetch is a
-/// whole extra track allocated in RAM beside the one playing, and a board that
-/// cannot afford one does not get slow, it dies. See `GAPLESS_MIN_TOTAL_KB`.
+/// USER's `gapless_enabled` is a preference. The HOST's answer —
+/// [`gapless_successor_can_be_bounded`] — is a floor, and it is not overridable
+/// by the preference: a board that cannot bound the successor does not get
+/// slow, it dies.
 ///
 /// Both halves are well covered on their own — `MemoryProfile::from_total_kb`
-/// pins the floor per board size, and `should_arm_prefetch` takes the result as
-/// a parameter — but their composition lived inline in the audio thread, where
-/// the only way to reach it was to run the thread on a host with the right
-/// amount of RAM. Which direction the AND falls is exactly the thing worth
-/// getting right: the wrong one silently turns gapless off for everybody, or
-/// silently turns it on for the boards it kills.
+/// pins the RAM figure per board size, and `should_arm_prefetch` takes the
+/// result as a parameter — but their composition lived inline in the audio
+/// thread, where the only way to reach it was to run the thread on a host with
+/// the right amount of RAM. Which direction the AND falls is exactly the thing
+/// worth getting right: the wrong one silently turns gapless off for everybody,
+/// or silently turns it on for the boards it kills.
 fn gapless_prefetch_allowed(user_enabled: bool, host_allows: bool) -> bool {
     user_enabled && host_allows
+}
+
+/// Whether this host can produce a gapless successor whose memory cost is
+/// BOUNDED — the question the old RAM floor was a proxy for.
+///
+/// It was a good proxy while a prefetch meant `cmaf::download_full` and a whole
+/// track in a `Vec<u8>`: below `GAPLESS_MIN_TOTAL_KB` there was nowhere to put
+/// 200 MB, so the answer was no. It stopped being one when the destination
+/// became a decision made from the segment table before any bytes exist
+/// (`plan_successor`): a track too big for RAM is written straight to the card
+/// as it decrypts and handed over as a PATH, which costs a `BufReader`. So the
+/// floor was refusing gapless on 512 MB boards for an allocation those boards
+/// had already stopped making — including for an L1 or L2 cache HIT, which
+/// never allocated anything at all.
+///
+/// Either half is enough on its own. RAM above the floor means a whole track
+/// fits beside the playing one, which is what a memory-only cache needs
+/// (`audio.cache_to_disk` off is a deliberate setting on a board with the room,
+/// and it keeps gapless working with no card writes). A disk destination means
+/// the size stops mattering at all.
+///
+/// The one board this changes is the small one with a card: a Pi 3A / Zero 2 W
+/// gets gapless when `audio.cache_to_disk` is on, and still does not when it is
+/// off — there the successor has nowhere bounded to live and
+/// [`plan_successor`] refuses it per track as well.
+fn gapless_successor_can_be_bounded(
+    host_can_hold_whole_track: bool,
+    disk_spill_available: bool,
+) -> bool {
+    host_can_hold_whole_track || disk_spill_available
 }
 
 /// The finished-track release policy, over a cache rather than over a `Player`.
@@ -677,6 +707,111 @@ fn begin_new_track(
 
 pub(crate) fn spill_to_disk(total: usize, budget: usize) -> bool {
     total.saturating_mul(2) > budget
+}
+
+/// Where a track fetched for a gapless hand-off may go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SuccessorPlan {
+    /// Assemble it in RAM: it fits beside the playing track, or this host can
+    /// afford a whole one anyway.
+    InMemory,
+    /// Stream it to the card as it decrypts and hand over the path.
+    OnDisk,
+    /// Do not fetch it. Playback still advances at the end of the track through
+    /// the ordinary next-track path; it just has a gap, which is the right
+    /// trade against an OOM.
+    Refuse,
+}
+
+/// Decide where a successor of `total` bytes goes, from the size the CMAF
+/// segment table gives up front.
+///
+/// The pair that has to fit is the playing track and its successor, so
+/// [`spill_to_disk`]'s `2 * total > budget` is the line: under it the track is
+/// half the L1 budget or less and RAM is the cheaper answer on any board.
+///
+/// Over it, the card takes it — and when there is no card, `host_can_hold_whole_track`
+/// decides. That parameter is the RAM floor (`MemoryProfile::allow_gapless_prefetch`)
+/// rather than the memory CLASS, deliberately: a 1 GB Pi is `LowMemory` and is
+/// ALSO the board people run with `audio.cache_to_disk` off to keep the card
+/// quiet, where holding one 200 MB successor beside a windowed current track is
+/// a trade it can make. A 512 MB board cannot, and that is the case this arm
+/// exists for — it is the OOM reported as a Pi 3A rebooting mid-album.
+pub(crate) fn plan_successor(
+    total: usize,
+    budget: usize,
+    disk_available: bool,
+    host_can_hold_whole_track: bool,
+) -> SuccessorPlan {
+    if !spill_to_disk(total, budget) {
+        return SuccessorPlan::InMemory;
+    }
+    if disk_available {
+        return SuccessorPlan::OnDisk;
+    }
+    if host_can_hold_whole_track {
+        SuccessorPlan::InMemory
+    } else {
+        SuccessorPlan::Refuse
+    }
+}
+
+/// [`plan_successor`] as the closure `download_full_sized` asks for.
+///
+/// A free function taking owned arguments rather than a method, so both fetch
+/// paths — the gapless hand-off and the queue prefetch — apply one policy
+/// instead of two that drift. They used to differ in the only way that matters:
+/// the hand-off chose a destination from the size, and the prefetch called
+/// `cmaf::download_full`, which has no destination to choose and returns the
+/// whole track as an `Arc<[u8]>` whatever the host is.
+///
+/// `begin_write` failing is the one thing the plan cannot see coming — a full
+/// card, a read-only mount, an IO error on this one track — so the disk arm
+/// re-decides as if there were no disk at all rather than falling through to a
+/// whole-track allocation on a board that cannot take one.
+fn destination_chooser(
+    track_id: u64,
+    tag: &'static str,
+    spill_cache: Option<Arc<qbz_cache::PlaybackCache>>,
+    budget: usize,
+    host_can_hold_whole_track: bool,
+) -> impl FnOnce(usize) -> qbz_qobuz::TrackDestination {
+    move |total: usize| {
+        let mb = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
+        let plan = plan_successor(
+            total,
+            budget,
+            spill_cache.is_some(),
+            host_can_hold_whole_track,
+        );
+        if plan == SuccessorPlan::OnDisk {
+            if let Some(part) = spill_cache
+                .as_ref()
+                .and_then(|cache| cache.begin_write(track_id, total as u64))
+            {
+                log::info!(
+                    "[{tag}] Track {track_id} is {:.1} MB — streaming it to disk (L1 budget {:.1} MB)",
+                    mb(total),
+                    mb(budget),
+                );
+                return qbz_qobuz::TrackDestination::File(part);
+            }
+            log::warn!("[{tag}] Track {track_id}: the disk cache would not take it");
+        }
+        match plan_successor(total, budget, false, host_can_hold_whole_track) {
+            SuccessorPlan::Refuse => {
+                log::info!(
+                    "[{tag}] Track {track_id} is {:.1} MB against an L1 budget of {:.1} MB and \
+                     there is no disk cache to stream it to — skipping it. Playback will advance \
+                     normally, with a gap.",
+                    mb(total),
+                    mb(budget),
+                );
+                qbz_qobuz::TrackDestination::Refuse
+            }
+            _ => qbz_qobuz::TrackDestination::Memory,
+        }
+    }
 }
 
 /// A reader's range request for the CMAF feeder, unless it asks for a byte
@@ -1479,6 +1614,16 @@ pub struct SharedState {
     /// can detect that a queued `PlayStreaming` was superseded by a newer play
     /// and stop waiting on its initial buffer instead of blocking ~60s (#591).
     play_generation: Arc<AtomicU64>,
+    /// Whether a gapless successor too big for RAM has somewhere bounded to go
+    /// — i.e. the L2 disk cache opened.
+    ///
+    /// Here rather than read from `AudioSettings.cache_to_disk` on the audio
+    /// thread, because the setting says what was ASKED for and this says what
+    /// exists: a cache that failed to open leaves the setting true and the
+    /// destination missing, which is precisely the case that would otherwise
+    /// allocate a whole track on a board that cannot hold one. Set once by
+    /// `Player::new`, after the cache it describes has been built.
+    disk_spill_available: Arc<AtomicBool>,
 }
 
 impl Default for SharedState {
@@ -1510,7 +1655,17 @@ impl SharedState {
             buffer_progress: Arc::new(AtomicU32::new(0)),
             bit_perfect_mode: Arc::new(AtomicU8::new(0)),
             play_generation: Arc::new(AtomicU64::new(0)),
+            disk_spill_available: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub fn set_disk_spill_available(&self, available: bool) {
+        self.disk_spill_available.store(available, Ordering::SeqCst);
+    }
+
+    /// See [`SharedState::disk_spill_available`].
+    pub fn disk_spill_available(&self) -> bool {
+        self.disk_spill_available.load(Ordering::SeqCst)
     }
 
     pub fn set_stream_error(&self, error: bool) {
@@ -4573,19 +4728,24 @@ impl Player {
                                 // buffer is not copied, so the slot is never
                                 // cleared and `is_none()` would never fire.
                                 // Same rule as the PlayNext guard.
-                                // The host floor is not a preference and is not
-                                // overridable by the setting: a prefetch is a
-                                // whole extra track allocated in RAM, and a
-                                // board that cannot afford one is not slow, it
-                                // is dead. See `GAPLESS_MIN_TOTAL_KB`.
+                                // The host half is not a preference and is not
+                                // overridable by the setting: a successor this
+                                // board can neither hold in RAM nor stream to a
+                                // card is not slow, it is dead. RAM alone used
+                                // to be the whole answer; it stopped being one
+                                // when the destination became a per-track
+                                // decision. See `gapless_successor_can_be_bounded`.
                                 let gapless_enabled = gapless_prefetch_allowed(
                                     thread_settings
                                         .lock()
                                         .ok()
                                         .map(|s| s.gapless_enabled)
                                         .unwrap_or(false),
-                                    qbz_models::system_capabilities::memory_profile()
-                                        .allow_gapless_prefetch,
+                                    gapless_successor_can_be_bounded(
+                                        qbz_models::system_capabilities::memory_profile()
+                                            .allow_gapless_prefetch,
+                                        thread_state.disk_spill_available(),
+                                    ),
                                 );
                                 if should_arm_prefetch(
                                     gapless_enabled,
@@ -4759,17 +4919,10 @@ impl Player {
                 profile.max_initial_buffer_bytes / 1024,
                 if profile.allow_hires_prefetch { "allowed" } else { "not allowed" },
             );
-            // Say it plainly and say why: on a board below the floor, gapless
-            // silently not happening is otherwise indistinguishable from gapless
-            // being broken, and the next bug report is about the wrong thing.
-            if !profile.allow_gapless_prefetch {
-                log::warn!(
-                    "[Player] Gapless: OFF — this host has {} MB of RAM and prefetching the next \
-                     track needs at least {} MB. Tracks will still follow one another, with a gap.",
-                    profile.mem_total_kb / 1024,
-                    qbz_models::system_capabilities::GAPLESS_MIN_TOTAL_KB / 1024,
-                );
-            }
+            // Whether gapless survives on this host is logged further down,
+            // once the disk cache has been built: below the RAM floor it is the
+            // card that decides, and saying so before that is known was how the
+            // message came to state a reason that was not the reason.
             set_max_initial_buffer_bytes(profile.max_initial_buffer_bytes);
         }
 
@@ -4871,6 +5024,42 @@ impl Player {
                 }
             }
         };
+
+        // What the audio thread's arming gate reads, and the reason it is a fact
+        // rather than a setting: `cache_to_disk` can be on with no cache behind
+        // it (the `Err` arm above).
+        let disk_spill_available = audio_cache.get_playback_cache().is_some();
+        state.set_disk_spill_available(disk_spill_available);
+
+        // Say plainly whether gapless works here and why. On a board below the
+        // RAM floor, gapless silently not happening is otherwise
+        // indistinguishable from gapless being broken, and the next bug report
+        // is about the wrong thing.
+        {
+            let profile = qbz_models::system_capabilities::memory_profile();
+            if gapless_successor_can_be_bounded(
+                profile.allow_gapless_prefetch,
+                disk_spill_available,
+            ) {
+                if !profile.allow_gapless_prefetch {
+                    log::info!(
+                        "[Player] Gapless: ON via the disk cache — this host has {} MB of RAM, \
+                         below the {} MB needed to hold a whole track, so a successor too big for \
+                         memory is streamed to the card and played from there.",
+                        profile.mem_total_kb / 1024,
+                        qbz_models::system_capabilities::GAPLESS_MIN_TOTAL_KB / 1024,
+                    );
+                }
+            } else {
+                log::warn!(
+                    "[Player] Gapless: OFF — this host has {} MB of RAM, below the {} MB needed to \
+                     hold a whole track, and there is no disk cache to stream one to (see \
+                     audio.cache_to_disk). Tracks will still follow one another, with a gap.",
+                    profile.mem_total_kb / 1024,
+                    qbz_models::system_capabilities::GAPLESS_MIN_TOTAL_KB / 1024,
+                );
+            }
+        }
 
         Self {
             tx,
@@ -5289,17 +5478,16 @@ impl Player {
     /// Download a track fully into the L1/L2 cache **without** starting
     /// playback.
     ///
-    /// Gapless playback requires upcoming tracks to be cache hits so they
-    /// play via `play_data` (fully in-memory) rather than the streaming
-    /// path — the audio engine's `PlayNext` handler ignores gapless
-    /// requests while a streaming source is active. This method is the
-    /// prefetch primitive the controller drives for the next 1-2 queue
-    /// tracks.
+    /// A gapless hand-off needs the successor ready as a whole decodable
+    /// thing — bytes or a file — before the current track ends, so this warms
+    /// the cache for the next queue track and `fetch_for_gapless` then finds it
+    /// in L1 or L2. This is the prefetch primitive the controller drives.
     ///
-    /// Mirrors the Tauri V2 prefetch download: CMAF `download_full` first
-    /// (Akamai CDN), legacy `/track/getFileUrl` full download as fallback.
-    /// No-ops when `streaming_only` is set, when the track is already
-    /// cached, or when another fetch for the same id is in flight.
+    /// The destination is chosen by [`Player::destination_chooser`] from the
+    /// size the CMAF segment table declares, so a track too big for RAM here is
+    /// staged on the card instead and one that fits nowhere bounded is skipped.
+    /// No-ops when `streaming_only` is set, when the track is already cached,
+    /// or when another fetch for the same id is in flight.
     pub async fn prefetch_into_cache(
         &self,
         client: &QobuzClient,
@@ -5318,9 +5506,9 @@ impl Player {
             return Ok(());
         }
 
-        // Already cached, or another prefetch for this id is already
-        // running — nothing to do.
-        if self.audio_cache.contains(track_id) {
+        // Already cached in either tier, or another prefetch for this id is
+        // already running — nothing to do.
+        if self.is_track_cached(track_id) {
             log::debug!("[PREFETCH] Track {track_id} already cached");
             return Ok(());
         }
@@ -5345,15 +5533,64 @@ impl Player {
         self.audio_cache.mark_fetching(track_id);
         log::info!("[PREFETCH] Prefetching track {track_id} at {quality:?}");
 
-        // Try CMAF full download first (Akamai CDN), legacy full download
-        // as fallback (nginx CDN).
-        let result: Result<TrackBytes, String> =
-            match qbz_qobuz::cmaf::download_full(client, track_id, quality).await {
+        // Try CMAF first (Akamai CDN), legacy full download as fallback (nginx
+        // CDN). Where the bytes land is decided from the segment table before
+        // the download starts, exactly as `fetch_for_gapless` decides it: this
+        // used to call `cmaf::download_full`, which has no destination to choose
+        // and returns the WHOLE track as an `Arc<[u8]>` on any host. Nothing
+        // gated it on the host's memory either, so on a 512 MB board a plain
+        // `next` allocated ~210 MB of Hi-Res beside the playing track — the same
+        // OOM `GAPLESS_MIN_TOTAL_KB` was written to prevent, reached through the
+        // other door.
+        let choose = self.destination_chooser(track_id, "PREFETCH");
+        let result: Result<Option<TrackBytes>, String> =
+            match qbz_qobuz::cmaf::download_full_sized(client, track_id, quality, None, choose)
+                .await
+            {
                 // Already the allocation the cache will share — assembled there
                 // segment by segment, so the track is never resident twice.
-                Ok(data) => Ok(data),
+                Ok(qbz_qobuz::DownloadedTrack::Memory(data)) => Ok(Some(data)),
+                // On the card already, which is the whole point of the warm-up:
+                // the hand-off that follows finds it in L2 and hands over a
+                // path. Publishing it is what makes it findable.
+                Ok(qbz_qobuz::DownloadedTrack::File(_)) => {
+                    match self
+                        .audio_cache
+                        .get_playback_cache()
+                        .and_then(|c| c.commit_write(track_id))
+                    {
+                        Some(path) => {
+                            log::info!(
+                                "[PREFETCH] Track {track_id} staged on disk ({})",
+                                path.display()
+                            );
+                            Ok(None)
+                        }
+                        None => Err(format!("track {track_id} could not be published to disk")),
+                    }
+                }
+                // Declined on purpose, reason already logged. Not a failure, so
+                // it must not be marked failed and must not fall through to the
+                // legacy path, which would undo the decision.
+                Ok(qbz_qobuz::DownloadedTrack::Refused) => {
+                    self.audio_cache.unmark_fetching(track_id);
+                    return Ok(());
+                }
                 Err(e) => {
                     log::warn!("[PREFETCH] CMAF failed for track {track_id}: {e}, trying legacy");
+                    if let Some(cache) = self.audio_cache.get_playback_cache() {
+                        cache.abort_write(track_id);
+                    }
+                    if !self.host_can_hold_whole_track() {
+                        // No segment table means no size to decide on, so there
+                        // is no bounded way to take this path here.
+                        log::info!(
+                            "[PREFETCH] Track {track_id}: the legacy download has no size to \
+                             decide on — skipping it on this host"
+                        );
+                        self.audio_cache.unmark_fetching(track_id);
+                        return Ok(());
+                    }
                     match client.get_stream_url_with_fallback(track_id, quality).await {
                         // The legacy nginx path streams into a `Vec` without
                         // knowing the length up front, so this one still pays
@@ -5362,14 +5599,14 @@ impl Player {
                         Ok(stream_url) => self
                             .download_audio(&stream_url.url)
                             .await
-                            .map(TrackBytes::from),
+                            .map(|data| Some(TrackBytes::from(data))),
                         Err(e) => Err(format!("Failed to get stream URL: {e}")),
                     }
                 }
             };
 
         match result {
-            Ok(data) => {
+            Ok(Some(data)) => {
                 // Brief delay before the cache write to avoid racing the
                 // audio thread, matching the Tauri prefetch path.
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -5378,6 +5615,11 @@ impl Player {
                 self.audio_cache.unmark_fetching(track_id);
                 self.audio_cache.clear_failed(track_id);
                 log::info!("[PREFETCH] Complete for track {track_id} ({len} bytes)");
+                Ok(())
+            }
+            Ok(None) => {
+                self.audio_cache.unmark_fetching(track_id);
+                self.audio_cache.clear_failed(track_id);
                 Ok(())
             }
             Err(e) => {
@@ -5389,11 +5631,22 @@ impl Player {
         }
     }
 
-    /// True if `track_id` is present in the L1/L2 playback cache. Used by
-    /// the gapless controller to decide whether a track can be queued for
-    /// a seamless handoff.
+    /// True if `track_id` is already warm in EITHER tier — the question a
+    /// caller asks before deciding to fetch it.
+    ///
+    /// It used to ask only L1, which was close enough while every prefetch
+    /// landed there. It is not close enough now that an oversized successor is
+    /// staged on the card instead: L1 would report it missing on every driver
+    /// tick and the prefetch would download the same 200 MB again. (The same
+    /// hole was already reachable the other way: L1 refuses a track larger than
+    /// its budget, so on a small board a Hi-Res prefetch never registered as
+    /// cached either.)
     pub fn is_track_cached(&self, track_id: u64) -> bool {
         self.audio_cache.contains(track_id)
+            || self
+                .audio_cache
+                .get_playback_cache()
+                .is_some_and(|cache| cache.path_if_present(track_id).is_some())
     }
 
     /// A track just finished playing — free its bytes early, but only where the
@@ -5462,8 +5715,41 @@ impl Player {
         }
     }
 
+    /// Whether this host could hold a whole extra track in RAM beside the one
+    /// playing — the RAM half of [`gapless_successor_can_be_bounded`].
+    fn host_can_hold_whole_track(&self) -> bool {
+        qbz_models::system_capabilities::memory_profile().allow_gapless_prefetch
+    }
+
+    /// Whether a gapless successor can be bounded on this host at all.
+    ///
+    /// The daemon reports this rather than the RAM figure alone, because on a
+    /// small board with a card the two now disagree — and the figure a status
+    /// endpoint prints is the one a bug report quotes.
+    pub fn gapless_prefetch_possible(&self) -> bool {
+        gapless_successor_can_be_bounded(
+            self.host_can_hold_whole_track(),
+            self.audio_cache.get_playback_cache().is_some(),
+        )
+    }
+
+    /// This player's [`destination_chooser`], for a download of `track_id`.
+    fn destination_chooser(
+        &self,
+        track_id: u64,
+        tag: &'static str,
+    ) -> impl FnOnce(usize) -> qbz_qobuz::TrackDestination {
+        destination_chooser(
+            track_id,
+            tag,
+            self.audio_cache.get_playback_cache().cloned(),
+            self.audio_cache.budget_bytes(),
+            self.host_can_hold_whole_track(),
+        )
+    }
+
     /// Fetch a track's audio bytes for a gapless handoff: L1 memory →
-    /// L2 disk → CMAF `download_full` (legacy full download as fallback).
+    /// L2 disk → CMAF `download_full_sized` (legacy full download as fallback).
     /// Does not start playback — the caller passes the bytes to
     /// `play_next`. Returns `None` only when every tier fails.
     ///
@@ -5504,23 +5790,7 @@ impl Player {
         // it decrypts. Assembling it in RAM and writing it out afterwards was a
         // whole-track `Arc` copy plus an 11-15 s fsync'd burst that underran ALSA
         // audibly, twice, measured mid-write.
-        let spill_cache = self.audio_cache.get_playback_cache().cloned();
-        let budget = self.audio_cache.budget_bytes();
-        let choose = move |total: usize| {
-            if spill_to_disk(total, budget) {
-                if let Some(cache) = spill_cache.as_ref() {
-                    if let Some(part) = cache.begin_write(track_id, total as u64) {
-                        log::info!(
-                            "[GAPLESS] Track {track_id} is {:.1} MB — streaming it to disk (L1 budget {:.1} MB)",
-                            total as f64 / (1024.0 * 1024.0),
-                            budget as f64 / (1024.0 * 1024.0),
-                        );
-                        return qbz_qobuz::TrackDestination::File(part);
-                    }
-                }
-            }
-            qbz_qobuz::TrackDestination::Memory
-        };
+        let choose = self.destination_chooser(track_id, "GAPLESS");
 
         match qbz_qobuz::cmaf::download_full_sized(client, track_id, quality, None, choose).await {
             Ok(qbz_qobuz::DownloadedTrack::File(_)) => {
@@ -5547,6 +5817,12 @@ impl Player {
                 self.audio_cache.insert(track_id, bytes.clone());
                 return Some(TrackAudio::Memory(bytes));
             }
+            Ok(qbz_qobuz::DownloadedTrack::Refused) => {
+                // Declined on purpose, with the reason already logged by the
+                // chooser. Not a failure: nothing to abort, nothing to retry,
+                // and the legacy fallback below would undo the decision.
+                return None;
+            }
             Err(e) => {
                 log::warn!("[GAPLESS] CMAF failed for track {track_id}: {e}, trying legacy");
                 if let Some(cache) = self.audio_cache.get_playback_cache() {
@@ -5557,6 +5833,17 @@ impl Player {
 
         // Legacy fallback: a plain URL download, always in memory — CMAF failed
         // outright, so there is no segment table and no size to decide on.
+        //
+        // No size means no way to bound it, so a host that cannot afford an
+        // arbitrary whole track does not take this path at all. It is the
+        // fallback for a CDN failure, not a route worth an OOM.
+        if !self.host_can_hold_whole_track() {
+            log::info!(
+                "[GAPLESS] Track {track_id}: CMAF failed and the legacy download has no size to \
+                 decide on — skipping it on this host"
+            );
+            return None;
+        }
         match client.get_stream_url_with_fallback(track_id, quality).await {
             Ok(stream_url) => match self.download_audio(&stream_url.url).await {
                 Ok(data) => {
@@ -7076,7 +7363,12 @@ mod new_track_and_prefetch_tests {
 mod memory_policy_tests {
     use qbz_models::system_capabilities::MemoryClass;
 
-    use super::{gapless_prefetch_allowed, should_promote_streaming_buffer};
+    use qbz_models::system_capabilities::{l1_cache_bytes_for_total_kb, GAPLESS_MIN_TOTAL_KB};
+
+    use super::{
+        gapless_prefetch_allowed, gapless_successor_can_be_bounded, plan_successor,
+        should_promote_streaming_buffer, SuccessorPlan,
+    };
 
     /// The user's preference cannot switch the host floor off.
     ///
@@ -7107,5 +7399,75 @@ mod memory_policy_tests {
     fn the_streaming_buffer_is_promoted_only_where_a_second_copy_is_affordable() {
         assert!(should_promote_streaming_buffer(MemoryClass::Normal));
         assert!(!should_promote_streaming_buffer(MemoryClass::LowMemory));
+    }
+
+    /// Either half bounds the successor, and neither is required.
+    ///
+    /// The row that changed is the middle one: a 512 MB board WITH a card. It
+    /// was refused for years on the reasoning that a prefetch is a whole track
+    /// in RAM — which stopped being true when `plan_successor` started sending
+    /// an oversized track to the card instead, and was never true of an L1 or
+    /// L2 cache hit.
+    #[test]
+    fn gapless_needs_either_the_ram_or_the_card() {
+        // 1 GB board, memory-only cache by choice: RAM alone carries it.
+        assert!(gapless_successor_can_be_bounded(true, false));
+        // 512 MB board with the disk cache on: the card carries it.
+        assert!(gapless_successor_can_be_bounded(false, true));
+        // 512 MB board, no disk cache: nowhere bounded to put a successor.
+        assert!(
+            !gapless_successor_can_be_bounded(false, false),
+            "with neither the RAM nor a card this must stay off — it is the Pi 3A OOM"
+        );
+        assert!(gapless_successor_can_be_bounded(true, true));
+    }
+
+    /// The destination decision, on the boards it decides differently for.
+    ///
+    /// Sizes are the real ones: Hi-Res runs ~21 MB/min, so a five-minute 24/192
+    /// track is ~105 MB and a ten-minute movement ~210; CD is ~5-6 MB/min.
+    /// Budgets are what `l1_cache_bytes_for_total_kb` gives those boards.
+    #[test]
+    fn a_successor_goes_where_the_board_can_take_it() {
+        const HIRES: usize = 210 * 1024 * 1024;
+        const CD: usize = 22 * 1024 * 1024;
+
+        // Pi 3A / Zero 2 W: ~439 MB reported, 72 MB of L1, below the RAM floor.
+        let small = l1_cache_bytes_for_total_kb(439_000);
+        // A 3A cannot hold a whole track; a 1 GB 3B can. Both pinned in
+        // `system_capabilities`, restated here because they are what the last
+        // argument below means.
+        const { assert!(439_000 < GAPLESS_MIN_TOTAL_KB) };
+
+        assert_eq!(
+            plan_successor(HIRES, small, true, false),
+            SuccessorPlan::OnDisk,
+            "with a card, a Hi-Res successor streams to it instead of into RAM"
+        );
+        assert_eq!(
+            plan_successor(HIRES, small, false, false),
+            SuccessorPlan::Refuse,
+            "without one there is nowhere to put 210 MB on a 439 MB board"
+        );
+        assert_eq!(
+            plan_successor(CD, small, false, false),
+            SuccessorPlan::InMemory,
+            "a CD track is under half the budget — the refusal is about SIZE, \
+             not about the board"
+        );
+
+        // Pi 3B, 1 GB: above the floor, and the board people run memory-only to
+        // keep the card quiet. Refusing there would take away gapless that works.
+        let pi3b = l1_cache_bytes_for_total_kb(926_832);
+        const { assert!(926_832 > GAPLESS_MIN_TOTAL_KB) };
+        assert_eq!(
+            plan_successor(HIRES, pi3b, false, true),
+            SuccessorPlan::InMemory
+        );
+        assert_eq!(
+            plan_successor(HIRES, pi3b, true, true),
+            SuccessorPlan::OnDisk,
+            "and with a card it still prefers the card: the pair has to fit"
+        );
     }
 }

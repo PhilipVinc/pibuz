@@ -50,8 +50,13 @@ pub struct MemoryProfile {
     /// [`l1_cache_bytes_for_total_kb`] so a 2 GB Pi 5 — nominally
     /// Normal-class — does not get a desktop's cache either.
     pub audio_cache_l1_max_bytes: usize,
-    /// Whether this host may prefetch the NEXT track at all — i.e. whether
-    /// gapless is possible here. See [`GAPLESS_MIN_TOTAL_KB`].
+    /// Whether this host can hold a whole extra track in RAM beside the one
+    /// playing. See [`GAPLESS_MIN_TOTAL_KB`].
+    ///
+    /// Half of whether gapless is possible here, not all of it: a board below
+    /// this line can still hand over a successor it streamed to the card. The
+    /// composed answer is `qbz_player`'s `gapless_successor_can_be_bounded`,
+    /// which is what the arming gate and `/api/status` ask.
     pub allow_gapless_prefetch: bool,
     /// Seconds of DECODED audio to hold between the decoder and the DAC.
     ///
@@ -88,10 +93,10 @@ pub struct MemoryProfile {
 
 /// Least RAM a host needs before it may hold a second whole track.
 ///
-/// A prefetch is not a cache decision, it is an allocation: `cmaf::download_full`
-/// returns the ENTIRE track as a `Vec<u8>`, and the L1 budget, the disk staging
-/// and the timing all happen downstream of it. At the default 24/192 (~42 MB per
-/// minute) a five-minute track is ~210 MB, and it lands beside the playing
+/// A prefetch used to be an allocation and nothing else: `cmaf::download_full`
+/// returned the ENTIRE track as a `Vec<u8>`, and the L1 budget, the disk staging
+/// and the timing all happened downstream of it. At the default 24/192 (~42 MB
+/// per minute) a five-minute track is ~210 MB, and it landed beside the playing
 /// track's own full buffer. On a 512 MB board — which reports ~439 MB — that is
 /// the OOM killer, reported on the moOde forum as a Pi 3A rebooting mid-album.
 /// Nothing stood in its way: the `allow_hires_prefetch` flag written for this
@@ -99,9 +104,18 @@ pub struct MemoryProfile {
 /// its `MemoryPressure` snapshot and `read_memory_pressure` sat here with no
 /// caller until they were deleted.
 ///
-/// So the small boards do not prefetch. Playback still advances at the end of a
-/// track through the ordinary next-track path; it just has a gap, which is the
-/// right trade against a reboot.
+/// This is no longer the whole gate, because that allocation is no longer
+/// forced. `qbz_player`'s `plan_successor` picks the destination from the size
+/// the segment table declares before any bytes exist, so an oversized successor
+/// is streamed to the card and handed over as a path — and a cache hit never
+/// allocated a whole track to begin with. What this figure now says is narrower
+/// and still true: below it, RAM ALONE cannot bound a successor, so a board
+/// here gets gapless only through the disk cache and refuses an unbounded
+/// download per track.
+///
+/// Where nothing can bound it, playback still advances at the end of a track
+/// through the ordinary next-track path; it just has a gap, which is the right
+/// trade against a reboot.
 ///
 /// 768 MiB rather than a round 512 MB, for the same reason [`NORMAL_FLOOR_KB`]
 /// is 1.75 GiB: a board reports well under its sticker once the kernel and GPU
@@ -234,10 +248,57 @@ pub fn detect_profile_from_meminfo(content: &str) -> MemoryProfile {
         .unwrap_or_else(|| MemoryProfile::from_total_kb(u64::MAX))
 }
 
+/// Name of the development override described on [`parse_forced_mem_total_kb`].
+pub const FORCE_MEM_TOTAL_KB_ENV: &str = "QBZ_FORCE_MEM_TOTAL_KB";
+
+/// Parse a forced `MemTotal` (in kB) out of [`FORCE_MEM_TOTAL_KB_ENV`]'s value.
+///
+/// # Why a whole MemTotal, and not a class or a flag
+///
+/// Every figure the profile carries is derived from that one number — the
+/// class, the L1 budget, the window ceiling, the ring depth, and whether the
+/// host clears [`GAPLESS_MIN_TOTAL_KB`]. A knob that set the CLASS alone would
+/// describe a board that does not exist, and the paths worth testing are the
+/// ones real boards take. `QBZ_FORCE_MEM_TOTAL_KB=439000` is a Pi 3A / Zero 2 W
+/// exactly: LowMemory, 72 MB of L1, an 8 MB window ceiling, a 2 s decoded ring,
+/// and below the floor, so the successor planning only those boards reach can be
+/// exercised on a laptop or on a Pi that has RAM to spare.
+///
+/// Pair it with `audio.cache_to_disk false` to get the other half of that board:
+/// no disk destination, so gapless is refused and an oversized successor is
+/// declined per track.
+///
+/// Env-only and deliberately not a setting: it is a test instrument, moOde's
+/// `startQobuz()` never writes it, and a setting would be one more key to keep
+/// in sync in `bundle.rs` for a value no user should ever set. Rejects zero and
+/// anything unparseable rather than guessing — a typo must not silently hand
+/// back a board nobody meant.
+pub fn parse_forced_mem_total_kb(raw: &str) -> Option<u64> {
+    match raw.trim().parse::<u64>() {
+        Ok(0) | Err(_) => None,
+        Ok(kb) => Some(kb),
+    }
+}
+
 /// Read `/proc/meminfo` and derive the profile. Returns the Normal-fallback
 /// profile on platforms without `/proc/meminfo` (macOS, Windows) or when
 /// the file is unreadable for any reason.
 fn detect_profile() -> MemoryProfile {
+    if let Some(kb) = std::env::var(FORCE_MEM_TOTAL_KB_ENV)
+        .ok()
+        .as_deref()
+        .and_then(parse_forced_mem_total_kb)
+    {
+        // Loud on purpose, and at warn: a daemon behaving like a board it is
+        // not is exactly the thing somebody will otherwise spend an afternoon
+        // chasing in a log.
+        log::warn!(
+            "[system] FORCED memory profile: pretending this host has {} MB of RAM \
+             ({FORCE_MEM_TOTAL_KB_ENV}). Unset it to use the real figure.",
+            kb / 1024,
+        );
+        return MemoryProfile::from_total_kb(kb);
+    }
     match std::fs::read_to_string("/proc/meminfo") {
         Ok(content) => detect_profile_from_meminfo(&content),
         Err(_) => MemoryProfile::from_total_kb(u64::MAX),
@@ -277,6 +338,40 @@ pub fn memory_profile() -> &'static MemoryProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The override is a board, not a mood: the figure it takes is the one
+    /// every other figure is derived from, so forcing it has to produce the
+    /// same profile the real board would get.
+    #[test]
+    fn forcing_a_pi_3a_gives_exactly_a_pi_3a() {
+        let forced = parse_forced_mem_total_kb("439000").expect("a plain figure parses");
+        let profile = MemoryProfile::from_total_kb(forced);
+
+        assert_eq!(profile.class, MemoryClass::LowMemory);
+        assert_eq!(profile.mem_total_kb, 439_000);
+        assert!(
+            !profile.allow_gapless_prefetch,
+            "the whole point is to land BELOW the floor, where the successor \
+             planning that only 512 MB boards reach runs"
+        );
+        assert_eq!(profile.audio_cache_l1_max_bytes / (1024 * 1024), 72);
+        assert_eq!(
+            profile.stream_window_max_bytes,
+            STREAM_WINDOW_MAX_LOW_MEMORY
+        );
+        assert_eq!(profile.pcm_ring_seconds, PCM_RING_SECONDS_LOW_MEMORY);
+    }
+
+    /// A typo must not hand back a board nobody meant — an unusable value means
+    /// "not set", which falls through to the host's own RAM.
+    #[test]
+    fn an_unusable_override_is_no_override() {
+        assert_eq!(parse_forced_mem_total_kb(" 926832 "), Some(926_832));
+        assert_eq!(parse_forced_mem_total_kb("0"), None);
+        assert_eq!(parse_forced_mem_total_kb(""), None);
+        assert_eq!(parse_forced_mem_total_kb("512MB"), None);
+        assert_eq!(parse_forced_mem_total_kb("-1"), None);
+    }
 
     /// The ring is the stall budget, so the small board must still get a real
     /// one — and the big board must not get so much that the allocation itself
@@ -461,13 +556,17 @@ MemFree:          250000 kB
         assert_eq!(mb(l1_cache_bytes_for_total_kb(32 * 1024 * 1024)), 512);
     }
 
-    /// A board that cannot afford a second whole track does not prefetch one.
-    /// The 512 MB Pi 3A / Zero 2 W is the case: `cmaf::download_full` allocates
-    /// the ENTIRE next track, ~210 MB at the default 24/192, on a box reporting
-    /// ~439 MB — and it was the OOM killer, not a slow transition.
+    /// Which boards can hold a second whole track in RAM. The 512 MB Pi 3A /
+    /// Zero 2 W cannot: a Hi-Res successor is ~210 MB at the default 24/192 on
+    /// a box reporting ~439 MB, and materialising one there was the OOM killer,
+    /// not a slow transition.
+    ///
+    /// This is the RAM half of the gapless answer, not the answer — such a
+    /// board can still stream a successor to the card. See
+    /// `qbz_player`'s `gapless_successor_can_be_bounded`.
     #[test]
     fn gapless_prefetch_needs_a_board_that_can_hold_two_tracks() {
-        // 512 MB boards: no prefetch.
+        // 512 MB boards: RAM alone cannot bound a successor.
         assert!(!MemoryProfile::from_total_kb(439_000).allow_gapless_prefetch);
         // 1 GB Pi 3B, measured — this is the board gapless is verified on.
         assert!(MemoryProfile::from_total_kb(926_832).allow_gapless_prefetch);

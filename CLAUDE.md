@@ -215,6 +215,21 @@ Both remaining singleton reads are named functions now — `gapless_prefetch_all
 and `should_promote_streaming_buffer` — so the policies are tested even though the
 lookup still happens at the call site.
 
+**To run the whole daemon as a board it is not**, set
+`QBZ_FORCE_MEM_TOTAL_KB` to that board's MemTotal in kB before starting it:
+`QBZ_FORCE_MEM_TOTAL_KB=439000 pibuz ...` is a Pi 3A / Zero 2 W exactly —
+LowMemory, 72 MB of L1, an 8 MB window ceiling, a 2 s ring, and below
+`GAPLESS_MIN_TOTAL_KB`, which is the only way to reach the successor planning
+that only 512 MB boards take. Add `audio.cache_to_disk false` for the half of
+that board with no card to spill to. It logs a warning at startup so nobody
+chases the behaviour of a board that is not there.
+
+It is a whole MemTotal rather than a class because every other figure is derived
+from it, and it is an env var rather than a setting because moOde must never
+write it. **It does not solve the trap above** — it is read once, inside the same
+`OnceLock`, so a test process still gets one answer for all its cases. It is for
+running the daemon, not for writing tests.
+
 Assert `Arc::strong_count`, not just byte totals. A residency leak here IS one
 extra live `TrackBytes` clone, so "the release dropped the last reference" is a
 discrete assertion where "peak bytes ≤ budget" is an inequality with slack that

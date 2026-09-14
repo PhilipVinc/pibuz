@@ -42,6 +42,11 @@ pub struct MemoryStatus {
     /// class by passing `u64::MAX`, which is a sentinel and not a RAM figure:
     /// putting it on the wire would have the status block report 16 EB.
     pub total_kb: Option<u64>,
+    /// Whether a gapless successor can be bounded on this host at all — RAM
+    /// above the floor, OR a disk cache to stream an oversized one to. Not
+    /// `MemoryProfile::allow_gapless_prefetch`, which is only the RAM half:
+    /// on a 512 MB board with `audio.cache_to_disk` on the two disagree, and
+    /// this is the one that answers "will my album play gapless".
     pub gapless_prefetch: bool,
     pub hires_prefetch: bool,
 }
@@ -321,7 +326,7 @@ fn assemble_live(state: &super::ApiState) -> StatusDoc {
                 u64::MAX => None,
                 kb => Some(kb),
             },
-            gapless_prefetch: profile.allow_gapless_prefetch,
+            gapless_prefetch: player.gapless_prefetch_possible(),
             hires_prefetch: profile.allow_hires_prefetch,
         },
         cache: CacheStatus {

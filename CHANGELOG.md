@@ -102,6 +102,28 @@ different programs at the same path. The project is **Pibuz** and the binary is
   `.normalization_gain`. Additive only — every documented key still means what
   it meant, so no `api_version` bump, and `/api/now-playing` (the endpoint an
   overlay actually polls) is untouched.
+- **Gapless on 512 MB boards.** A Pi 3A / Zero 2 W was refused gapless outright
+  by a RAM floor that argued a prefetch is a whole track allocated in memory.
+  That stopped being true when the download started choosing its destination
+  from the size the CMAF segment table declares: a successor too big for the L1
+  budget is streamed to the card as it decrypts and handed over as a path, and
+  an L1 or L2 cache hit never allocated one at all. Such a board now gets
+  gapless **when `audio.cache_to_disk` is on**, and still does not when it is
+  off — there a successor has nowhere bounded to live. Boards above the floor
+  are unchanged, including with a memory-only cache. The startup line says
+  which case the host is in instead of naming RAM as the reason either way.
+- **The queue prefetch can no longer OOM a small board.** It called
+  `cmaf::download_full`, which returns the entire track as an `Arc<[u8]>` on any
+  host, and nothing gated it on memory — so on a 512 MB board a plain *next*
+  allocated ~210 MB of Hi-Res beside the playing track, which is the reboot the
+  RAM floor existed to prevent, reached through the other door. It now uses the
+  same size-aware destination as the gapless hand-off, and both decline a track
+  they cannot place rather than allocating it. A download with no declared size
+  (the legacy non-CMAF fallback) is skipped on a host that cannot hold an
+  arbitrary track.
+- **`/api/status` `memory.gapless_prefetch` reports whether gapless actually
+  works here**, RAM or card, rather than the RAM figure alone. On a small board
+  with a disk cache those two now disagree.
 - **The streaming buffer is bounded.** The downloader now parks when it is
   `audio.stream_window_seconds` (default 8) of the track's own byte-rate ahead
   of the decoder, and resumes at 75 % of that. Before, nothing bounded it: the
