@@ -7264,8 +7264,14 @@ mod new_track_and_prefetch_tests {
     #[test]
     fn a_rate_matched_stream_still_arms_the_prefetch() {
         // Not complete — it never will be until the track ends — but the
-        // window is full, so the link is free.
-        let satisfied = false || true; // is_complete() || window_full()
+        // window is full, so the link is free. Named rather than written as
+        // the literal `false || true`: that spelled the disjunction out but
+        // needed a trailing comment to say which operand was which, and
+        // clippy 1.96 (the rustc moOde's build recipe pins) rejects it as a
+        // non-minimal bool.
+        let is_complete = false;
+        let window_full = true;
+        let satisfied = is_complete || window_full;
         assert!(
             should_arm_prefetch(true, false, 300, false, false, false, 0, satisfied),
             "a parked feeder means the prefetch may run"
