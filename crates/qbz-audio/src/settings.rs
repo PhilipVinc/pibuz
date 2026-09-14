@@ -100,6 +100,25 @@ pub struct AudioSettings {
     ///
     /// Keep it SMALL — 50 ms is plenty. It is a floor, not a target, but
     /// whatever silence is queued is latency the next track waits behind.
+    ///
+    /// **Known broken as it stands; leave it off.** Measured on a Pi at 50 ms
+    /// against a 24/96 stream: `resolve_keepalive_depth_ms` widened it to 62 ms,
+    /// the ALSA ring was 250 ms, and `stop_threshold` is left at the ring
+    /// length — so the device drains the silence it was given, finds the buffer
+    /// empty, and the driver calls that an underrun. Top up, start, drain,
+    /// XRUN, once every 76 ms: 32 `Recovered from PCM error (keep-alive)` lines
+    /// in two seconds, against one real PCM error in the whole run.
+    ///
+    /// Two things follow. The feature does not do its job — the clock is
+    /// stopped and restarted ~13 times a second rather than held running — and
+    /// it is worst for its own audience, since a DAC that clicks when the clock
+    /// stops would click at that rate instead of once per gap. It also buries
+    /// the genuine underruns this log line exists to surface.
+    ///
+    /// Any depth below the ring underruns by construction while `stop_threshold`
+    /// is the whole ring, so the fix is in that relationship or in the top-up
+    /// cadence — not in choosing a different number here. moOde deliberately
+    /// does not offer this control for that reason.
     #[serde(default)]
     pub dac_keepalive_ms: u16,
     /// Milliseconds of DECODED audio to keep buffered ahead of the DAC; `0`
