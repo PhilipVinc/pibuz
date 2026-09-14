@@ -3,7 +3,7 @@
 Notable changes per release. Versions are plain semver; releases are `vX.Y.Z`
 tags on `main`.
 
-## 2.4.0 — unreleased
+## 2.4.0-rc.1 — unreleased
 
 **The project is now Pibuz and the binary is `pibuz`** — see *Renamed* below
 for what an upgrade has to touch (little: the unit file) and what it keeps (the
