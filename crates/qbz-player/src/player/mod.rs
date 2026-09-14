@@ -1389,6 +1389,33 @@ pub struct PlaybackEvent {
     pub buffer_progress: Option<f32>,
 }
 
+/// A snapshot of both cache tiers, from [`Player::cache_report`].
+///
+/// The L1 budget is the EFFECTIVE one — `audio.memory_cache_mb` when the host
+/// set it, the memory profile's 17 % share when it did not — so a reader never
+/// has to re-derive which of the two won.
+#[derive(Debug, Clone)]
+pub struct CacheReport {
+    pub l1_tracks: usize,
+    pub l1_bytes: usize,
+    pub l1_budget_bytes: usize,
+    /// Tracks being downloaded into L1 right now.
+    pub l1_fetching: usize,
+    /// `None` when `audio.cache_to_disk` is off, or the disk cache failed to
+    /// open at start — the two cases are indistinguishable from here, and both
+    /// mean the same thing to a reader: nothing is being written to the card.
+    pub l2: Option<DiskCacheReport>,
+}
+
+/// The L2 (on-disk) tier of [`CacheReport`].
+#[derive(Debug, Clone)]
+pub struct DiskCacheReport {
+    pub tracks: usize,
+    pub bytes: u64,
+    pub budget_bytes: u64,
+    pub dir: String,
+}
+
 /// Shared state between main thread and audio thread
 #[derive(Clone)]
 pub struct SharedState {
@@ -5404,6 +5431,35 @@ impl Player {
         class: qbz_models::system_capabilities::MemoryClass,
     ) -> bool {
         release_finished_track_from(&self.audio_cache, track_id, class)
+    }
+
+    /// What the two cache tiers are holding right now.
+    ///
+    /// `audio_cache` is private and the daemon's `/api/status` is the only
+    /// caller outside this crate, so this hands back plain figures rather
+    /// than the tier types themselves — nothing downstream has to name
+    /// `qbz_cache` to render a memory section.
+    ///
+    /// Takes each tier's lock briefly and drops it before returning; safe to
+    /// call from the HTTP serving thread.
+    pub fn cache_report(&self) -> CacheReport {
+        let l1 = self.audio_cache.stats();
+        let l2 = self.audio_cache.get_playback_cache().map(|pc| {
+            let s = pc.stats();
+            DiskCacheReport {
+                tracks: s.cached_tracks,
+                bytes: s.current_size_bytes,
+                budget_bytes: s.max_size_bytes,
+                dir: pc.cache_dir().display().to_string(),
+            }
+        });
+        CacheReport {
+            l1_tracks: l1.cached_tracks,
+            l1_bytes: l1.current_size_bytes,
+            l1_budget_bytes: l1.max_size_bytes,
+            l1_fetching: l1.fetching_count,
+            l2,
+        }
     }
 
     /// Fetch a track's audio bytes for a gapless handoff: L1 memory →

@@ -54,6 +54,9 @@ enum Cmd {
     Status {
         #[arg(long)]
         json: bool,
+        /// Also show the memory, cache and buffer sections
+        #[arg(short, long)]
+        verbose: bool,
     },
     Ping {
         #[arg(long)]
@@ -355,11 +358,11 @@ async fn main() {
                 }
             }
         }
-        Cmd::Status { json } => {
+        Cmd::Status { json, verbose } => {
             // The CLI reads only local pibuz.toml (for the opt-in token); the
             // config root is always at its XDG default.
             let roots = paths::ProfileRoots::resolve(None, None);
-            cli::status::status(cli.host, json, &roots).await
+            cli::status::status(cli.host, json, verbose, &roots).await
         }
         Cmd::Ping { json } => {
             let roots = paths::ProfileRoots::resolve(None, None);

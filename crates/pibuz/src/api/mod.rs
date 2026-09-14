@@ -458,6 +458,14 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// response routes through this instead of a bare `json!(v)`. 3 decimals is
 /// plenty of precision for a 0.0-1.0 level.
 pub(crate) fn canon_volume(v: f32) -> serde_json::Value {
+    canon_f32(v)
+}
+
+/// The same 3-decimal treatment for every OTHER f32 that reaches the wire —
+/// `playback.buffer_progress` and `playback.normalization_gain` — which take
+/// the identical `Number::from_f32` widening and would otherwise land as
+/// `0.9800000190734863`.
+pub(crate) fn canon_f32(v: f32) -> serde_json::Value {
     let rounded = (v as f64 * 1000.0).round() / 1000.0;
     serde_json::json!(rounded)
 }

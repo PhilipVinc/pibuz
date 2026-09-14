@@ -22,7 +22,77 @@ pub struct StatusDoc {
     pub playback: PlaybackStatus,
     pub qconnect: QconnectStatus,
     pub network: NetworkStatus,
+    /// The host's memory class and the sizing that follows from it. Resolved
+    /// DAEMON-side on purpose: `memory_profile()` is a `OnceLock` off this
+    /// box's `/proc/meminfo`, so a laptop running `pibuz status --host pi`
+    /// would otherwise report its own class for the Pi's daemon.
+    pub memory: MemoryStatus,
+    pub cache: CacheStatus,
+    pub buffers: BufferStatus,
     pub last_errors: LatchedErrors,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryStatus {
+    /// "normal" | "low" — the `MemoryClass` that gates prefetch, gapless,
+    /// ring depth and the compressed window.
+    pub class: String,
+    /// `null` where the daemon cannot read `/proc/meminfo` — macOS and
+    /// Windows, i.e. a dev box. `detect_profile` falls back to the Normal
+    /// class by passing `u64::MAX`, which is a sentinel and not a RAM figure:
+    /// putting it on the wire would have the status block report 16 EB.
+    pub total_kb: Option<u64>,
+    pub gapless_prefetch: bool,
+    pub hires_prefetch: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CacheStatus {
+    pub l1: L1CacheStatus,
+    /// `null` when `audio.cache_to_disk` is off or the disk cache failed to
+    /// open: nothing is being written to the card either way.
+    pub l2: Option<L2CacheStatus>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct L1CacheStatus {
+    pub tracks: usize,
+    pub bytes: usize,
+    /// The budget in force — `audio.memory_cache_mb` when set, else the
+    /// profile's share of RAM.
+    pub budget_bytes: usize,
+    pub fetching: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct L2CacheStatus {
+    pub tracks: usize,
+    pub bytes: u64,
+    pub budget_bytes: u64,
+    pub dir: String,
+}
+
+/// Every buffer between the CDN and the DAC, in the order the bytes cross them.
+#[derive(Debug, Clone, Serialize)]
+pub struct BufferStatus {
+    /// Compressed read-ahead: `audio.stream_window_seconds` of music, clamped
+    /// to `window_max_bytes` (the profile's ceiling) at the top and 2 MB at
+    /// the bottom. Seconds rather than bytes because a byte constant is a
+    /// different amount of music at every quality. `null` only when the
+    /// settings DB could not be read — which is a different fact from `0`.
+    pub window_seconds: Option<u8>,
+    pub window_max_bytes: usize,
+    /// Process-wide cap on the initial buffer a stream waits for before it
+    /// starts. The actual figure is chosen per track from measured link speed
+    /// and clamped to this.
+    pub initial_max_bytes: usize,
+    /// Decoded ring depth. `audio.pcm_ring_ms` when the host set it, else the
+    /// profile's seconds — always the EFFECTIVE value, never the raw `0`.
+    pub pcm_ring_ms: u32,
+    /// `audio.alsa_buffer_ms`; `null` when it is the rate-derived default
+    /// (500 ms at 192 kHz+, 250 ms from 96 kHz, 125 ms below), which is not
+    /// known here because it depends on the stream.
+    pub alsa_buffer_ms: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -55,6 +125,14 @@ pub struct PlaybackStatus {
     pub volume: f32,
     pub muted: bool,
     pub queue_len: usize,
+    /// How much of the streaming track has been downloaded (0.0-1.0). `null`
+    /// when not streaming, or once the track is complete.
+    pub buffer_progress: Option<f32>,
+    /// The audio thread has the next track pre-queued for a gapless handoff.
+    pub gapless_ready: bool,
+    pub gapless_next_track_id: Option<u64>,
+    /// Replay-gain factor being applied; `null` when normalization is off.
+    pub normalization_gain: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -96,6 +174,19 @@ pub fn status(state: &super::ApiState) -> Response<Cursor<Vec<u8>>> {
     // with the canonical form — see `super::canon_volume`.
     if let Some(vol) = value.pointer_mut("/playback/volume") {
         *vol = super::canon_volume(doc.playback.volume);
+    }
+    // Same widening, same fix, for the other two f32s on the wire.
+    if let (Some(slot), Some(p)) = (
+        value.pointer_mut("/playback/buffer_progress"),
+        doc.playback.buffer_progress,
+    ) {
+        *slot = super::canon_f32(p);
+    }
+    if let (Some(slot), Some(g)) = (
+        value.pointer_mut("/playback/normalization_gain"),
+        doc.playback.normalization_gain,
+    ) {
+        *slot = super::canon_f32(g);
     }
     super::json(200, value)
 }
@@ -150,7 +241,14 @@ fn assemble_live(state: &super::ApiState) -> StatusDoc {
         Some(dev) => device_open || device_is_present(state, dev),
     };
 
-    // 5. playback block. `stopped` when nothing is loaded and the queue has no
+    // 5. cache tiers and the host's memory profile. `memory_profile()` is a
+    //    process-wide `OnceLock` the player already resolved at start, so this
+    //    is a read, not a detection; `cache_report` takes each tier's lock
+    //    briefly and drops it before returning.
+    let cache = player.cache_report();
+    let profile = qbz_models::system_capabilities::memory_profile();
+
+    // 6. playback block. `stopped` when nothing is loaded and the queue has no
     //    current track; otherwise `playing`/`paused`.
     let has_track = queue.current_track.is_some();
     let pstate = if ev.is_playing {
@@ -193,10 +291,59 @@ fn assemble_live(state: &super::ApiState) -> StatusDoc {
             volume: ev.volume,
             muted,
             queue_len: queue.total_tracks,
+            buffer_progress: if stopped { None } else { ev.buffer_progress },
+            gapless_ready: ev.gapless_ready,
+            gapless_next_track_id: match ev.gapless_next_track_id {
+                0 => None,
+                id => Some(id),
+            },
+            normalization_gain: ev.normalization_gain,
         },
         qconnect,
         network: NetworkStatus {
             online: network_online,
+        },
+        memory: MemoryStatus {
+            class: match profile.class {
+                qbz_models::system_capabilities::MemoryClass::LowMemory => "low",
+                qbz_models::system_capabilities::MemoryClass::Normal => "normal",
+            }
+            .to_string(),
+            total_kb: match profile.mem_total_kb {
+                u64::MAX => None,
+                kb => Some(kb),
+            },
+            gapless_prefetch: profile.allow_gapless_prefetch,
+            hires_prefetch: profile.allow_hires_prefetch,
+        },
+        cache: CacheStatus {
+            l1: L1CacheStatus {
+                tracks: cache.l1_tracks,
+                bytes: cache.l1_bytes,
+                budget_bytes: cache.l1_budget_bytes,
+                fetching: cache.l1_fetching,
+            },
+            l2: cache.l2.map(|d| L2CacheStatus {
+                tracks: d.tracks,
+                bytes: d.bytes,
+                budget_bytes: d.budget_bytes,
+                dir: d.dir,
+            }),
+        },
+        buffers: BufferStatus {
+            window_seconds: settings.as_ref().map(|s| s.stream_window_seconds),
+            window_max_bytes: profile.stream_window_max_bytes,
+            initial_max_bytes: qbz_player::player::max_initial_buffer_bytes(),
+            // `0` in the setting means "the profile decides"; resolve it here
+            // rather than making every reader know that.
+            pcm_ring_ms: match settings.as_ref().map(|s| s.pcm_ring_ms).unwrap_or(0) {
+                0 => u32::from(profile.pcm_ring_seconds) * 1000,
+                ms => ms,
+            },
+            alsa_buffer_ms: settings
+                .as_ref()
+                .map(|s| s.alsa_buffer_ms)
+                .filter(|ms| *ms > 0),
         },
         last_errors,
     }
@@ -298,9 +445,40 @@ mod tests {
                 volume: 0.0,
                 muted: false,
                 queue_len: 0,
+                buffer_progress: None,
+                gapless_ready: false,
+                gapless_next_track_id: None,
+                normalization_gain: None,
             },
             qconnect: QconnectStatus::default(),
             network: NetworkStatus { online: true },
+            memory: MemoryStatus {
+                class: "normal".into(),
+                total_kb: Some(3_998_000),
+                gapless_prefetch: true,
+                hires_prefetch: true,
+            },
+            cache: CacheStatus {
+                l1: L1CacheStatus {
+                    tracks: 0,
+                    bytes: 0,
+                    budget_bytes: 644 * 1024 * 1024,
+                    fetching: 0,
+                },
+                l2: Some(L2CacheStatus {
+                    tracks: 37,
+                    bytes: 1_288_490_188,
+                    budget_bytes: 800 * 1024 * 1024,
+                    dir: "/home/pi/.cache/pibuz/audio".into(),
+                }),
+            },
+            buffers: BufferStatus {
+                window_seconds: Some(8),
+                window_max_bytes: 32 * 1024 * 1024,
+                initial_max_bytes: 2 * 1024 * 1024,
+                pcm_ring_ms: 6000,
+                alsa_buffer_ms: None,
+            },
             last_errors: LatchedErrors {
                 stream: None,
                 auth: Some("token rejected by Qobuz (401) — cleared".into()),
@@ -324,10 +502,76 @@ mod tests {
             "playback",
             "qconnect",
             "network",
+            "memory",
+            "cache",
+            "buffers",
             "last_errors",
         ] {
             assert!(obj.contains_key(key), "missing top-level key: {key}");
         }
+    }
+
+    #[test]
+    fn the_new_sections_are_additive_only() {
+        // The §3.3.3 keys an existing reader knows must all still be there and
+        // still mean what they meant — `memory`/`cache`/`buffers` are ADDED
+        // beside them, which is why this needs no `api_version` bump and why
+        // the moOde overlay (which polls /api/now-playing, not this) is
+        // untouched.
+        let json = serde_json::to_value(idle_doc()).unwrap();
+        assert_eq!(json["playback"]["state"], "stopped");
+        assert_eq!(json["audio"]["device_present"], true);
+        assert_eq!(json["network"]["online"], true);
+        // And the new ones carry the daemon's own figures, not a reader's guess.
+        assert_eq!(json["memory"]["class"], "normal");
+        assert_eq!(json["cache"]["l2"]["tracks"], 37);
+        assert_eq!(json["buffers"]["pcm_ring_ms"], 6000);
+    }
+
+    /// On a dev box `memory_profile()` has no `/proc/meminfo` to read and
+    /// falls back to Normal by passing `u64::MAX` — a sentinel, not a size.
+    #[test]
+    fn a_host_with_no_meminfo_reports_no_ram_figure() {
+        let mut doc = idle_doc();
+        doc.memory.total_kb = None;
+        let json = serde_json::to_value(&doc).unwrap();
+        assert!(json["memory"]["total_kb"].is_null());
+        // The class is still the daemon's real answer, and still useful.
+        assert_eq!(json["memory"]["class"], "normal");
+    }
+
+    #[test]
+    fn a_disk_cache_that_is_off_is_null_not_zero() {
+        // `cache_to_disk = false` and "the disk cache holds nothing" are
+        // different facts, and the status block renders them differently:
+        // `null` says nothing is written to the card at all.
+        let mut doc = idle_doc();
+        doc.cache.l2 = None;
+        let json = serde_json::to_value(&doc).unwrap();
+        assert!(json["cache"]["l2"].is_null());
+    }
+
+    #[test]
+    fn the_f32_fields_all_serialize_canonically() {
+        // Same `Number::from_f32` widening as `volume`: `buffer_progress` and
+        // `normalization_gain` would land as `0.9800000190734863` raw.
+        let mut doc = idle_doc();
+        doc.playback.buffer_progress = Some(0.98f32);
+        doc.playback.normalization_gain = Some(0.75f32);
+        let mut value = serde_json::to_value(&doc).unwrap();
+        for (ptr, v) in [
+            ("/playback/buffer_progress", 0.98f32),
+            ("/playback/normalization_gain", 0.75f32),
+        ] {
+            *value.pointer_mut(ptr).unwrap() = crate::api::canon_f32(v);
+        }
+        let rendered = serde_json::to_string(&value).unwrap();
+        assert!(rendered.contains("\"buffer_progress\":0.98"), "{rendered}");
+        assert!(
+            rendered.contains("\"normalization_gain\":0.75"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("0.98000"), "{rendered}");
     }
 
     #[test]

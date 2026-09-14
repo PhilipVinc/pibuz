@@ -313,9 +313,9 @@ impl AudioCache {
         }
     }
 
-    /// Cache statistics, read by this crate's own tests to assert eviction and
-    /// sizing. No production caller — the tests ARE the reason it exists, and
-    /// deleting it would mean deleting the coverage with it.
+    /// Cache statistics — this crate's own tests assert eviction and sizing
+    /// through it, and `Player::cache_report` feeds the daemon's
+    /// `/api/status` memory section from it.
     pub fn stats(&self) -> CacheStats {
         let state = self.state.lock().unwrap();
         CacheStats {

@@ -157,10 +157,34 @@ set -e
 echo "$status_json" | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
-for k in ('audio', 'playback', 'qconnect', 'network', 'last_errors', 'driver_tick_age_ms'):
+for k in ('audio', 'playback', 'qconnect', 'network', 'last_errors', 'driver_tick_age_ms',
+          'memory', 'cache', 'buffers'):
     assert k in d, f'missing status key: {k}'
 assert 'auth' not in d, 'there is no account state any more'
+# The memory sections must carry the DAEMON's live figures. Zero here means the
+# assembler wired a placeholder rather than the cache and the profile, which a
+# shape-only check would pass.
+assert d['memory']['class'] in ('normal', 'low'), d['memory']
+assert d['cache']['l1']['budget_bytes'] > 0, d['cache']
+assert d['buffers']['pcm_ring_ms'] > 0, d['buffers']
+assert d['buffers']['initial_max_bytes'] > 0, d['buffers']
+assert d['buffers']['window_max_bytes'] > 0, d['buffers']
 "
+
+echo "== status -v renders the memory and buffer sections (and only there) =="
+if pibuz status | grep -q 'L1 audio'; then
+  fail "the default block leaked the memory section"
+fi
+pibuz status -v | grep -q 'L1 audio' || fail "status -v has no memory section"
+pibuz status -v | grep -q '^buffers$' || fail "status -v has no buffers section"
+# The layout exists to fit a terminal, so a regression here is a wrapped block.
+# python3, not awk: awk's `length` counts BYTES, and the block is full of
+# multi-byte separators -- every line would measure long.
+pibuz status -v | python3 -c "
+import sys
+for line in sys.stdin.read().splitlines():
+    assert len(line) <= 72, f'{len(line)} columns: {line}'
+" || fail "a status -v line is wider than 72 columns"
 
 echo "== ping/info shape (02 section 3.3.1 / 3.3.2) =="
 curl -fsS "127.0.0.1:${PORT}/api/ping" | python3 -c "
