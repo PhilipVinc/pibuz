@@ -18,11 +18,15 @@ mod tui;
 pub const API_VERSION: u32 = 1; // 02-cli-and-api.md §1.6
 
 /// The version this build reports everywhere (`pibuz version`, `--version`,
-/// `/api/status`). Normally the Cargo version; the release workflow stamps the
-/// tag's version over it with `QBZD_BUILD_ID` at compile time so a prerelease
-/// tag (`v2.1.0-rc.1`) reports itself accurately. Falls back to the Cargo
-/// version, so a plain `cargo build` is unchanged.
-pub const VERSION: &str = match option_env!("QBZD_BUILD_ID") {
+/// `/api/status`, the Connect device's softwareVersion). Normally the Cargo
+/// version — releases are tagged to match it and CI checks that, so a release
+/// build needs no override.
+///
+/// `PIBUZ_BUILD_ID` exists for the case Cargo.toml cannot express: a binary
+/// built straight from a working tree and installed on a Pi, which
+/// `scripts/pibuz-to-pi.sh` stamps `2.4.0.local-<sha>-dirty` so it can be
+/// identified later. Compile-time (`option_env!`), never read at runtime.
+pub const VERSION: &str = match option_env!("PIBUZ_BUILD_ID") {
     Some(id) => id,
     None => env!("CARGO_PKG_VERSION"),
 };

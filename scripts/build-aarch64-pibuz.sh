@@ -11,7 +11,7 @@
 #   • a 4 GB Pi CAN build it natively;
 #   • the container caps here are small — no 48 GB swap headroom needed.
 #
-# Three modes, auto-selected by host OS+arch (override: QBZD_BUILD_MODE):
+# Three modes, auto-selected by host OS+arch (override: PIBUZ_BUILD_MODE):
 #
 #   1. NATIVE    (on aarch64 Linux: the Pi itself, an ARM VM/runner)
 #   2. CROSS     (on x86-64 Linux with Docker, via `cross`; Cross.toml
@@ -40,10 +40,10 @@ DEPS=(
 
 # Mode selection. Keyed on the OS *first*: `uname -m` alone reports "arm64" on
 # an Apple-silicon Mac, which used to fall into the NATIVE branch and quietly
-# build a macOS binary. Override with QBZD_BUILD_MODE=native|cross|container.
+# build a macOS binary. Override with PIBUZ_BUILD_MODE=native|cross|container.
 os="$(uname -s)"
 arch="$(uname -m)"
-mode="${QBZD_BUILD_MODE:-auto}"
+mode="${PIBUZ_BUILD_MODE:-${QBZD_BUILD_MODE:-auto}}"
 
 if [ "$mode" = auto ]; then
   case "$os" in
@@ -99,26 +99,26 @@ case "$mode" in
       echo "  colima start --vm-type vz --mount-type virtiofs --cpu 6 --memory 8 --mount \"$REPO:w\"" >&2
       exit 1
     fi
-    # QBZD_BUILD_ID stamps the version the binary self-reports (`pibuz version`,
+    # PIBUZ_BUILD_ID stamps the version the binary self-reports (`pibuz version`,
     # /api/status, the Connect device softwareVersion) — the same knob
     # release.yml sets. Without it a local build claims the bare Cargo version
     # and is indistinguishable on the Pi from a released build, which breaks
     # A/B-ing. Default marks it local + the sha.
-    if [ -z "${QBZD_BUILD_ID:-}" ]; then
+    if [ -z "${PIBUZ_BUILD_ID:-${QBZD_BUILD_ID:-}}" ]; then
       _ver="$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')"
       _sha="$(git rev-parse --short HEAD 2>/dev/null || echo nogit)"
       git diff --quiet 2>/dev/null || _sha="$_sha-dirty"
-      QBZD_BUILD_ID="$_ver.local.$_sha"
+      PIBUZ_BUILD_ID="$_ver.local.$_sha"
     fi
-    echo "[pibuz-aarch64] QBZD_BUILD_ID=$QBZD_BUILD_ID"
+    echo "[pibuz-aarch64] PIBUZ_BUILD_ID=$PIBUZ_BUILD_ID"
 
-    IMAGE="${QBZD_IMAGE:-pibuz-aarch64-build:ubuntu22.04}"
+    IMAGE="${PIBUZ_IMAGE:-${QBZD_IMAGE:-pibuz-aarch64-build:ubuntu22.04}}"
     DOCKERFILE="$REPO/packaging/docker/pibuz-aarch64.Dockerfile"
     # Named volumes, NOT bind mounts: the target dir and the crates.io registry
     # stay on the VM's own disk, which is what keeps rebuilds fast (virtiofs is
     # fine for reading source, poor for a million small target/ writes).
-    TARGET_VOL="${QBZD_TARGET_VOLUME:-pibuz-aarch64-target}"
-    REGISTRY_VOL="${QBZD_REGISTRY_VOLUME:-pibuz-aarch64-registry}"
+    TARGET_VOL="${PIBUZ_TARGET_VOLUME:-${QBZD_TARGET_VOLUME:-pibuz-aarch64-target}}"
+    REGISTRY_VOL="${PIBUZ_REGISTRY_VOLUME:-${QBZD_REGISTRY_VOLUME:-pibuz-aarch64-registry}}"
 
     docker build --platform linux/arm64 -t "$IMAGE" -f "$DOCKERFILE" \
       "$REPO/packaging/docker"
@@ -132,7 +132,7 @@ case "$mode" in
       -v "$REGISTRY_VOL:/usr/local/cargo/registry" \
       -v "$REPO/dist:/out" \
       -w /src \
-      -e QBZD_BUILD_ID="$QBZD_BUILD_ID" \
+      -e PIBUZ_BUILD_ID="$PIBUZ_BUILD_ID" \
       "$IMAGE" \
       bash -euo pipefail -c '
         cargo build --release --locked -p pibuz
@@ -152,7 +152,7 @@ case "$mode" in
       '
     ;;
   *)
-    echo "[pibuz-aarch64] ERROR: unknown QBZD_BUILD_MODE: $mode" >&2
+    echo "[pibuz-aarch64] ERROR: unknown PIBUZ_BUILD_MODE: $mode" >&2
     exit 1
     ;;
 esac

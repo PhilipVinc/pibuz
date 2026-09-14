@@ -17,20 +17,20 @@
 #
 # Usage:
 #   ./scripts/pibuz-acceptance.sh
-#   QBZD_BIN=/path/to/pibuz ./scripts/pibuz-acceptance.sh
-#   QBZD_TEST_PORT=28182 ./scripts/pibuz-acceptance.sh
+#   PIBUZ_BIN=/path/to/pibuz ./scripts/pibuz-acceptance.sh
+#   PIBUZ_TEST_PORT=28182 ./scripts/pibuz-acceptance.sh
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-QBZD_BIN="${QBZD_BIN:-$ROOT/target/release/pibuz}"
-PORT="${QBZD_TEST_PORT:-28182}"
+PIBUZ_BIN="${PIBUZ_BIN:-${QBZD_BIN:-$ROOT/target/release/pibuz}}"
+PORT="${PIBUZ_TEST_PORT:-${QBZD_TEST_PORT:-28182}}"
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
 
 command -v curl    >/dev/null 2>&1 || fail "curl is required"
 command -v python3 >/dev/null 2>&1 || fail "python3 is required (status/ping/info shape checks)"
 command -v timeout  >/dev/null 2>&1 || fail "timeout (coreutils) is required"
-[ -x "$QBZD_BIN" ] || fail "pibuz binary not found/executable at $QBZD_BIN -- build it first (release, on its own: cargo build --release -p pibuz)"
+[ -x "$PIBUZ_BIN" ] || fail "pibuz binary not found/executable at $PIBUZ_BIN -- build it first (release, on its own: cargo build --release -p pibuz)"
 
 # ---------------------------------------------------------------------------
 # Isolated scratch profile root. NEVER the real daemon/desktop roots: dirs::
@@ -85,10 +85,10 @@ trap cleanup EXIT
 
 # Never steal a live port -- if something already answers, stop rather than guess.
 if curl -fsS -m 1 "127.0.0.1:${PORT}/api/ping" >/dev/null 2>&1; then
-  fail "something is already answering on 127.0.0.1:${PORT} -- set QBZD_TEST_PORT to a free port"
+  fail "something is already answering on 127.0.0.1:${PORT} -- set PIBUZ_TEST_PORT to a free port"
 fi
 
-pibuz() { "$QBZD_BIN" --host "$QBZD_HOST" "$@"; }
+pibuz() { "$PIBUZ_BIN" --host "$QBZD_HOST" "$@"; }
 
 write_config() {
   mkdir -p "$XDG_CONFIG_HOME/pibuz"
@@ -108,7 +108,7 @@ EOF
 start_daemon() {
   write_config
   : > "$LOGFILE"
-  "$QBZD_BIN" run >>"$LOGFILE" 2>&1 &
+  "$PIBUZ_BIN" run >>"$LOGFILE" 2>&1 &
   DAEMON_PID=$!
   for _ in $(seq 1 50); do
     pibuz ping >/dev/null 2>&1 && return 0
@@ -219,7 +219,7 @@ set -e
 echo "== instance lock: a second 'pibuz run' on the same root exits 3 (01 section 8.3) =="
 start_daemon
 set +e
-timeout 5 "$QBZD_BIN" run >>"$LOGFILE" 2>&1
+timeout 5 "$PIBUZ_BIN" run >>"$LOGFILE" 2>&1
 rc_second=$?
 set -e
 [ "$rc_second" -eq 3 ] || fail "second 'pibuz run' on the same data root != 3 (got $rc_second)"
@@ -227,7 +227,7 @@ pibuz ping >/dev/null || fail "the first daemon stopped answering after the doub
 
 echo "== non-tty 'pibuz setup' exits 2, never hangs (03 section 2.4) =="
 set +e
-timeout 5 "$QBZD_BIN" setup </dev/null >/dev/null 2>&1
+timeout 5 "$PIBUZ_BIN" setup </dev/null >/dev/null 2>&1
 rc_setup=$?
 set -e
 [ "$rc_setup" -eq 2 ] || fail "non-tty setup != 2 (got $rc_setup)"

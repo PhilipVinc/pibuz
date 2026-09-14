@@ -13,7 +13,7 @@
 #     is broken if it lags, but the tree is dirty at the moment you want to tag.
 #   - the CHANGELOG's `## <version> — unreleased` heading.
 #   - the tag. `release.yml` stamps the TAG's version into the binary through
-#     QBZD_BUILD_ID, so a tag that disagrees with Cargo.toml ships a binary
+#     the tag, so a tag that disagrees with Cargo.toml ships a tarball
 #     whose `--version` does not match its own source. The release workflow
 #     rejects that now; this keeps you from reaching it.
 #

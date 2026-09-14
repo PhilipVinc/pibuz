@@ -62,11 +62,23 @@ different programs at the same path. The project is **Pibuz** and the binary is
   updated — the last one went out as `2.0.2.moode57` from a 2.4.0 tree, so the
   binary announced a version its source had not been at for months.
 
-- **A tag that disagrees with `Cargo.toml` is rejected.** The tag is what gets
-  stamped into the binary through `QBZD_BUILD_ID`, so this could ship a
-  `pibuz --version` the source never said. `scripts/bump-version.sh` sets the
-  version, the lock and the CHANGELOG heading together, and `--check` verifies
-  them before you tag.
+- **A tag that disagrees with `Cargo.toml` is rejected**, so an asset named
+  `pibuz-2.5.0-…` can no longer hold a binary that reports 2.4.0.
+  `scripts/bump-version.sh` sets the version, the lock and the CHANGELOG
+  heading together, and `--check` verifies them before you tag.
+
+- **`QBZD_BUILD_ID` is `PIBUZ_BUILD_ID`, and CI no longer sets it.** It exists
+  so a build can report a version `Cargo.toml` cannot hold, which was the
+  `.moodeN` suffix; with that gone and the tag pinned, stamping a release would
+  only set the value `CARGO_PKG_VERSION` already has. `scripts/pibuz-to-pi.sh`
+  still uses it for the case that remains genuinely unrepresentable —
+  `2.4.0.local-<sha>-dirty` on a Pi built from a working tree. It is
+  compile-time only, which is why it could be renamed at all: the `QBZD_*`
+  names read from the environment at RUNTIME (`QBZD_HOOK`, `QBZD_HOST`,
+  `QBZD_MPRIS`, `QBZD_TOKEN`) are set by other people's scripts and stay.
+  The dev-script variables (`QBZD_PI`, `QBZD_BIN`, `QBZD_TEST_PORT`, the
+  build-image and volume overrides) take `PIBUZ_*` names too, each still
+  accepting its old name as a fallback.
 
 ### Changed
 

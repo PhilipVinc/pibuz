@@ -26,12 +26,12 @@
 #   as an error — a build that "succeeds" against no source.
 #
 # USAGE
-#   ./scripts/pibuz-to-pi.sh              # build and install on $QBZD_PI (default: moode)
+#   ./scripts/pibuz-to-pi.sh              # build and install on $PIBUZ_PI (default: moode)
 #   ./scripts/pibuz-to-pi.sh --build-only # leave the binary in dist/, install nothing
 set -euo pipefail
 
-PI="${QBZD_PI:-moode}"
-IMAGE="${QBZD_BUILD_IMAGE:-pibuz-aarch64-build:ubuntu22.04}"
+PI="${PIBUZ_PI:-${QBZD_PI:-moode}}"
+IMAGE="${PIBUZ_BUILD_IMAGE:-${QBZD_BUILD_IMAGE:-pibuz-aarch64-build:ubuntu22.04}}"
 HOST_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # The directory colima shares, and this checkout's path within it.
 MOUNT_ROOT="$(dirname "$HOST_ROOT")"
@@ -51,11 +51,11 @@ SHA="$(git -C "$HOST_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 DIRTY=""
 git -C "$HOST_ROOT" diff --quiet 2>/dev/null || DIRTY="-dirty"
 BASE="$(grep -m1 '^version = ' "$HOST_ROOT/Cargo.toml" | sed 's/version = "\(.*\)"/\1/')"
-export QBZD_BUILD_ID="${BASE}.local-${SHA}${DIRTY}"
+export PIBUZ_BUILD_ID="${BASE}.local-${SHA}${DIRTY}"
 
-say "building pibuz $QBZD_BUILD_ID (release, aarch64) in $IMAGE"
+say "building pibuz $PIBUZ_BUILD_ID (release, aarch64) in $IMAGE"
 docker run --rm \
-  -e QBZD_BUILD_ID \
+  -e PIBUZ_BUILD_ID \
   -v "$MOUNT_ROOT:/work" \
   -v pibuz-cargo-registry:/usr/local/cargo/registry \
   -v pibuz-target-aarch64:/target \
@@ -66,7 +66,7 @@ docker run --rm \
     # The mount trap: an unshared host path shows up as an empty directory,
     # not as an error, so a build can "succeed" against no source at all.
     test -f Cargo.toml || { echo "no Cargo.toml at $PWD — colima is not sharing this checkout"; exit 1; }
-    CARGO_TARGET_DIR=/target QBZD_BUILD_ID="$QBZD_BUILD_ID" cargo build --release -p pibuz
+    CARGO_TARGET_DIR=/target PIBUZ_BUILD_ID="$PIBUZ_BUILD_ID" cargo build --release -p pibuz
     mkdir -p "/work/'"$REL"'/dist"
     cp /target/release/pibuz "/work/'"$REL"'/dist/pibuz-aarch64-linux"
   '

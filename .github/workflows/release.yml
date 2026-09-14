@@ -23,12 +23,11 @@ on:
   push:
     tags:
       - "v*"
+  # Dispatch builds whatever ref you pick, at its Cargo.toml version, and
+  # publishes nothing (the release job needs a tag ref). There is deliberately
+  # no version input: it never checked the named tag out, it only relabelled
+  # the build, which is how you get a tarball whose name and contents disagree.
   workflow_dispatch:
-    inputs:
-      tag:
-        description: "Tag to build (e.g. v2.4.0). Empty = build HEAD with the Cargo.toml version, no Release publish."
-        required: false
-        type: string
 
 concurrency:
   group: release-${{ github.ref }}
@@ -81,20 +80,14 @@ jobs:
       - name: Resolve version
         id: release
         run: |
-          VERSION=""
-          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            VERSION="${GITHUB_REF#refs/tags/v}"
-          elif [[ -n "${{ inputs.tag }}" ]]; then
-            VERSION="${{ inputs.tag }}"
-            VERSION="${VERSION#v}"
-          else
-            VERSION="$(grep -m1 '^version = ' Cargo.toml | sed 's/version = \"\(.*\)\"/\1/')"
-          fi
+          set -euo pipefail
+          VERSION="$(awk '/^\[workspace\.package\]/{f=1; next} f && /^version = /{gsub(/version = "|"/,""); print; exit}' Cargo.toml)"
+          [ -n "$VERSION" ] || { echo "::error::no [workspace.package] version in Cargo.toml"; exit 1; }
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      # The tag is what gets stamped into the binary through QBZD_BUILD_ID, so
-      # a tag that disagrees with Cargo.toml ships a `pibuz --version` that its
-      # own source never said. CONTRIBUTING has always told you to "tag what
+      # The binary reports its Cargo version, and the tarball is named after the
+      # tag, so a tag that disagrees with Cargo.toml ships an asset whose name
+      # and contents differ. CONTRIBUTING has always told you to "tag what
       # Cargo.toml already says"; nothing checked it, and the retired moOde tag
       # series drifted a whole minor version doing exactly that.
       - name: tag must agree with Cargo.toml
@@ -103,11 +96,11 @@ jobs:
           VERSION: ${{ steps.release.outputs.version }}
         run: |
           set -euo pipefail
-          CARGO="$(awk '/^\[workspace\.package\]/{f=1; next} f && /^version = /{gsub(/version = "|"/,""); print; exit}' Cargo.toml)"
-          echo "tag version: $VERSION"
-          echo "Cargo.toml:  $CARGO"
-          if [ "$VERSION" != "$CARGO" ]; then
-            echo "::error::tag says $VERSION, Cargo.toml says $CARGO — run scripts/bump-version.sh and tag what it sets"
+          TAG="${GITHUB_REF#refs/tags/v}"
+          echo "tag:        $TAG"
+          echo "Cargo.toml: $VERSION"
+          if [ "$TAG" != "$VERSION" ]; then
+            echo "::error::tag says $TAG, Cargo.toml says $VERSION — run scripts/bump-version.sh and tag what it sets"
             exit 1
           fi
 
@@ -124,14 +117,13 @@ jobs:
                  | grep -E '\bslint[a-z-]* v' || true)
           [ -z "$hits" ] || { echo "::error::pibuz graph resolves Slint:"; echo "$hits"; exit 1; }
 
-      # QBZD_BUILD_ID stamps the release version into the binary, so
-      # `pibuz version`, `--version`, /api/status and the Connect device's
-      # softwareVersion all report the released version instead of the bare Cargo
-      # version. A four-part id like that is not valid semver and so cannot live
-      # in Cargo.toml.
+      # No PIBUZ_BUILD_ID here. It exists so a build can report a version
+      # Cargo.toml cannot hold, and it used to carry the `.moodeN` suffix; with
+      # that retired and the tag pinned to Cargo.toml above, stamping would set
+      # the value `CARGO_PKG_VERSION` already has. `scripts/pibuz-to-pi.sh`
+      # still uses it, for the one case that is genuinely unrepresentable:
+      # `2.4.0.local-<sha>-dirty` on a Pi built straight from a working tree.
       - name: build
-        env:
-          QBZD_BUILD_ID: ${{ steps.release.outputs.version }}
         run: cargo build --release -p pibuz
 
       # Empirical gate: the binary must run on glibc 2.35

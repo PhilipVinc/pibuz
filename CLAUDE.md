@@ -299,10 +299,16 @@ it, which `release.yml` enforces. Bump with `./scripts/bump-version.sh <X.Y.Z>`;
 do not hand-edit the version into a second place, and do not paste the current
 number into prose here, which is how this line went stale before.
 
-The release workflow stamps the tag's version through the `QBZD_BUILD_ID` env
-var at compile time, which `crates/pibuz/src/main.rs` reads into `VERSION` — that is
-what `pibuz version`, `--version` and `/api/status` report. Without it you get the
-Cargo version, so a plain `cargo build` is unchanged.
+A release build reports the Cargo version, full stop — CI refuses a tag that
+disagrees with it, so there is nothing to override. `PIBUZ_BUILD_ID` (compile
+time, `option_env!` in `crates/pibuz/src/main.rs`) covers the one case
+Cargo.toml cannot express: `scripts/pibuz-to-pi.sh` stamps
+`2.4.0.local-<sha>-dirty` so a Pi running a working-tree build can be
+identified later.
+
+It is the ONLY `QBZD_*` name that was renamed. The others — `QBZD_HOOK`,
+`QBZD_HOST`, `QBZD_MPRIS`, `QBZD_TOKEN` — are read from the environment at
+RUNTIME by other people's scripts and stay as they are.
 
 ## Branches, CI and releases
 
