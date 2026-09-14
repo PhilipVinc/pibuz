@@ -522,12 +522,45 @@ impl BufferState {
     /// nowhere else.
     fn should_park(&mut self) -> bool {
         let ahead = self.ahead_bytes();
+        let was = self.feeder_parked;
         if self.feeder_parked {
             if ahead < self.resume_bytes {
                 self.feeder_parked = false;
             }
         } else if ahead >= self.window_bytes {
             self.feeder_parked = true;
+        }
+        // Log the TRANSITIONS, which hysteresis already makes rare — one line
+        // per park and one per resume, not one per chunk.
+        //
+        // This exists because a parked feeder is invisible. It stops polling
+        // its body, so the 60 s `read_timeout` never advances and nothing is
+        // logged by anyone; a stall on the Pi left seven minutes of silence
+        // after `body open at byte N` and no way to tell whether the feeder was
+        // parked, spinning, or gone. The anchor is the number that decides it,
+        // so it is the number to print.
+        if was != self.feeder_parked {
+            let anchor = self
+                .reader_positions
+                .get(&self.reader_epoch)
+                .copied()
+                .unwrap_or(self.primary_offset);
+            log::info!(
+                "Streaming feeder {}: {} bytes contiguous from the reader anchor {} \
+                 (window {}, resume below {}, write head {}, epoch {}, {} reader(s))",
+                if self.feeder_parked {
+                    "PARKED"
+                } else {
+                    "resumed"
+                },
+                ahead,
+                anchor,
+                self.window_bytes,
+                self.resume_bytes,
+                self.write_pos,
+                self.reader_epoch,
+                self.readers,
+            );
         }
         self.feeder_parked
     }
@@ -2938,6 +2971,94 @@ mod buffer_behaviour_tests {
             bodies_after, 1,
             "a seek into buffered bytes must not re-open the body"
         );
+    }
+
+    /// The shape of the resume stall seen on a moOde Pi, 2026-09-14 — as a
+    /// guard, NOT as a reproduction.
+    ///
+    /// The field case: a cast paused and resumed 240 s into a 223 MB 24/96
+    /// track. `ResumeInput::Ranged` rebuilds the decoder over the SAME buffer,
+    /// that reader probes the format, then seeks back to the paused position.
+    /// Playback advanced one second and stopped forever — no chunk, no error,
+    /// no log line for seven minutes, controller showing "loading". The feeder
+    /// had opened the body at the target 56 ms earlier and then went silent,
+    /// which means it was parked: a parked feeder never polls its body, so the
+    /// 60 s `read_timeout` never advances either.
+    ///
+    /// This case walks that sequence — read forward, build a second reader over
+    /// the same buffer while the first is still alive, probe, seek backward past
+    /// the look-behind slack, read — and it PASSES. So whatever wedged the Pi is
+    /// NOT simply "a rebuilt reader seeks backward": the window anchoring
+    /// (`ahead_bytes` over `reader_positions`) survives this shape.
+    ///
+    /// It is kept because the invariant is worth pinning and the sequence is
+    /// otherwise untested. The field stall is still open; do not read a green
+    /// result here as evidence that it is fixed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reader_that_seeks_back_after_reading_is_not_left_behind_a_parked_feeder() {
+        const TOTAL: u64 = 8 * MB as u64;
+        const WINDOW: usize = 512 * KB;
+        let log = Arc::new(FeedLog::default());
+        let cfg = StreamingConfig {
+            initial_buffer_bytes: 32 * KB,
+            window_bytes: WINDOW,
+        };
+        let (source, writer) = BufferedMediaSource::new_seekable(cfg, Some(TOTAL));
+        let source = Arc::new(source);
+
+        // Reader A: the pre-pause decoder. Walk it far enough in that the
+        // feeder has a full window of contiguous bytes sitting ahead of it.
+        let mut before = source.create_reader();
+        let feeder = tokio::spawn(feed(writer, TOTAL, 32 * KB, None, log.clone()));
+        let landed = tokio::task::spawn_blocking(move || {
+            let mut buf = vec![0u8; 4 * MB];
+            before
+                .read_exact(&mut buf)
+                .expect("walk the stream forward");
+            // Hold the reader alive, as the resume path does: the outgoing
+            // decoder is dropped only after the new one is built.
+            (before, 4 * MB as u64)
+        })
+        .await
+        .expect("pre-pause reader");
+        let (_outgoing, walked) = landed;
+
+        // Reader B: the decoder the resume rebuilds. It records a position of
+        // its own while probing, then seeks back to where playback was paused.
+        let mut after = source.create_reader();
+        let resumed = tokio::task::spawn_blocking(move || {
+            // The probe: enough to register a position inside the held run.
+            after.seek(SeekFrom::Start(walked)).expect("probe seek");
+            let mut probe = vec![0u8; 16 * KB];
+            after.read_exact(&mut probe).expect("probe read");
+
+            // The resume seek: backward, past the look-behind slack, so the
+            // target is outside the run the window is measuring.
+            let target = walked - SEEK_LOOKBEHIND_BYTES - (64 * KB) as u64;
+            after.seek(SeekFrom::Start(target)).expect("resume seek");
+            let mut back = vec![0u8; 32 * KB];
+            after
+                .read_exact(&mut back)
+                .expect("read at the resume point");
+            for (i, got) in back.iter().enumerate() {
+                assert_eq!(*got, byte_at(target + i as u64), "wrong byte after resume");
+            }
+        });
+
+        let outcome = tokio::time::timeout(Duration::from_secs(10), resumed).await;
+        if outcome.is_err() {
+            // Same reason as the trimmed-region case: the reader is a blocking
+            // task on the condvar and the runtime waits for it at shutdown, so
+            // it has to be let go before the failure can be reported.
+            source.abandon();
+        }
+        outcome
+            .expect(
+                "the resume seek deadlocked: the feeder parked on the OLD reader position \
+                 while the reader waited for bytes behind it",
+            )
+            .expect("resumed reader thread");
+        feeder.abort();
     }
 
     /// A reader that stops for a while and comes back keeps playing.
