@@ -112,7 +112,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: system deps
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libjack-jackd2-dev libdbus-1-dev libssl-dev
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libjack-jackd2-dev
 
       # pibuz must never resolve Slint.
       - name: slint-free dep-graph gate

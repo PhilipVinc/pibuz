@@ -8,7 +8,7 @@
 # Mac. This image adds a third: on an M-series host, `linux/arm64` containers
 # execute NATIVELY (no QEMU), so this is not a cross-compile at all — it is the
 # NATIVE build, in a box. That matters, because pibuz's dep graph resolves
-# `aws-lc-sys` (rustls provider, cmake + C) plus `alsa-sys` and `jack-sys`;
+# `aws-lc-sys` (rustls provider, C via cc) plus `alsa-sys` and `jack-sys`;
 # a macOS -> linux-gnu cross would have to defeat all three, and a native
 # container defeats none of them.
 #
@@ -18,16 +18,19 @@
 # trixie carries glibc 2.41 — forward-compatible, never backward).
 #
 # Dep list is kept in sync with build-aarch64-pibuz.sh's DEPS array and the
-# workflow's `system deps` step. The GUI stack is deliberately absent: pibuz is
-# the slint-free column and links none of it.
+# workflow's `system deps` step, and it is short on purpose. libssl-dev,
+# libdbus-1-dev, clang/libclang-dev and cmake all used to be here and none was
+# ever used: TLS is rustls, MPRIS is zbus, nothing runs bindgen, and aws-lc-sys
+# builds its C with cc on aarch64. The GUI stack is absent for the older
+# reason: pibuz is the slint-free column and links none of it.
 FROM ubuntu:22.04
 
 ARG RUST_TOOLCHAIN=stable
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      build-essential pkg-config cmake clang libclang-dev \
-      libasound2-dev libjack-jackd2-dev libdbus-1-dev libssl-dev \
+      build-essential pkg-config \
+      libasound2-dev libjack-jackd2-dev \
       curl ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 

@@ -44,13 +44,16 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          # pibuz links ALSA / JACK / D-Bus (qbz-audio) and OpenSSL (reqwest).
+          # pibuz links ALSA and JACK (qbz-audio); that is all the workspace
+          # needs. It does NOT link D-Bus or OpenSSL - MPRIS is mpris-server on
+          # zbus and TLS is rustls, so neither libdbus-1-dev nor libssl-dev has
+          # anything to satisfy (`cargo tree --workspace --all-features` resolves
+          # no dbus-sys and no openssl-sys on either linux target).
           # mold matches the release linker for faster test-binary link.
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential pkg-config mold \
-            libasound2-dev libjack-jackd2-dev \
-            libdbus-1-dev libssl-dev
+            libasound2-dev libjack-jackd2-dev
 
       # Floating stable is fine here: rust-cache keys on rustc -V, so a stable
       # bump just rebuilds the test cache once.

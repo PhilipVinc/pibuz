@@ -28,14 +28,19 @@ REPO="$(pwd)"
 TARGET="aarch64-unknown-linux-gnu"
 OUT="$REPO/dist/pibuz-aarch64-linux"
 
-# Native deps for the DAEMON only. Audio (ALSA/JACK; PipeWire is reached through
-# its ALSA shim), D-Bus for MPRIS, TLS, and the usual -sys toolchain. The GUI
-# stack the desktop needs (fontconfig, freetype, xkbcommon, wayland, xcb, GL,
-# EGL) is deliberately absent — pibuz links none of it.
+# Native deps for the DAEMON only: audio (ALSA/JACK; PipeWire is reached through
+# its ALSA shim), and pkg-config to probe for both. That is the whole list.
+#
+# Four packages this used to carry are NOT needed, each checked by removing it
+# and rebuilding the crate that would have wanted it: libssl-dev (TLS is
+# rustls, nothing resolves openssl-sys), libdbus-1-dev (MPRIS is mpris-server
+# on zbus, pure Rust), clang/libclang-dev (nothing runs bindgen), and cmake
+# (aws-lc-sys builds its C with cc on this target). The GUI stack the desktop
+# needs (fontconfig, freetype, xkbcommon, wayland, xcb, GL, EGL) is absent for
+# the same reason it always was — pibuz links none of it.
 DEPS=(
-  build-essential pkg-config cmake clang libclang-dev
+  build-essential pkg-config
   libasound2-dev libjack-jackd2-dev
-  libdbus-1-dev libssl-dev
 )
 
 # Mode selection. Keyed on the OS *first*: `uname -m` alone reports "arm64" on
@@ -91,7 +96,7 @@ case "$mode" in
     # NATIVE-IN-A-BOX. On an Apple-silicon host, linux/arm64 containers run
     # natively (no QEMU), so this is the aarch64 native build — not a
     # macOS -> linux-gnu cross. That distinction is the whole point: pibuz
-    # pulls aws-lc-sys (cmake + C), alsa-sys and jack-sys, each of which a
+    # pulls aws-lc-sys (C via cc), alsa-sys and jack-sys, each of which a
     # real cross would have to fight. See packaging/docker/pibuz-aarch64.Dockerfile.
     echo "[pibuz-aarch64] CONTAINER build (native linux/arm64) on $os/$arch"
     if ! docker info >/dev/null 2>&1; then
