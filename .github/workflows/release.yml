@@ -8,7 +8,8 @@
 #   - builds the pibuz binary and ships a stable asset shape consumers pin
 #     against: pibuz-<version>-linux-<arch>.tar.gz containing
 #     pibuz-<version>-linux-<arch>/pibuz, with a .sha256 beside it;
-#   - publishes a PRERELEASE GitHub Release on the tag.
+#   - publishes a GitHub Release on the tag: a full release, and Latest, for a
+#     plain `v2.4.0`; a prerelease for a suffixed `v2.4.0-rc.3`.
 #
 # Tag `v2.1.0` -> version `2.1.0`. Plain semver: no distro suffixes.
 
@@ -190,8 +191,14 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           files: dist/*
-          prerelease: true
-          make_latest: false
+          # A pre-release tag carries a suffix — `v2.4.0-rc.3`; a final release
+          # is plain semver. Publishing every tag as a prerelease that is never
+          # Latest was right while only rcs existed, and wrong the moment 2.4.0
+          # was cut: it marked the release "Pre-release", and `/releases/latest`
+          # — what a consumer asking for "the current version" reads — answered
+          # with nothing at all.
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          make_latest: ${{ !contains(github.ref_name, '-') }}
           body: |
             Pibuz — standalone headless Qobuz Connect daemon.
 
