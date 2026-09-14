@@ -70,10 +70,6 @@ own source never said.
 `./scripts/bump-version.sh --check` verifies Cargo.toml, Cargo.lock and the
 CHANGELOG agree before you tag.
 
-A build cut for a moOde package carries a distro suffix the Cargo version
-cannot hold, so it is tagged `pibuz-v<version>.moodeN` —
-`./scripts/bump-version.sh --moode` prints the next one, derived from the
-current Cargo version rather than a base of its own.
 
 `release.yml` builds the aarch64 + amd64 tarballs and publishes a
 prerelease GitHub Release. Its first job refuses any release tag whose commit is

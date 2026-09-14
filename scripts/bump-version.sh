@@ -20,7 +20,6 @@
 # USAGE
 #   ./scripts/bump-version.sh 2.5.0        # set the version
 #   ./scripts/bump-version.sh --check      # verify the tree agrees with itself
-#   ./scripts/bump-version.sh --moode      # next moOde build id for this version
 #
 # It does not commit and does not tag: it prints the two commands, because
 # "which commit is the release" is a decision, not a step.
@@ -57,20 +56,8 @@ case "${1:-}" in
 	echo "consistent."
 	exit 0
 	;;
---moode)
-	# moOde builds are tagged `pibuz-v<version>.moodeN`, where N is a counter
-	# within that version. Deriving the base from Cargo.toml is the point: the
-	# scheme previously kept a base of its own, which silently stayed at 2.0.2
-	# while the tree moved on, so the binary announced a version the source had
-	# not been at for months.
-	git fetch --tags --quiet 2>/dev/null || true
-	LAST="$(git tag --list "pibuz-v${CURRENT}.moode*" "qbzd-v${CURRENT}.moode*" \
-		| sed 's/.*\.moode//' | sort -n | tail -1)"
-	echo "${CURRENT}.moode$(( ${LAST:-0} + 1 ))"
-	exit 0
-	;;
 "" | -h | --help)
-	echo "usage: $0 <X.Y.Z> | --check | --moode"
+	echo "usage: $0 <X.Y.Z> | --check"
 	echo "current version: $CURRENT"
 	exit 0
 	;;
@@ -78,7 +65,7 @@ esac
 
 NEW="$1"
 [[ "$NEW" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] ||
-	die "'$NEW' is not plain semver (no distro suffixes here — see --moode)"
+	die "'$NEW' is not plain semver"
 [ "$NEW" != "$CURRENT" ] || die "already at $NEW"
 
 # Cargo.toml — the [workspace.package] line only.

@@ -14,18 +14,15 @@
 
 name: release
 
-# Two tag shapes publish, because two conventions are in use:
-#   v2.4.0                  — the project's own semver releases
-#   pibuz-v2.0.2.moode57    — a build cut for a moOde package, where the version
-#                             string carries a distro suffix Cargo cannot hold
-# Both resolve to the version after the LAST `v`, and both publish. (Before
-# 2.4.0 the trigger said `v*` while the publish job required a `qbzd-v*` ref,
-# which no tag could satisfy at once — so every tag built and none released.)
+# One tag shape: `v<X.Y.Z>`, plain semver, matching Cargo.toml. (Before 2.4.0
+# the trigger said `v*` while the publish job required a `qbzd-v*` ref, which
+# no tag could satisfy at once — so every tag built and none released. The
+# `qbzd-v<version>.moodeN` series that did publish is retired: a moOde build is
+# just a release now.)
 on:
   push:
     tags:
       - "v*"
-      - "pibuz-v*"
   workflow_dispatch:
     inputs:
       tag:
@@ -86,12 +83,10 @@ jobs:
         run: |
           VERSION=""
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            # `refs/tags/v2.4.0` and `refs/tags/pibuz-v2.0.2.moode57` alike:
-            # everything after the last `v`.
-            VERSION="${GITHUB_REF##*v}"
+            VERSION="${GITHUB_REF#refs/tags/v}"
           elif [[ -n "${{ inputs.tag }}" ]]; then
             VERSION="${{ inputs.tag }}"
-            VERSION="${VERSION##*v}"
+            VERSION="${VERSION#v}"
           else
             VERSION="$(grep -m1 '^version = ' Cargo.toml | sed 's/version = \"\(.*\)\"/\1/')"
           fi
@@ -100,11 +95,8 @@ jobs:
       # The tag is what gets stamped into the binary through QBZD_BUILD_ID, so
       # a tag that disagrees with Cargo.toml ships a `pibuz --version` that its
       # own source never said. CONTRIBUTING has always told you to "tag what
-      # Cargo.toml already says"; nothing checked it, and the moOde tag series
-      # drifted a whole minor version doing exactly that.
-      #
-      #   v2.4.0                -> must equal the Cargo version
-      #   pibuz-v2.4.0.moode7   -> must START with it; the suffix is the point
+      # Cargo.toml already says"; nothing checked it, and the retired moOde tag
+      # series drifted a whole minor version doing exactly that.
       - name: tag must agree with Cargo.toml
         if: startsWith(github.ref, 'refs/tags/')
         env:
@@ -114,13 +106,8 @@ jobs:
           CARGO="$(awk '/^\[workspace\.package\]/{f=1; next} f && /^version = /{gsub(/version = "|"/,""); print; exit}' Cargo.toml)"
           echo "tag version: $VERSION"
           echo "Cargo.toml:  $CARGO"
-          if [[ "${GITHUB_REF}" == refs/tags/pibuz-v* ]]; then
-            case "$VERSION" in
-              "$CARGO".*) ;;
-              *) echo "::error::moOde tag $VERSION is not a suffixed $CARGO — bump Cargo.toml first (scripts/bump-version.sh --moode prints the right id)"; exit 1;;
-            esac
-          elif [ "$VERSION" != "$CARGO" ]; then
-            echo "::error::tag says $VERSION, Cargo.toml says $CARGO — tag what Cargo.toml already says"
+          if [ "$VERSION" != "$CARGO" ]; then
+            echo "::error::tag says $VERSION, Cargo.toml says $CARGO — run scripts/bump-version.sh and tag what it sets"
             exit 1
           fi
 
@@ -191,7 +178,7 @@ jobs:
   # Single publisher so the two matrix legs never race on Release creation.
   release:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/pibuz-v')
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     permissions:
       contents: write

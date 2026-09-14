@@ -292,12 +292,14 @@ adding the import.
 
 ## Versioning
 
-Plain semver, no distro suffixes. `[workspace.package] version` in the root
-`Cargo.toml` is the source of truth — one `[workspace.package] version` that
-every crate inherits — and release tags are `vX.Y.Z` matching it, which
-`release.yml` now enforces. Bump with `./scripts/bump-version.sh <X.Y.Z>`; do
-not hand-edit the version into a second place, and do not paste the current
-number into prose here, which is how this line went stale before. The release workflow stamps the tag's version through the `QBZD_BUILD_ID` env
+Plain semver, no distro suffixes — not even for a moOde build. The root
+`Cargo.toml`'s `[workspace.package] version` is the source of truth and every
+crate inherits it, so there is one number. Release tags are `vX.Y.Z` matching
+it, which `release.yml` enforces. Bump with `./scripts/bump-version.sh <X.Y.Z>`;
+do not hand-edit the version into a second place, and do not paste the current
+number into prose here, which is how this line went stale before.
+
+The release workflow stamps the tag's version through the `QBZD_BUILD_ID` env
 var at compile time, which `crates/pibuz/src/main.rs` reads into `VERSION` — that is
 what `pibuz version`, `--version` and `/api/status` report. Without it you get the
 Cargo version, so a plain `cargo build` is unchanged.

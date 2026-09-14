@@ -48,19 +48,48 @@ different programs at the same path. The project is **Pibuz** and the binary is
 
 ### Fixed (release)
 
-- **Tagging a release actually publishes one.** Two tag conventions are in use
+- **Tagging a release actually publishes one.** Two tag conventions were in use
   — `vX.Y.Z` for the project's own releases, and `qbzd-v2.0.2.moodeNN` for the
   builds the moOde installer downloads — and the workflow ended up half on each:
   it triggered on `v*` while the publish job required a `refs/tags/qbzd-v*`
   ref, which no single tag can satisfy. So a `vX.Y.Z` tag built both
   architectures, uploaded the artifacts and skipped the Release, and a
-  `qbzd-v*` tag did not start the workflow at all. It now triggers and
-  publishes on `v*` **and** `pibuz-v*`, and reads the version as everything
-  after the last `v`, so a distro-suffixed `pibuz-v2.0.2.moode58` works
-  alongside a plain `v2.4.0`.
+  `qbzd-v*` tag did not start the workflow at all.
+
+  **The `.moodeN` series is retired**: a build for moOde is a release like any
+  other, tagged `vX.Y.Z`. It existed because the version needed a counter the
+  Cargo version could not hold, and the cost was a base that stopped being
+  updated — the last one went out as `2.0.2.moode57` from a 2.4.0 tree, so the
+  binary announced a version its source had not been at for months.
+
+- **A tag that disagrees with `Cargo.toml` is rejected.** The tag is what gets
+  stamped into the binary through `QBZD_BUILD_ID`, so this could ship a
+  `pibuz --version` the source never said. `scripts/bump-version.sh` sets the
+  version, the lock and the CHANGELOG heading together, and `--check` verifies
+  them before you tag.
 
 ### Changed
 
+- **`pibuz status` is a sectioned block, and it reports what the daemon knows
+  about its own memory.** The five `·`-joined lines ran to 95 columns and wrapped
+  on a narrow terminal; the block is now labelled rows under `audio`, `playback`
+  and `qconnect`, none wider than 72 columns, and a row the daemon has no answer
+  for is omitted rather than printed empty — an idle daemon is a short block.
+  Three things it already knew but never showed are now on it: whether the
+  device is *open*, whether this box is the session's **active renderer** (a
+  controller switching to its own speakers leaves us connected and silent, which
+  looked identical on every other field), and whether the pairing listener is
+  serving.
+  `pibuz status -v` adds `memory` and `buffers`: L1 and L2 cache occupancy
+  against the budget actually in force, the host's memory class, the compressed
+  window, the initial buffer cap and the decoded ring depth — the figures that
+  explain a dropout, resolved daemon-side so asking a Pi from a laptop reports
+  the *Pi's* class. `--json` is the whole payload either way.
+- **`/api/status` gained `memory`, `cache` and `buffers`** plus
+  `playback.buffer_progress`, `.gapless_ready`, `.gapless_next_track_id` and
+  `.normalization_gain`. Additive only — every documented key still means what
+  it meant, so no `api_version` bump, and `/api/now-playing` (the endpoint an
+  overlay actually polls) is untouched.
 - **The streaming buffer is bounded.** The downloader now parks when it is
   `audio.stream_window_seconds` (default 8) of the track's own byte-rate ahead
   of the decoder, and resumes at 75 % of that. Before, nothing bounded it: the
