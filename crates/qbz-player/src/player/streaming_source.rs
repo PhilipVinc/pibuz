@@ -1061,6 +1061,23 @@ impl BufferedMediaSource {
             state.downloaded()
         );
         state.primary_offset = pos;
+        // Move THIS reader's recorded position to where it is now waiting.
+        //
+        // `ahead_bytes` anchors the window on the newest reader's last-read
+        // position, and a seek makes that stale: the reader is at `pos`, its
+        // record still says wherever it stopped reading. After a BACKWARD seek
+        // the bytes it walked past are still buffered, so the window measured
+        // from the stale point is full while the reader has nothing — the
+        // feeder parks, never polls the body it just opened at `pos`, and the
+        // reader waits on a condvar that nothing will notify.
+        //
+        // Measured on a Pi, 2026-09-14, with the park line this fix made
+        // visible:
+        //   PARKED: 13439717 bytes contiguous from the reader anchor 149294623
+        //           (window 2419344, write head 148550456, epoch 2)
+        // The reader was waiting at 148550456, 744 KB BEHIND that anchor, and
+        // playback never recovered.
+        state.reader_positions.insert(self.reader_id, pos);
         state.pending_request = Some(fetch_from);
         self.shared.wanted.notify_one();
         // A parked feeder is the one that must service this.
@@ -2973,31 +2990,35 @@ mod buffer_behaviour_tests {
         );
     }
 
-    /// The shape of the resume stall seen on a moOde Pi, 2026-09-14 — as a
-    /// guard, NOT as a reproduction.
+    /// The resume stall seen on a moOde Pi, 2026-09-14.
     ///
-    /// The field case: a cast paused and resumed 240 s into a 223 MB 24/96
-    /// track. `ResumeInput::Ranged` rebuilds the decoder over the SAME buffer,
-    /// that reader probes the format, then seeks back to the paused position.
-    /// Playback advanced one second and stopped forever — no chunk, no error,
-    /// no log line for seven minutes, controller showing "loading". The feeder
-    /// had opened the body at the target 56 ms earlier and then went silent,
-    /// which means it was parked: a parked feeder never polls its body, so the
-    /// 60 s `read_timeout` never advances either.
+    /// A cast paused and resumed mid-track wedged permanently: playback froze,
+    /// the controller showed "loading", and the log went silent for minutes
+    /// after the feeder opened the body at the seek target. The park line this
+    /// case exists for named it exactly:
     ///
-    /// This case walks that sequence — read forward, build a second reader over
-    /// the same buffer while the first is still alive, probe, seek backward past
-    /// the look-behind slack, read — and it PASSES. So whatever wedged the Pi is
-    /// NOT simply "a rebuilt reader seeks backward": the window anchoring
-    /// (`ahead_bytes` over `reader_positions`) survives this shape.
+    /// ```text
+    /// PARKED: 13439717 bytes contiguous from the reader anchor 149294623
+    ///         (window 2419344, write head 148550456, epoch 2, 2 readers)
+    /// ```
     ///
-    /// It is kept because the invariant is worth pinning and the sequence is
-    /// otherwise untested. The field stall is still open; do not read a green
-    /// result here as evidence that it is fixed.
+    /// The reader was waiting at 148550456. The anchor was 149294623 — where it
+    /// had last READ, 744 KB further on — and the bytes it had walked past were
+    /// still buffered, so the window measured from that stale point was full.
+    /// The feeder parked, never polled the body it had just opened at the
+    /// target, and the reader waited on a condvar nothing would notify. Neither
+    /// side was wrong on its own; they simply disagreed about where the reader
+    /// was.
+    ///
+    /// The shape that makes it reachable, and what this case builds: a window's
+    /// worth of CONTIGUOUS bytes sitting ahead of the reader's last-read
+    /// position, then a backward seek out of the buffered run. Without the
+    /// first half the feeder never parks and the bug hides — an earlier version
+    /// of this test seeked backward without it and passed against the fault.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_reader_that_seeks_back_after_reading_is_not_left_behind_a_parked_feeder() {
+    async fn a_backward_seek_moves_the_window_anchor_with_the_reader() {
         const TOTAL: u64 = 8 * MB as u64;
-        const WINDOW: usize = 512 * KB;
+        const WINDOW: usize = 256 * KB;
         let log = Arc::new(FeedLog::default());
         let cfg = StreamingConfig {
             initial_buffer_bytes: 32 * KB,
@@ -3005,59 +3026,60 @@ mod buffer_behaviour_tests {
         };
         let (source, writer) = BufferedMediaSource::new_seekable(cfg, Some(TOTAL));
         let source = Arc::new(source);
+        let mut reader = source.create_reader();
 
-        // Reader A: the pre-pause decoder. Walk it far enough in that the
-        // feeder has a full window of contiguous bytes sitting ahead of it.
-        let mut before = source.create_reader();
         let feeder = tokio::spawn(feed(writer, TOTAL, 32 * KB, None, log.clone()));
-        let landed = tokio::task::spawn_blocking(move || {
+
+        let replay = tokio::task::spawn_blocking(move || {
+            // Read in far enough that the feeder has built a full window of
+            // contiguous bytes ahead of where this reader stops, and far enough
+            // that the look-behind trim has discarded the early part of the
+            // file. Both halves are needed: the first makes the window look
+            // full from the stale anchor, the second makes the seek a real
+            // fetch rather than a read out of the buffer.
             let mut buf = vec![0u8; 4 * MB];
-            before
-                .read_exact(&mut buf)
-                .expect("walk the stream forward");
-            // Hold the reader alive, as the resume path does: the outgoing
-            // decoder is dropped only after the new one is built.
-            (before, 4 * MB as u64)
-        })
-        .await
-        .expect("pre-pause reader");
-        let (_outgoing, walked) = landed;
+            reader.read_exact(&mut buf).expect("walk forward");
+            let stopped_at = 4 * MB as u64;
 
-        // Reader B: the decoder the resume rebuilds. It records a position of
-        // its own while probing, then seeks back to where playback was paused.
-        let mut after = source.create_reader();
-        let resumed = tokio::task::spawn_blocking(move || {
-            // The probe: enough to register a position inside the held run.
-            after.seek(SeekFrom::Start(walked)).expect("probe seek");
-            let mut probe = vec![0u8; 16 * KB];
-            after.read_exact(&mut probe).expect("probe read");
+            // Let the feeder run ahead and park on its own, as it had in the
+            // field before the seek arrived.
+            std::thread::sleep(Duration::from_millis(200));
 
-            // The resume seek: backward, past the look-behind slack, so the
-            // target is outside the run the window is measuring.
-            let target = walked - SEEK_LOOKBEHIND_BYTES - (64 * KB) as u64;
-            after.seek(SeekFrom::Start(target)).expect("resume seek");
-            let mut back = vec![0u8; 32 * KB];
-            after
+            // Seek BACK past the look-behind slack, so those bytes are gone and
+            // the feeder must be sent for them. The reader is now at `target`;
+            // its RECORDED position is still `stopped_at`, with a full window
+            // contiguous ahead of it.
+            let target = stopped_at - SEEK_LOOKBEHIND_BYTES - MB as u64;
+            reader.seek(SeekFrom::Start(target)).expect("seek back");
+            let mut back = vec![0u8; 64 * KB];
+            reader
                 .read_exact(&mut back)
                 .expect("read at the resume point");
             for (i, got) in back.iter().enumerate() {
                 assert_eq!(*got, byte_at(target + i as u64), "wrong byte after resume");
             }
+
+            // And keep going forward from there, which is what resumed
+            // playback does — the feeder has to stay awake for it.
+            let mut on = vec![0u8; 512 * KB];
+            reader
+                .read_exact(&mut on)
+                .expect("carry on after the resume");
         });
 
-        let outcome = tokio::time::timeout(Duration::from_secs(10), resumed).await;
+        let outcome = tokio::time::timeout(Duration::from_secs(10), replay).await;
         if outcome.is_err() {
-            // Same reason as the trimmed-region case: the reader is a blocking
-            // task on the condvar and the runtime waits for it at shutdown, so
-            // it has to be let go before the failure can be reported.
+            // The reader is a blocking task parked on the condvar and the
+            // runtime waits for it at shutdown, so it has to be let go before
+            // the failure can be reported rather than hanging the binary.
             source.abandon();
         }
         outcome
             .expect(
-                "the resume seek deadlocked: the feeder parked on the OLD reader position \
-                 while the reader waited for bytes behind it",
+                "the backward seek deadlocked: the feeder parked on the reader's STALE \
+                 last-read position while the reader waited behind it",
             )
-            .expect("resumed reader thread");
+            .expect("reader thread");
         feeder.abort();
     }
 
