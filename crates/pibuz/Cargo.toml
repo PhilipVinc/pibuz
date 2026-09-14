@@ -54,3 +54,29 @@ tempfile = "3"
 
 [lints]
 workspace = true
+
+# Debian packaging, read by `cargo deb -p pibuz`.
+#
+# moOde builds pibuz from source on the device (moode-player/pkgbuild), and
+# without this section cargo-deb has nothing to read, so that recipe carried a
+# patch that appended it. Keeping it here means the recipe just builds a tag.
+#
+# Binary only, on purpose: `service/pibuz.service` is NOT shipped. moOde starts
+# and stops the daemon itself from renderer.php, the same way it drives
+# librespot, and a unit file installed next to that would be a second owner of
+# the process. Distros packaging pibuz standalone want the unit and should add
+# it in their own packaging rather than have it appear here.
+#
+# `$auto` resolves the runtime deps from what the binary actually links:
+# libasound2 and libjack-jackd2-0 (jack-sys), plus libc/libgcc. No TLS or D-Bus
+# runtime dep — rustls and zbus are pure Rust.
+[package.metadata.deb]
+maintainer = "Filippo Vicentini <filippovicentini@gmail.com>"
+copyright = "2024 blitzkriegfc, 2026 Filippo Vicentini, MIT"
+section = "sound"
+priority = "optional"
+extended-description = "Headless Qobuz Connect renderer: a playback daemon, a local control API and a CLI in one binary. None of the desktop GUI stack is linked."
+depends = "$auto"
+assets = [
+    ["target/release/pibuz", "usr/bin/", "755"],
+]
