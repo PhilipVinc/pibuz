@@ -3,7 +3,7 @@
 Notable changes per release. Versions are plain semver; releases are `vX.Y.Z`
 tags on `main`.
 
-## 2.4.0-rc.3 — unreleased
+## 2.4.0 — 2026-09-15
 
 **The project is now Pibuz and the binary is `pibuz`** — see *Renamed* below
 for what an upgrade has to touch (little: the unit file) and what it keeps (the
@@ -262,6 +262,17 @@ different programs at the same path. The project is **Pibuz** and the binary is
   metadata accessors, and a reader may re-request any region the window threw
   away, with the feeder staying up to serve it instead of exiting once the file
   has been walked.
+- **A cast paused and resumed mid-track no longer wedges.** The feeder parks
+  when the buffer ahead of the reader is full, and it measured that window from
+  where the reader had last *read* rather than from where it was waiting. After
+  a seek those are two different places, and the bytes between them were still
+  buffered, so the window looked full against a reader that was starving: the
+  feeder parked, the reader waited on a condvar nothing would notify, and
+  playback stopped for good with the controller showing "loading". The anchor
+  now moves with a reader that seeks. Parking and unparking are logged too — a
+  parked feeder stops polling its body, so parked, spinning and gone all looked
+  identical from outside, which is why this took a run of seven silent minutes
+  to pin down.
 - **A seek reports its position within the track, not within the source.** A
   cached track played from an offset used to start the clock at zero and seek
   afterwards, so the controller saw a position below the one it asked for and
