@@ -5761,12 +5761,49 @@ impl Player {
     /// Ports the L1/L2/CMAF tiers of Tauri's `v2_play_next_gapless`; the
     /// ephemeral / offline-cache / local-library tiers are intentionally
     /// omitted as they do not exist in the Slint MVP.
+    /// Tell the L2 cache which tracks must not be evicted: the one playing and
+    /// the one being staged for the hand-off.
+    ///
+    /// Called BEFORE the successor is written, not after, so the entry is
+    /// protected from the moment it exists — a pin applied afterwards still
+    /// leaves the window in which the write itself triggers the eviction.
+    ///
+    /// Pinning an id the cache does not hold is harmless: eviction filters by
+    /// id, so a pin simply has nothing to protect until the file lands.
+    fn pin_live_tracks(&self, staging: Option<u64>) {
+        let Some(l2) = self.audio_cache.get_playback_cache() else {
+            return;
+        };
+        let mut ids: Vec<u64> = Vec::with_capacity(3);
+        // `0` is the "nothing here" sentinel for both of these.
+        for id in [
+            self.state.current_track_id(),
+            self.state.get_gapless_next_track_id(),
+        ] {
+            if id != 0 {
+                ids.push(id);
+            }
+        }
+        if let Some(id) = staging {
+            ids.push(id);
+        }
+        l2.set_pinned(ids);
+    }
+
     pub async fn fetch_for_gapless(
         &self,
         client: &QobuzClient,
         track_id: u64,
         quality: Quality,
     ) -> Option<TrackAudio> {
+        // The player is about to hold this track's path across a hand-off, and
+        // the playing track's across the rest of it. An LRU that cannot see
+        // that deletes one of them to make room for the next successor: the
+        // transport reports `paused` nobody asked for, and every resume fails
+        // with `cached file ... No such file or directory`. Observed on a Pi
+        // once gapless-via-disk made two Hi-Res tracks the normal residents of
+        // a 400 MB budget.
+        self.pin_live_tracks(Some(track_id));
         // L1: in-memory cache.
         if let Some(cached) = self.audio_cache.get(track_id) {
             log::info!(

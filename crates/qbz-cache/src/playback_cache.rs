@@ -23,6 +23,17 @@ struct PlaybackCacheState {
     entries: HashMap<u64, CacheEntry>,
     /// Current total size in bytes
     current_size: u64,
+    /// Tracks the player is HOLDING — the one playing and the one queued for
+    /// the gapless hand-off. Never evicted, however old they look.
+    ///
+    /// The player takes a `TrackAudio::File(path)` from this cache and opens
+    /// that path later, on resume and on every seek. An LRU that cannot see
+    /// that deletes the file from under it: the transport reports `paused`
+    /// without anyone pausing, and each retry fails with `cannot resume -
+    /// cached file ... No such file or directory`. Observed on a Pi the moment
+    /// gapless-via-disk made two Hi-Res tracks the normal residents of a
+    /// 400 MB budget.
+    pinned: std::collections::HashSet<u64>,
 }
 
 /// Disk-based playback cache for evicted tracks
@@ -50,6 +61,23 @@ impl PlaybackCache {
         Self::with_path(cache_dir, max_size_bytes)
     }
 
+    /// Declare which tracks the player is holding open, replacing the previous
+    /// set. Pinned entries are never evicted.
+    ///
+    /// The player owns this: it knows which track is playing and which one is
+    /// staged for the gapless hand-off, and the cache cannot infer either — an
+    /// entry written seconds ago and about to be played looks exactly like an
+    /// entry written seconds ago and never wanted again.
+    ///
+    /// Keep the set SMALL. Every pinned byte is a byte the budget cannot
+    /// reclaim, so pinning more than the current track and its successor turns
+    /// a cache into a leak on the boards that have the least room to spare.
+    pub fn set_pinned<I: IntoIterator<Item = u64>>(&self, ids: I) {
+        if let Ok(mut state) = self.state.lock() {
+            state.pinned = ids.into_iter().collect();
+        }
+    }
+
     /// Create a new playback cache at a specific path
     pub fn with_path(cache_dir: PathBuf, max_size_bytes: u64) -> Result<Self, String> {
         // Create directory
@@ -60,6 +88,7 @@ impl PlaybackCache {
             state: Mutex::new(PlaybackCacheState {
                 entries: HashMap::new(),
                 current_size: 0,
+                pinned: std::collections::HashSet::new(),
             }),
             cache_dir,
             max_size_bytes,
@@ -254,7 +283,14 @@ impl PlaybackCache {
             );
             return None;
         }
-        self.evict_if_needed(expected_size);
+        if !self.evict_if_needed(expected_size) {
+            log::debug!(
+                "Track {} not staged: the {} MB budget is held by tracks in use",
+                track_id,
+                self.max_size_bytes / (1024 * 1024)
+            );
+            return None;
+        }
         let part = self.track_path(track_id).with_extension("part");
         if let Some(parent) = part.parent() {
             let _ = fs::create_dir_all(parent);
@@ -359,8 +395,17 @@ impl PlaybackCache {
             }
         }
 
-        // Evict old entries if needed
-        self.evict_if_needed(size);
+        // Evict old entries if needed. Refusing beats evicting a track the
+        // player is holding: a track the cache declines is re-fetched, a file
+        // deleted under an open path kills playback until the next cast.
+        if !self.evict_if_needed(size) {
+            log::debug!(
+                "Track {} not cached: the {} MB budget is held by tracks in use",
+                track_id,
+                self.max_size_bytes / (1024 * 1024)
+            );
+            return;
+        }
 
         let path = self.track_path(track_id);
 
@@ -426,14 +471,21 @@ impl PlaybackCache {
     }
 
     /// Evict oldest entries to make room for new data
-    fn evict_if_needed(&self, needed_bytes: u64) {
+    /// Make room for `needed_bytes`, and say whether it worked.
+    ///
+    /// `false` means the only entries left are pinned — the caller must NOT
+    /// store its track, because the alternative is deleting a file the player
+    /// is about to open.
+    fn evict_if_needed(&self, needed_bytes: u64) -> bool {
         let mut state = self.state.lock().unwrap();
 
         while state.current_size + needed_bytes > self.max_size_bytes && !state.entries.is_empty() {
-            // Find oldest entry
+            // Oldest EVICTABLE entry. A pinned one is not a candidate at any
+            // age: the player is holding its path and will open it again.
             let oldest_id = state
                 .entries
                 .iter()
+                .filter(|(id, _)| !state.pinned.contains(id))
                 .min_by_key(|(_, e)| e.last_accessed)
                 .map(|(id, _)| *id);
 
@@ -454,9 +506,11 @@ impl PlaybackCache {
                     }
                 }
             } else {
+                // Nothing evictable left: what remains is pinned.
                 break;
             }
         }
+        state.current_size + needed_bytes <= self.max_size_bytes
     }
 
     /// Clear the entire cache
@@ -609,6 +663,61 @@ mod tests {
         assert!(cache.contains(3));
         assert!(cache.stats().current_size_bytes <= 8192);
         assert!(!dir.join("1.audio").exists(), "its file is deleted too");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The track the player is about to play must survive the arrival of the
+    /// next one.
+    ///
+    /// Seen on a moOde Pi, 2026-09-14: the transport reported **paused**
+    /// without anyone pausing, and would not resume. The player was holding
+    /// `TrackAudio::File(.../62589629.audio)` for its gapless successor; the
+    /// next successor's insert evicted that file by LRU and deleted it, so
+    /// every later resume and seek failed with
+    /// `cannot resume - cached file ... No such file or directory` and gave up.
+    ///
+    /// This is not a corner case on the boards that need it most. Gapless on a
+    /// 512 MB host IS gapless-via-disk — an oversized successor is streamed to
+    /// the card because it cannot fit in a 73 MB L1 — and a Hi-Res pair is
+    /// 300-450 MB against a 400-800 MB budget. Nearly every successor insert
+    /// has to evict something, and the freshly written successor is exactly the
+    /// entry an LRU reaches for once the playing track has been touched.
+    #[test]
+    fn a_pinned_track_is_never_evicted_from_under_the_player() {
+        let (cache, dir) = temp_cache(8192);
+        cache.insert(1, &vec![0u8; 4096]); // the track playing
+        cache.insert(2, &vec![0u8; 4096]); // the successor queued for gapless
+
+        // The player tells the cache what it is holding.
+        cache.set_pinned([1, 2]);
+
+        // The NEXT successor arrives and the budget is already full.
+        cache.insert(3, &vec![0u8; 4096]);
+
+        assert!(
+            cache.contains(2),
+            "the queued successor was evicted while the player held its path"
+        );
+        assert!(
+            dir.join("2.audio").exists(),
+            "its file was deleted while the player held its path"
+        );
+        assert!(cache.contains(1), "the playing track was evicted");
+
+        // With nothing evictable left, the newcomer is refused rather than
+        // taking a pinned entry with it. `insert` already refuses a track
+        // bigger than the whole budget, so callers understand a refusal.
+        assert!(
+            !cache.contains(3),
+            "an insert that can only be satisfied by evicting a live track must be refused"
+        );
+        assert!(cache.stats().current_size_bytes <= 8192);
+
+        // Unpinning lets the cache reclaim normally again.
+        cache.set_pinned([1]);
+        cache.insert(3, &vec![0u8; 4096]);
+        assert!(cache.contains(3), "an unpinned entry is evictable again");
+        assert!(cache.contains(1), "the still-pinned track stays");
         fs::remove_dir_all(&dir).ok();
     }
 

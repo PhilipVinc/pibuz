@@ -119,6 +119,22 @@ different programs at the same path. The project is **Pibuz** and the binary is
 
 ### Changed
 
+- **The disk cache no longer deletes a track the player is holding.** Playback
+  stopped dead on a Pi with the transport reporting *paused* that nobody asked
+  for, and every retry failing with `cannot resume - cached file ... No such
+  file or directory`. The player had a `TrackAudio::File` path for its gapless
+  successor; the next successor's insert evicted that entry by LRU and deleted
+  the file underneath it.
+
+  `PlaybackCache` now takes a pinned set — the playing track and the one being
+  staged — and never evicts it. An insert that could only be satisfied by
+  evicting a live entry is refused instead, the way an oversized track already
+  was: a track the cache declines is re-fetched, a file deleted under an open
+  path kills playback until the next cast.
+
+  This is not an edge case on the boards it matters for. Gapless on a 512 MB
+  host *is* gapless-via-disk, and a Hi-Res pair is 300-450 MB against a
+  400-800 MB budget, so nearly every successor insert has to evict something.
 - **A low-memory board's decoded ring is 4 seconds, was 2.** That figure was
   chosen when a board below the gapless floor never prefetched: nothing else
   touched the card while a track played, so the only stalls to absorb were the
