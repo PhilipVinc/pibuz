@@ -8,12 +8,11 @@
 // own `jwt_api` (qconnect/pairing.rs), and a route that genuinely cannot
 // resolve a stream fails at the core call with the reason.
 //
-// DSD-direct guard: `Player::is_dsd_direct_active()` (qbz-player/src/player/
-// mod.rs:4893, "True while a DoP stream is active (volume fixed, seek
-// unsupported)") is the player's own guard — previously unconsumed anywhere
-// in the workspace. `seek`/`volume` (incl. the `mute` body form) check it
-// FIRST and refuse 409 rather than silently no-op (the brief's explicit
-// requirement — a silent no-op reads as broken, 02 §1.4).
+// There is no DSD guard on `seek`/`volume` any more. It used to check
+// `Player::is_dsd_direct_active()` and refuse 409 while a DoP stream was open,
+// because scaling or re-positioning DSD samples corrupts the stream. DSD
+// playback went with the local-library code, and Qobuz serves PCM only, so
+// there is no state left for it to guard.
 //
 // Mute is daemon-owned state in `DaemonShared.{muted, premute_volume}` (T2
 // seam), with stash-then-zero / restore semantics.
@@ -461,7 +460,6 @@ fn repeat_str(mode: qbz_models::RepeatMode) -> String {
 
 /// 503 `audio_unavailable` — the frozen taxonomy's device/audio bucket
 /// (02 §3.1.3), exit 5. Reserved for GENUINE audio/device conditions: the
-/// DSD-direct guards (handled inline via `err_json`, not this helper) and
 /// cold-start's `play_track_resolved` failure (no device / stream resolve
 /// failed). Each route's documented exit set (02 §2.2) decides which one
 /// applies — `pause`/`stop`/plain `seek`/`volume`/`next`/`prev` never list
