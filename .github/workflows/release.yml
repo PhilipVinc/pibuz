@@ -97,6 +97,33 @@ jobs:
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
+      # The tag is what gets stamped into the binary through QBZD_BUILD_ID, so
+      # a tag that disagrees with Cargo.toml ships a `pibuz --version` that its
+      # own source never said. CONTRIBUTING has always told you to "tag what
+      # Cargo.toml already says"; nothing checked it, and the moOde tag series
+      # drifted a whole minor version doing exactly that.
+      #
+      #   v2.4.0                -> must equal the Cargo version
+      #   pibuz-v2.4.0.moode7   -> must START with it; the suffix is the point
+      - name: tag must agree with Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          CARGO="$(awk '/^\[workspace\.package\]/{f=1; next} f && /^version = /{gsub(/version = "|"/,""); print; exit}' Cargo.toml)"
+          echo "tag version: $VERSION"
+          echo "Cargo.toml:  $CARGO"
+          if [[ "${GITHUB_REF}" == refs/tags/pibuz-v* ]]; then
+            case "$VERSION" in
+              "$CARGO".*) ;;
+              *) echo "::error::moOde tag $VERSION is not a suffixed $CARGO — bump Cargo.toml first (scripts/bump-version.sh --moode prints the right id)"; exit 1;;
+            esac
+          elif [ "$VERSION" != "$CARGO" ]; then
+            echo "::error::tag says $VERSION, Cargo.toml says $CARGO — tag what Cargo.toml already says"
+            exit 1
+          fi
+
       - uses: dtolnay/rust-toolchain@stable
 
       - name: system deps

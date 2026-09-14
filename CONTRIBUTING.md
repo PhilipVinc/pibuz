@@ -54,14 +54,26 @@ hotfix/123  ──┘
 Releases are tags, not merges. Tag a commit **that is already on `main`**:
 
 ```bash
-git checkout main
-git pull
-git tag v2.1.0
-git push origin v2.1.0
+./scripts/bump-version.sh 2.5.0     # Cargo.toml + Cargo.lock + CHANGELOG heading
+git commit -am 'Version 2.5.0'
+git tag v2.5.0
+git push origin main v2.5.0
 ```
 
 Versions are plain semver — `2.1.0`, `2.1.1`, `2.2.0-rc.1` — with no distro
-suffixes. `Cargo.toml` is the source of truth; tag what it already says.
+suffixes. `Cargo.toml` is the source of truth, and every crate inherits it with
+`version.workspace = true`, so there is one number to change. `release.yml`
+refuses a tag that disagrees with it, because the tag is what gets stamped into
+the binary: tagging `v2.5.0` on a 2.4.0 tree would ship a `pibuz --version` its
+own source never said.
+
+`./scripts/bump-version.sh --check` verifies Cargo.toml, Cargo.lock and the
+CHANGELOG agree before you tag.
+
+A build cut for a moOde package carries a distro suffix the Cargo version
+cannot hold, so it is tagged `pibuz-v<version>.moodeN` —
+`./scripts/bump-version.sh --moode` prints the next one, derived from the
+current Cargo version rather than a base of its own.
 
 `release.yml` builds the aarch64 + amd64 tarballs and publishes a
 prerelease GitHub Release. Its first job refuses any release tag whose commit is
