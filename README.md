@@ -16,16 +16,6 @@ Features:
   hardware streamer, so ANY Qobuz account in the household can cast to it from the official app.
 
 
-## Credit
-
-Pibuz began as a fork of **[QBZ](https://github.com/vicrodh/qbz)** by
-**[@vicrodh](https://github.com/vicrodh)**.
-I decided to keep the git history here from the past.
-
-While qbz worked great, making it talk with moode, and running reliably on low power/memory devices, required substantial work to rewrite all the internals.
-Eventually I decided that the rewrite was so profound that it was not worth to try to upstream all the changes, and here we are.
-Nevertheless, I am grateful to those who attempted this before me :).
-
 ## Building
 
 Standard Cargo workspace — manifest at the repo root, members under `crates/`.
@@ -54,6 +44,16 @@ pibuz supports cross compilation through a few scripts in the scripts directory.
 
 A 4 GB Pi can build the daemon natively. The cross path uses `Cross.toml` to supply the arm64 dev libs inside the `cross` image.
 
+
+## Credit
+
+Pibuz began as a fork of **[QBZ](https://github.com/vicrodh/qbz)** by
+**[@vicrodh](https://github.com/vicrodh)**.
+I decided to keep the git history here from the past.
+
+While qbz worked great, making it talk with moode, and running reliably on low power/memory devices, required substantial work to rewrite all the internals.
+Eventually I decided that the rewrite was so profound that it was not worth to try to upstream all the changes, and here we are.
+Nevertheless, I am grateful to those who attempted this before me :).
 
 ## Known Issues
 
