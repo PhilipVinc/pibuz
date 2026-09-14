@@ -1,12 +1,16 @@
 // crates/pibuz/src/tui/screens/playback.rs — the Playback screen (03 §3.3).
 //
 // Reads three stores at entry (daemon_prefs.streaming_quality, AudioSettings
-// quality/fallback rows, PlaybackPreferences) and writes back through the App's
-// write_one path. The two spec subtleties, both pure + tested:
-//   - the ask→fallback rendering rule (§3.3.2): the select offers only the two
-//     concrete values; a stored `ask` renders a note until picked; the TUI never
-//     writes `ask`.
+// quality rows, PlaybackPreferences) and writes back through the App's
+// write_one path. One spec subtlety, pure + tested:
 //   - `infinite` autoplay (P1 radio) renders read-only until toggled (§3.3.1).
+//
+// The Quality group used to carry four more rows — a device-rate limiter, its
+// max-rate select, an allow-fallback toggle and a retry-on-failure select, plus
+// the `ask` rendering rule that hung off the last of them. They are gone with
+// the keys behind them (see `cli::settings::KEY_TABLE`): the daemon reads none
+// of the four, so every one of them was a control the operator could move
+// without anything changing.
 
 use qbz_app::settings::playback::{AutoplayMode, PlaybackPreferences};
 use qbz_audio::settings::AudioSettings;
@@ -19,30 +23,14 @@ use crate::tui::app::{DrawCtx, ScreenAction};
 use crate::tui::strings as s;
 use crate::tui::widgets::{self, SelectOutcome, SelectPopup};
 
-const MAX_RATES: &[(&str, Option<u32>)] = &[
-    (s::RATE_NO_LIMIT, None),
-    ("44.1 kHz", Some(44_100)),
-    ("48 kHz", Some(48_000)),
-    ("88.2 kHz", Some(88_200)),
-    ("96 kHz", Some(96_000)),
-    ("176.4 kHz", Some(176_400)),
-    ("192 kHz", Some(192_000)),
-    ("352.8 kHz", Some(352_800)),
-    ("384 kHz", Some(384_000)),
-];
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct StagedPlayback {
-    pub quality: String,              // playback.quality
-    pub limit_to_device: bool,        // audio.limit_quality_to_device
-    pub max_sample_rate: Option<u32>, // audio.device_max_sample_rate
-    pub allow_fallback: bool,         // audio.allow_quality_fallback
-    pub fallback_behavior: String,    // audio.quality_fallback_behavior
-    pub autoplay: String,             // playback.autoplay
-    pub gapless: bool,                // audio.gapless_enabled
-    pub restore_session: bool,        // playback.persist_session
-    pub resume_position: bool,        // playback.resume_playback_position
-    pub mpris: bool,                  // playback.mpris (applies on restart)
+    pub quality: String,       // playback.quality
+    pub autoplay: String,      // playback.autoplay
+    pub gapless: bool,         // audio.gapless_enabled
+    pub restore_session: bool, // playback.persist_session
+    pub resume_position: bool, // playback.resume_playback_position
+    pub mpris: bool,           // playback.mpris (applies on restart)
     /// Read-only, from the audio store — drives the Gapless disabled reason.
     pub streaming_only: bool,
 }
@@ -50,10 +38,6 @@ pub struct StagedPlayback {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PField {
     Quality,
-    Limit,
-    MaxRate,
-    AllowFallback,
-    RetryFail,
     Continue,
     Gapless,
     Restore,
@@ -65,15 +49,6 @@ pub enum PField {
 pub fn row_state(field: PField, p: &StagedPlayback) -> (bool, bool, Option<&'static str>) {
     use PField::*;
     match field {
-        MaxRate => (
-            p.limit_to_device,
-            true,
-            if p.limit_to_device {
-                None
-            } else {
-                Some(s::R_LIMIT_OFF)
-            },
-        ),
         Gapless => (
             true,
             !p.streaming_only,
@@ -98,27 +73,14 @@ pub fn row_state(field: PField, p: &StagedPlayback) -> (bool, bool, Option<&'sta
 
 pub fn visible_fields(p: &StagedPlayback) -> Vec<PField> {
     use PField::*;
-    [
-        Quality,
-        Limit,
-        MaxRate,
-        AllowFallback,
-        RetryFail,
-        Continue,
-        Gapless,
-        Restore,
-        Resume,
-        Mpris,
-    ]
-    .into_iter()
-    .filter(|f| row_state(*f, p).0)
-    .collect()
+    [Quality, Continue, Gapless, Restore, Resume, Mpris]
+        .into_iter()
+        .filter(|f| row_state(*f, p).0)
+        .collect()
 }
 
 enum Editor {
     Quality(SelectPopup),
-    MaxRate(SelectPopup),
-    Retry(SelectPopup),
 }
 
 pub struct PlaybackState {
@@ -137,10 +99,6 @@ impl PlaybackState {
     ) -> Self {
         let staged = StagedPlayback {
             quality: quality.to_string(),
-            limit_to_device: audio.limit_quality_to_device,
-            max_sample_rate: audio.device_max_sample_rate,
-            allow_fallback: audio.allow_quality_fallback,
-            fallback_behavior: audio.quality_fallback_behavior.clone(),
             autoplay: autoplay_value(prefs.autoplay_mode).to_string(),
             gapless: audio.gapless_enabled,
             restore_session: prefs.persist_session,
@@ -170,46 +128,17 @@ impl PlaybackState {
     pub fn editing_label(&self) -> Option<&'static str> {
         match &self.editor {
             Some(Editor::Quality(_)) => Some(s::P_QUALITY),
-            Some(Editor::MaxRate(_)) => Some(s::P_MAX_RATE),
-            Some(Editor::Retry(_)) => Some(s::P_RETRY_FAIL),
             None => None,
         }
     }
 
-    /// Changed dotted keys for write_one. NEVER emits `ask` (§3.3.2).
+    /// Changed dotted keys for write_one.
     pub fn save_keys(&self) -> Vec<(String, String)> {
         let b = &self.baseline;
         let a = &self.staged;
         let mut out = Vec::new();
         if a.quality != b.quality {
             out.push(("playback.quality".to_string(), a.quality.clone()));
-        }
-        if a.limit_to_device != b.limit_to_device {
-            out.push((
-                "audio.limit_quality_to_device".to_string(),
-                a.limit_to_device.to_string(),
-            ));
-        }
-        if a.max_sample_rate != b.max_sample_rate {
-            out.push((
-                "audio.device_max_sample_rate".to_string(),
-                a.max_sample_rate
-                    .map(|r| r.to_string())
-                    .unwrap_or_else(|| "none".to_string()),
-            ));
-        }
-        if a.allow_fallback != b.allow_fallback {
-            out.push((
-                "audio.allow_quality_fallback".to_string(),
-                a.allow_fallback.to_string(),
-            ));
-        }
-        // Only write fallback_behavior when it is a concrete value (never `ask`).
-        if a.fallback_behavior != b.fallback_behavior && a.fallback_behavior != "ask" {
-            out.push((
-                "audio.quality_fallback_behavior".to_string(),
-                a.fallback_behavior.clone(),
-            ));
         }
         if a.autoplay != b.autoplay {
             out.push(("playback.autoplay".to_string(), a.autoplay.clone()));
@@ -298,35 +227,6 @@ impl PlaybackState {
                     false,
                 )));
             }
-            PField::MaxRate => {
-                let opts: Vec<String> = MAX_RATES.iter().map(|(l, _)| l.to_string()).collect();
-                let sel = MAX_RATES
-                    .iter()
-                    .position(|(_, v)| *v == self.staged.max_sample_rate)
-                    .unwrap_or(0);
-                self.editor = Some(Editor::MaxRate(SelectPopup::new(
-                    s::P_MAX_RATE,
-                    opts,
-                    sel,
-                    false,
-                )));
-            }
-            PField::RetryFail => {
-                let opts = vec![s::RETRY_FALLBACK.to_string(), s::RETRY_SKIP.to_string()];
-                let sel = if self.staged.fallback_behavior == "always_skip" {
-                    1
-                } else {
-                    0
-                };
-                self.editor = Some(Editor::Retry(SelectPopup::new(
-                    s::P_RETRY_FAIL,
-                    opts,
-                    sel,
-                    false,
-                )));
-            }
-            PField::Limit => self.staged.limit_to_device ^= true,
-            PField::AllowFallback => self.staged.allow_fallback ^= true,
             PField::Continue => {
                 // §3.3.1: infinite (radio) is preserved until toggled; the first
                 // toggle from infinite lands on off (track_only).
@@ -361,33 +261,6 @@ impl PlaybackState {
                     ScreenAction::Consumed
                 }
             },
-            Editor::MaxRate(mut p) => match p.handle_key(key) {
-                SelectOutcome::Chosen(i) => {
-                    self.staged.max_sample_rate = MAX_RATES.get(i).map(|(_, v)| *v).unwrap_or(None);
-                    ScreenAction::Consumed
-                }
-                SelectOutcome::Cancelled => ScreenAction::Consumed,
-                SelectOutcome::Pending => {
-                    self.editor = Some(Editor::MaxRate(p));
-                    ScreenAction::Consumed
-                }
-            },
-            Editor::Retry(mut p) => match p.handle_key(key) {
-                SelectOutcome::Chosen(i) => {
-                    self.staged.fallback_behavior = if i == 1 {
-                        "always_skip"
-                    } else {
-                        "always_fallback"
-                    }
-                    .to_string();
-                    ScreenAction::Consumed
-                }
-                SelectOutcome::Cancelled => ScreenAction::Consumed,
-                SelectOutcome::Pending => {
-                    self.editor = Some(Editor::Retry(p));
-                    ScreenAction::Consumed
-                }
-            },
         }
     }
 
@@ -410,7 +283,7 @@ impl PlaybackState {
         let mut secs: Vec<widgets::Section> = Vec::new();
         let mut anchor: Option<widgets::FocusAnchor> = None;
 
-        let quality: &[PField] = &[Quality, Limit, MaxRate, AllowFallback, RetryFail];
+        let quality: &[PField] = &[Quality];
         let (q_lines, q_a) = self.group_block(&fields, quality, focused_field, ctrl_col, width);
         if !q_lines.is_empty() {
             widgets::push_section(
@@ -466,11 +339,8 @@ impl PlaybackState {
 
         widgets::sections_scroll(f, area, &secs, anchor);
 
-        match &self.editor {
-            Some(Editor::Quality(p)) | Some(Editor::MaxRate(p)) | Some(Editor::Retry(p)) => {
-                p.draw(f, area)
-            }
-            None => {}
+        if let Some(Editor::Quality(p)) = &self.editor {
+            p.draw(f, area);
         }
     }
 
@@ -537,18 +407,6 @@ impl PlaybackState {
                 quality_label(&a.quality).to_string(),
                 "[select]",
             ),
-            PField::Limit => (s::P_LIMIT_DEVICE, on_off(a.limit_to_device), "[toggle]"),
-            PField::MaxRate => (
-                s::P_MAX_RATE,
-                max_rate_label(a.max_sample_rate).to_string(),
-                "[select]",
-            ),
-            PField::AllowFallback => (s::P_ALLOW_FALLBACK, on_off(a.allow_fallback), "[toggle]"),
-            PField::RetryFail => (
-                s::P_RETRY_FAIL,
-                retry_label(&a.fallback_behavior).to_string(),
-                "[select]",
-            ),
             PField::Continue => (
                 s::P_CONTINUE,
                 autoplay_label(&a.autoplay).to_string(),
@@ -579,22 +437,6 @@ fn quality_label(q: &str) -> &'static str {
         "cd" => s::Q_CD,
         "hires" => s::Q_HIRES,
         _ => s::Q_HIRES_PLUS,
-    }
-}
-
-fn max_rate_label(v: Option<u32>) -> &'static str {
-    MAX_RATES
-        .iter()
-        .find(|(_, r)| *r == v)
-        .map(|(l, _)| *l)
-        .unwrap_or(s::RATE_NO_LIMIT)
-}
-
-fn retry_label(v: &str) -> &'static str {
-    match v {
-        "always_skip" => s::RETRY_SKIP,
-        "always_fallback" => s::RETRY_FALLBACK,
-        _ => s::RETRY_ASK, // stored `ask` — rendered until the operator picks
     }
 }
 
@@ -629,36 +471,37 @@ mod tests {
     }
 
     #[test]
-    fn ask_renders_note_and_is_never_written() {
+    fn the_screen_offers_no_key_the_daemon_ignores() {
+        // The four rows this screen used to carry in its Quality group wrote
+        // keys with no consumer in the daemon, so moving them changed nothing
+        // audible. They are gone; this pins that they stay gone, and that every
+        // key the screen CAN write is one `settings set` still accepts.
         let mut st = PlaybackState::new(
-            "hires_plus",
-            true,
+            "cd",
+            false,
             &AudioSettings::default(),
             &PlaybackPreferences::default(),
         );
-        // AudioSettings::default() seeds fallback_behavior = "ask".
-        assert_eq!(st.staged.fallback_behavior, "ask");
-        assert_eq!(retry_label("ask"), s::RETRY_ASK);
-        // A save with the value still `ask` writes nothing for that key.
-        assert!(st
-            .save_keys()
-            .iter()
-            .all(|(k, _)| k != "audio.quality_fallback_behavior"));
-        // Picking a concrete value makes it writable.
-        st.staged.fallback_behavior = "always_skip".to_string();
-        assert!(st
-            .save_keys()
-            .iter()
-            .any(|(k, v)| k == "audio.quality_fallback_behavior" && v == "always_skip"));
-    }
+        st.staged.quality = "mp3".to_string();
+        st.staged.autoplay = "track_only".to_string();
+        st.staged.gapless = !st.staged.gapless;
+        st.staged.restore_session = !st.staged.restore_session;
+        st.staged.resume_position = !st.staged.resume_position;
+        st.staged.mpris = !st.staged.mpris;
 
-    #[test]
-    fn max_rate_hidden_unless_limit_on() {
-        let mut p = base();
-        p.limit_to_device = false;
-        assert!(!row_state(PField::MaxRate, &p).0);
-        p.limit_to_device = true;
-        assert!(row_state(PField::MaxRate, &p).0);
+        let written: Vec<String> = st.save_keys().into_iter().map(|(k, _)| k).collect();
+        assert_eq!(
+            written,
+            vec![
+                "playback.quality",
+                "playback.autoplay",
+                "audio.gapless_enabled",
+                "playback.persist_session",
+                "playback.resume_playback_position",
+                "playback.mpris",
+            ],
+            "every writable key must still be in cli::settings::KEY_TABLE"
+        );
     }
 
     #[test]

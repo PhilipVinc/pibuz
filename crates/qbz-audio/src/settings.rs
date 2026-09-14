@@ -137,6 +137,25 @@ pub struct AudioSettings {
     /// setting that disables caching altogether.
     #[serde(default = "default_cache_to_disk")]
     pub cache_to_disk: bool,
+    /// Hard budget for the L2 (on-disk) audio cache, in megabytes. Ignored
+    /// entirely when [`Self::cache_to_disk`] is false — there is no L2 then.
+    ///
+    /// `0` means take [`DEFAULT_DISK_CACHE_MB`], which is what this was before
+    /// it was a setting: a constant compiled into the player, invisible and
+    /// unchangeable. That is the wrong shape for the one number that decides how
+    /// much of the card this daemon occupies, on exactly the small boards that
+    /// route their cache to disk because they have no RAM for it.
+    ///
+    /// The cache enforces it by LRU, and sweeps down to it at startup when the
+    /// budget has been LOWERED since the last run, so shrinking it takes effect
+    /// on the next daemon start rather than waiting for the next eviction.
+    ///
+    /// Read once, when the player builds its cache: changing it needs a daemon
+    /// restart. Same floor logic as the L1 budget — a cap below one track's size
+    /// means nothing is ever cached, so gapless from disk stops working under
+    /// ~120 MB at Hi-Res.
+    #[serde(default)]
+    pub disk_cache_mb: u16,
     /// When true, cap the REQUESTED streaming quality tier at the local output
     /// device's detected ceiling (#638 fix 3; consumed by the desktop's
     /// request-time resolution, never by the audio backends). Applies to local
@@ -194,6 +213,15 @@ fn default_cache_to_disk() -> bool {
     true
 }
 
+/// The L2 disk budget used when [`AudioSettings::disk_cache_mb`] is `0`.
+///
+/// 800 MB because that is the figure this shipped with as a hard-coded literal,
+/// and it is a reasonable middle: ~4 Hi-Res albums, comfortably inside the free
+/// space on the 8 GB card that is the smallest moOde supports, and large enough
+/// that ordinary listening rarely evicts. Making it a named constant rather than
+/// a magic number at the construction site is half the point of the setting.
+pub const DEFAULT_DISK_CACHE_MB: u16 = 800;
+
 /// On by default. The promotion needs an rlimit the service unit grants, and
 /// degrades to a single info line where it is absent, so defaulting it on costs
 /// nothing on a host that cannot use it and is the right answer on every host
@@ -248,6 +276,7 @@ impl Default for AudioSettings {
             pcm_ring_ms: 0,      // 0 = take the host memory profile's figure
             writer_rt_priority: default_writer_rt_priority(),
             cache_to_disk: default_cache_to_disk(),
+            disk_cache_mb: 0,                          // 0 = DEFAULT_DISK_CACHE_MB
             limit_quality_to_device: false, // Opt-in. Off since 1.1.9 (#45); wired to the read-only probe in #638 fix 3
             device_max_sample_rate: None,   // Set when device is selected
             device_sample_rate_limits: HashMap::new(), // Per-device limits (empty = no limit)
@@ -402,6 +431,10 @@ impl AudioSettingsStore {
             "ALTER TABLE audio_settings ADD COLUMN writer_rt_priority INTEGER DEFAULT 5",
             [],
         );
+        let _ = conn.execute(
+            "ALTER TABLE audio_settings ADD COLUMN disk_cache_mb INTEGER DEFAULT 0",
+            [],
+        );
 
         // Seed the single settings row on first run with the OOTB default backend
         // ("System"). INSERT OR IGNORE is a one-time seed: it only fires when the
@@ -467,7 +500,7 @@ impl AudioSettingsStore {
     pub fn get_settings(&self) -> Result<AudioSettings, String> {
         self.conn
             .query_row(
-                "SELECT output_device, exclusive_mode, dac_passthrough, preferred_sample_rate, backend_type, alsa_plugin, alsa_hardware_volume, stream_first_track, stream_buffer_seconds, streaming_only, limit_quality_to_device, device_max_sample_rate, normalization_enabled, normalization_target_lufs, gapless_enabled, device_sample_rate_limits, pw_force_bitperfect, sync_audio_on_startup, quality_fallback_behavior, skip_sink_switch, allow_quality_fallback, reserve_dac_while_running, memory_cache_mb, alsa_mixer_device, volume_curve, alsa_buffer_ms, cache_to_disk, dac_keepalive_ms, pcm_ring_ms, writer_rt_priority, stream_window_seconds FROM audio_settings WHERE id = 1",
+                "SELECT output_device, exclusive_mode, dac_passthrough, preferred_sample_rate, backend_type, alsa_plugin, alsa_hardware_volume, stream_first_track, stream_buffer_seconds, streaming_only, limit_quality_to_device, device_max_sample_rate, normalization_enabled, normalization_target_lufs, gapless_enabled, device_sample_rate_limits, pw_force_bitperfect, sync_audio_on_startup, quality_fallback_behavior, skip_sink_switch, allow_quality_fallback, reserve_dac_while_running, memory_cache_mb, alsa_mixer_device, volume_curve, alsa_buffer_ms, cache_to_disk, dac_keepalive_ms, pcm_ring_ms, writer_rt_priority, stream_window_seconds, disk_cache_mb FROM audio_settings WHERE id = 1",
                 [],
                 |row| {
                     // Parse backend_type from JSON string
@@ -525,6 +558,7 @@ impl AudioSettingsStore {
                         dac_keepalive_ms: row.get::<_, Option<i64>>(27)?.unwrap_or(0) as u16,
                         pcm_ring_ms: row.get::<_, Option<i64>>(28)?.unwrap_or(0) as u32,
                         stream_window_seconds: row.get::<_, Option<i64>>(30)?.unwrap_or(8) as u8,
+                        disk_cache_mb: row.get::<_, Option<i64>>(31)?.unwrap_or(0) as u16,
                         writer_rt_priority: row.get::<_, Option<i64>>(29)?.unwrap_or_else(
                             || i64::from(default_writer_rt_priority()),
                         ) as u8,
@@ -664,6 +698,16 @@ impl AudioSettingsStore {
     /// next track (or the next renderer start).
     /// Enable or disable L2 disk caching. Read when the player builds its cache,
     /// so it takes effect on the next daemon start.
+    pub fn set_disk_cache_mb(&self, mb: u16) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE audio_settings SET disk_cache_mb = ?1 WHERE id = 1",
+                params![mb as i64],
+            )
+            .map_err(|e| format!("Failed to set disk_cache_mb: {}", e))?;
+        Ok(())
+    }
+
     pub fn set_cache_to_disk(&self, enabled: bool) -> Result<(), String> {
         self.conn
             .execute(
@@ -1015,7 +1059,8 @@ impl AudioSettingsStore {
                     dac_keepalive_ms = ?27,
                     pcm_ring_ms = ?28,
                     writer_rt_priority = ?29,
-                    stream_window_seconds = ?30
+                    stream_window_seconds = ?30,
+                    disk_cache_mb = ?31
                 WHERE id = 1",
                 params![
                     defaults.output_device,
@@ -1048,6 +1093,7 @@ impl AudioSettingsStore {
                     defaults.pcm_ring_ms as i64,
                     defaults.writer_rt_priority as i64,
                     defaults.stream_window_seconds as i64,
+                    defaults.disk_cache_mb as i64,
                 ],
             )
             .map_err(|e| format!("Failed to reset audio settings: {}", e))?;

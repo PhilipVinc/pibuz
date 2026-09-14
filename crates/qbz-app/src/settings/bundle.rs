@@ -714,6 +714,7 @@ fn plan_audio(
                     | "stream_window_seconds"
                     | "writer_rt_priority"
                     | "cache_to_disk"
+                    | "disk_cache_mb"
             )
             || k.eq_ignore_ascii_case("volume");
         if !known {
@@ -942,10 +943,16 @@ fn plan_audio_machine(
         applied_line(plan, "audio.writer_rt_priority", v, "");
     }
 
-    // cache_to_disk — whether the L2 cache is written at all. A host preference
-    // about the storage, not about the output device.
+    // cache_to_disk / disk_cache_mb — whether the L2 cache is written at all,
+    // and how much of the card it may take. Host preferences about the storage,
+    // not about the output device. The budget travels for the same reason the L1
+    // one does: it states something about this box, and an operator moving a
+    // bundle to a second box of the same shape means it there too.
     if let Some(v) = map.get("cache_to_disk") {
         applied_line(plan, "audio.cache_to_disk", v, "");
+    }
+    if let Some(v) = map.get("disk_cache_mb") {
+        applied_line(plan, "audio.disk_cache_mb", v, "");
     }
 
     // alsa_plugin / alsa_hardware_volume / alsa_mixer_device — apply only with a
@@ -1217,6 +1224,28 @@ fn apply_audio_writes(data_root: &Path, writes: &[(&str, &Value)]) -> Result<(),
             "quality_fallback_behavior" => {
                 store.set_quality_fallback_behavior(value.as_str().unwrap_or("always_fallback"))?
             }
+            // The host/storage block. Every one of these was PLANNED — the
+            // import printed it under "applied" — and then fell through to the
+            // warn arm below and was never written, so `settings import`
+            // reported eight settings it did not make. Each takes the store's
+            // own default when the bundle's value is the wrong shape, matching
+            // how the rest of this match handles a malformed field.
+            "cache_to_disk" => store.set_cache_to_disk(as_bool(value))?,
+            "disk_cache_mb" => store.set_disk_cache_mb(value.as_u64().unwrap_or(0) as u16)?,
+            "memory_cache_mb" => store.set_memory_cache_mb(value.as_u64().unwrap_or(0) as u16)?,
+            "alsa_mixer_device" => store.set_alsa_mixer_device(value.as_str().unwrap_or(""))?,
+            "volume_curve" => {
+                store.set_volume_curve(value.as_str().unwrap_or("perceptual"))?;
+            }
+            "alsa_buffer_ms" => store.set_alsa_buffer_ms(value.as_u64().unwrap_or(0) as u16)?,
+            "dac_keepalive_ms" => store.set_dac_keepalive_ms(value.as_u64().unwrap_or(0) as u16)?,
+            "pcm_ring_ms" => store.set_pcm_ring_ms(value.as_u64().unwrap_or(0) as u32)?,
+            "writer_rt_priority" => store.set_writer_rt_priority(
+                value
+                    .as_u64()
+                    .unwrap_or(u64::from(qbz_audio::rt::DEFAULT_WRITER_RT_PRIORITY))
+                    as u8,
+            )?,
             other => log::warn!("[bundle] apply: unhandled audio key {other}"),
         }
     }

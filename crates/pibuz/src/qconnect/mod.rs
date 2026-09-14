@@ -267,9 +267,15 @@ impl DaemonQconnectService {
         }
 
         // T10 (OD4, §7.4): if locked volume mode, pin the player to 100% (1.0)
-        // at connect time. Harmless no-op on bit-perfect backends (ALSA-direct
-        // hw_volume=false, JACK, DoP/DSD), corrects Rodio backends (PipeWire/
-        // Pulse) where Player default is 0.75 (not 1.0).
+        // at connect time. Corrects Rodio backends (PipeWire/Pulse), where the
+        // Player default is 0.75 rather than 1.0.
+        //
+        // This USED to be described as a harmless no-op on ALSA-direct with
+        // hw_volume=false, and it is not: that branch stores a software gain for
+        // the writer thread now (`PlaybackEngine::set_volume`) instead of doing
+        // nothing, so unity here is load-bearing rather than decorative. The
+        // matching guard is in `session::deferred_renderer_join`, which must not
+        // undo this pin with `qconnect.initial_volume`.
         if volume_mode == engine::VolumeMode::Locked {
             if let Err(err) = self.runtime.core().set_volume(1.0) {
                 log::warn!("[QConnect] failed to pin volume to 100% at connect: {err}");

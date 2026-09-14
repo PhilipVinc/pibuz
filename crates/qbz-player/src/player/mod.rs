@@ -5013,7 +5013,12 @@ impl Player {
             log::info!("[Player] L2 disk cache: off (audio.cache_to_disk) — nothing is written to the card");
             Arc::new(qbz_cache::AudioCache::new(l1_max_bytes))
         } else {
-            match qbz_cache::PlaybackCache::new(800 * 1024 * 1024) {
+            let l2_mb = match audio_settings.disk_cache_mb {
+                0 => qbz_audio::settings::DEFAULT_DISK_CACHE_MB,
+                mb => mb,
+            };
+            log::info!("[Player] L2 disk cache: {l2_mb} MB (audio.disk_cache_mb)");
+            match qbz_cache::PlaybackCache::new(u64::from(l2_mb) * 1024 * 1024) {
                 Ok(pc) => Arc::new(qbz_cache::AudioCache::with_playback_cache(
                     l1_max_bytes,
                     Arc::new(pc),

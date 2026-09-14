@@ -281,6 +281,14 @@ enum SettingsCmd {
     },
     Set {
         key: String,
+        /// `allow_hyphen_values` because a setting's value may legitimately
+        /// start with `-`: `audio.normalization_target_lufs` is NEGATIVE at
+        /// every usable setting, its own default included. Without this, clap
+        /// reads `-14` as an unknown short flag and
+        /// `settings set audio.normalization_target_lufs -14` fails with
+        /// "unexpected argument '-1' found" — the one key the CLI could not
+        /// write at all, and the failure looked like a typo rather than a bug.
+        #[arg(allow_hyphen_values = true)]
         value: String,
     },
 }

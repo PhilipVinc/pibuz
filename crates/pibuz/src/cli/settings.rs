@@ -58,6 +58,25 @@ pub enum ApplyClass {
 /// `playback.*` (daemon_prefs.streaming_quality + `PlaybackPreferencesStore`),
 /// `qconnect.*` (the daemon-root `qconnect_settings.db` KV, T9),
 /// `hooks.*` (daemon_prefs, CONSOLE ext).
+///
+/// **A key belongs here only if the daemon READS it.** Six were dropped in 2.4
+/// because nothing outside the settings plumbing itself consumed them — they
+/// were desktop settings that survived the unwind, offering the operator a
+/// control that did nothing:
+///
+/// | dropped key | why it does nothing here |
+/// |---|---|
+/// | `audio.quality_fallback_behavior` | no tier-retry path; quality comes straight from `playback.quality` |
+/// | `audio.allow_quality_fallback` | the gate for that same absent path |
+/// | `audio.limit_quality_to_device` | the desktop's request-time resolution, which pibuz does not have |
+/// | `audio.device_max_sample_rate` | only fed the limiter above (still compared by `daemon::audio_routing_changed`, never set here) |
+/// | `audio.sync_audio_on_startup` | worked around a Flatpak stale-settings case with no daemon analogue |
+/// | `playback.show_context_icon` | a desktop UI preference; its own doc comment says so |
+///
+/// Their `AudioSettings` fields, columns and migrations all STAY, and
+/// `settings::bundle` still imports and exports them, so a bundle exported by
+/// the desktop round-trips unchanged. What went is only this CLI's offer to set
+/// them. Do not re-add one without a consumer to point at.
 const KEY_TABLE: &[(&str, ApplyClass)] = &[
     // --- audio (Reinit — 03-setup-tui.md §4.3's 9-field list) -------------
     ("audio.backend", ApplyClass::Reinit),
@@ -68,7 +87,6 @@ const KEY_TABLE: &[(&str, ApplyClass)] = &[
     ("audio.exclusive_mode", ApplyClass::Reinit),
     ("audio.dac_passthrough", ApplyClass::Reinit),
     ("audio.skip_sink_switch", ApplyClass::Reinit),
-    ("audio.device_max_sample_rate", ApplyClass::Reinit),
     // --- audio (Reload) -----------------------------------------------------
     ("audio.stream_first_track", ApplyClass::Reload),
     ("audio.stream_buffer_seconds", ApplyClass::Reload),
@@ -81,6 +99,8 @@ const KEY_TABLE: &[(&str, ApplyClass)] = &[
     ("audio.volume_curve", ApplyClass::None),
     // Read when the player builds its cache: next daemon start.
     ("audio.cache_to_disk", ApplyClass::None),
+    // Same — the L2 budget is fixed when the disk cache is constructed.
+    ("audio.disk_cache_mb", ApplyClass::None),
     // Read when a stream opens — Reinit so a change takes effect on the next
     // track rather than waiting for a daemon restart.
     ("audio.alsa_buffer_ms", ApplyClass::Reinit),
@@ -93,21 +113,16 @@ const KEY_TABLE: &[(&str, ApplyClass)] = &[
     // The promotion happens as the writer thread starts, and the value is read
     // once when the player does: next daemon start.
     ("audio.writer_rt_priority", ApplyClass::None),
-    ("audio.limit_quality_to_device", ApplyClass::Reload),
-    ("audio.allow_quality_fallback", ApplyClass::Reload),
-    ("audio.quality_fallback_behavior", ApplyClass::Reload),
     ("audio.gapless_enabled", ApplyClass::Reload),
     ("audio.normalization_enabled", ApplyClass::Reload),
     ("audio.normalization_target_lufs", ApplyClass::Reload),
     ("audio.pw_force_bitperfect", ApplyClass::Reload),
     ("audio.reserve_dac_while_running", ApplyClass::Reload),
-    ("audio.sync_audio_on_startup", ApplyClass::Reload),
     // --- playback (daemon_prefs + PlaybackPreferencesStore) ----------------
     ("playback.quality", ApplyClass::None),
     ("playback.autoplay", ApplyClass::None),
     ("playback.persist_session", ApplyClass::None),
     ("playback.resume_playback_position", ApplyClass::None),
-    ("playback.show_context_icon", ApplyClass::None),
     ("playback.mpris", ApplyClass::None),
     // --- qconnect (daemon-root qconnect_settings.db KV, T9) ----------------
     ("qconnect.device_name", ApplyClass::None),
@@ -243,38 +258,6 @@ fn parse_hook_script(v: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
-/// `audio.device_max_sample_rate`: "none"/"" clears the limit (Hz, matching
-/// the stored unit directly — e.g. `192000`, not `192` kHz).
-fn parse_opt_u32(v: &str) -> Result<Option<u32>, String> {
-    let trimmed = v.trim();
-    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
-        return Ok(None);
-    }
-    trimmed.parse::<u32>().map(Some).map_err(|_| {
-        format!("invalid sample rate '{trimmed}' — expected a Hz integer (e.g. 192000) or none")
-    })
-}
-fn render_opt_u32(v: Option<u32>) -> String {
-    v.map(|r| r.to_string())
-        .unwrap_or_else(|| "none".to_string())
-}
-
-/// The daemon has no one to ask (03-setup-tui.md §3.3.2) — `settings set`
-/// never writes `"ask"`, even though a legacy/imported store may still hold
-/// it (readable via `settings show`, just not settable back to it).
-fn parse_quality_fallback_behavior(v: &str) -> Result<String, String> {
-    match v.to_ascii_lowercase().as_str() {
-        "always_fallback" | "always_skip" => Ok(v.to_ascii_lowercase()),
-        "ask" => Err(
-            "'ask' needs a UI the daemon doesn't have — use always_fallback or always_skip"
-                .to_string(),
-        ),
-        other => Err(format!(
-            "invalid value '{other}' — expected one of: always_fallback, always_skip"
-        )),
-    }
-}
-
 fn parse_f32(v: &str) -> Result<f32, String> {
     v.trim()
         .parse::<f32>()
@@ -408,7 +391,43 @@ fn parse_volume_curve(v: &str) -> Result<String, String> {
 }
 
 /// `auto` (or `0`) hands sizing back to the host memory profile; anything else
-/// is a hard budget in MB, up to 1024.
+/// is a hard budget in MB, up to 4096.
+///
+/// The ceiling was 1024, which was under what the hardware in the field can
+/// hold: an 8 GB Pi 5 running this as a renderer has room for a 2 GB L1, and
+/// moOde's own cache-size control offers exactly that. The old cap rejected it
+/// with no visible effect — `settings set` failed, the caller discarded the exit
+/// status, and the box kept whatever budget it already had.
+///
+/// 4096 rather than no cap at all: past that this stops being a cache budget and
+/// starts being a way to OOM a renderer, and `auto` remains the right answer for
+/// everyone who has not measured their own box.
+/// `auto` (or `0`) takes [`qbz_audio::settings::DEFAULT_DISK_CACHE_MB`];
+/// anything else is a hard budget in MB, 100-65535.
+///
+/// The floor is 100 MB rather than 0 because, unlike the L1 budget, a tiny L2 is
+/// not a smaller cache — it is a cache that refuses every Hi-Res track it is
+/// offered and writes the card for nothing. Below one track's size
+/// (`PlaybackCache::insert` rejects anything over the cap) the right way to say
+/// "do not use the disk" is `audio.cache_to_disk false`, which also skips
+/// building it.
+fn parse_disk_cache_mb(v: &str) -> Result<u16, String> {
+    let v = v.trim();
+    if v.eq_ignore_ascii_case("auto") {
+        return Ok(0);
+    }
+    let n: u16 = v
+        .parse()
+        .map_err(|_| format!("invalid cache size '{v}' — expected 'auto' or 100-65535 (MB)"))?;
+    if n != 0 && n < 100 {
+        return Err(format!(
+            "disk cache {n} MB is below one track — expected 'auto' or 100-65535 (MB), \
+             or 'audio.cache_to_disk false' to use no disk at all"
+        ));
+    }
+    Ok(n)
+}
+
 fn parse_memory_cache_mb(v: &str) -> Result<u16, String> {
     let v = v.trim();
     if v.eq_ignore_ascii_case("auto") {
@@ -416,10 +435,10 @@ fn parse_memory_cache_mb(v: &str) -> Result<u16, String> {
     }
     let n: u16 = v
         .parse()
-        .map_err(|_| format!("invalid cache size '{v}' — expected 'auto' or 0-1024 (MB)"))?;
-    if n > 1024 {
+        .map_err(|_| format!("invalid cache size '{v}' — expected 'auto' or 0-4096 (MB)"))?;
+    if n > 4096 {
         return Err(format!(
-            "invalid cache size '{n}' — expected 'auto' or 0-1024 (MB)"
+            "invalid cache size '{n}' — expected 'auto' or 0-4096 (MB)"
         ));
     }
     Ok(n)
@@ -516,7 +535,6 @@ fn read_all(roots: &ProfileRoots) -> Result<Vec<(&'static str, String)>, String>
             "audio.exclusive_mode" => render_bool(audio.exclusive_mode),
             "audio.dac_passthrough" => render_bool(audio.dac_passthrough),
             "audio.skip_sink_switch" => render_bool(audio.skip_sink_switch),
-            "audio.device_max_sample_rate" => render_opt_u32(audio.device_max_sample_rate),
             "audio.stream_first_track" => render_bool(audio.stream_first_track),
             "audio.stream_buffer_seconds" => audio.stream_buffer_seconds.to_string(),
             "audio.stream_window_seconds" => audio.stream_window_seconds.to_string(),
@@ -530,6 +548,13 @@ fn read_all(roots: &ProfileRoots) -> Result<Vec<(&'static str, String)>, String>
             }
             "audio.volume_curve" => audio.volume_curve.clone(),
             "audio.cache_to_disk" => render_bool(audio.cache_to_disk),
+            "audio.disk_cache_mb" => {
+                if audio.disk_cache_mb == 0 {
+                    "auto".to_string()
+                } else {
+                    audio.disk_cache_mb.to_string()
+                }
+            }
             "audio.alsa_buffer_ms" => {
                 if audio.alsa_buffer_ms == 0 {
                     "auto".to_string()
@@ -558,20 +583,15 @@ fn read_all(roots: &ProfileRoots) -> Result<Vec<(&'static str, String)>, String>
                     audio.writer_rt_priority.to_string()
                 }
             }
-            "audio.limit_quality_to_device" => render_bool(audio.limit_quality_to_device),
-            "audio.allow_quality_fallback" => render_bool(audio.allow_quality_fallback),
-            "audio.quality_fallback_behavior" => audio.quality_fallback_behavior.clone(),
             "audio.gapless_enabled" => render_bool(audio.gapless_enabled),
             "audio.normalization_enabled" => render_bool(audio.normalization_enabled),
             "audio.normalization_target_lufs" => audio.normalization_target_lufs.to_string(),
             "audio.pw_force_bitperfect" => render_bool(audio.pw_force_bitperfect),
             "audio.reserve_dac_while_running" => render_bool(audio.reserve_dac_while_running),
-            "audio.sync_audio_on_startup" => render_bool(audio.sync_audio_on_startup),
             "playback.quality" => prefs.streaming_quality.clone(),
             "playback.autoplay" => render_autoplay(playback.autoplay_mode),
             "playback.persist_session" => render_bool(playback.persist_session),
             "playback.resume_playback_position" => render_bool(playback.resume_playback_position),
-            "playback.show_context_icon" => render_bool(playback.show_context_icon),
             "playback.mpris" => render_bool(prefs.mpris_enabled),
             "qconnect.device_name" => render_opt_string(&qconnect_kv::load_device_name_at(&db)),
             "qconnect.startup_mode" => qconnect_kv::load_startup_mode_at(&db).as_str().to_string(),
@@ -692,13 +712,6 @@ pub(crate) fn write_one(
                 .set_skip_sink_switch(v)
                 .map_err(SetError::Io)?
         }
-        "audio.device_max_sample_rate" => {
-            let v = parse_opt_u32(raw).map_err(SetError::Usage)?;
-            open_audio(roots)
-                .map_err(SetError::Io)?
-                .set_device_max_sample_rate(v)
-                .map_err(SetError::Io)?
-        }
         "audio.stream_first_track" => {
             let v = parse_bool(raw).map_err(SetError::Usage)?;
             open_audio(roots)
@@ -769,32 +782,18 @@ pub(crate) fn write_one(
                 .set_cache_to_disk(v)
                 .map_err(SetError::Io)?
         }
+        "audio.disk_cache_mb" => {
+            let v = parse_disk_cache_mb(raw).map_err(SetError::Usage)?;
+            open_audio(roots)
+                .map_err(SetError::Io)?
+                .set_disk_cache_mb(v)
+                .map_err(SetError::Io)?
+        }
         "audio.volume_curve" => {
             let v = parse_volume_curve(raw).map_err(SetError::Usage)?;
             open_audio(roots)
                 .map_err(SetError::Io)?
                 .set_volume_curve(&v)
-                .map_err(SetError::Io)?
-        }
-        "audio.limit_quality_to_device" => {
-            let v = parse_bool(raw).map_err(SetError::Usage)?;
-            open_audio(roots)
-                .map_err(SetError::Io)?
-                .set_limit_quality_to_device(v)
-                .map_err(SetError::Io)?
-        }
-        "audio.allow_quality_fallback" => {
-            let v = parse_bool(raw).map_err(SetError::Usage)?;
-            open_audio(roots)
-                .map_err(SetError::Io)?
-                .set_allow_quality_fallback(v)
-                .map_err(SetError::Io)?
-        }
-        "audio.quality_fallback_behavior" => {
-            let v = parse_quality_fallback_behavior(raw).map_err(SetError::Usage)?;
-            open_audio(roots)
-                .map_err(SetError::Io)?
-                .set_quality_fallback_behavior(&v)
                 .map_err(SetError::Io)?
         }
         "audio.gapless_enabled" => {
@@ -832,13 +831,6 @@ pub(crate) fn write_one(
                 .set_reserve_dac_while_running(v)
                 .map_err(SetError::Io)?
         }
-        "audio.sync_audio_on_startup" => {
-            let v = parse_bool(raw).map_err(SetError::Usage)?;
-            open_audio(roots)
-                .map_err(SetError::Io)?
-                .set_sync_audio_on_startup(v)
-                .map_err(SetError::Io)?
-        }
         "playback.quality" => {
             let v = parse_streaming_quality(raw).map_err(SetError::Usage)?;
             let mut prefs = daemon_prefs::load_at(&roots.data);
@@ -870,13 +862,6 @@ pub(crate) fn write_one(
             open_playback(roots)
                 .map_err(SetError::Io)?
                 .set_resume_playback_position(v)
-                .map_err(SetError::Io)?
-        }
-        "playback.show_context_icon" => {
-            let v = parse_bool(raw).map_err(SetError::Usage)?;
-            open_playback(roots)
-                .map_err(SetError::Io)?
-                .set_show_context_icon(v)
                 .map_err(SetError::Io)?
         }
         "qconnect.device_name" => qconnect_kv::persist_device_name_at(
@@ -1635,15 +1620,12 @@ mod tests {
             "read_all must cover every canonical key"
         );
         for (key, value) in &values {
-            // The one documented exception (03-setup-tui.md §3.3.2): a fresh
-            // (or desktop-imported) store's `quality_fallback_behavior`
-            // column defaults to `"ask"`, which `set` correctly REJECTS —
-            // "the daemon has no one to ask... the TUI never writes ask".
-            // `show` must still be able to READ it; the round-trip property
-            // is deliberately one-way for this single value.
-            if *key == "audio.quality_fallback_behavior" && value == "ask" {
-                continue;
-            }
+            // No exceptions any more. The one that used to live here was
+            // `audio.quality_fallback_behavior`, whose store default of `"ask"`
+            // `show` could read but `set` correctly refused — a one-way key in
+            // a table whose whole promise is that it round-trips. It left the
+            // table with the rest of the inert keys, and the property is total
+            // again: every value `show` prints, `set` accepts back.
             write_one(&roots, key, value).unwrap_or_else(|e| {
                 panic!("show's own value for '{key}' ('{value}') was rejected by set: {e}")
             });
@@ -1793,20 +1775,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_quality_fallback_behavior_rejects_ask() {
-        assert_eq!(
-            parse_quality_fallback_behavior("always_fallback"),
-            Ok("always_fallback".into())
-        );
-        assert_eq!(
-            parse_quality_fallback_behavior("always_skip"),
-            Ok("always_skip".into())
-        );
-        let err = parse_quality_fallback_behavior("ask").unwrap_err();
-        assert!(err.contains("needs a UI"), "{err}");
-    }
-
-    #[test]
     fn parse_streaming_quality_matches_the_four_canonical_keys() {
         for ok in ["mp3", "cd", "hires", "hires_plus"] {
             assert!(parse_streaming_quality(ok).is_ok(), "{ok}");
@@ -1835,11 +1803,26 @@ mod tests {
     }
 
     #[test]
-    fn parse_opt_u32_clears_on_none_or_empty() {
-        assert_eq!(parse_opt_u32(""), Ok(None));
-        assert_eq!(parse_opt_u32("none"), Ok(None));
-        assert_eq!(parse_opt_u32("192000"), Ok(Some(192_000)));
-        assert!(parse_opt_u32("loud").is_err());
+    fn cache_budgets_accept_what_the_shipped_uis_offer() {
+        // The L1 cap was 1024, under moOde's own "2 GB" option — which meant
+        // picking it failed and left the previous budget in place, invisibly.
+        assert_eq!(parse_memory_cache_mb("auto"), Ok(0));
+        assert_eq!(parse_memory_cache_mb("512"), Ok(512));
+        assert_eq!(parse_memory_cache_mb("2048"), Ok(2048));
+        assert_eq!(parse_memory_cache_mb("4096"), Ok(4096));
+        assert!(parse_memory_cache_mb("5000").is_err());
+        assert!(parse_memory_cache_mb("lots").is_err());
+
+        // The L2 budget: `auto` takes the shipped default, and a value too
+        // small to hold one track is refused rather than silently caching
+        // nothing while still writing the card.
+        assert_eq!(parse_disk_cache_mb("auto"), Ok(0));
+        assert_eq!(parse_disk_cache_mb("0"), Ok(0));
+        assert_eq!(parse_disk_cache_mb("100"), Ok(100));
+        assert_eq!(parse_disk_cache_mb("4000"), Ok(4000));
+        let err = parse_disk_cache_mb("50").unwrap_err();
+        assert!(err.contains("below one track"), "{err}");
+        assert!(err.contains("cache_to_disk"), "{err}");
     }
 
     #[test]

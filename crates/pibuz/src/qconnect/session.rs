@@ -211,6 +211,29 @@ pub async fn bootstrap_remote_presence(
     Ok(())
 }
 
+/// The join-time volume to actually apply, as a 0.0-1.0 fraction, or `None` to
+/// leave the player where it is. Named so the decision can be tested.
+///
+/// `qconnect.initial_volume` exists so a controller that has never spoken to
+/// this renderer cannot push its own remembered level — near full scale on the
+/// phone apps — at a system that may have no volume control after us.
+///
+/// It does NOT apply in `Locked` mode. Locked means this renderer does not
+/// attenuate: `connect()` has just pinned the player to unity for exactly that
+/// reason, and a join-time level is the attenuation the mode promises not to
+/// apply. Applying it anyway was silent and unrecoverable — the software gain
+/// landed on the bit-perfect ALSA-direct path (`hardware_volume == false` stores
+/// a gain for the writer thread; it stopped being a no-op when that branch
+/// stopped doing nothing), and `Locked` ignores the controller's SetVolume, so
+/// the listener was left quiet with a slider that did nothing. A moOde player
+/// set to fixed 0 dB output reached this on every single connect.
+fn join_volume_fraction(initial_volume: Option<u8>, mode: VolumeMode) -> Option<f32> {
+    match mode {
+        VolumeMode::Locked => None,
+        VolumeMode::Software => initial_volume.map(|pct| f32::from(pct.min(100)) / 100.0),
+    }
+}
+
 /// Deferred renderer join: called from the session loop when SESSION_STATE with a
 /// session_uuid arrives. Idempotent per uuid (P1-8). Mirrors the Tauri
 /// `deferred_renderer_join`, reading the current track duration via
@@ -358,11 +381,25 @@ pub async fn deferred_renderer_join(
     // Setting ours BEFORE the report below means the daemon and the app agree on
     // the number from the first frame, instead of the app pushing full scale at
     // a system that may have no volume control after us.
-    if let Some(percent) = initial_volume {
-        let fraction = f32::from(percent.min(100)) / 100.0;
-        log::info!("[QConnect] Join-time volume: {percent}% (qconnect.initial_volume)");
-        if let Err(err) = runtime.core().set_volume(fraction) {
-            log::warn!("[QConnect] Could not apply the join-time volume: {err}");
+    //
+    // See [`join_volume_fraction`] for why `Locked` is excluded.
+    match join_volume_fraction(initial_volume, volume_mode) {
+        Some(fraction) => {
+            log::info!(
+                "[QConnect] Join-time volume: {}% (qconnect.initial_volume)",
+                (fraction * 100.0).round() as u32
+            );
+            if let Err(err) = runtime.core().set_volume(fraction) {
+                log::warn!("[QConnect] Could not apply the join-time volume: {err}");
+            }
+        }
+        None => {
+            if let Some(percent) = initial_volume {
+                log::info!(
+                    "[QConnect] Join-time volume {percent}% not applied: volume_mode=locked \
+                     (the player stays at unity)"
+                );
+            }
         }
     }
 
@@ -417,5 +454,49 @@ pub async fn deferred_renderer_join(
     {
         let mut st = sync_state.lock().await;
         st.last_joined_session_uuid = Some(session_uuid.to_string());
+    }
+}
+
+#[cfg(test)]
+mod join_volume_tests {
+    use super::{join_volume_fraction, VolumeMode};
+
+    #[test]
+    fn software_mode_applies_the_configured_percentage() {
+        assert_eq!(
+            join_volume_fraction(Some(10), VolumeMode::Software),
+            Some(0.10)
+        );
+        assert_eq!(
+            join_volume_fraction(Some(100), VolumeMode::Software),
+            Some(1.0)
+        );
+    }
+
+    #[test]
+    fn locked_mode_never_attenuates() {
+        // The regression this guards: moOde with `mpdmixer == 'none'` sends
+        // volume_mode=locked AND initial_volume=10, and the listener ended up
+        // at 10 % on a fixed-output chain with a slider that could not raise it
+        // (Locked ignores the controller's SetVolume).
+        assert_eq!(join_volume_fraction(Some(10), VolumeMode::Locked), None);
+        assert_eq!(join_volume_fraction(Some(100), VolumeMode::Locked), None);
+    }
+
+    #[test]
+    fn unset_leaves_the_player_alone_in_either_mode() {
+        assert_eq!(join_volume_fraction(None, VolumeMode::Software), None);
+        assert_eq!(join_volume_fraction(None, VolumeMode::Locked), None);
+    }
+
+    #[test]
+    fn an_out_of_range_percentage_cannot_amplify() {
+        // `load_initial_volume_at` already filters to 1..=100, so this is a
+        // belt-and-braces clamp rather than a reachable input — but a fraction
+        // above 1.0 would be gain, not attenuation.
+        assert_eq!(
+            join_volume_fraction(Some(200), VolumeMode::Software),
+            Some(1.0)
+        );
     }
 }

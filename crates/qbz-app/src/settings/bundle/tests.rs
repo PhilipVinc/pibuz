@@ -463,6 +463,49 @@ fn roundtrip_same_box_is_noop() {
 }
 
 #[test]
+fn every_host_storage_key_the_plan_claims_is_actually_written() {
+    // The regression: nine audio keys were PLANNED — each printed under
+    // "applied" — and then hit `other => log::warn!("unhandled audio key")` in
+    // `apply_audio_writes`, so `settings import` reported settings it never
+    // made. A plan line and a store write are two different things, and the
+    // only honest test reads the store back.
+    let p = scratch("host-storage-apply");
+    let bundle = bundle_with(json!({
+        "audio": {
+            "cache_to_disk": false,
+            "disk_cache_mb": 1500,
+            "memory_cache_mb": 256,
+            "alsa_mixer_device": "hw:2",
+            "volume_curve": "linear",
+            "alsa_buffer_ms": 750,
+            "dac_keepalive_ms": 60,
+            "pcm_ring_ms": 4000,
+            "writer_rt_priority": 9
+        }
+    }));
+
+    let plan = plan(&bundle, &p, &ImportOptions::default(), &live()).expect("plan");
+    apply(&plan, &p, None).expect("apply");
+
+    let stored = read_audio_settings(&p.data_root).expect("read back the audio store");
+    assert!(!stored.cache_to_disk);
+    assert_eq!(stored.disk_cache_mb, 1500);
+    assert_eq!(stored.memory_cache_mb, 256);
+    assert_eq!(stored.volume_curve, "linear");
+    assert_eq!(stored.alsa_buffer_ms, 750);
+    assert_eq!(stored.dac_keepalive_ms, 60);
+    assert_eq!(stored.pcm_ring_ms, 4000);
+    assert_eq!(stored.writer_rt_priority, 9);
+    // alsa_mixer_device rides the ALSA device gate, so it is planned as a skip
+    // without one — assert only that the plan and the store agree about it.
+    if find(&plan.applied, "audio.alsa_mixer_device").is_some() {
+        assert_eq!(stored.alsa_mixer_device, "hw:2");
+    }
+
+    cleanup(&p);
+}
+
+#[test]
 fn remember_last_maps_to_on_in_adapted() {
     // §5.5: startup_mode remember_last → on (daemon has no last-state tracking).
     let p = scratch("remember");
