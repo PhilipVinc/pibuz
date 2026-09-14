@@ -3,7 +3,7 @@
 Notable changes per release. Versions are plain semver; releases are `vX.Y.Z`
 tags on `main`.
 
-## 2.4.0-rc.2 — unreleased
+## 2.4.0-rc.3 — unreleased
 
 **The project is now Pibuz and the binary is `pibuz`** — see *Renamed* below
 for what an upgrade has to touch (little: the unit file) and what it keeps (the
@@ -45,6 +45,23 @@ different programs at the same path. The project is **Pibuz** and the binary is
   `QBZ (<hostname>)`. The device identity is the `device_uuid`, not the name,
   so this renames the existing endpoint rather than creating a second one.
   `QBZ_QCONNECT_DEVICE_BRAND` / `_MODEL` / `_NAME` still override all three.
+
+### Changed
+
+- **The JACK output backend is now off by default.** It moved behind a `jack`
+  feature on `qbz-audio`, so released builds no longer offer it and no longer
+  carry libjack. JACK is a routing tool — it makes the daemon a patchable
+  client in a graph, at the cost of resampling to the graph's one fixed rate —
+  and a headless bit-perfect endpoint has no use for it. Building with
+  `--features qbz-audio/jack` restores it unchanged.
+
+  Two things this buys anyone compiling from source, as moOde does on the
+  device. `libjack-jackd2-dev` is no longer a build requirement: `jack-sys`
+  fails its build script without `jack.pc`, so merely having the crate in the
+  graph forced that package onto every builder. And a crash is gone — the
+  `jack` crate dlopens libjack rather than linking it, through an `unwrap()`
+  that PANICS on a machine without it, which was reachable whenever a package
+  was built on one box and installed on another.
 
 ### Fixed (release)
 
