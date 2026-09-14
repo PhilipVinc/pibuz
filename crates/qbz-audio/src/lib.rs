@@ -56,7 +56,13 @@ pub mod device_reservation;
 pub mod diagnostic;
 pub mod dynamic_amplify;
 pub mod health;
-#[cfg(target_os = "linux")]
+// `jack_backend` is the real client when the `jack` feature is on, and a
+// stub that only knows how to fail when it is off. Same module path and same
+// `JackStream` type either way, so every caller is cfg-free.
+#[cfg(all(target_os = "linux", feature = "jack"))]
+pub mod jack_backend;
+#[cfg(all(target_os = "linux", not(feature = "jack")))]
+#[path = "jack_unavailable.rs"]
 pub mod jack_backend;
 pub mod loudness;
 pub mod loudness_analyzer;

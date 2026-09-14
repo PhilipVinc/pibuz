@@ -21,8 +21,11 @@
 # workflow's `system deps` step, and it is short on purpose. libssl-dev,
 # libdbus-1-dev, clang/libclang-dev and cmake all used to be here and none was
 # ever used: TLS is rustls, MPRIS is zbus, nothing runs bindgen, and aws-lc-sys
-# builds its C with cc on aarch64. The GUI stack is absent for the older
-# reason: pibuz is the slint-free column and links none of it.
+# builds its C with cc on aarch64. libjack-jackd2-dev left with them when the
+# JACK backend became qbz-audio's off-by-default `jack` feature — jack-sys
+# cannot even BUILD without jack.pc, so its mere presence in the graph was the
+# cost. The GUI stack is absent for the older reason: pibuz is the slint-free
+# column and links none of it.
 FROM ubuntu:22.04
 
 ARG RUST_TOOLCHAIN=stable
@@ -30,7 +33,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential pkg-config \
-      libasound2-dev libjack-jackd2-dev \
+      libasound2-dev \
       curl ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 

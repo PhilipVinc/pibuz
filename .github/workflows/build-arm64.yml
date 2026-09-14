@@ -18,7 +18,7 @@ jobs:
           ref: ${{ inputs.ref }}
       - uses: dtolnay/rust-toolchain@stable
       - name: system deps
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libjack-jackd2-dev
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - name: tests (pibuz + models + daemon prefs)
         # qbz-app's shell::tests hit a long-standing reqwest TLS-provider
         # panic that predates this tree, so scope qbz-app to its settings tests.

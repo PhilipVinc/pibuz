@@ -28,19 +28,27 @@ REPO="$(pwd)"
 TARGET="aarch64-unknown-linux-gnu"
 OUT="$REPO/dist/pibuz-aarch64-linux"
 
-# Native deps for the DAEMON only: audio (ALSA/JACK; PipeWire is reached through
-# its ALSA shim), and pkg-config to probe for both. That is the whole list.
+# Native deps for the DAEMON only: ALSA (PipeWire is reached through its ALSA
+# shim), and pkg-config to probe for it. That is the whole list.
 #
-# Four packages this used to carry are NOT needed, each checked by removing it
+# Five packages this used to carry are NOT needed, each checked by removing it
 # and rebuilding the crate that would have wanted it: libssl-dev (TLS is
 # rustls, nothing resolves openssl-sys), libdbus-1-dev (MPRIS is mpris-server
 # on zbus, pure Rust), clang/libclang-dev (nothing runs bindgen), and cmake
-# (aws-lc-sys builds its C with cc on this target). The GUI stack the desktop
-# needs (fontconfig, freetype, xkbcommon, wayland, xcb, GL, EGL) is absent for
-# the same reason it always was — pibuz links none of it.
+# (aws-lc-sys builds its C with cc on this target).
+#
+# libjack-jackd2-dev went with them once the JACK backend became the off-by-
+# default `jack` feature of qbz-audio. jack-sys hard-fails its build script
+# without jack.pc, so having it in the graph AT ALL made libjack a build
+# requirement — for a backend a headless endpoint can never open. Building with
+# `--features qbz-audio/jack` needs it back; test-crates.yml does exactly that.
+#
+# The GUI stack the desktop needs (fontconfig, freetype, xkbcommon, wayland,
+# xcb, GL, EGL) is absent for the same reason it always was — pibuz links none
+# of it.
 DEPS=(
   build-essential pkg-config
-  libasound2-dev libjack-jackd2-dev
+  libasound2-dev
 )
 
 # Mode selection. Keyed on the OS *first*: `uname -m` alone reports "arm64" on

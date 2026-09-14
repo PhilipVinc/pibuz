@@ -44,9 +44,12 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          # pibuz links ALSA and JACK (qbz-audio); that is all the workspace
-          # needs. It does NOT link D-Bus or OpenSSL - MPRIS is mpris-server on
-          # zbus and TLS is rustls, so neither libdbus-1-dev nor libssl-dev has
+          # ALSA is what the default build links. libjack-jackd2-dev is here
+          # ONLY for the `jack`-feature check below: the shipped build no longer
+          # needs it (qbz-audio gates JACK behind an off-by-default feature), but
+          # jack-sys cannot BUILD without jack.pc, so exercising that path needs
+          # the dev package. No D-Bus or OpenSSL - MPRIS is mpris-server on zbus
+          # and TLS is rustls, so neither libdbus-1-dev nor libssl-dev has
           # anything to satisfy (`cargo tree --workspace --all-features` resolves
           # no dbus-sys and no openssl-sys on either linux target).
           # mold matches the release linker for faster test-binary link.
@@ -99,6 +102,25 @@ jobs:
           ./scripts/cargo-test.sh
           END=$(date +%s)
           echo "cargo test wall time: $((END - START))s"
+
+      # The JACK backend is off by default, so nothing else in CI would notice
+      # if jack_backend.rs stopped compiling. Check it explicitly -- the desktop
+      # tree shares this crate and still turns the feature on.
+      - name: jack feature still builds
+        run: cargo clippy -p qbz-audio -p qbz-player -p pibuz --features qbz-audio/jack -- -D warnings
+
+      # ...and the converse: the DEFAULT build must not drag libjack back in.
+      # jack-sys is the whole reason libjack-jackd2-dev was ever a build dep, so
+      # a stray `default-features` or a new dep re-enabling it would silently
+      # restore that requirement for everyone building pibuz from source.
+      - name: default build stays jack-free
+        run: |
+          set -euo pipefail
+          hits=$(cargo tree -p pibuz -e normal,build \
+                 | grep -E '\bjack(-sys)? v' || true)
+          if [ -n "$hits" ]; then
+            echo "::error::default pibuz graph resolves JACK:"; echo "$hits"; exit 1
+          fi
 
       # The UI crates are deleted in this fork; the gate stays so a Slint
       # dependency can never re-enter pibuz's graph through a crates.io dep.

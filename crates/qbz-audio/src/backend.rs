@@ -301,8 +301,14 @@ impl BackendManager {
 
             // JACK (#263 Tier 3): offered now that the player wiring is in place
             // (StreamType::Jack + dispatch + PlaybackEngine::Jack feeder/resampler).
-            // The binary links libjack, so reaching here means it is present;
-            // opening the client fails gracefully if no JACK server is reachable.
+            // Only when compiled in -- the old note here claimed "the binary links
+            // libjack, so reaching here means it is present", which was never true:
+            // the `jack` crate's default `dynamic_loading` feature dlopens it, so a
+            // box without libjack got a panic out of jack-sys rather than an error.
+            // Gating the offer on the feature means a build that cannot open JACK
+            // does not advertise it. With the feature on, opening still fails
+            // gracefully when no JACK server is reachable.
+            #[cfg(feature = "jack")]
             backends.push(AudioBackendType::Jack);
         }
 

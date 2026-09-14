@@ -59,10 +59,9 @@ alsa-sys = "0.4"
 # secret-service/souvlaki and avoid duplicate zbus compiles.
 zbus = { version = "4", default-features = false, features = ["tokio"] }
 # JACK native backend (#263 Tier 3): QBZ as a first-class JACK client with stable
-# ports. Links libjack (provided by pipewire-jack on the rig). TODO(distribution):
-# feature-gate for Flatpak/distro builds that may not ship libjack — not blocking
-# while Tauri isn't being released.
-jack = "0.13"
+# ports, for patching into qjackctl / qpwgraph / Reaper. Behind the `jack`
+# feature and OFF by default -- see [features] below.
+jack = { version = "0.13", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # CoreAudio for device probing, sample rate switching, and (future) hog mode / exclusive mode
@@ -71,3 +70,25 @@ objc2-core-audio = "0.3.2"
 
 [lints]
 workspace = true
+
+[features]
+# The JACK output backend, off by default.
+#
+# JACK is a routing tool: it makes the daemon a patchable client in a graph
+# (qjackctl, qpwgraph, Reaper), at the cost of resampling to the graph's one
+# fixed rate. Desktop builds want it; a headless bit-perfect endpoint does not,
+# and `pibuz` on moOde is exactly that -- ALSA straight to a `hw:` device, no
+# JACK server anywhere on the box.
+#
+# Off by default because the dependency is not free when unused. `jack-sys`'s
+# build script runs `pkg_config::find_library("jack").unwrap()` on Linux, so
+# merely having it in the graph makes libjack's DEV package a hard build
+# requirement -- an extra apt install on every device that compiles pibuz from
+# source, for a backend it can never open.
+#
+# It is also not inert at runtime. The `jack` crate enables `dynamic_loading`
+# by default, so nothing links libjack; jack-sys dlopens it on first use,
+# through a `lazy_static` whose initialiser is `crate::library().unwrap()`. On
+# a box without libjack that is a panic, not the `Err` the player's dispatch is
+# written to handle. Compiling the backend out removes the panic path entirely.
+jack = ["dep:jack"]
