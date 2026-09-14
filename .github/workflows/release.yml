@@ -56,7 +56,12 @@ jobs:
             echo "Not a tag ref ($REF_NAME) — nothing to publish, skipping the check."
             exit 0
           fi
-          git fetch --no-tags --depth=0 origin +refs/heads/main:refs/remotes/origin/main
+          # No --depth: the checkout above already has full history
+          # (fetch-depth: 0), and `git fetch --depth=0` is not "no limit", it is
+          # an error — "fatal: depth 0 is not a positive number". This job died
+          # on that line for every tag ever pushed, which is half of why no
+          # release was ever published.
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
           if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
             echo "::error::Tag $REF_NAME points at $GITHUB_SHA, which is not an ancestor of main. Merge to main first, then tag."
             exit 1
