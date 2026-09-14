@@ -25,9 +25,11 @@ impl JackStream {
     /// Always `Err`. The player's dispatch already renders this as
     /// "JACK backend unavailable: {e}" and falls no further.
     pub fn new(_channels: u16) -> Result<Self, String> {
-        Err("this build has no JACK support (qbz-audio was compiled without \
+        Err(
+            "this build has no JACK support (qbz-audio was compiled without \
              the `jack` feature)"
-            .to_string())
+                .to_string(),
+        )
     }
 
     pub fn sample_rate(&self) -> u32 {
