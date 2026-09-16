@@ -44,13 +44,18 @@
 
   <h2>Install or upgrade</h2>
   <pre><code>curl -fsSL https://philipvinc.github.io/pibuz/install.sh | sudo sh</code></pre>
-  <p class="note">Installs <code>pibuz</code> @VERSION@ to <code>/usr/bin</code>, writes a systemd
-  unit that runs as your own user, enables it, and reboots. Re-run it to upgrade.</p>
+  <p class="note">Installs <code>pibuz</code> @VERSION@ over whatever is on your <code>PATH</code>
+  (or into <code>/usr/local/bin</code>) and reboots. Re-run it to upgrade.</p>
+  <p class="note"><strong>On moOde</strong> that is all it does — moOde starts the daemon itself,
+  so no service is installed and Renderer Config stays in charge. A first install on moOde belongs
+  in Renderer Config → Qobuz Connect. <strong>Anywhere else</strong> it also writes and enables a
+  systemd unit, so pibuz comes up at boot.</p>
 
   <h2>Options</h2>
   <pre><code>curl -fsSL https://philipvinc.github.io/pibuz/install.sh | sudo sh -s -- --no-reboot
                                                               --version 2.4.0
-                                                              --user pi</code></pre>
+                                                              --user pi
+                                                              --standalone</code></pre>
 
   <h2>What it needs</h2>
   <ul>

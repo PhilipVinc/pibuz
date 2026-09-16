@@ -18,15 +18,25 @@ Features:
 
 ## Install
 
-On moOde, a Raspberry Pi, or any 64-bit Linux box:
-
 ```bash
 curl -fsSL https://philipvinc.github.io/pibuz/install.sh | sudo sh
 ```
 
-That fetches the latest release, verifies its checksum, installs `/usr/bin/pibuz`,
-writes a systemd unit that runs as your own user, enables it and reboots. Re-run
-the same line to upgrade. It warns — and carries on — if the box is not moOde 10.x.
+Fetches the latest release for this architecture, verifies its published
+checksum, replaces whatever `pibuz` is already on `PATH` (or installs to
+`/usr/local/bin`), and reboots. Re-run the same line to upgrade.
+
+**On moOde that is all it does.** moOde starts the daemon itself — Renderer
+Config pushes the audio device, the quality cap and the event hook, then runs
+`pibuz run` — so the script installs no service and leaves that alone; the
+reboot is what hands moOde the new binary. A *first* install on moOde belongs in
+Renderer Config → Qobuz Connect → Install, which builds moOde's own package and
+wires all of that up; this script is for jumping to a release moOde does not
+offer yet, and it says so if dpkg still records an older packaged version.
+
+**Anywhere else** it also generates a systemd *system* unit for your user and
+enables it, so pibuz starts at boot without `loginctl enable-linger` and does
+not die with your SSH session.
 
 Flags go after `sh -s --`:
 
@@ -34,9 +44,9 @@ Flags go after `sh -s --`:
 curl -fsSL https://philipvinc.github.io/pibuz/install.sh | sudo sh -s -- --no-reboot
 ```
 
-`--version X.Y.Z` pins a release, `--user NAME` picks the account the daemon runs
-as (default: the invoking user, then uid 1000). Prefer to do it by hand? Every
-release tarball carries its own README with the manual steps.
+`--version X.Y.Z` pins a release, `--user NAME` sets the account the daemon runs
+as, `--standalone` forces the systemd path on a moOde box. Every release tarball
+also carries a README with the manual steps.
 
 ## Building
 
