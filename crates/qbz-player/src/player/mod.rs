@@ -4922,11 +4922,10 @@ impl Player {
         {
             let profile = qbz_models::system_capabilities::memory_profile();
             log::info!(
-                "[Player] memory profile: {:?} ({} MB RAM) — initial buffer <= {} KB, hi-res prefetch {}",
+                "[Player] memory profile: {:?} ({} MB RAM) — initial buffer <= {} KB",
                 profile.class,
                 profile.mem_total_kb / 1024,
                 profile.max_initial_buffer_bytes / 1024,
-                if profile.allow_hires_prefetch { "allowed" } else { "not allowed" },
             );
             // Whether gapless survives on this host is logged further down,
             // once the disk cache has been built: below the RAM floor it is the

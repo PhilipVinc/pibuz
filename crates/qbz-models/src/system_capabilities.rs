@@ -39,10 +39,6 @@ pub struct MemoryProfile {
     pub max_initial_buffer_bytes: usize,
     /// Concurrency cap for prefetch downloads.
     pub max_concurrent_prefetch: usize,
-    /// When false, prefetch downgrades from HiRes/UltraHiRes to Lossless
-    /// (44.1 kHz / 16-bit FLAC) so each cached track stays under ~15 MB
-    /// instead of ~60 MB.
-    pub allow_hires_prefetch: bool,
     /// Upper bound for the L1 (in-memory) audio cache. The 400 MB figure
     /// this is capped at is sized for Normal-class desktops; on a Pi 3B
     /// (1 GB total) that single subsystem could consume 40 % of RAM, which
@@ -71,8 +67,10 @@ pub struct MemoryProfile {
     /// a board that can play Hi-Res at all.
     ///
     /// Four seconds on a small board rather than six: a 512 MB Pi has no 9 MB
-    /// to spare for a Hi-Res ring, and it does not need one — `allow_hires_prefetch`
-    /// is false there, so 4 s costs 1.3 MB at CD and 2.9 MB at 24/96.
+    /// to spare for a Hi-Res ring. What the seconds cost is the RATE's, not the
+    /// class's — 4 s is 1.3 MB at CD and 2.9 MB at 24/96 — and nothing caps the
+    /// rate by class, so the 24/192 worst case is what
+    /// `the_decoded_ring_is_sized_by_class_and_stays_cheap` bounds.
     ///
     /// It was TWO, and the reasoning expired. Two seconds was chosen when a
     /// board below [`GAPLESS_MIN_TOTAL_KB`] never prefetched at all: nothing
@@ -115,9 +113,11 @@ pub struct MemoryProfile {
 /// track's own full buffer. On a 512 MB board — which reports ~439 MB — that is
 /// the OOM killer, reported on the moOde forum as a Pi 3A rebooting mid-album.
 /// Nothing stood in its way: the `allow_hires_prefetch` flag written for this
-/// is referenced only by a log line, and the memory watchdog was never built —
-/// its `MemoryPressure` snapshot and `read_memory_pressure` sat here with no
-/// caller until they were deleted.
+/// never reached the prefetch path — a log line and `/api/status` were its only
+/// readers, where it told a 1 GB Pi's owner their board did not prefetch Hi-Res
+/// while it did — and it has been deleted. The memory watchdog was never built
+/// either; its `MemoryPressure` snapshot and `read_memory_pressure` sat here
+/// with no caller until they were deleted.
 ///
 /// This is no longer the whole gate, because that allocation is no longer
 /// forced. `qbz_player`'s `plan_successor` picks the destination from the size
@@ -214,7 +214,6 @@ impl MemoryProfile {
                 prefetch_count: 5,
                 max_initial_buffer_bytes: 2 * 1024 * 1024,
                 max_concurrent_prefetch: 2,
-                allow_hires_prefetch: true,
                 audio_cache_l1_max_bytes: l1_cache_bytes_for_total_kb(mem_total_kb),
                 allow_gapless_prefetch: mem_total_kb >= GAPLESS_MIN_TOTAL_KB,
                 pcm_ring_seconds: PCM_RING_SECONDS_NORMAL,
@@ -227,7 +226,6 @@ impl MemoryProfile {
                 prefetch_count: 1,
                 max_initial_buffer_bytes: 256 * 1024,
                 max_concurrent_prefetch: 1,
-                allow_hires_prefetch: false,
                 audio_cache_l1_max_bytes: l1_cache_bytes_for_total_kb(mem_total_kb),
                 allow_gapless_prefetch: mem_total_kb >= GAPLESS_MIN_TOTAL_KB,
                 pcm_ring_seconds: PCM_RING_SECONDS_LOW_MEMORY,
@@ -331,7 +329,7 @@ pub fn memory_profile() -> &'static MemoryProfile {
         match profile.class {
             MemoryClass::LowMemory => {
                 log::info!(
-                    "[system] Low-memory profile active: {} MB total RAM, prefetch={}, max_initial_buffer={}KB, audio_cache_l1={}MB, hires_prefetch=disabled",
+                    "[system] Low-memory profile active: {} MB total RAM, prefetch={}, max_initial_buffer={}KB, audio_cache_l1={}MB",
                     profile.mem_total_kb / 1024,
                     profile.prefetch_count,
                     profile.max_initial_buffer_bytes / 1024,
@@ -408,9 +406,10 @@ mod tests {
         //
         // The ceiling was 4 MB, which 4 s exceeds at this rate. Raised rather
         // than dropped: 5.9 MB is 1.4 % of a 428 MB board, against the 73 MB
-        // (17 %) that same board already gives the L1 cache, and a LowMemory
-        // host has `allow_hires_prefetch` false — so 24/192 is the arithmetic
-        // worst case here, not the expected one. The cap is still doing its
+        // (17 %) that same board already gives the L1 cache. Nothing stops a
+        // board this size playing 24/192 — the quality cap that was supposed to
+        // is a flag no code ever read — so this is a rate the ring must really
+        // survive, not a hypothetical. The cap is still doing its
         // job: it is what would catch someone giving a 512 MB board the
         // desktop's six seconds.
         let bytes = |secs: u8| usize::from(secs) * 192_000 * 2 * 4;
@@ -467,7 +466,6 @@ SwapTotal:       2097152 kB
         assert_eq!(profile.class, MemoryClass::LowMemory);
         assert_eq!(profile.prefetch_count, 1);
         assert_eq!(profile.max_concurrent_prefetch, 1);
-        assert!(!profile.allow_hires_prefetch);
         assert!(profile.max_initial_buffer_bytes <= 256 * 1024);
         // L1 cap must be a small fraction of total RAM, not the four-tenths
         // the old flat 400 MB reserved on a 1 GB host — but big enough to
@@ -519,7 +517,6 @@ SwapTotal:       2097152 kB
         let profile = MemoryProfile::from_total_kb(2 * 1024 * 1024);
         assert_eq!(profile.class, MemoryClass::Normal);
         assert_eq!(profile.prefetch_count, 5);
-        assert!(profile.allow_hires_prefetch);
     }
 
     #[test]

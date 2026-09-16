@@ -48,7 +48,6 @@ pub struct MemoryStatus {
     /// on a 512 MB board with `audio.cache_to_disk` on the two disagree, and
     /// this is the one that answers "will my album play gapless".
     pub gapless_prefetch: bool,
-    pub hires_prefetch: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -327,7 +326,6 @@ fn assemble_live(state: &super::ApiState) -> StatusDoc {
                 kb => Some(kb),
             },
             gapless_prefetch: player.gapless_prefetch_possible(),
-            hires_prefetch: profile.allow_hires_prefetch,
         },
         cache: CacheStatus {
             l1: L1CacheStatus {
@@ -488,7 +486,6 @@ mod tests {
                 class: "normal".into(),
                 total_kb: Some(3_998_000),
                 gapless_prefetch: true,
-                hires_prefetch: true,
             },
             cache: CacheStatus {
                 l1: L1CacheStatus {

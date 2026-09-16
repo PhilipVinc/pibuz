@@ -363,8 +363,6 @@ fn memory_section(b: &mut Block, p: &Value) {
         ));
         if mem.get("gapless_prefetch").and_then(|v| v.as_bool()) == Some(false) {
             host.push_str(" · no gapless");
-        } else if mem.get("hires_prefetch").and_then(|v| v.as_bool()) == Some(false) {
-            host.push_str(" · no Hi-Res prefetch");
         }
         b.row("host", host);
     }
@@ -617,7 +615,7 @@ mod tests {
                          "last_transport_reconnect": null, "pairing": true, "pairing_port": 9100},
             "network": {"online": true},
             "memory": {"class": "normal", "total_kb": 3_998_000,
-                       "gapless_prefetch": true, "hires_prefetch": true},
+                       "gapless_prefetch": true},
             "cache": {"l1": {"tracks": 2, "bytes": 192_937_984,
                              "budget_bytes": 675_282_944, "fetching": 1},
                       "l2": {"tracks": 37, "bytes": 1_288_490_188,
@@ -839,6 +837,25 @@ mod tests {
         let block = render(&p, "127.0.0.1:8182", true);
         assert!(block.contains("host      normal profile"), "{block}");
         assert!(!block.contains("RAM"), "{block}");
+    }
+
+    /// The host row claims only what the daemon enforces. A 1 GB Pi is
+    /// LowMemory and prefetches at whatever quality the listener set — nothing
+    /// downgrades Hi-Res anywhere — so the row said "no Hi-Res prefetch" to
+    /// every owner of one for as long as it was rendered from a flag no code
+    /// read. The class and the gapless answer are the two facts left.
+    #[test]
+    fn a_low_memory_host_is_not_told_it_lost_hi_res() {
+        let mut p = healthy_payload();
+        p["memory"]["class"] = Value::from("low");
+        p["memory"]["total_kb"] = Value::from(926_832);
+        let block = render(&p, "127.0.0.1:8182", true);
+        assert!(
+            block.contains("host      905 MB RAM · low profile"),
+            "{block}"
+        );
+        assert!(!block.contains("Hi-Res"), "{block}");
+        assert!(!block.contains("no gapless"), "{block}");
     }
 
     #[test]
