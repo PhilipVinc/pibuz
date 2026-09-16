@@ -3,292 +3,101 @@
 Notable changes per release. Versions are plain semver; releases are `vX.Y.Z`
 tags on `main`.
 
-## 2.4.0 — 2026-09-15
-
-**The project is now Pibuz and the binary is `pibuz`** — see *Renamed* below
-for what an upgrade has to touch (little: the unit file) and what it keeps (the
-profile, the device identity, every `QBZ_*` hook variable).
-
-Also bounded streaming, verified on a 905 MB Pi 3B against a live Qobuz Connect
-session: the held buffer stays at 2.9 MB where it used to grow to the whole
-track, RSS while playing 24/96 went from ~125 MB to ~40 MB, and the download
-is paced at the track's own byte-rate instead of the link's.
-
-### Renamed
-
-The daemon shipped as `μqbzd`/`muqbzd` with a `qbzd` binary. Both names were
-unpronounceable, had two spellings between them, and `qbzd` collided with the
-binary of the desktop project this tree forked from — installing both put two
-different programs at the same path. The project is **Pibuz** and the binary is
-**`pibuz`**.
-
-- **Binary, crate and unit file** are `pibuz` / `pibuz.service`. Release assets
-  are `pibuz-<version>-linux-<arch>.tar.gz`, unpacking to a directory of the
-  same name holding `pibuz`. Update `ExecStart=` to the new path, and the unit
-  name you enable.
-- **Profile directories** are `~/.config/pibuz`, `~/.local/share/pibuz`,
-  `~/.cache/pibuz`, with the config file `pibuz.toml`. **An existing `qbzd`
-  profile keeps being used as-is** when the `pibuz` one is absent — that
-  directory holds the persisted QConnect `device_uuid` and the audio settings,
-  so an upgrade stays the same device in the Qobuz app and keeps its
-  bit-perfect configuration. Nothing is copied or moved; rename the directory
-  yourself whenever you want to, with the daemon stopped.
-- **Every `QBZ_*` and `QBZD_*` environment variable is unchanged** — hook
-  scripts written against `QBZ_EVENT`, `QBZ_ARTIST` and friends keep working
-  untouched, and so do `QBZD_HOST`, `QBZD_TOKEN`, `QBZD_HOOK` and `QBZD_MPRIS`.
-- **MPRIS** now publishes `org.mpris.MediaPlayer2.pibuz`. It used to claim the
-  desktop application's `com.blitzfc.qbz` bus name, which meant the two could
-  not be on one session bus and a controller could not tell which had answered.
-  Anything that addressed the daemon by the old name needs the new one.
-- **The Connect device** advertises brand and model `Pibuz`, and a box that
-  never set a custom device name is now `Pibuz (<hostname>)` instead of
-  `QBZ (<hostname>)`. The device identity is the `device_uuid`, not the name,
-  so this renames the existing endpoint rather than creating a second one.
-  `QBZ_QCONNECT_DEVICE_BRAND` / `_MODEL` / `_NAME` still override all three.
-
-### Changed
-
-- **The JACK output backend is now off by default.** It moved behind a `jack`
-  feature on `qbz-audio`, so released builds no longer offer it and no longer
-  carry libjack. JACK is a routing tool — it makes the daemon a patchable
-  client in a graph, at the cost of resampling to the graph's one fixed rate —
-  and a headless bit-perfect endpoint has no use for it. Building with
-  `--features qbz-audio/jack` restores it unchanged.
-
-  Two things this buys anyone compiling from source, as moOde does on the
-  device. `libjack-jackd2-dev` is no longer a build requirement: `jack-sys`
-  fails its build script without `jack.pc`, so merely having the crate in the
-  graph forced that package onto every builder. And a crash is gone — the
-  `jack` crate dlopens libjack rather than linking it, through an `unwrap()`
-  that PANICS on a machine without it, which was reachable whenever a package
-  was built on one box and installed on another.
-
-### Fixed (release)
-
-- **Tagging a release actually publishes one.** Two tag conventions were in use
-  — `vX.Y.Z` for the project's own releases, and `qbzd-v2.0.2.moodeNN` for the
-  builds the moOde installer downloads — and the workflow ended up half on each:
-  it triggered on `v*` while the publish job required a `refs/tags/qbzd-v*`
-  ref, which no single tag can satisfy. So a `vX.Y.Z` tag built both
-  architectures, uploaded the artifacts and skipped the Release, and a
-  `qbzd-v*` tag did not start the workflow at all.
-
-  **The `.moodeN` series is retired**: a build for moOde is a release like any
-  other, tagged `vX.Y.Z`. It existed because the version needed a counter the
-  Cargo version could not hold, and the cost was a base that stopped being
-  updated — the last one went out as `2.0.2.moode57` from a 2.4.0 tree, so the
-  binary announced a version its source had not been at for months.
-
-- **A tag that disagrees with `Cargo.toml` is rejected**, so an asset named
-  `pibuz-2.5.0-…` can no longer hold a binary that reports 2.4.0.
-  `scripts/bump-version.sh` sets the version, the lock and the CHANGELOG
-  heading together, and `--check` verifies them before you tag.
-
-- **`QBZD_BUILD_ID` is `PIBUZ_BUILD_ID`, and CI no longer sets it.** It exists
-  so a build can report a version `Cargo.toml` cannot hold, which was the
-  `.moodeN` suffix; with that gone and the tag pinned, stamping a release would
-  only set the value `CARGO_PKG_VERSION` already has. `scripts/pibuz-to-pi.sh`
-  still uses it for the case that remains genuinely unrepresentable —
-  `2.4.0.local-<sha>-dirty` on a Pi built from a working tree. It is
-  compile-time only, which is why it could be renamed at all: the `QBZD_*`
-  names read from the environment at RUNTIME (`QBZD_HOOK`, `QBZD_HOST`,
-  `QBZD_MPRIS`, `QBZD_TOKEN`) are set by other people's scripts and stay.
-  The dev-script variables (`QBZD_PI`, `QBZD_BIN`, `QBZD_TEST_PORT`, the
-  build-image and volume overrides) take `PIBUZ_*` names too, each still
-  accepting its old name as a fallback.
-
-### Removed
-
-- **Six settings keys the daemon never read.** `audio.quality_fallback_behavior`,
-  `audio.allow_quality_fallback`, `audio.limit_quality_to_device`,
-  `audio.device_max_sample_rate`, `audio.sync_audio_on_startup` and
-  `playback.show_context_icon` are gone from `settings show`, `settings set` and
-  the TUI. Every one was a desktop setting that survived the unwind: outside the
-  settings plumbing their only references were in a reload test, so moving them
-  changed nothing audible. There is no tier-retry path in this daemon at all —
-  quality comes straight from `playback.quality` — which is what the first two
-  were gating.
-
-  **A script setting one of these now gets exit 2 and the list of valid keys.**
-  The fields, columns and migrations all stay, and `settings import` still
-  accepts and applies them, so a bundle exported by the desktop round-trips
-  unchanged. The TUI's Playback screen loses four rows with them, and with the
-  retry-on-failure row goes the `ask` rendering rule — so the one documented
-  exception to `settings show --json` round-tripping back into `settings set` is
-  gone too, and that property is now total.
-
-### Changed
-
-- **The disk cache no longer deletes a track the player is holding.** Playback
-  stopped dead on a Pi with the transport reporting *paused* that nobody asked
-  for, and every retry failing with `cannot resume - cached file ... No such
-  file or directory`. The player had a `TrackAudio::File` path for its gapless
-  successor; the next successor's insert evicted that entry by LRU and deleted
-  the file underneath it.
-
-  `PlaybackCache` now takes a pinned set — the playing track and the one being
-  staged — and never evicts it. An insert that could only be satisfied by
-  evicting a live entry is refused instead, the way an oversized track already
-  was: a track the cache declines is re-fetched, a file deleted under an open
-  path kills playback until the next cast.
-
-  This is not an edge case on the boards it matters for. Gapless on a 512 MB
-  host *is* gapless-via-disk, and a Hi-Res pair is 300-450 MB against a
-  400-800 MB budget, so nearly every successor insert has to evict something.
-- **A low-memory board's decoded ring is 4 seconds, was 2.** That figure was
-  chosen when a board below the gapless floor never prefetched: nothing else
-  touched the card while a track played, so the only stalls to absorb were the
-  network's. Those boards now stream an oversized successor to the card *during*
-  playback — that is what gapless on 512 MB is — and the ring has to cover an
-  ~85 MB SD write running beside the decode.
-
-  Measured on a Pi 3B forced to a 3A profile (`QBZ_FORCE_MEM_TOTAL_KB=439000`)
-  playing 24/48 with the disk cache on: three `decoded ring fell to 2192 frames`
-  warnings in the first two minutes, two of them inside a successor's spill
-  write, none once the card went idle. No xrun and nothing audible, so this is
-  margin rather than a fix for a symptom — but 46 ms left of a 2 s ring is not
-  the cushion the number is supposed to be. Costs 1.3 MB at CD and 2.9 MB at
-  24/96, against the 73 MB L1 the same board already gets.
-- **`audio.disk_cache_mb` sizes the L2 disk cache.** It was
-  `PlaybackCache::new(800 * 1024 * 1024)` — a literal at the construction site,
-  invisible and unchangeable, and the single number deciding how much of the
-  card this daemon occupies on exactly the small boards that route their cache
-  to disk because they have no RAM for it. `auto` keeps the 800 MB it always
-  had. Refused below 100 MB: under one track's size a cache declines everything
-  it is offered while still writing the card, and the honest way to say "no
-  disk" is `audio.cache_to_disk false`.
-- **`audio.memory_cache_mb` accepts up to 4096 MB**, was 1024. The old cap was
-  under what shipping UIs already offered, so choosing 2 GB failed and left the
-  previous budget in place — silently, for any caller that does not check the
-  exit status.
-- **`pibuz status` is a sectioned block, and it reports what the daemon knows
-  about its own memory.** The five `·`-joined lines ran to 95 columns and wrapped
-  on a narrow terminal; the block is now labelled rows under `audio`, `playback`
-  and `qconnect`, none wider than 72 columns, and a row the daemon has no answer
-  for is omitted rather than printed empty — an idle daemon is a short block.
-  Three things it already knew but never showed are now on it: whether the
-  device is *open*, whether this box is the session's **active renderer** (a
-  controller switching to its own speakers leaves us connected and silent, which
-  looked identical on every other field), and whether the pairing listener is
-  serving.
-  `pibuz status -v` adds `memory` and `buffers`: L1 and L2 cache occupancy
-  against the budget actually in force, the host's memory class, the compressed
-  window, the initial buffer cap and the decoded ring depth — the figures that
-  explain a dropout, resolved daemon-side so asking a Pi from a laptop reports
-  the *Pi's* class. `--json` is the whole payload either way.
-- **`/api/status` gained `memory`, `cache` and `buffers`** plus
-  `playback.buffer_progress`, `.gapless_ready`, `.gapless_next_track_id` and
-  `.normalization_gain`. Additive only — every documented key still means what
-  it meant, so no `api_version` bump, and `/api/now-playing` (the endpoint an
-  overlay actually polls) is untouched.
-- **Gapless on 512 MB boards.** A Pi 3A / Zero 2 W was refused gapless outright
-  by a RAM floor that argued a prefetch is a whole track allocated in memory.
-  That stopped being true when the download started choosing its destination
-  from the size the CMAF segment table declares: a successor too big for the L1
-  budget is streamed to the card as it decrypts and handed over as a path, and
-  an L1 or L2 cache hit never allocated one at all. Such a board now gets
-  gapless **when `audio.cache_to_disk` is on**, and still does not when it is
-  off — there a successor has nowhere bounded to live. Boards above the floor
-  are unchanged, including with a memory-only cache. The startup line says
-  which case the host is in instead of naming RAM as the reason either way.
-- **The queue prefetch can no longer OOM a small board.** It called
-  `cmaf::download_full`, which returns the entire track as an `Arc<[u8]>` on any
-  host, and nothing gated it on memory — so on a 512 MB board a plain *next*
-  allocated ~210 MB of Hi-Res beside the playing track, which is the reboot the
-  RAM floor existed to prevent, reached through the other door. It now uses the
-  same size-aware destination as the gapless hand-off, and both decline a track
-  they cannot place rather than allocating it. A download with no declared size
-  (the legacy non-CMAF fallback) is skipped on a host that cannot hold an
-  arbitrary track.
-- **`/api/status` `memory.gapless_prefetch` reports whether gapless actually
-  works here**, RAM or card, rather than the RAM figure alone. On a small board
-  with a disk cache those two now disagree.
-- **The streaming buffer is bounded.** The downloader now parks when it is
-  `audio.stream_window_seconds` (default 8) of the track's own byte-rate ahead
-  of the decoder, and resumes at 75 % of that. Before, nothing bounded it: the
-  link measured 4.5 MB/s against ~0.26 MB/s of playback, so the whole
-  compressed track — 120–220 MB at Hi-Res — was resident within seconds of
-  pressing play. A Hi-Res stream now holds single-digit megabytes.
-  The window is in *seconds*, not bytes, because a byte constant is a
-  different amount of music at every quality.
-- **The cast path uses the cache.** Casting from the Qobuz app now checks the
-  memory and disk caches before the network, and stages what it streams into
-  the disk cache. Previously that path read neither and wrote neither, so
-  pressing *previous* re-downloaded a track already on the card.
-- **Gapless arms on "this track can spare the bandwidth"** rather than "this
-  track has finished downloading", which a bounded window makes true only at
-  the very end of a track.
-- **CMAF playback holds one copy of a track instead of three**, and no longer
-  allocates per FLAC frame.
-- **Gapless defaults agree.** The struct default, the database default and
-  `reset_all()` gave three different answers; a fresh install had it off while
-  `AudioSettings::default()` claimed on. Choosing the ALSA backend no longer
-  switches gapless off.
+## 2.4.1 — 2026-09-16
 
 ### Fixed
 
-- **A fixed-output player no longer ends up quiet with a slider that cannot
-  raise it.** With `qconnect.volume_mode locked` the connect path pins the
-  player to unity — that mode means this renderer does not attenuate — and the
-  join handler then applied `qconnect.initial_volume` straight over the top. The
-  gain landed on the bit-perfect ALSA-direct path (`alsa_hardware_volume false`
-  stores a software gain for the writer thread; the comment calling that a
-  harmless no-op had been wrong since the branch stopped doing nothing), and
-  `Locked` ignores the controller's SetVolume, so nothing could undo it. A moOde
-  player set to Fixed (0dB) output reached this on every connect. The join-time
-  volume is now skipped in `Locked` and logged as skipped.
-- **`settings set` accepts a value starting with `-`.** Every usable loudness
-  target is negative, so `audio.normalization_target_lufs -14` — its own default
-  — was rejected as an unknown short flag. That key could not be written at all,
-  by anyone, since it was added.
-- **`settings import` writes the settings it says it wrote.** Nine audio keys —
-  `cache_to_disk`, `disk_cache_mb`, `memory_cache_mb`, `alsa_mixer_device`,
-  `volume_curve`, `alsa_buffer_ms`, `dac_keepalive_ms`, `pcm_ring_ms`,
-  `writer_rt_priority` — were planned, printed to the operator under *applied*,
-  and then fell through to the unhandled-key warning. An import reported a box's
-  whole storage and buffer configuration as moved and moved none of it.
+- `playback.quality` now caps the cast path, not just local playback — on a
+  cast-only daemon it was inert (vicrodh/qbz#693). Advertised as a capability
+  and clamped at both load seams; read fresh per load.
+- The loudness cache no longer panics on a full or read-only card, killing
+  playback for the life of the process (vicrodh/qbz#780). It degrades to memory,
+  opens on first use, and honors `--profile`; a stale
+  `~/.local/share/qbz/loudness_cache.db` can be deleted.
+- Signed stream URLs are redacted in logs. They are bearer credentials, and
+  `reqwest` errors put them in `pibuz.log` (vicrodh/qbz#780).
+- `bump-version.sh` opens the new CHANGELOG section again.
+- The 2.4.0 *Removed* entry is corrected: quality did not come from
+  `playback.quality`.
 
-- The daemon now raises its own `RLIMIT_RTPRIO`, so the ALSA writer actually
-  gets `SCHED_FIFO` where it is started without a systemd unit — which is how
-  moOde starts it, and where the promotion had been silently refused.
-- A completed stream that could not be promoted no longer drops its buffer
-  anyway, which left the track unresumable after the next pause.
-- The HTTP client used a *total* request timeout, which a rate-matched
-  download would have hit on every track over five minutes; it now times out
-  on stalls instead.
-- **Seeking on a bounded stream works.** A seek rebuilds the decoder, which
-  re-probes the container from byte 0 — a region the window has long since
-  discarded. The pinned header is now readable by decoders rather than only by
-  metadata accessors, and a reader may re-request any region the window threw
-  away, with the feeder staying up to serve it instead of exiting once the file
-  has been walked.
-- **A cast paused and resumed mid-track no longer wedges.** The feeder parks
-  when the buffer ahead of the reader is full, and it measured that window from
-  where the reader had last *read* rather than from where it was waiting. After
-  a seek those are two different places, and the bytes between them were still
-  buffered, so the window looked full against a reader that was starving: the
-  feeder parked, the reader waited on a condvar nothing would notify, and
-  playback stopped for good with the controller showing "loading". The anchor
-  now moves with a reader that seeks. Parking and unparking are logged too — a
-  parked feeder stops polling its body, so parked, spinning and gone all looked
-  identical from outside, which is why this took a run of seven silent minutes
-  to pin down.
-- **A seek reports its position within the track, not within the source.** A
-  cached track played from an offset used to start the clock at zero and seek
-  afterwards, so the controller saw a position below the one it asked for and
-  spun until it caught up. It now starts where it was asked to, which also
-  stops it decoding the whole song to throw the result away.
-- **The disk cache is usable again.** A quality gate demanded more than 96 kHz
-  for the Hi-Res+ tier, which most hi-res masters do not have, so every cached
-  copy of such a track was refused and re-downloaded forever.
-- **The cast path keeps the controller in step.** A track served from the cache
-  no longer lets a stale report for the outgoing track reach the controller,
-  which showed as the artwork flicking to the previous song.
-- **A gapless successor whose track was skipped past is discarded** rather than
-  queued, which used to send the player backwards through the queue.
-- **Gapless is no longer refused for the whole track.** A third gate was keyed
-  on the download being complete, which a bounded window makes false until the
-  very end; the prefetch ran, succeeded, and was discarded at every hand-off.
+
+## 2.4.0 — 2026-09-15
+
+Renamed to **Pibuz**, binary `pibuz` — update the unit file, everything else
+carries over. Streaming is now bounded: on a Pi 3B the held buffer stays at 2.9
+MB instead of growing to the whole track, and RSS at 24/96 went ~125 → ~40 MB.
+
+### Renamed
+
+- Binary, crate and unit are `pibuz` / `pibuz.service`; update `ExecStart=`.
+- Profile is `~/.config/pibuz` and siblings, but an existing `qbzd` profile is
+  still used when absent — same Connect device, same bit-perfect settings.
+- `QBZ_*` and `QBZD_*` environment variables are unchanged.
+- MPRIS is `org.mpris.MediaPlayer2.pibuz`, not the desktop app's
+  `com.blitzfc.qbz`.
+- Connect brand and model are `Pibuz`, default name `Pibuz (<hostname>)`, same
+  `device_uuid`.
+
+### Changed
+
+- JACK output is off by default, behind the `qbz-audio/jack` feature. Drops the
+  `libjack-jackd2-dev` build dependency.
+- The disk cache no longer evicts the track being played or staged.
+- The streaming buffer is bounded to `audio.stream_window_seconds` (default 8)
+  of the track's byte-rate. Hi-Res held 120–220 MB before.
+- Gapless works on 512 MB boards when `audio.cache_to_disk` is on.
+- The queue prefetch no longer allocates a whole Hi-Res track on a small board.
+- `audio.disk_cache_mb` sizes the L2 cache; `auto` is 800 MB, under 100 MB
+  refused.
+- `audio.memory_cache_mb` accepts up to 4096 MB, was 1024.
+- A low-memory board's decoded ring is 4 s, was 2.
+- `pibuz status` is a sectioned block, and adds device-open, active-renderer and
+  pairing-listener state, plus `memory` and `buffers` under `-v`.
+- `/api/status` gained `memory`, `cache`, `buffers` and four `playback.*` keys.
+- The cast path reads and writes the cache.
+- Gapless arms on spare bandwidth, not on a completed download.
+- CMAF playback holds one copy of a track instead of three.
+- Gapless defaults agree; the ALSA backend no longer switches it off.
+
+### Removed
+
+- Six settings keys the daemon never read: `audio.quality_fallback_behavior`,
+  `.allow_quality_fallback`, `.limit_quality_to_device`,
+  `.device_max_sample_rate`, `.sync_audio_on_startup`,
+  `playback.show_context_icon`. Setting one gets exit 2; `settings import` still
+  accepts them.
+
+  **Correction:** this entry originally claimed quality comes straight from
+  `playback.quality`. Not true of the cast path; fixed in 2.4.1.
+
+### Fixed (release)
+
+- A `vX.Y.Z` tag actually publishes a Release. The `.moodeN` tag series is
+  retired.
+- A tag that disagrees with `Cargo.toml` is rejected; `bump-version.sh --check`
+  verifies the tree.
+- `QBZD_BUILD_ID` is `PIBUZ_BUILD_ID`, compile-time only; runtime `QBZD_*` names
+  are unchanged.
+
+### Fixed
+
+- `qconnect.volume_mode locked` no longer leaves a fixed-output player quiet
+  with a slider that cannot raise it.
+- `settings set` accepts a value starting with `-`, so
+  `audio.normalization_target_lufs -14` can be written.
+- `settings import` applies the nine audio keys it reported as applied.
+- The daemon raises its own `RLIMIT_RTPRIO`, so the ALSA writer gets
+  `SCHED_FIFO` without a systemd unit — how moOde starts it.
+- Seeking on a bounded stream works: the header is pinned and discarded regions
+  can be re-requested.
+- A cast paused and resumed mid-track no longer wedges on a parked feeder.
+- A seek reports its position within the track, not the source.
+- The disk cache is usable again; its Hi-Res+ gate demanded more than 96 kHz.
+- The cast path no longer sends a stale report for the outgoing track.
+- A gapless successor whose track was skipped past is discarded, not queued.
+- Gapless is no longer refused by a gate keyed on the download being complete.
+- A completed stream that could not be promoted keeps its buffer.
+- The HTTP client times out on stalls, not on total request time.
 
 ## 2.3.0 — 2026-09-13
 
