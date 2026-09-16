@@ -592,6 +592,17 @@ impl QconnectRendererEngine for DaemonRendererEngine {
         }
     }
 
+    /// The daemon's own ceiling: `playback.quality` (vicrodh/qbz#693).
+    ///
+    /// Read fresh on every load rather than captured at connect, so a
+    /// `pibuz settings set playback.quality cd` binds the NEXT track without a
+    /// reconnect — the same liveness `resolve_quality` gives the local path.
+    /// The advertised capability (transport.rs) already tells a controller not
+    /// to ask above this; this is what holds one that asks anyway.
+    fn local_max_quality(&self) -> Option<Quality> {
+        super::transport::local_max_quality()
+    }
+
     fn current_output_format(&self) -> Option<(u32, u32)> {
         let player = self.core().player();
         Some((player.state.get_sample_rate(), player.state.get_bit_depth()))

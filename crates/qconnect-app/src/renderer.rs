@@ -18,7 +18,7 @@ use crate::queue_resolution::{
     dedupe_track_ids, resolve_core_shuffle_order, resolve_remote_start_index,
 };
 use crate::renderer_engine::QconnectRendererEngine;
-use crate::session::quality_from_max_audio_quality;
+use crate::session::{cap_quality, quality_from_max_audio_quality};
 use crate::{QConnectQueueState, QConnectRendererState, QconnectRemoteSyncState, RendererCommand};
 
 /// QConnect protocol `playing_state` wire values. Single source of truth for the
@@ -222,7 +222,10 @@ pub async fn ensure_remote_track_loaded(
         state.last_load_attempt = Some((track_id, Instant::now()));
     }
 
-    let quality = quality_from_max_audio_quality(max_audio_quality);
+    let quality = cap_quality(
+        quality_from_max_audio_quality(max_audio_quality),
+        engine.local_max_quality(),
+    );
     let duration_secs = engine
         .get_track(track_id)
         .await
@@ -274,7 +277,10 @@ pub async fn force_remote_track_stream(
         state.last_load_attempt = Some((track_id, Instant::now()));
     }
 
-    let quality = quality_from_max_audio_quality(max_audio_quality);
+    let quality = cap_quality(
+        quality_from_max_audio_quality(max_audio_quality),
+        engine.local_max_quality(),
+    );
     let duration_secs = engine
         .get_track(track_id)
         .await
@@ -1171,6 +1177,7 @@ mod tests {
         get_tracks_batch: u32,
         start_track_streams: Vec<u64>,
         start_positions: Vec<u64>,
+        start_qualities: Vec<Quality>,
     }
 
     /// Records every engine call; serves canned `PlaybackState` + queue snapshot.
@@ -1180,6 +1187,9 @@ mod tests {
         queue_tracks: Vec<QueueTrack>,
         queue_index: Option<usize>,
         loaded_audio: bool,
+        /// This renderer's configured ceiling; `None` = uncapped, as the
+        /// desktop is.
+        local_max_quality: Option<Quality>,
     }
 
     impl MockEngine {
@@ -1190,7 +1200,13 @@ mod tests {
                 queue_tracks: Vec::new(),
                 queue_index: None,
                 loaded_audio: false,
+                local_max_quality: None,
             }
+        }
+
+        fn capped_at(mut self, cap: Quality) -> Self {
+            self.local_max_quality = Some(cap);
+            self
         }
 
         fn calls(&self) -> std::sync::MutexGuard<'_, MockCalls> {
@@ -1269,14 +1285,18 @@ mod tests {
         async fn start_track_stream(
             &self,
             track_id: u64,
-            _quality: Quality,
+            quality: Quality,
             _duration_secs: u64,
             start_position_secs: u64,
         ) -> Result<(), String> {
             let mut calls = self.calls();
             calls.start_track_streams.push(track_id);
             calls.start_positions.push(start_position_secs);
+            calls.start_qualities.push(quality);
             Ok(())
+        }
+        fn local_max_quality(&self) -> Option<Quality> {
+            self.local_max_quality
         }
         fn current_output_format(&self) -> Option<(u32, u32)> {
             Some((44_100, 16))
@@ -1351,6 +1371,111 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(engine.calls().start_track_streams, vec![42]);
+    }
+
+    // -----------------------------------------------------------------------
+    // vicrodh/qbz#693 — the local quality cap binds the CAST path too.
+    //
+    // The bug: a renderer configured for CD streamed 24/192 whenever a phone
+    // asked for it, because these seams took the controller's
+    // `max_audio_quality` as the whole answer. Both seams are covered because
+    // the class of bug is "a load path that forgot to ask" — a new one that
+    // forgets is caught by `every_stream_quality_is_capped` below.
+    // -----------------------------------------------------------------------
+
+    /// A controller demanding Ultra Hi-Res (level 4) against a CD-capped
+    /// renderer streams CD.
+    #[tokio::test]
+    async fn ensure_remote_track_loaded_holds_the_controller_to_the_local_cap() {
+        let engine = MockEngine::new().capped_at(Quality::Lossless);
+        let sync = sync();
+        ensure_remote_track_loaded(&engine, &sync, 42, Some(4), 0)
+            .await
+            .unwrap();
+        assert_eq!(engine.calls().start_qualities, vec![Quality::Lossless]);
+    }
+
+    /// The takeback seam is the one that does NOT go through
+    /// `ensure_remote_track_loaded`, so it needs the cap of its own.
+    #[tokio::test]
+    async fn force_remote_track_stream_holds_the_controller_to_the_local_cap() {
+        let engine = MockEngine::new().capped_at(Quality::Lossless);
+        let sync = sync();
+        force_remote_track_stream(&engine, &sync, 42, Some(4), 0)
+            .await
+            .unwrap();
+        assert_eq!(engine.calls().start_qualities, vec![Quality::Lossless]);
+    }
+
+    /// A MISSING `max_audio_quality` resolves to UltraHiRes (uncapped is the
+    /// protocol default), which is exactly the case the cap has to survive —
+    /// a controller that never sends the message must not win by silence.
+    #[tokio::test]
+    async fn a_silent_controller_does_not_escape_the_local_cap() {
+        let engine = MockEngine::new().capped_at(Quality::HiRes);
+        let sync = sync();
+        ensure_remote_track_loaded(&engine, &sync, 42, None, 0)
+            .await
+            .unwrap();
+        assert_eq!(engine.calls().start_qualities, vec![Quality::HiRes]);
+    }
+
+    /// The cap is a ceiling, never a floor: a controller asking for MP3 against
+    /// a hi-res-capable renderer still gets MP3 (it may be on cellular data).
+    #[tokio::test]
+    async fn the_cap_never_upgrades_a_modest_request() {
+        let engine = MockEngine::new().capped_at(Quality::UltraHiRes);
+        let sync = sync();
+        ensure_remote_track_loaded(&engine, &sync, 42, Some(1), 0)
+            .await
+            .unwrap();
+        assert_eq!(engine.calls().start_qualities, vec![Quality::Mp3]);
+    }
+
+    /// An UNCAPPED renderer (the desktop, which has no `playback.quality`)
+    /// keeps honoring the controller exactly as before this fix.
+    #[tokio::test]
+    async fn an_uncapped_renderer_still_honors_the_controller() {
+        let engine = MockEngine::new();
+        let sync = sync();
+        ensure_remote_track_loaded(&engine, &sync, 42, Some(4), 0)
+            .await
+            .unwrap();
+        assert_eq!(engine.calls().start_qualities, vec![Quality::UltraHiRes]);
+    }
+
+    /// The structural half of #693, and the reason it can't come back: the bug
+    /// was not a wrong mapping, it was a LOAD PATH THAT FORGOT TO ASK. Any new
+    /// seam that turns a controller's `max_audio_quality` into a `Quality` has
+    /// to hand the result to `cap_quality` — this reads the module's own source
+    /// and fails on a raw use, before anyone has to notice it on a Pi.
+    #[test]
+    fn every_stream_quality_is_capped() {
+        // Only the production half: the test half names the function in prose.
+        let production = include_str!("renderer.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("renderer.rs has a production half")
+            .to_string();
+
+        let needle = "quality_from_max_audio_quality(";
+        let mut calls = 0;
+        let mut rest = production.as_str();
+        while let Some(at) = rest.find(needle) {
+            calls += 1;
+            let before = rest[..at].trim_end();
+            assert!(
+                before.ends_with("cap_quality("),
+                "a raw `{needle}` call escapes the #693 local quality cap. \
+                 Wrap it: cap_quality({needle}..), engine.local_max_quality())"
+            );
+            rest = &rest[at + needle.len()..];
+        }
+        assert!(
+            calls >= 2,
+            "the guard lost its subject ({calls} call sites found, expected the \
+             two load seams) — was `{needle}` renamed or moved?"
+        );
     }
 
     /// #2 — no reload when the audio thread already plays the requested track.

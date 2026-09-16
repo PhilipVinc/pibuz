@@ -1976,17 +1976,23 @@ pub struct Player {
 
 impl Default for Player {
     fn default() -> Self {
-        Self::new(None, AudioSettings::default(), AudioDiagnostic::new())
+        Self::new(None, AudioSettings::default(), AudioDiagnostic::new(), None)
     }
 }
 
 impl Player {
     /// Create a new player with an optional specific output device and audio settings
     /// If device_name is None, uses the system default device
+    ///
+    /// `data_root` is the caller's profile root, where the loudness cache is
+    /// kept — the same root `AudioSettingsStore::new_at` is given. `None` means
+    /// the caller has no root of its own, and the cache then lives in memory
+    /// for the run rather than guessing at a path outside the caller's profile.
     pub fn new(
         device_name: Option<String>,
         audio_settings: AudioSettings,
         diagnostic: AudioDiagnostic,
+        data_root: Option<std::path::PathBuf>,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<AudioCommand>();
         // The audio thread sends to ITSELF in one place: after a seek rebuilds
@@ -2004,21 +2010,24 @@ impl Player {
         // Clone the diagnostic for the audio thread
         let thread_diagnostic = diagnostic.clone();
 
+        // Where the loudness cache belongs, moved into the thread that opens it.
+        let thread_data_root = data_root;
+
         // Spawn dedicated audio thread
         thread::spawn(move || {
             log::info!("Audio thread starting...");
 
             // Initialize loudness analysis system
             let (analyzer_tx, analyzer_rx) = mpsc::sync_channel::<AnalyzerMessage>(64);
-            let loudness_cache = match LoudnessCache::new() {
-                Ok(c) => Arc::new(c),
-                Err(e) => {
-                    log::error!("Failed to create loudness cache: {}. Normalization will work without caching.", e);
-                    // Create a fallback in-memory cache (will be lost on restart)
-                    // For now, just panic — this should not fail in practice
-                    panic!("LoudnessCache creation failed: {}", e);
-                }
-            };
+            // Infallible by construction, and opened on first use. This used
+            // to `panic!` on a disk error — on the audio thread, before a note
+            // had played — so a full or read-only card meant total silence
+            // rather than normalization without a cache (vicrodh/qbz#780
+            // item 1). `LoudnessCache` now degrades to memory instead.
+            let loudness_cache = Arc::new(match thread_data_root {
+                Some(root) => LoudnessCache::open_at(root),
+                None => LoudnessCache::in_memory(),
+            });
             let _analyzer_handle = LoudnessAnalyzer::spawn(analyzer_rx, loudness_cache.clone());
             let analyzer_enabled = Arc::new(AtomicBool::new(false));
 

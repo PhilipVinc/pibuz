@@ -13,7 +13,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
+use qbz_app::playback_driver;
+use qbz_app::settings::daemon_prefs;
 use qbz_app::shell::AppRuntime;
+use qbz_models::Quality;
 use qconnect_transport_ws::WsTransportConfig;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -49,6 +52,17 @@ pub fn init_settings_db_path(path: PathBuf) {
 /// The daemon-root QConnect settings DB path, if `init_settings_db_path` ran.
 fn qconnect_settings_db_path() -> Option<PathBuf> {
     DAEMON_QCONNECT_SETTINGS_DB.get().cloned()
+}
+
+/// The daemon's data root, set once by `qconnect::start` alongside the settings
+/// DB. Separate from it because `daemon_prefs` lives in the root itself, not in
+/// the KV — deriving it from the DB path's parent would couple the two layouts.
+static DAEMON_DATA_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
+/// Point the QConnect quality cap at the daemon's data root. Idempotent (a
+/// second call is ignored). Called from `qconnect::start(roots)`.
+pub fn init_data_root(path: PathBuf) {
+    let _ = DAEMON_DATA_ROOT.set(path);
 }
 
 /// Persistent QConnect device identity for the DAEMON. Daemon adaptation vs. the
@@ -150,10 +164,13 @@ pub fn resolve_qconnect_friendly_name(custom_name: Option<&str>) -> String {
 // daemon keeps ONE identity of its own.
 // ---------------------------------------------------------------------------
 
-// AudioQuality wire levels: 1=mp3, 4=hires_l2(192k). Capabilities advertise the
+// AudioQuality wire levels: 1=mp3, 2=cd, 3=hires_l1(96k), 4=hires_l2(192k) --
+// the same four tiers `playback.quality` names. Capabilities advertise the
 // device's min/max decode support; VOLUME_REMOTE_CONTROL_ALLOWED(2) means a
 // controller may set our volume.
 pub const AUDIO_QUALITY_MP3: i32 = 1;
+pub const AUDIO_QUALITY_CD: i32 = 2;
+pub const AUDIO_QUALITY_HIRES_LEVEL1: i32 = 3;
 pub const AUDIO_QUALITY_HIRES_LEVEL2: i32 = 4;
 const VOLUME_REMOTE_CONTROL_ALLOWED: i32 = 2;
 /// Renderer buffer-state wire value for OK/ready (mirrors the Tauri adapter).
@@ -288,6 +305,53 @@ fn load_persisted_device_name() -> Option<String> {
     qconnect_settings_db_path().and_then(|path| load_device_name_at(&path))
 }
 
+// ---------------------------------------------------------------------------
+// The local quality cap on the cast path (vicrodh/qbz#693).
+//
+// `playback.quality` (daemon_prefs.streaming_quality) used to bind only the
+// local playback path (`api/playback.rs::resolve_quality`). As a QConnect
+// renderer the daemon took the controller's `max_audio_quality` as gospel AND
+// advertised level 4 unconditionally, so a box configured for CD streamed
+// 24/192 whenever a phone asked for it. Since pibuz is cast-only, that made the
+// setting inert for every track that actually plays.
+//
+// Two halves, and both are needed: advertise the cap so a well-behaved
+// controller never offers above it, and clamp at the load seam so one that does
+// is held anyway (`qconnect_app::session::cap_quality`).
+// ---------------------------------------------------------------------------
+
+/// Where a `Quality` sits on the QConnect wire scale.
+fn audio_quality_level(quality: Quality) -> i32 {
+    match quality {
+        Quality::Mp3 => AUDIO_QUALITY_MP3,
+        Quality::Lossless => AUDIO_QUALITY_CD,
+        Quality::HiRes => AUDIO_QUALITY_HIRES_LEVEL1,
+        Quality::UltraHiRes => AUDIO_QUALITY_HIRES_LEVEL2,
+    }
+}
+
+/// The configured ceiling, read fresh from `daemon_prefs` under `data_root`.
+///
+/// Goes through the SAME `quality_from_key` contract the local path uses, so
+/// the two can never drift: one key table, one meaning of "cd".
+pub fn local_max_quality_at(data_root: &Path) -> Quality {
+    playback_driver::quality_from_key(&daemon_prefs::load_at(data_root).streaming_quality)
+}
+
+/// The configured ceiling, or `None` when `init_data_root` never ran (fail-open
+/// = uncapped, matching every other resolver in this module).
+pub fn local_max_quality() -> Option<Quality> {
+    DAEMON_DATA_ROOT
+        .get()
+        .map(|root| local_max_quality_at(root))
+}
+
+/// The ceiling as a wire level, for the capability payload and the renderer
+/// report. Uncapped advertises the top tier, which is what it always did.
+pub fn local_max_audio_quality_level() -> i32 {
+    audio_quality_level(local_max_quality().unwrap_or(Quality::UltraHiRes))
+}
+
 /// Build the device-info payload with the EFFECTIVE friendly name: the persisted
 /// custom device name when one is set, else the default. The persisted name must
 /// win here (not only at the controller-bootstrap call site that threads it
@@ -314,7 +378,7 @@ pub fn default_qconnect_device_info_with_name(
         device_type: Some(resolve_qconnect_device_type()),
         capabilities: Some(QconnectDeviceCapabilitiesPayload {
             min_audio_quality: Some(AUDIO_QUALITY_MP3),
-            max_audio_quality: Some(AUDIO_QUALITY_HIRES_LEVEL2),
+            max_audio_quality: Some(local_max_audio_quality_level()),
             volume_remote_control: Some(VOLUME_REMOTE_CONTROL_ALLOWED),
         }),
         software_version: Some(resolve_qconnect_software_version()),
@@ -793,6 +857,56 @@ mod tests {
         let uuid = resolve_qconnect_device_uuid();
         std::env::remove_var("QBZ_QCONNECT_DEVICE_UUID");
         assert_eq!(uuid, "env-override-uuid-123");
+    }
+
+    /// vicrodh/qbz#693 — what the daemon ADVERTISES has to be the configured
+    /// cap, not a constant. A controller that respects the capability never
+    /// offers above it, which is the half of the fix that keeps hi-res off the
+    /// wire instead of merely off the DAC.
+    #[test]
+    fn the_advertised_ceiling_is_the_configured_playback_quality() {
+        let root = std::env::temp_dir().join(format!(
+            "pibuz_qconnect_cap_test_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("scratch data root");
+
+        let set = |key: &str| {
+            let mut prefs = daemon_prefs::load_at(&root);
+            prefs.streaming_quality = key.to_string();
+            daemon_prefs::save_at(&prefs, &root).expect("save prefs");
+        };
+
+        // Every key `settings set playback.quality` accepts maps to the wire
+        // level for the same tier — one table, shared with the local path.
+        for (key, level, quality) in [
+            ("mp3", AUDIO_QUALITY_MP3, Quality::Mp3),
+            ("cd", AUDIO_QUALITY_CD, Quality::Lossless),
+            ("hires", AUDIO_QUALITY_HIRES_LEVEL1, Quality::HiRes),
+            (
+                "hires_plus",
+                AUDIO_QUALITY_HIRES_LEVEL2,
+                Quality::UltraHiRes,
+            ),
+        ] {
+            set(key);
+            assert_eq!(local_max_quality_at(&root), quality, "{key}");
+            assert_eq!(
+                audio_quality_level(local_max_quality_at(&root)),
+                level,
+                "{key}"
+            );
+        }
+
+        // An unreadable / unset root must not silently cap playback: fail open.
+        assert_eq!(
+            local_max_quality_at(&root.join("does-not-exist")),
+            Quality::UltraHiRes
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

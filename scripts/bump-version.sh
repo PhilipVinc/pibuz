@@ -81,7 +81,11 @@ CL="$(changelog_version)"
 if head -20 CHANGELOG.md | grep -q "^## ${CL} — unreleased"; then
 	perl -i -pe "s/^## \Q${CL}\E — unreleased$/## ${NEW} — unreleased/" CHANGELOG.md
 else
-	perl -i -pe "s/^(## \Q${CL}\E)/## ${NEW} — unreleased\n\n\n\$1/ if !\$done++" CHANGELOG.md
+	# `$done` counts the SUBSTITUTION, not the lines: `if !$done++` incremented
+	# on line 1 ("# Changelog") and disabled itself before ever reaching the
+	# heading, so this branch — the one every normal release takes — silently
+	# left the CHANGELOG at the previous version.
+	perl -i -pe "\$done ||= s/^(## \Q${CL}\E)/## ${NEW} — unreleased\n\n\n\$1/" CHANGELOG.md
 fi
 
 cargo update --workspace --quiet

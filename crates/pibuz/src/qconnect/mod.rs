@@ -658,6 +658,9 @@ pub fn start(
     let settings_db = roots.data.join("qconnect_settings.db");
     // Re-point device identity + KV at the daemon root (NEVER the desktop global).
     transport::init_settings_db_path(settings_db.clone());
+    // And the quality cap at the root itself, where `daemon_prefs` lives: the
+    // cast path reads `playback.quality` from here (vicrodh/qbz#693).
+    transport::init_data_root(roots.data.clone());
 
     // Effective startup decision (Ready-state only). `cli_override` stays None: a
     // `Some` would permanently shadow the KV store that `pibuz qconnect

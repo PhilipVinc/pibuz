@@ -32,8 +32,9 @@ use uuid::Uuid;
 use super::engine::VolumeMode; // T10 (OD4): join-time volume report honors the mode
 use super::sink::{DaemonEventSink, DaemonQconnectApp};
 use super::transport::{
-    default_qconnect_device_info, default_qconnect_device_info_with_name, resolve_transport_config,
-    QconnectJoinSessionRequest, AUDIO_QUALITY_HIRES_LEVEL2, BUFFER_STATE_OK,
+    default_qconnect_device_info, default_qconnect_device_info_with_name,
+    local_max_audio_quality_level, resolve_transport_config, QconnectJoinSessionRequest,
+    BUFFER_STATE_OK,
 };
 use super::{update_lifecycle_state_if_running, DaemonQconnectInner};
 use crate::adapter::DaemonAdapter;
@@ -424,7 +425,7 @@ pub async fn deferred_renderer_join(
         RendererReportType::RndrSrvrMaxAudioQualityChanged,
         Uuid::new_v4().to_string(),
         queue_version_ref,
-        json!({ "max_audio_quality": AUDIO_QUALITY_HIRES_LEVEL2 }),
+        json!({ "max_audio_quality": local_max_audio_quality_level() }),
     );
     if let Err(err) = app.send_renderer_report_command(max_quality_report).await {
         log::error!("[QConnect] Deferred renderer max quality report failed: {err}");

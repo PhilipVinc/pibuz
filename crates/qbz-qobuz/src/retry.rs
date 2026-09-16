@@ -51,7 +51,14 @@ pub fn reqwest_is_transient(e: &reqwest::Error) -> bool {
 /// are treated as transient — a definitive "gone" answer comes back as a 404
 /// *status*, not a transport error.
 pub fn classify_reqwest(e: &reqwest::Error, context: &str) -> FetchError {
-    FetchError::Transient(format!("{}: {}", context, e))
+    // Redacted, not raw: this wraps the CMAF segment fetch, whose URL carries
+    // the signed token, and the message is logged (vicrodh/qbz#780 item 10).
+    // The host is kept, so classification and diagnosis are unchanged.
+    FetchError::Transient(format!(
+        "{}: {}",
+        context,
+        crate::redact::redact_urls(&e.to_string())
+    ))
 }
 
 /// Classify a non-success HTTP status into a `FetchError`. 5xx and 429 are

@@ -205,6 +205,33 @@ pub fn quality_from_max_audio_quality(level: Option<i32>) -> Quality {
     }
 }
 
+/// Where a `Quality` sits on the QConnect `max_audio_quality` scale, so two
+/// tiers can be compared. Spelled out rather than leaning on the enum's
+/// discriminants (5/6/7/27), which happen to sort correctly today but are Qobuz
+/// format ids, not a rank.
+pub fn quality_tier(quality: Quality) -> u8 {
+    match quality {
+        Quality::Mp3 => 0,
+        Quality::Lossless => 1,
+        Quality::HiRes => 2,
+        Quality::UltraHiRes => 3,
+    }
+}
+
+/// Hold `requested` to this renderer's OWN ceiling.
+///
+/// The controller's `max_audio_quality` is a REQUEST, not an instruction: a
+/// phone asking for Ultra Hi-Res must not override a renderer configured to cap
+/// at CD (vicrodh/qbz#693 — the local cap was applied only on the local playback
+/// path, so casting bypassed it entirely). `cap` of `None` means uncapped, and a
+/// cap ABOVE the request never upgrades it — the lower of the two always wins.
+pub fn cap_quality(requested: Quality, cap: Option<Quality>) -> Quality {
+    match cap {
+        Some(cap) if quality_tier(cap) < quality_tier(requested) => cap,
+        _ => requested,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Session topology types (relocated from the Tauri adapter — slice 2+4).
 //
@@ -646,6 +673,35 @@ mod tests {
             quality_from_max_audio_quality(Some(99)),
             Quality::UltraHiRes
         );
+    }
+
+    /// vicrodh/qbz#693 — the cap is a CEILING on the controller's request.
+    #[test]
+    fn cap_quality_is_a_ceiling_and_never_a_floor() {
+        use Quality::{HiRes, Lossless, Mp3, UltraHiRes};
+
+        // No cap: the controller's request stands (the desktop's behaviour).
+        assert_eq!(cap_quality(UltraHiRes, None), UltraHiRes);
+
+        // A cap below the request clamps — including the `None` level that
+        // resolves to UltraHiRes, which is how a silent controller used to win.
+        assert_eq!(cap_quality(UltraHiRes, Some(Lossless)), Lossless);
+        assert_eq!(cap_quality(HiRes, Some(Mp3)), Mp3);
+
+        // A cap at or ABOVE the request leaves it alone: a phone asking for MP3
+        // on cellular data does not get upgraded to hi-res by our config.
+        assert_eq!(cap_quality(Lossless, Some(Lossless)), Lossless);
+        assert_eq!(cap_quality(Mp3, Some(UltraHiRes)), Mp3);
+    }
+
+    /// The tiers must sort by audio quality, not by the Qobuz format ids the
+    /// enum carries — a new variant added out of id order must not reorder the
+    /// cap silently.
+    #[test]
+    fn quality_tiers_ascend_with_quality() {
+        assert!(quality_tier(Quality::Mp3) < quality_tier(Quality::Lossless));
+        assert!(quality_tier(Quality::Lossless) < quality_tier(Quality::HiRes));
+        assert!(quality_tier(Quality::HiRes) < quality_tier(Quality::UltraHiRes));
     }
 
     /// The ids answer the role outright in two shapes and cannot in the third.

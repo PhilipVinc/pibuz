@@ -601,15 +601,10 @@ pub async fn download_and_stream_remote_track(
 /// "message head is too large" two levels down). Walk `source()` and join the
 /// chain so logs AND signature matching see the real cause.
 pub fn describe_reqwest_error(err: &reqwest::Error) -> String {
-    use std::error::Error as _;
-    let mut out = err.to_string();
-    let mut source = err.source();
-    while let Some(cause) = source {
-        out.push_str(": ");
-        out.push_str(&cause.to_string());
-        source = cause.source();
-    }
-    out
+    // Chain-expanded AND redacted: `reqwest::Error`'s Display embeds the signed
+    // stream URL, and every caller here puts the result in a log line or an API
+    // error string (vicrodh/qbz#780 item 10).
+    qbz_qobuz::redact::describe_reqwest(err)
 }
 
 /// True when an error message (already chain-expanded by

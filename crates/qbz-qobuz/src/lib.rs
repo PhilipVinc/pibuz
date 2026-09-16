@@ -38,6 +38,7 @@ pub mod endpoints;
 pub mod error;
 pub mod forbidden_breaker;
 pub mod link_resolver;
+pub mod redact;
 pub mod retry;
 
 // Re-export main types

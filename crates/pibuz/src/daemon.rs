@@ -296,6 +296,10 @@ async fn boot(
         adapter,
         settings.output_device.clone(),
         settings,
+        // The loudness cache too: it used to be the one store that resolved its
+        // own path (`dirs::data_dir()/qbz`), which put the daemon's cache in the
+        // DESKTOP app's directory and ignored `--profile`.
+        Some(roots.data.clone()),
     ));
 
     // Offline-tolerant (§8.1-8): a network failure here still leaves a locally

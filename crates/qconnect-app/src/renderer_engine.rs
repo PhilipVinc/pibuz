@@ -95,6 +95,17 @@ pub trait QconnectRendererEngine: Send + Sync {
         start_position_secs: u64,
     ) -> Result<(), String>;
 
+    /// This renderer's OWN quality ceiling, or `None` when it is uncapped.
+    ///
+    /// The controller's `max_audio_quality` is a request; this is the local
+    /// policy that bounds it (see [`crate::session::cap_quality`]). The desktop
+    /// has no such setting and takes the default; pibuz returns the configured
+    /// `playback.quality`, read fresh so a `settings set` applies to the next
+    /// load without a reconnect.
+    fn local_max_quality(&self) -> Option<Quality> {
+        None
+    }
+
     // ---- report-back source (the single per-frontend "engine read") ----
     /// The ACTUAL DAC output format `(sample_rate, bit_depth)` under bit-perfect
     /// passthrough — read from `player().state`. Drives the file/device
