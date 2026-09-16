@@ -16,6 +16,28 @@ Features:
   hardware streamer, so ANY Qobuz account in the household can cast to it from the official app.
 
 
+## Install
+
+On moOde, a Raspberry Pi, or any 64-bit Linux box:
+
+```bash
+curl -fsSL https://philipvinc.github.io/pibuz/install.sh | sudo sh
+```
+
+That fetches the latest release, verifies its checksum, installs `/usr/bin/pibuz`,
+writes a systemd unit that runs as your own user, enables it and reboots. Re-run
+the same line to upgrade. It warns — and carries on — if the box is not moOde 10.x.
+
+Flags go after `sh -s --`:
+
+```bash
+curl -fsSL https://philipvinc.github.io/pibuz/install.sh | sudo sh -s -- --no-reboot
+```
+
+`--version X.Y.Z` pins a release, `--user NAME` picks the account the daemon runs
+as (default: the invoking user, then uid 1000). Prefer to do it by hand? Every
+release tarball carries its own README with the manual steps.
+
 ## Building
 
 Standard Cargo workspace — manifest at the repo root, members under `crates/`.

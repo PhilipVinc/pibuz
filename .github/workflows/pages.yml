@@ -1,0 +1,71 @@
+# The install page: https://philipvinc.github.io/pibuz/
+#
+# Serves two files and nothing else — `index.html` and `install.sh`, the
+# one-liner in the README fetches the latter. It is republished when a release
+# is PUBLISHED (not when a tag is pushed: the script resolves "latest release"
+# at run time, so the page must not start advertising a version whose release
+# assets do not exist yet).
+#
+# Dispatch it by hand to republish the page against the current latest release
+# without cutting a new one.
+name: pages
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+# Last writer wins; never cancel a deploy half-done.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # A prerelease never becomes the page: `install.sh` installs the latest
+      # FULL release, so a page naming an rc would lie about what it installs.
+      - name: Resolve the release to advertise
+        id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="$(gh release view --json tagName,isPrerelease \
+                   --jq 'select(.isPrerelease == false) | .tagName')"
+          [ -n "$TAG" ] || { echo "::error::no full release to advertise"; exit 1; }
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Assemble the site
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p site
+          install -m 644 scripts/install.sh site/install.sh
+          sed -e "s/@VERSION@/${VERSION}/g" \
+              -e "s/@DATE@/$(date -u +%Y-%m-%d)/g" \
+              packaging/pages/index.html > site/index.html
+          if grep -q "@VERSION@" site/index.html; then
+            echo "::error::unsubstituted placeholder in index.html"; exit 1
+          fi
+          sh -n site/install.sh
+          echo "published: pibuz ${VERSION}"
+
+      - uses: actions/configure-pages@v6
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+      - id: deploy
+        uses: actions/deploy-pages@v5

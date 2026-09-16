@@ -1,0 +1,75 @@
+<!doctype html>
+<!-- The install page served at https://philipvinc.github.io/pibuz/.
+     The VERSION and DATE placeholders are substituted by
+     .github/workflows/pages.yml when a release is published, so the page always
+     names the release install.sh will actually fetch. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pibuz — headless Qobuz Connect daemon</title>
+<style>
+  :root { color-scheme: light dark; --fg: #16181d; --dim: #5d636e; --bg: #fbfbf9;
+          --card: #fff; --line: #e3e2dd; --accent: #7b4bd8; }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg: #e8e8e6; --dim: #9aa0aa; --bg: #15161a; --card: #1d1f24;
+            --line: #2c2f36; --accent: #b193f5; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 3rem 1rem 4rem; background: var(--bg); color: var(--fg);
+         font: 16px/1.6 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  main { max-width: 42rem; margin: 0 auto; }
+  h1 { font-size: 1.9rem; margin: 0 0 .3rem; letter-spacing: -.02em; }
+  h2 { font-size: .8rem; text-transform: uppercase; letter-spacing: .08em;
+       color: var(--dim); margin: 2.5rem 0 .8rem; }
+  p { margin: 0 0 1rem; }
+  .lede { color: var(--dim); margin-bottom: 2rem; }
+  pre { background: var(--card); border: 1px solid var(--line); border-radius: 8px;
+        padding: 1rem; overflow-x: auto; margin: 0 0 .6rem;
+        font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  code { font: 13.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  ul { padding-left: 1.2rem; margin: 0 0 1rem; }
+  li { margin: .35rem 0; }
+  a { color: var(--accent); }
+  .note { color: var(--dim); font-size: .9rem; }
+  footer { margin-top: 3rem; padding-top: 1.2rem; border-top: 1px solid var(--line);
+           color: var(--dim); font-size: .85rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Pibuz</h1>
+  <p class="lede">A headless <strong>Qobuz Connect</strong> endpoint for a Raspberry Pi.
+  Bit-perfect, one binary, appears in the official Qobuz apps like any hardware streamer.</p>
+
+  <h2>Install or upgrade</h2>
+  <pre><code>curl -fsSL https://philipvinc.github.io/pibuz/install.sh | sudo sh</code></pre>
+  <p class="note">Installs <code>pibuz</code> @VERSION@ to <code>/usr/bin</code>, writes a systemd
+  unit that runs as your own user, enables it, and reboots. Re-run it to upgrade.</p>
+
+  <h2>Options</h2>
+  <pre><code>curl -fsSL https://philipvinc.github.io/pibuz/install.sh | sudo sh -s -- --no-reboot
+                                                              --version 2.4.0
+                                                              --user pi</code></pre>
+
+  <h2>What it needs</h2>
+  <ul>
+    <li>A 64-bit Linux box — moOde 10.x is what it is tested on; any aarch64 or amd64 Debian works.</li>
+    <li>A DAC. Run <code>pibuz setup</code> once to pick it, or let it take the default.</li>
+    <li>No Qobuz login on the box: you cast to it from the Qobuz app, so any account in the house can.</li>
+  </ul>
+
+  <h2>Then</h2>
+  <pre><code>pibuz status      # is it up, what is it playing, what is the buffer doing
+pibuz setup       # pick the DAC, name the device
+pibuz settings    # everything else</code></pre>
+
+  <footer>
+    <a href="https://github.com/PhilipVinc/pibuz">Source</a> ·
+    <a href="https://github.com/PhilipVinc/pibuz/releases/latest">Release notes</a> ·
+    <a href="https://github.com/PhilipVinc/pibuz/blob/main/CHANGELOG.md">Changelog</a><br>
+    Pibuz @VERSION@ · page generated @DATE@ · not affiliated with Qobuz.
+  </footer>
+</main>
+</body>
+</html>
