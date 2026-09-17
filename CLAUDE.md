@@ -332,3 +332,42 @@ path-filtered to `crates/**`. Releases are **tags on main**: pushing a `vX.Y.Z` 
 triggers `release.yml`, whose first job refuses any tag whose commit is not an
 ancestor of `origin/main`. `build-arm64.yml` is manual-dispatch and publishes
 nothing — use it for a Pi test binary without tagging.
+
+## The installer, and what it must not do on moOde
+
+`scripts/install.sh` is the `curl … | sudo sh` installer, served from
+**https://philipvinc.github.io/pibuz/install.sh** by `pages.yml` — which
+republishes the page on `release: published` (never on a tag push: the script
+resolves "latest release" at run time, so the page must not name a release whose
+assets do not exist yet) and never for a prerelease. `packaging/pages/index.html`
+carries `@VERSION@`/`@DATE@`, substituted at publish; the job fails on an
+unsubstituted placeholder and runs `sh -n` over the script it is about to serve.
+
+Before touching the script, know the three moOde facts it is shaped around.
+Each was wrong in the first cut and each broke it on a real box:
+
+- **moOde has no systemd unit for pibuz, and must not get one.**
+  `startQobuz()` in moOde's `www/inc/renderer.php` pushes the audio device, the
+  quality cap and the hook script, then runs `pibuz run &`; `stopQobuz()` does
+  `killall pibuz`; `worker.php` calls them at boot and on every renderer toggle.
+  A unit means a SECOND daemon on one `hw:` device, and `Restart=on-failure`
+  resurrects what moOde just killed. So on moOde the script swaps the binary and
+  stops — the reboot is the handover (moOde starts it ~20 s into boot). The
+  systemd path is for non-moOde boxes; `--standalone` forces it.
+- **PATH picks the binary, and `/usr/local/bin` precedes `/usr/bin`.** moOde
+  calls bare `pibuz` through `sysCmd`. `scripts/pibuz-to-pi.sh` installs to
+  `/usr/local/bin/pibuz`, cargo-deb's asset puts the packaged one in
+  `/usr/bin/pibuz`, so writing a fixed path silently changes nothing that runs.
+  Install over `command -v pibuz`, else the dpkg-owned `/usr/bin`, else
+  `/usr/local/bin` — and warn about a copy earlier on PATH.
+- **A swapped binary and moOde's package diverge.** `isQobuzInstalled()` greps
+  `dpkg-query --show pibuz | grep moode`, so moOde's UI keeps reporting the
+  packaged version and its "Upgrade" rebuilds moOde's own pinned tag over the
+  file. Warn when a package is installed; do not refuse when one is not — a
+  box the deploy script grafted a binary onto is exactly that state.
+
+Test it without a Pi: stub `id`, `getent`, `systemctl`, `sha256sum`, `moodeutl`
+and `dpkg-query` on PATH and set `PIBUZ_BIN`/`PIBUZ_UNIT` at a scratch path —
+that covers every branch except running the aarch64 binary. On a real box,
+`PIBUZ_BIN=/tmp/probe … --no-reboot` exercises detection, download, checksum and
+placement without touching the live install.
