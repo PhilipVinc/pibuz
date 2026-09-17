@@ -248,9 +248,10 @@ fn assemble_live(state: &super::ApiState) -> StatusDoc {
         .as_ref()
         .and_then(|s| backend_label(s.backend_type));
     let configured_device = settings.as_ref().and_then(|s| s.output_device.clone());
+    let configured_backend = settings.as_ref().and_then(|s| s.backend_type);
     let device_present = match &configured_device {
         None => true, // system default is always "present"
-        Some(dev) => device_open || device_is_present(state, dev),
+        Some(dev) => device_open || device_is_present(state, configured_backend, dev),
     };
 
     // 5. cache tiers and the host's memory profile. `memory_profile()` is a
@@ -411,35 +412,96 @@ fn backend_label(b: Option<qbz_audio::AudioBackendType>) -> Option<String> {
     })
 }
 
-/// Best-effort presence check against the TTL-cached device enumeration. Exact
-/// device identity is refined in T10; here a substring match on either side
-/// tolerates the CPAL-name vs `hw:` mismatch without false negatives on a match.
-fn device_is_present(state: &super::ApiState, dev: &str) -> bool {
-    cached_device_names(state)
+/// Best-effort presence check. Exact device identity is refined in T10; here a
+/// substring match on either side tolerates the CPAL-name vs `hw:` mismatch
+/// without false negatives on a match.
+///
+/// The ALSA backend answers from `/proc/asound` instead, and deliberately: an
+/// enumeration goes through `snd_device_name_hint`, which resolves every PCM
+/// definition in the namespace and opens the ones whose config does not
+/// declare a direction. `status` is polled every few seconds forever — moOde's
+/// watchdog does exactly that — so answering this question by enumerating
+/// means walking the whole of `/etc/alsa/conf.d`, and opening the DAC behind
+/// it, for the life of the daemon.
+fn device_is_present(
+    state: &super::ApiState,
+    backend: Option<qbz_audio::AudioBackendType>,
+    dev: &str,
+) -> bool {
+    #[cfg(target_os = "linux")]
+    if backend == Some(qbz_audio::AudioBackendType::Alsa) {
+        return qbz_audio::alsa_backend::alsa_device_present(dev);
+    }
+    cached_device_names(state, backend)
         .iter()
         .any(|n| n == dev || n.contains(dev) || dev.contains(n.as_str()))
 }
 
-/// Device names, re-enumerated at most every 5 s (a `status` poll must not
-/// re-scan CPAL on every call). On enumeration failure the timestamp is still
-/// bumped so a broken audio stack is not hammered.
-fn cached_device_names(state: &super::ApiState) -> Vec<String> {
-    use std::time::{Duration, Instant};
+/// How long an enumeration answers for. A configured device does not come and
+/// go on a timescale a human notices, and every poll that misses the cache
+/// costs a real scan of the audio stack — a `pw-dump` subprocess on PipeWire,
+/// a walk of the whole PCM namespace on CPAL. moOde polls `status` every three
+/// seconds for as long as the box is up, so this is the difference between
+/// twenty scans a minute and two.
+const DEVICE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Device names, re-enumerated at most once per [`DEVICE_CACHE_TTL`]. On
+/// enumeration failure the timestamp is still bumped so a broken audio stack
+/// is not hammered.
+fn cached_device_names(
+    state: &super::ApiState,
+    backend: Option<qbz_audio::AudioBackendType>,
+) -> Vec<String> {
+    use std::time::Instant;
     let mut cache = match state.devices.lock() {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
     let fresh = cache
         .at
-        .map(|t| t.elapsed() < Duration::from_secs(5))
+        .map(|t| t.elapsed() < DEVICE_CACHE_TTL)
         .unwrap_or(false);
     if !fresh {
-        if let Ok(sinks) = qbz_audio::output_sinks::list_output_sinks() {
-            cache.names = sinks.into_iter().map(|s| s.name).collect();
+        if let Some(names) = enumerate_device_names(backend) {
+            cache.names = names;
         }
         cache.at = Some(Instant::now());
     }
     cache.names.clone()
+}
+
+/// Names to match the configured device against, from **the backend that
+/// stores that id**.
+///
+/// This used to always ask `output_sinks::list_output_sinks`, i.e. CPAL — and
+/// on Linux CPAL is the ALSA host, which yields PCM ids and card descriptions.
+/// The PipeWire backend stores `alsa_output.*` node names, which no ALSA
+/// enumeration ever produces, so `device_present` was false for every
+/// PipeWire user whose device was merely idle rather than open.
+///
+/// Both the id and the display name go in, because the caller's match is a
+/// substring test in either direction and the stored id may be either one.
+fn enumerate_device_names(backend: Option<qbz_audio::AudioBackendType>) -> Option<Vec<String>> {
+    if let Some(backend) = backend {
+        let devices = qbz_audio::backend::BackendManager::create_backend(backend)
+            .ok()
+            .and_then(|b| b.enumerate_devices().ok());
+        if let Some(devices) = devices {
+            return Some(
+                devices
+                    .into_iter()
+                    .flat_map(|d| [d.id, d.name])
+                    .filter(|n| !n.is_empty())
+                    .collect(),
+            );
+        }
+        return None;
+    }
+    // Auto / unset: no backend owns the id yet, so the host default is the
+    // only thing to ask.
+    qbz_audio::output_sinks::list_output_sinks()
+        .ok()
+        .map(|sinks| sinks.into_iter().map(|s| s.name).collect())
 }
 
 #[cfg(test)]

@@ -1785,23 +1785,12 @@ impl AlsaDirectStream {
     ///
     /// The generic aliases are excluded: those name a sound server rather than a
     /// device, and CPAL negotiates with them better than we would.
+    /// The named-PCM half is [`crate::device_filter::is_named_config_pcm`],
+    /// shared with the guard that keeps those same PCMs away from rodio — the
+    /// two answers have to agree, or a PCM this path declines has nowhere left
+    /// to go but the one that `abort()`s.
     pub fn supports_direct_open(device_id: &str) -> bool {
-        const GENERIC_ALIASES: &[&str] = &[
-            "default",
-            "sysdefault",
-            "pulse",
-            "pipewire",
-            "jack",
-            "null",
-            "oss",
-            "speex",
-            "upmix",
-            "vdownmix",
-        ];
-        if Self::is_hw_device(device_id) {
-            return true;
-        }
-        !device_id.is_empty() && !device_id.contains(':') && !GENERIC_ALIASES.contains(&device_id)
+        Self::is_hw_device(device_id) || crate::device_filter::is_named_config_pcm(device_id)
     }
 }
 

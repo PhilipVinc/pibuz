@@ -3,6 +3,42 @@
 Notable changes per release. Versions are plain semver; releases are `vX.Y.Z`
 tags on `main`.
 
+## 2.4.2-dev.1 — unreleased
+
+### Fixed
+
+- **pibuz no longer crash-loops when PeppyALSA is on** (moodeaudio.org #4660).
+  Turning PeppyALSA on inserts a `softvol` → `meter` plugin chain into the ALSA
+  namespace and repoints `_audioout` at it. The `status` endpoint — which
+  moOde's watchdog polls every few seconds — asked libasound what every PCM in
+  the namespace supported, and libasound answers that question about a plugin
+  chain by aborting the process
+  (`snd1_pcm_hw_param_get_min: Assertion '!snd_interval_empty(i)' failed`).
+  The daemon died within seconds of every start, forever. Plugin PCMs are now
+  never probed, and never handed to rodio, which probes them in turn.
+  (The `Cannot get card index for Loopback` line above the crash is unrelated
+  noise from `trx_send.conf`; it appears on every enumeration.)
+- `status` no longer walks the ALSA namespace on a poll at all: with the ALSA
+  backend, `device_present` is answered from `/proc/asound`. Enumerating meant
+  resolving every drop-in in `/etc/alsa/conf.d`, and opening the DAC behind
+  them, for the life of the daemon.
+- ALSA devices report their measured sample rates again. The CPAL lookup was
+  keyed on the device's human description rather than its PCM id, so it never
+  matched and every card fell back to an assumed ceiling.
+- `device_present` is no longer permanently false for PipeWire users. It
+  enumerated through CPAL, which on Linux is always the ALSA host and never
+  yields the `alsa_output.*` node names the PipeWire backend stores.
+- libasound's own messages reach the log with a timestamp. The error handler
+  was installed by the first playback, so anything before that — including the
+  crash above — went to stderr raw.
+
+### Added
+
+- A clippy `disallowed-methods` gate on the three cpal/rodio calls that probe a
+  PCM's hardware parameters. Each of the 13 call sites now records why its
+  device is safe to ask; a new probe cannot be added without that sentence.
+
+
 ## 2.4.1 — 2026-09-16
 
 ### Fixed

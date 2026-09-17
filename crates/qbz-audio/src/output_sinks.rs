@@ -45,8 +45,11 @@ fn cpal_device_name(device: &rodio::cpal::Device) -> Option<String> {
 
 /// Enumerate the system's CPAL output devices.
 ///
-/// On Linux the CPAL host is PipeWire/PulseAudio (rodio defaults to
-/// CPAL's PipeWire host on modern distros); on macOS/Windows it is the
+/// On Linux the CPAL host is **ALSA** — cpal has no PipeWire host, so a
+/// PipeWire box is reached through libasound's `pipewire`/`pulse` PCMs like
+/// any other. What that means here is that this walks the whole ALSA PCM
+/// namespace, `/etc/alsa/conf.d` drop-ins included, and must therefore never
+/// hand libasound a PCM it could `abort()` on. On macOS/Windows it is the
 /// platform default. Output is shaped for the audio settings UI.
 ///
 /// CRITICAL: The returned `name` is exactly the CPAL device name, so it
@@ -84,28 +87,55 @@ pub fn list_output_sinks() -> Result<Vec<OutputSinkInfo>, String> {
                 .map(|d| d == &name)
                 .unwrap_or(false);
 
+            // The RAW PCM id ("peppy", "hw:CARD=IQaudIODAC,DEV=0"), not the
+            // human description `cpal_device_name` returns — the probe guard
+            // keys on the id, and on ALSA the two are different strings.
+            let pcm_id = crate::device_filter::cpal_pcm_id(&device).unwrap_or_else(|| name.clone());
+
             // Same diagnostic logging as the legacy command, so log output
             // for the V2 command matches what users / support reports
             // already document.
-            let configs_info = device
-                .supported_output_configs()
-                .ok()
-                .map(|configs| {
-                    let config_strs: Vec<String> = configs
-                        .take(3)
-                        .map(|c| format!("{}ch/{}Hz", c.channels(), c.max_sample_rate()))
-                        .collect();
-                    config_strs.join(", ")
-                })
-                .unwrap_or_else(|| "no configs".to_string());
+            //
+            // The probe is a DIAGNOSTIC and is treated as one. It used to run
+            // unconditionally, on every PCM in the namespace, on a path the
+            // `status` endpoint polls every few seconds — and probing a
+            // third-party plugin PCM makes libasound `abort()` the process
+            // (see `device_filter::is_probe_safe_pcm_id`). That is what
+            // crash-looped pibuz on moOde with PeppyALSA on. So: only when
+            // someone is actually reading debug logs, and only for PCMs that
+            // resolve to a kernel device. Everything else reports "not
+            // probed", which is the honest answer.
+            let configs_info = if !log::log_enabled!(log::Level::Debug) {
+                None
+            } else if !crate::device_filter::is_probe_safe_pcm_id(&pcm_id) {
+                Some("not probed (plugin PCM)".to_string())
+            } else {
+                // PROBE. Guarded by the `is_probe_safe_pcm_id` arm above.
+                #[allow(clippy::disallowed_methods)]
+                let probed = device.supported_output_configs().ok();
+                Some(
+                    probed
+                        .map(|configs| {
+                            let config_strs: Vec<String> = configs
+                                .take(3)
+                                .map(|c| format!("{}ch/{}Hz", c.channels(), c.max_sample_rate()))
+                                .collect();
+                            config_strs.join(", ")
+                        })
+                        .unwrap_or_else(|| "no configs".to_string()),
+                )
+            };
 
-            log::debug!(
-                "[qbz-audio]   [{}] Device: '{}' (default: {}) - Configs: {}",
-                idx,
-                name,
-                is_default,
-                configs_info
-            );
+            if let Some(configs_info) = configs_info {
+                log::debug!(
+                    "[qbz-audio]   [{}] Device: '{}' (pcm: {}) (default: {}) - Configs: {}",
+                    idx,
+                    name,
+                    pcm_id,
+                    is_default,
+                    configs_info
+                );
+            }
 
             // Use the CPAL name for both `name` and `description`: PipeWire
             // CPAL names are already user-friendly, and storing the same

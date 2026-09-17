@@ -777,7 +777,12 @@ impl AudioBackend for PipeWireBackend {
             buffer_size: BufferSize::Default,
         };
 
-        // Check if CPAL device supports this configuration
+        // Check if CPAL device supports this configuration.
+        //
+        // PROBE. Safe because `device` here is the sound-server PCM this
+        // function selected by score just above — `pipewire` or `pulse`, both
+        // probe-safe — never a PCM from the user's config tree.
+        #[allow(clippy::disallowed_methods)]
         let supported_configs = device
             .supported_output_configs()
             .map_err(|e| format!("Failed to get supported configs: {}", e))?;
@@ -847,7 +852,11 @@ impl AudioBackend for PipeWireBackend {
             None
         };
 
-        // Create MixerDeviceSink with custom config
+        // Create MixerDeviceSink with custom config.
+        //
+        // PROBE (rodio reads the device's default config). Same device as
+        // above: the `pipewire`/`pulse` server PCM, not a config-tree chain.
+        #[allow(clippy::disallowed_methods)]
         let mixer_sink = DeviceSinkBuilder::from_device(device)
             .map_err(|e| format!("Failed to create device sink builder: {}", e))?
             .with_supported_config(&supported_config)
