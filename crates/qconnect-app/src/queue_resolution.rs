@@ -189,11 +189,22 @@ pub fn resolve_remote_start_index(
     renderer_track_id: Option<u64>,
 ) -> Option<usize> {
     if let Some(queue_item_id) = renderer_queue_item_id {
-        if let Some(index) = queue_state
+        // An exact id first, then the NORMALIZED head: the cloud names a
+        // freshly-pushed queue's placeholder head by the 0 the renderer reports
+        // for it, which no raw id in the queue carries. 0 is also an ordinary id
+        // further down a queue, so the exact match has to win — otherwise naming
+        // that item lands the cursor on the head instead.
+        let by_queue_item_id = queue_state
             .queue_items
             .iter()
             .position(|item| item.queue_item_id == queue_item_id)
-        {
+            .or_else(|| {
+                (0..queue_state.queue_items.len()).find(|&index| {
+                    normalize_current_queue_item_id_from_queue_state(queue_state, index)
+                        == queue_item_id
+                })
+            });
+        if let Some(index) = by_queue_item_id {
             // Only trust the queue_item_id when the track at that position matches
             // the renderer's reported track (or no track was reported). A qid that
             // resolves to a DIFFERENT track means the cached renderer projection is
@@ -290,6 +301,23 @@ pub fn resolve_core_shuffle_order(
     Some(ordered)
 }
 
+/// Does the head of this queue carry the cloud's PLACEHOLDER id rather than a
+/// real one?
+///
+/// The cloud mints the head item of a freshly-pushed queue with the track's own
+/// catalog id where the queue item id belongs, and every renderer has to report
+/// that item back as 0. Observed on the wire as queue item ids
+/// `[126886853, 10, 1]` over tracks `[126886853, 123452387, 126886854]`: the
+/// tell is the head's id equalling its track id, and the later items — whose ids
+/// are ordinary small ones — CORROBORATE it.
+///
+/// A release of exactly one track has no later item to corroborate with, and
+/// demanding one anyway is what left a single release reporting its catalog id
+/// where the controller expected 0. The controller cannot find that id in the
+/// queue it holds, so the play button spun forever while the renderer sat paused
+/// (vicrodh/qbz#794). Corroborate when there is something to corroborate with; a
+/// queue of one rests on the head alone, which is safe because a catalog id is
+/// never also a queue position.
 fn is_cloud_placeholder_current_queue_item(
     queue: &QConnectQueueState,
     current_index: usize,
@@ -298,9 +326,12 @@ fn is_cloud_placeholder_current_queue_item(
         return false;
     };
 
-    current_index == 0
-        && current_item.queue_item_id == current_item.track_id
-        && queue
+    if current_index != 0 || current_item.queue_item_id != current_item.track_id {
+        return false;
+    }
+
+    queue.queue_items.len() == 1
+        || queue
             .queue_items
             .iter()
             .skip(1)
@@ -379,5 +410,60 @@ mod tests {
     fn track_id_lookup_when_qid_absent_from_queue() {
         let q = queue(vec![item(0, 100), item(7, 200)]);
         assert_eq!(resolve_remote_start_index(&q, Some(99), Some(200)), Some(1));
+    }
+
+    /// Regression (vicrodh/qbz#794, "Blister Sunrise" by M83): a release of ONE
+    /// track. Its head is the cloud's placeholder exactly as a longer release's
+    /// is, and must normalize to 0 — there is simply no second item to prove it
+    /// with. Reporting the catalog id instead left the controller's play button
+    /// spinning forever.
+    #[test]
+    fn the_placeholder_head_of_a_one_track_release_still_normalizes_to_zero() {
+        let q = queue(vec![item(126886853, 126886853)]);
+        assert_eq!(normalize_current_queue_item_id_from_queue_state(&q, 0), 0);
+    }
+
+    /// The same shape a longer release arrives in, pinned beside it: ids
+    /// `[126886853, 10, 1]` over tracks `[126886853, 123452387, 126886854]`, as
+    /// captured from the wire.
+    #[test]
+    fn the_placeholder_head_of_a_longer_release_normalizes_to_zero() {
+        let q = queue(vec![
+            item(126886853, 126886853),
+            item(10, 123452387),
+            item(1, 126886854),
+        ]);
+        assert_eq!(normalize_current_queue_item_id_from_queue_state(&q, 0), 0);
+        assert_eq!(normalize_current_queue_item_id_from_queue_state(&q, 1), 10);
+    }
+
+    /// A one-item queue whose head carries a REAL id is left alone: the tell is
+    /// the id equalling the track id, and nothing else about a queue of one.
+    #[test]
+    fn a_one_item_queue_with_a_real_head_id_is_not_treated_as_a_placeholder() {
+        let q = queue(vec![item(7, 126886853)]);
+        assert_eq!(normalize_current_queue_item_id_from_queue_state(&q, 0), 7);
+    }
+
+    /// The cloud names the head by the id the renderer reports for it — 0 — and
+    /// states no track. The raw ids hold the placeholder, so only the normalized
+    /// id can match it. `find_cursor_index_by_queue_item_id` has always matched
+    /// on both; this is the same rule on the start-index path.
+    #[test]
+    fn a_placeholder_head_resolves_when_the_cloud_names_it_by_zero() {
+        let q = queue(vec![item(126886853, 126886853), item(1, 126886854)]);
+        assert_eq!(resolve_remote_start_index(&q, Some(0), None), Some(0));
+    }
+
+    /// 0 is also a perfectly ordinary queue item id further down a queue, so an
+    /// EXACT match wins over the normalized head.
+    #[test]
+    fn an_exact_zero_further_down_the_queue_beats_the_normalized_head() {
+        let q = queue(vec![
+            item(126886853, 126886853),
+            item(1, 126886854),
+            item(0, 126886855),
+        ]);
+        assert_eq!(resolve_remote_start_index(&q, Some(0), None), Some(2));
     }
 }

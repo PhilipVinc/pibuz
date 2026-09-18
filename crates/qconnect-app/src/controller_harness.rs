@@ -704,6 +704,22 @@ impl VirtualController {
             .await;
     }
 
+    /// Tap play on a release the cloud has only just minted, in the shape it
+    /// really mints one.
+    ///
+    /// The cloud does not give the HEAD item of a freshly-pushed queue an
+    /// ordinary id: it puts the track's own catalog id where the queue item id
+    /// belongs, a placeholder every renderer has to report back as 0. Captured
+    /// from the wire as queue item ids `[126886853, 10, 1]` over tracks
+    /// `[126886853, 123452387, 126886854]` — the head carries its track id while
+    /// the rest carry small ones, which is what
+    /// `normalize_current_queue_item_id_from_queue_state` reads.
+    pub async fn push_fresh_release_and_play(&self, track_ids: &[u64], selected: usize) {
+        let items = fresh_release_items(track_ids);
+        self.announce_queue(&items, selected).await;
+        self.tap_track(&items, selected).await;
+    }
+
     /// Tap play on a queue the controller just picked: the cloud pushes
     /// `QUEUE_TRACKS_LOADED` naming the selection, then a `SET_STATE` naming the
     /// track. This is the ordinary "user tapped a track in an album" flow.
@@ -988,6 +1004,21 @@ fn queue_event(message_type: &str, payload: Value) -> CloudFrame {
         queue_version: Some(QueueVersion::new(1, 1)),
         payload,
     })
+}
+
+/// The queue items the cloud mints for a release it has just been asked to play:
+/// the head item's id IS its track id (the placeholder), the rest are ordinary
+/// small ids. See [`VirtualController::push_fresh_release_and_play`].
+fn fresh_release_items(track_ids: &[u64]) -> Vec<QueueItem> {
+    track_ids
+        .iter()
+        .enumerate()
+        .map(|(index, &track_id)| QueueItem {
+            track_context_uuid: "ctx-harness".to_string(),
+            track_id,
+            queue_item_id: if index == 0 { track_id } else { index as u64 },
+        })
+        .collect()
 }
 
 fn queue_item_json(item: &QueueItem) -> Value {
@@ -1543,11 +1574,28 @@ impl ControllerHarness {
     /// A report tick with the triple stated outright — for the states the fake
     /// player has no way to reach, above all BUFFERING.
     pub async fn report_tick_as(&self, tick: ReportTick) {
-        let queue_version = self.inner.app.queue_state_snapshot().await.version;
-        let queue_item_id = {
-            let state = self.inner.sync_state.lock().await;
-            state.last_renderer_queue_item_id
-        };
+        let queue = self.inner.app.queue_state_snapshot().await;
+        let queue_version = queue.version;
+        // Mirrors `resolve_queue_item_ids_by_track_id`: the daemon does not
+        // report the queue item id it last cached, it RESOLVES one from the
+        // cloud queue for the track that is AUDIBLE, and caches that. Reading
+        // the cache back instead would report whatever the cloud last named,
+        // which is the one value that is never wrong — and would hide every bug
+        // in that resolution, the normalization of a freshly-pushed queue's
+        // placeholder head among them.
+        let audible_track_id = self.inner.engine.snapshot().track_id;
+        let (queue_item_id, next_queue_item_id, next_track_id) =
+            crate::queue_resolution::resolve_queue_item_ids_from_queue_state(
+                &queue,
+                audible_track_id,
+            );
+        if queue_item_id.is_some() {
+            let mut state = self.inner.sync_state.lock().await;
+            state.last_renderer_queue_item_id = queue_item_id;
+            state.last_renderer_next_queue_item_id = next_queue_item_id;
+            state.last_renderer_track_id = Some(audible_track_id);
+            state.last_renderer_next_track_id = next_track_id;
+        }
 
         self.inner
             .app
@@ -1570,7 +1618,7 @@ impl ControllerHarness {
                 "current_position": tick.position_ms,
                 "duration": tick.duration_ms,
                 "current_queue_item_id": queue_item_id,
-                "next_queue_item_id": Option::<u64>::None,
+                "next_queue_item_id": next_queue_item_id,
                 "queue_version": {
                     "major": queue_version.major,
                     "minor": queue_version.minor,
