@@ -310,12 +310,191 @@ impl SampleLayout {
         }
     }
 
+    /// The ALSA format this layout asks for.
+    ///
+    /// The inverse of [`SampleLayout::for_format`], and Linux-only for the same
+    /// reason: `alsa::Format` does not exist anywhere else. Every arm is
+    /// total — unlike `for_format`, which has to cope with a format we never
+    /// asked for — so a layout added to the enum cannot be silently unaskable.
+    /// A swapped arm here is SILENT: the wrong byte layout reaches the DAC,
+    /// which is noise or a wrong depth, not an error. `as_format_round_trips_through_for_format`
+    /// is what catches that.
+    #[cfg(target_os = "linux")]
+    pub fn as_format(self) -> Format {
+        match self {
+            SampleLayout::F32Le => Format::FloatLE,
+            SampleLayout::S32Le => Format::S32LE,
+            SampleLayout::S24Le => Format::S24LE,
+            SampleLayout::S24Le3 => Format::S243LE,
+            SampleLayout::S16Le => Format::S16LE,
+        }
+    }
+
+    /// The name `snd_pcm_format_name` would print, so a log line and a
+    /// libasound message about the same format read the same.
+    pub fn alsa_name(self) -> &'static str {
+        match self {
+            SampleLayout::F32Le => "FLOAT_LE",
+            SampleLayout::S32Le => "S32_LE",
+            SampleLayout::S24Le => "S24_LE",
+            SampleLayout::S24Le3 => "S24_3LE",
+            SampleLayout::S16Le => "S16_LE",
+        }
+    }
+
+    /// Whether alsa-lib's `type meter` plugin can read a stream in this layout.
+    ///
+    /// `s16_enable` in `pcm_meter.c` converts S8, S16, S24, S32 and their
+    /// unsigned variants (plus a-law/mu-law/ADPCM) to S16 for the `s16` scope
+    /// that peppyalsa reads through. The 3-byte packed formats and float are
+    /// not in that list, and a scope it cannot serve is left DISABLED with no
+    /// error the application can see. (Only peppyalsa's scope is established
+    /// to go through `s16` — it calls `snd_pcm_scope_s16_get_channel_buffer`.
+    /// A scope could read the raw stream instead; this says nothing about one
+    /// that does.)
+    ///
+    /// Only a preference, never a requirement: nothing here refuses to play.
+    /// See [`FormatRegime::formats`] for what it is used for and why.
+    pub fn is_meter_readable(self) -> bool {
+        match self {
+            SampleLayout::S32Le | SampleLayout::S24Le | SampleLayout::S16Le => true,
+            SampleLayout::S24Le3 | SampleLayout::F32Le => false,
+        }
+    }
+
     /// Bytes one sample occupies on the wire.
     pub fn bytes_per_sample(self) -> usize {
         match self {
             SampleLayout::F32Le | SampleLayout::S32Le | SampleLayout::S24Le => 4,
             SampleLayout::S24Le3 => 3,
             SampleLayout::S16Le => 2,
+        }
+    }
+}
+
+/// Which of two regimes a PCM is in — that is, whether
+/// `snd_pcm_hw_params_set_format` on it reports a fact or grants a wish.
+///
+/// One classifier, so the format list and the log line that explains it cannot
+/// come to different conclusions about the same device.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FormatRegime {
+    /// `hw:…` — the request reaches the kernel driver with nothing in between,
+    /// so a refusal means the hardware genuinely cannot clock it. `set_format`
+    /// is a PROBE and its answer is the truth.
+    Probe,
+    /// Everything else the direct path opens: `plughw:`, `plug:…`, or a bare
+    /// named PCM from `/etc/alsa/conf.d` such as moOde's `_audioout`. There may
+    /// be a converter in the way, and the id cannot tell us whether there is,
+    /// so a success means nothing in particular. `set_format` is a CHOICE.
+    Choice,
+}
+
+impl FormatRegime {
+    /// Classify the id a PCM was opened with.
+    ///
+    /// Deliberately narrower than [`AlsaDirectStream::is_hw_device`], which
+    /// also admits `plughw:` and `front:CARD=` and stays as it is: that one
+    /// answers "is this a card rather than a sound server", and a converter in
+    /// front does not change that answer. This one answers "will `set_format`
+    /// tell me the truth", and a converter changes it completely.
+    ///
+    /// The per-card aliases (`front:`, `sysdefault:`, `iec958:`, `hdmi:`)
+    /// never arrive here: `alsa_backend::raw_open_ids` rewrites each of them to
+    /// `hw:CARD=…` / `plughw:CARD=…` before the open, so they reach us already
+    /// classified. Whether alsa-lib puts a converter behind those aliases is
+    /// therefore a question this function does not have to answer — and it is
+    /// an open one, since `device_filter::is_probe_safe_pcm_id` reasons that
+    /// their slave is always a kernel PCM while `raw_open_ids` records that
+    /// snd-aloop's `front` routes through softvol.
+    pub fn of(device_id: &str) -> Self {
+        let raw_card = device_id
+            .trim()
+            .strip_prefix("hw:")
+            .is_some_and(|rest| !rest.is_empty());
+        if raw_card {
+            FormatRegime::Probe
+        } else {
+            FormatRegime::Choice
+        }
+    }
+
+    /// The formats to offer this PCM, best first.
+    ///
+    /// # Probe: packed 24-bit leads
+    ///
+    /// The driver refuses what it cannot clock, so the first format that
+    /// sticks is the best the hardware can do. `S24_3LE` leads because it is
+    /// required by SMSL-class USB DACs (TAS1020B), and offering `S32_LE` first
+    /// would drop them to 16-bit.
+    ///
+    /// # Choice: the widest container a meter can read leads
+    ///
+    /// Behind a plug layer nothing is refused — the plug converts — so the
+    /// FIRST ENTRY ALWAYS WINS and the list stops being a probe. `S24_3LE`
+    /// leading it was a bug seen on hardware.
+    ///
+    /// With PeppyALSA on, moOde points `_audioout` at `peppy` (`type plug`) →
+    /// `softvol_and_peppyalsa` → `peppyalsa` (`type meter`) → `_peppyout` →
+    /// `plughw:0,0`. softvol's format mask includes `S24_3LE`, so asking for it
+    /// succeeded and the whole chain ran packed — which matches what this tree
+    /// already recorded from a Pi, that pibuz fed `_audioout` S24_3LE at 96 kHz
+    /// and the chain handed the DAC S32_LE (see `BitPerfectMode::DirectNamedDevice`).
+    /// The meter's `s16` scope has no S16 conversion for a packed format
+    /// ([`SampleLayout::is_meter_readable`]), so it was left disabled —
+    /// silently, because moOde patches the abort that would otherwise follow
+    /// into a zeroed buffer (`alsa_lib_scope_no_abort.patch`). Audio was
+    /// perfect, nothing crashed, and the needles sat at zero at any volume
+    /// (moodeaudio.org #4660).
+    ///
+    /// So lead with the widest container a meter can read. The plug converts
+    /// whatever it is handed, so asking for a wide one costs nothing.
+    ///
+    /// # Why `S24_3LE` still outranks `S16_LE` here
+    ///
+    /// Because `Choice` is inferred from the id, and the id cannot see the
+    /// chain. A bare named PCM is only "accepts everything" if a `type plug` is
+    /// actually in it; a `copy`/`softvol`/`meter` chain ending at `hw:`
+    /// forwards the format mask, and there `set_format` is still a real probe.
+    /// On such a chain in front of a packed-only DAC, `S32_LE` and `S24_LE` are
+    /// refused — and the next offer decides between 24-bit audio and a working
+    /// needle. Bit depth wins: a silent meter is a cosmetic fault, 16-bit
+    /// output is not.
+    ///
+    /// Neither list may DROP a format. This is a preference, not a
+    /// requirement, and a chain that accepts only the packed or float layout
+    /// must still play.
+    pub fn formats(self) -> &'static [SampleLayout] {
+        match self {
+            FormatRegime::Probe => &[
+                SampleLayout::S24Le3,
+                SampleLayout::S32Le,
+                SampleLayout::S24Le,
+                SampleLayout::S16Le,
+                SampleLayout::F32Le,
+            ],
+            FormatRegime::Choice => &[
+                SampleLayout::S32Le,
+                SampleLayout::S24Le,
+                SampleLayout::S24Le3,
+                SampleLayout::S16Le,
+                SampleLayout::F32Le,
+            ],
+        }
+    }
+
+    /// What the chosen format means, for the log line.
+    ///
+    /// The distinction a report of a silent VU meter turns on: on a raw card
+    /// the driver decided, behind a plug we did.
+    pub fn why(self) -> &'static str {
+        match self {
+            FormatRegime::Probe => {
+                "raw card, so the driver refusing a format is what moved us down the list"
+            }
+            FormatRegime::Choice => {
+                "plug layer, where nothing is refused — this was our choice, not a probe"
+            }
         }
     }
 }
@@ -766,7 +945,7 @@ impl AlsaDirectStream {
         let mut configured: Option<(Format, Frames, Frames, bool)> = None;
         let mut first_failure: Option<String> = None;
         for allow_resample in [false, true] {
-            match Self::configure_hw(&pcm, sample_rate, channels, allow_resample) {
+            match Self::configure_hw(&pcm, device_id, sample_rate, channels, allow_resample) {
                 Ok((format, buffer_frames, period_frames)) => {
                     configured = Some((format, buffer_frames, period_frames, allow_resample));
                     break;
@@ -828,8 +1007,16 @@ impl AlsaDirectStream {
     /// once the params have been refined, the constraints cannot be relaxed
     /// again, so retrying with a different `rate_resample` needs a new
     /// container rather than a second `set_` on the old one.
+    ///
+    /// `device_id` is here only to classify the PCM for the format list; the
+    /// PCM itself is already open. It is the id this open was attempted with,
+    /// which is what the regime has to be read from: the backend derives
+    /// `hw:`/`plughw:`/`plug:<name>` variants of the configured device and
+    /// tries them in turn (`alsa_backend::try_create_direct_stream`), and those
+    /// variants are in different regimes.
     fn configure_hw(
         pcm: &PCM,
+        device_id: &str,
         sample_rate: u32,
         channels: u16,
         allow_resample: bool,
@@ -844,29 +1031,54 @@ impl AlsaDirectStream {
         hwp.set_access(Access::RWInterleaved)
             .map_err(|e| format!("Failed to set access: {e}"))?;
 
-        // Try formats in order of preference for bit-perfect playback.
-        // S24_3LE first: required by SMSL-class USB DACs (TAS1020B chip).
-        // Then descending bit-depth for quality.
-        let format_priority = [
-            (Format::S243LE, "S24_3LE"), // 24-bit packed (SMSL, Topping, Fosi DACs)
-            (Format::S32LE, "S32LE"),    // 32-bit
-            (Format::S24LE, "S24LE"),    // 24-bit in 32-bit container
-            (Format::S16LE, "S16LE"),    // 16-bit
-            (Format::FloatLE, "Float32LE"), // Float (compatibility)
-        ];
+        // Which formats to offer, and in which order, depends on whether
+        // `set_format` on this PCM reports a fact or grants a wish — see
+        // `FormatRegime`, which carries the reasoning.
+        let regime = FormatRegime::of(device_id);
+        let offered = regime.formats();
 
-        let mut selected_format = None;
-        for (format, name) in &format_priority {
-            if hwp.set_format(*format).is_ok() {
-                log::info!("[ALSA Direct] Selected format: {}", name);
-                selected_format = Some(*format);
+        let mut selected = None;
+        for (position, layout) in offered.iter().enumerate() {
+            if hwp.set_format(layout.as_format()).is_ok() {
+                selected = Some((position, *layout));
                 break;
             }
         }
-        let format = selected_format.ok_or_else(|| {
-            "No supported audio format found (tried S24_3LE, S32LE, S24LE, S16LE, FloatLE)"
-                .to_string()
+        let (position, layout) = selected.ok_or_else(|| {
+            format!(
+                "No supported audio format found on '{device_id}' (tried {})",
+                offered
+                    .iter()
+                    .map(|l| l.alsa_name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
         })?;
+        // The POSITION is the part a bug report needs: it says whether anything
+        // was turned down before this, which is the difference between "the
+        // hardware wanted this" and "we asked for this first".
+        log::info!(
+            "[ALSA Direct] Selected format: {} (offer {} of {} on '{device_id}'; {})",
+            layout.alsa_name(),
+            position + 1,
+            offered.len(),
+            regime.why()
+        );
+        // The breadcrumb this bug cost a forum thread to find. An ALSA meter
+        // plugin in the chain reads through the `s16` scope, which has no
+        // conversion for a packed or float layout, so it reports silence while
+        // the audio plays normally. Only worth saying where we had a choice: on
+        // a raw card the driver left us none, and no meter plugin is in the way
+        // of one anyway.
+        if regime == FormatRegime::Choice && !layout.is_meter_readable() {
+            log::warn!(
+                "[ALSA Direct] '{device_id}' accepted only {} — alsa-lib's `type meter` plugin \
+                 cannot convert that to S16, so a VU meter behind this device (PeppyALSA) will \
+                 read silence even though the audio is fine",
+                layout.alsa_name()
+            );
+        }
+        let format = layout.as_format();
 
         hwp.set_channels(u32::from(channels))
             .map_err(|e| format!("Failed to set channels: {e}"))?;
@@ -1910,6 +2122,161 @@ mod tests {
     fn generic_aliases_go_through_cpal() {
         for id in ["default", "sysdefault", "pulse", "pipewire", "jack", ""] {
             assert!(!AlsaDirectStream::supports_direct_open(id), "{id}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod format_choice_tests {
+    use super::{FormatRegime, SampleLayout};
+
+    const ALL: &[SampleLayout] = &[
+        SampleLayout::F32Le,
+        SampleLayout::S32Le,
+        SampleLayout::S24Le,
+        SampleLayout::S24Le3,
+        SampleLayout::S16Le,
+    ];
+
+    /// Behind a plug layer every format is accepted, so whatever leads the list
+    /// is what the whole chain runs at. `S24_3LE` leading it is what silenced
+    /// PeppyALSA's needles on a moOde 10.3.5 Pi while the audio was perfect
+    /// (moodeaudio.org #4660).
+    ///
+    /// Asserted through `is_meter_readable`, not against a named format:
+    /// membership in the list is what the old order already had and is exactly
+    /// what did not save it, and pinning `S32_LE` by name would forbid a
+    /// future `S24_LE` head that satisfies the same property.
+    ///
+    /// The ids are only the ones that can actually reach `configure_hw`: the
+    /// configured device as written, and the `plug:<name>` and `plughw:`
+    /// variants the backend derives from it. The per-card aliases are absent on
+    /// purpose — `raw_open_ids` has already rewritten them to `hw:`/`plughw:`
+    /// by this point — and so is `default`, which `supports_direct_open`
+    /// refuses outright.
+    #[test]
+    fn a_plug_layers_first_offer_is_one_a_meter_can_read() {
+        for id in [
+            "_audioout",      // moOde, the reported case
+            "plug:_audioout", // the fallback the backend derives from it
+            "peppy",          // moOde's chain head when PeppyALSA is on
+            "camilladsp",
+            "plughw:0,0",
+            "plughw:CARD=IQaudIODAC,DEV=0",
+        ] {
+            let regime = FormatRegime::of(id);
+            assert_eq!(regime, FormatRegime::Choice, "'{id}' may have a plug in it");
+            let first = regime.formats()[0];
+            assert!(
+                first.is_meter_readable(),
+                "'{id}' is offered {} first, which the s16 scope cannot convert",
+                first.alsa_name()
+            );
+        }
+    }
+
+    /// The raw-card list is a real probe — the driver refuses what it cannot
+    /// clock — and `S24_3LE` must stay in front there, or the SMSL-class USB
+    /// DACs that need it drop to 16-bit.
+    #[test]
+    fn a_raw_card_still_probes_packed_24_bit_first() {
+        for id in ["hw:0,0", "hw:2,0", "hw:CARD=IQaudIODAC,DEV=0"] {
+            let regime = FormatRegime::of(id);
+            assert_eq!(
+                regime,
+                FormatRegime::Probe,
+                "{id} reaches the kernel driver"
+            );
+            assert_eq!(regime.formats()[0], SampleLayout::S24Le3, "{id}");
+        }
+    }
+
+    /// `plughw:` is a card too, but a card behind a converter —
+    /// `is_hw_device` admits it and the regime must not. A bare `hw:` with
+    /// nothing after the colon is not a device at all.
+    #[test]
+    fn only_a_bare_hw_id_with_a_card_behind_it_is_a_probe() {
+        for id in [
+            "plughw:0,0",
+            "_audioout",
+            "plug:_audioout",
+            "hw:",
+            "",
+            "   ",
+        ] {
+            assert_eq!(
+                FormatRegime::of(id),
+                FormatRegime::Choice,
+                "{id} is not a bare kernel PCM"
+            );
+        }
+        assert_eq!(FormatRegime::of(" hw:1,0 "), FormatRegime::Probe);
+    }
+
+    /// When `S32_LE` and `S24_LE` are both refused — a `copy`/`softvol`/`meter`
+    /// chain ending at `hw:` forwards the mask, so that can happen even in the
+    /// `Choice` regime — the next offer decides between 24-bit audio and a
+    /// working needle. Bit depth wins: a silent meter is cosmetic, 16-bit
+    /// output is not. This is the one ordering the meter argument alone would
+    /// have got backwards.
+    #[test]
+    fn bit_depth_outranks_the_meter_below_the_first_offer() {
+        let offered = FormatRegime::Choice.formats();
+        let position = |l: SampleLayout| offered.iter().position(|o| *o == l).unwrap();
+        assert!(
+            position(SampleLayout::S24Le3) < position(SampleLayout::S16Le),
+            "packed 24-bit must be offered before 16-bit, meter or no meter"
+        );
+    }
+
+    /// Neither list may drop a format: this is a preference, not a
+    /// requirement, and a chain that accepts only the packed or float layout
+    /// must still play. Length plus contains-all over a distinct `ALL` is a
+    /// permutation check, so a duplicated entry fails it too.
+    #[test]
+    fn every_format_stays_reachable_in_both_regimes() {
+        for regime in [FormatRegime::Probe, FormatRegime::Choice] {
+            let offered = regime.formats();
+            assert_eq!(
+                offered.len(),
+                ALL.len(),
+                "{regime:?} offers a different number"
+            );
+            for layout in ALL {
+                assert!(
+                    offered.contains(layout),
+                    "{regime:?} cannot reach {layout:?}"
+                );
+            }
+        }
+    }
+
+    /// The names go into a log line beside libasound's own messages about the
+    /// same format, so they have to be spelled the way ALSA spells them. The
+    /// code this replaced printed `S32LE` and `Float32LE`, which match nothing
+    /// in `snd_pcm_format_name`'s table.
+    #[test]
+    fn layout_names_are_the_alsa_spellings() {
+        assert_eq!(SampleLayout::S24Le3.alsa_name(), "S24_3LE");
+        assert_eq!(SampleLayout::S24Le.alsa_name(), "S24_LE");
+        assert_eq!(SampleLayout::S32Le.alsa_name(), "S32_LE");
+        assert_eq!(SampleLayout::S16Le.alsa_name(), "S16_LE");
+        assert_eq!(SampleLayout::F32Le.alsa_name(), "FLOAT_LE");
+    }
+
+    /// The one new mapping where a mistake is SILENT — a swapped arm asks ALSA
+    /// for a layout the encoder does not write, so the DAC gets noise or the
+    /// wrong depth and nothing errors. Linux-only because `alsa::Format` is,
+    /// which is also why no machine but the container can check it.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn as_format_round_trips_through_for_format() {
+        for layout in ALL {
+            assert_eq!(
+                SampleLayout::for_format(layout.as_format()),
+                Some(*layout),
+                "{layout:?} does not survive the trip through alsa::Format"
+            );
         }
     }
 }

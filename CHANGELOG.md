@@ -18,6 +18,26 @@ tags on `main`.
   never probed, and never handed to rodio, which probes them in turn.
   (The `Cannot get card index for Loopback` line above the crash is unrelated
   noise from `trx_send.conf`; it appears on every enumeration.)
+- **The daemon no longer asks a plugin chain for a format its VU meter cannot
+  read.** With the crash above out of the way, audio played on moOde but the
+  PeppyALSA needles sat at zero at any volume. The direct ALSA path offered
+  `S24_3LE` first — right for a raw card, where the SMSL-class USB DACs need
+  it, but wrong behind a plug layer, which accepts every format, so the first
+  entry always won. moOde's `_audioout` is one: with PeppyALSA on it resolves
+  to `peppy` (`type plug`) → `softvol_and_peppyalsa` → `peppyalsa` (`type
+  meter`) → `_peppyout` → `plughw:0,0`, and softvol's format mask includes
+  `S24_3LE`, so the whole chain ran packed. alsa-lib's meter plugin has no S16
+  conversion for a packed format (`s16_enable` in `pcm_meter.c`), so the `s16`
+  scope peppyalsa reads through was left disabled — silently, because moOde
+  patches the abort that would otherwise have followed into a zeroed buffer
+  (`alsa_lib_scope_no_abort.patch`). Behind a plug the daemon now leads with
+  the widest container a meter can read; a raw card still probes packed 24-bit
+  first, and packed 24-bit still outranks 16-bit everywhere, so a packed-only
+  DAC cannot lose depth to this. The chosen format is logged with its position
+  in the offer list and which regime picked it, and picking an unreadable one
+  behind a plug now logs a warning naming the consequence.
+  Reasoned from `pcm_meter.c`, moOde's ALSA config and the report; **the fix
+  itself has not yet been confirmed on hardware.**
 - `status` no longer walks the ALSA namespace on a poll at all: with the ALSA
   backend, `device_present` is answered from `/proc/asound`. Enumerating meant
   resolving every drop-in in `/etc/alsa/conf.d`, and opening the DAC behind
