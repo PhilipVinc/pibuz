@@ -168,6 +168,8 @@ pub async fn probe_remote_stream_info(url: &str) -> Result<RemoteStreamInfo, Str
             )
         })?;
 
+    let headers_ms = start_time.elapsed().as_millis();
+
     if !range_response.status().is_success() {
         return Err(format!(
             "probe range request failed with status {}",
@@ -175,8 +177,36 @@ pub async fn probe_remote_stream_info(url: &str) -> Result<RemoteStreamInfo, Str
         ));
     }
 
-    let content_length = total_length_from(range_response.status(), range_response.headers())
-        .ok_or_else(|| "probe could not determine the track size".to_string())?;
+    // The evidence line for two claims this path RESTS on but cannot prove from
+    // inside itself.
+    //
+    // First: that dropping the HEAD is sound, which needs this CDN to send
+    // `Content-Range` on its 206 — RFC 9110 §14.4 requires it, but requiring is
+    // not observing, and if it ever stops, the size resolve fails and every
+    // track detours to the full download. The RAW header is printed, not just
+    // the number parsed out of it.
+    //
+    // Second: that sharing one client buys a warm connection. A fresh
+    // connection to this CDN measures ~150 ms (see the body-open note below), so
+    // this is the cold cost paid once per track; the body open that follows on a
+    // pooled connection should come in far under it. `x-cache` keeps our
+    // client's cost separable from the edge filling its own cache.
+    let status = range_response.status();
+    log::info!(
+        "[remote-stream/PROBE] {} headers in {}ms, content-range: {} [x-cache: {}]",
+        status.as_u16(),
+        headers_ms,
+        header_str(range_response.headers(), "content-range"),
+        header_str(range_response.headers(), "x-cache"),
+    );
+
+    let content_length = total_length_from(status, range_response.headers()).ok_or_else(|| {
+        format!(
+            "probe could not determine the track size from a {} (content-range: {})",
+            status.as_u16(),
+            header_str(range_response.headers(), "content-range")
+        )
+    })?;
 
     let initial_bytes = range_response
         .bytes()
@@ -395,7 +425,14 @@ pub async fn download_and_stream_remote_track(
         // not our client. `x-cache` says which it was (TCP_HIT vs
         // TCP_MISS), and pairing it with the elapsed time is what makes
         // that attributable rather than guessed at.
-        if !plan.is_whole_file() || opened_ms > 1000 {
+        // The FIRST body of a track is logged unconditionally, which it was not
+        // before: it is the whole-file open on a connection the probe just left
+        // in the pool, so its elapsed time is the direct read on whether sharing
+        // one client is doing anything. Against the ~150 ms a fresh connection
+        // costs, a reused one should be a small fraction of it — and a first
+        // open still sitting at 150 ms means the pool is not being hit at all.
+        let first_body = bytes_received == 0;
+        if first_body || !plan.is_whole_file() || opened_ms > 1000 {
             log::info!(
                 "[{}/STREAMING] Track {} body open at byte {} ({}) in {}ms [x-cache: {}]",
                 log_tag,
