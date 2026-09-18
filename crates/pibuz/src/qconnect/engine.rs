@@ -610,9 +610,13 @@ impl QconnectRendererEngine for DaemonRendererEngine {
 }
 
 async fn download_remote_audio(url: &str) -> Result<Vec<u8>, String> {
-    let response = reqwest::Client::new()
+    // Shared process-wide client (`qbz_qobuz::cdn`). This used to be a bare
+    // `Client::new()`, which carries NO connect timeout and NO read timeout —
+    // a CDN that accepted the connection and then went quiet hung this fallback
+    // forever, with the latch already armed and the controller showing a
+    // spinner. It inherits both bounds now.
+    let response = qbz_qobuz::cdn::client()?
         .get(url)
-        .header("User-Agent", "Mozilla/5.0")
         .send()
         .await
         .map_err(|err| {

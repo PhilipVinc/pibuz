@@ -146,7 +146,7 @@ pub async fn setup_streaming(
     let init_start = std::time::Instant::now();
 
     log::info!("[CMAF] Fetching init segment for track {}", track_id);
-    let init_data = fetch_bytes_with_retry(&http, &init_url, "CMAF init")
+    let init_data = fetch_bytes_with_retry(http, &init_url, "CMAF init")
         .await
         .map_err(|e| format!("Failed to fetch init segment: {}", e))?;
 
@@ -382,7 +382,7 @@ pub async fn download_full_sized(
             let mut output = ArcSlab::with_capacity(total_size);
             output.append(&setup.flac_header)?;
             fetch_decrypt_in_order(
-                &http,
+                http,
                 &setup.url_template,
                 setup.n_segments,
                 "CMAF-FULL",
@@ -419,7 +419,7 @@ pub async fn download_full_sized(
                 tokio::task::spawn_blocking(move || write_track_to_disk(&writer_path, header, rx));
 
             let fetch = fetch_decrypt_in_order(
-                &http,
+                http,
                 &setup.url_template,
                 setup.n_segments,
                 "CMAF-DISK",
@@ -694,7 +694,7 @@ pub async fn download_full_with_quality_progress(
     let mut output = ArcSlab::with_capacity(total_size);
     output.append(&setup.flac_header)?;
     fetch_decrypt_in_order(
-        &http,
+        http,
         &setup.url_template,
         setup.n_segments,
         "CMAF-FULL",
@@ -789,7 +789,7 @@ pub async fn download_raw_with_progress(
 
     // Audio segments — encrypted, stored as-is
     let segments = fetch_all_segments(
-        &http,
+        http,
         &url_template,
         file_url.n_segments,
         "CMAF-RAW",
@@ -817,16 +817,18 @@ pub async fn download_raw_with_progress(
     })
 }
 
-/// Build a reqwest client configured for Akamai CDN fetches.
+/// The shared Akamai CDN client (`crate::cdn`).
+///
+/// This used to BUILD a client, and every caller below built its own — four
+/// sites, so `download_full` alone made two per track (one here, one inside
+/// `setup_streaming`). They all share one now: warm connection pool, warm TLS
+/// session cache, roots parsed once. See `cdn` for the timeout contract.
 ///
 /// Uses the workspace reqwest feature set (rustls-tls): smaller binary, no
 /// system SSL dependency. If Akamai ever surfaces a cert issue, adding the
 /// `native-tls` feature to qbz-qobuz is the escape hatch.
-fn build_cdn_client() -> std::result::Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("CMAF client error: {}", e))
+fn build_cdn_client() -> std::result::Result<&'static reqwest::Client, String> {
+    crate::cdn::client()
 }
 
 /// Fetch a CDN URL into bytes, retrying transient failures (network blips,

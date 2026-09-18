@@ -5971,10 +5971,11 @@ impl Player {
             armed: true,
         };
         let writer = &guard.writer;
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .build()
-            .map_err(|e| format!("CMAF client error: {}", e))?;
+        // Shared process-wide CDN client (`qbz_qobuz::cdn`) — the segment
+        // fetchers in `qbz_qobuz::cmaf` use the same one, so a track that set
+        // up through there and streams through here keeps one warm connection
+        // instead of handshaking twice.
+        let client = qbz_qobuz::cdn::client()?;
 
         // Stage to L2 as the bytes go past. The windowed buffer will not be
         // holding them at the end.
@@ -6651,21 +6652,20 @@ impl Player {
         Ok(writer)
     }
 
-    /// Download audio from URL with timeout
+    /// Download a whole track from a URL, bounded by STALLS rather than by a
+    /// total deadline.
+    ///
+    /// It used to carry `timeout(60s)` — a TOTAL deadline over a whole-track
+    /// download. A Hi-Res track is 120-220 MB, so on any link slower than about
+    /// 3 MB/s that deadline severed a download that was proceeding perfectly
+    /// well, and the gapless prefetch this feeds simply gave up. The shared
+    /// client (`qbz_qobuz::cdn`) bounds the connect phase and the stall instead,
+    /// which is the thing that was actually worth catching.
     async fn download_audio(&self, url: &str) -> Result<Vec<u8>, String> {
-        use std::time::Duration;
-
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(60))
-            .connect_timeout(Duration::from_secs(10))
-            .build()
-            .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
-
         log::info!("Caching audio from URL...");
 
-        let response = client
+        let response = qbz_qobuz::cdn::client()?
             .get(url)
-            .header("User-Agent", "Mozilla/5.0")
             .send()
             .await
             .map_err(|e| format!("Failed to fetch audio: {}", e))?;

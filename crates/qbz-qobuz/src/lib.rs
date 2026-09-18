@@ -32,6 +32,7 @@
 
 pub mod auth;
 pub mod bundle;
+pub mod cdn;
 pub mod client;
 pub mod cmaf;
 pub mod endpoints;
