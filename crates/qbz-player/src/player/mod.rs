@@ -17,7 +17,8 @@ mod streaming_source;
 pub use disk_tee::DiskTee;
 pub use streaming_source::{
     max_initial_buffer_bytes, set_max_initial_buffer_bytes, BufferWriter, BufferedMediaSource,
-    FetchPlan, InMemorySource, IncrementalStreamingSource, StreamSeekMode, StreamingConfig,
+    FetchPlan, InMemorySource, IncrementalStreamingSource, PlanOrigin, StreamSeekMode,
+    StreamingConfig,
 };
 
 use rodio::buffer::SamplesBuffer;

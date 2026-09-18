@@ -745,6 +745,69 @@ pub struct FetchPlan {
     pub offset: u64,
     /// One past the last byte to fetch, or `None` to read to EOF.
     pub end: Option<u64>,
+    /// WHY this body is being opened. Carried so the feeder can say so in its
+    /// log line: a body open that served a waiting reader and one that was
+    /// speculative housekeeping cost the same seconds and look identical
+    /// otherwise, and telling them apart is the whole difference between a
+    /// dropout worth fixing and a background fetch nobody was waiting on.
+    pub origin: PlanOrigin,
+}
+
+/// Where a [`FetchPlan`] came from.
+///
+/// This is the plan's BIRTH, not a live account of who is waiting on it. A
+/// gap-fill can acquire a waiting reader after the fact: `take_unsatisfied`
+/// drops a pending request whose bytes have landed meanwhile, so a reader that
+/// walks forward into the region a `GapFill` body is already serving is never
+/// re-registered, and the body keeps its original label for the rest of its
+/// life. Read `gap-fill` in a log as "nobody was waiting when this opened",
+/// which is what it can actually support.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PlanOrigin {
+    /// The first body of a track.
+    #[default]
+    Initial,
+    /// A reader asked for a byte it could not read — someone IS waiting.
+    ReaderRequest,
+    /// A hole an earlier jump left behind. Nobody is waiting on these; they
+    /// exist so the track ends up whole and therefore cacheable.
+    GapFill,
+    /// The previous body broke and is being re-opened where it died.
+    Resume,
+}
+
+impl PlanOrigin {
+    /// Short tag for a log line.
+    pub fn label(self) -> &'static str {
+        match self {
+            PlanOrigin::Initial => "initial",
+            PlanOrigin::ReaderRequest => "reader-request",
+            PlanOrigin::GapFill => "gap-fill",
+            PlanOrigin::Resume => "resume",
+        }
+    }
+
+    /// The origin a re-opened body inherits after the previous one broke.
+    ///
+    /// A break does not change who is waiting: re-opening an abandoned
+    /// GAP-FILL still has nobody waiting on it, so it must not be promoted to
+    /// live demand just because it failed once. Everything else is demand
+    /// somebody is blocked on, and reads as `Resume` so the log can tell a
+    /// re-open from a first attempt.
+    pub fn as_resumed(self) -> PlanOrigin {
+        match self {
+            PlanOrigin::GapFill => PlanOrigin::GapFill,
+            _ => PlanOrigin::Resume,
+        }
+    }
+
+    /// True when a reader is blocked until this body delivers.
+    pub fn is_live_demand(self) -> bool {
+        matches!(
+            self,
+            PlanOrigin::Initial | PlanOrigin::ReaderRequest | PlanOrigin::Resume
+        )
+    }
 }
 
 impl FetchPlan {
@@ -1276,6 +1339,41 @@ pub struct BufferWriter {
 }
 
 impl BufferWriter {
+    /// Contiguous bytes the reader can still consume from where it is NOW.
+    ///
+    /// Logged when a body opens, because a five-second open with 4 MB of lead is
+    /// a non-event and the same open with 30 KB of lead is the dropout, and the
+    /// two are otherwise indistinguishable in the log.
+    ///
+    /// It delegates to `ahead_bytes`, which anchors on
+    /// `reader_positions[reader_epoch]` and falls back to `primary_offset` only
+    /// before any reader has moved. Anchoring on `primary_offset` DIRECTLY —
+    /// the obvious-looking version of this function — is wrong twice over, and
+    /// silently so:
+    ///
+    /// * `primary_offset` is not where the reader is. It is written in exactly
+    ///   one place, `request_range`, and holds the byte a reader could NOT
+    ///   read. So at the moment a `ReaderRequest` plan is logged — the very case
+    ///   this number exists for — nothing is buffered there and the answer is 0
+    ///   by construction.
+    /// * `trim_behind_readers` drops every segment below
+    ///   `slowest_reader - SEEK_LOOKBEHIND_BYTES`, so once playback is ~1 MiB in,
+    ///   `contiguous_from(primary_offset)` finds no segment at all and returns 0
+    ///   even with megabytes sitting ahead of the reader.
+    ///
+    /// Both failures report a starving reader in every state, which is the
+    /// wrong direction: it manufactures dropouts that are not happening.
+    ///
+    /// `None` means the buffer lock was poisoned — kept distinct from `Some(0)`,
+    /// because 0 is the reading that would send someone hunting a dropout.
+    pub fn reader_lead_bytes(&self) -> Option<u64> {
+        self.shared
+            .state
+            .lock()
+            .ok()
+            .map(|state| state.ahead_bytes())
+    }
+
     /// Push a chunk of downloaded data at the write head.
     ///
     /// This wakes up any readers waiting for data.
@@ -1316,6 +1414,7 @@ impl BufferWriter {
         FetchPlan {
             offset: 0,
             end: None,
+            origin: PlanOrigin::Initial,
         }
     }
 
@@ -1326,7 +1425,11 @@ impl BufferWriter {
         let mut state = self.shared.state.lock().ok()?;
         let offset = take_unsatisfied(&mut state)?;
         state.begin(offset);
-        Some(FetchPlan { offset, end: None })
+        Some(FetchPlan {
+            offset,
+            end: None,
+            origin: PlanOrigin::ReaderRequest,
+        })
     }
 
     /// The next body to fetch once the current one ends: a reader's range
@@ -1344,12 +1447,20 @@ impl BufferWriter {
         }
         if let Some(offset) = take_unsatisfied(&mut state) {
             state.begin(offset);
-            return Some(FetchPlan { offset, end: None });
+            return Some(FetchPlan {
+                offset,
+                end: None,
+                origin: PlanOrigin::ReaderRequest,
+            });
         }
         if state.seek_mode == StreamSeekMode::RangeRequests {
             if let Some((offset, end)) = state.first_gap() {
                 state.begin(offset);
-                return Some(FetchPlan { offset, end });
+                return Some(FetchPlan {
+                    offset,
+                    end,
+                    origin: PlanOrigin::GapFill,
+                });
             }
         }
         if !state.download_complete {
@@ -1426,7 +1537,11 @@ impl BufferWriter {
                 if let Some(offset) = take_unsatisfied(&mut state) {
                     state.begin(offset);
                     state.download_complete = false;
-                    return Some(FetchPlan { offset, end: None });
+                    return Some(FetchPlan {
+                        offset,
+                        end: None,
+                        origin: PlanOrigin::ReaderRequest,
+                    });
                 }
             }
             notified.await;
@@ -2354,7 +2469,11 @@ mod tests {
 
     /// An open-ended plan, the shape a live body always has.
     fn to_eof(offset: u64) -> FetchPlan {
-        FetchPlan { offset, end: None }
+        FetchPlan {
+            offset,
+            end: None,
+            origin: PlanOrigin::ReaderRequest,
+        }
     }
 
     /// Drive a range-capable buffer the way a feeder does: take the plan,
@@ -2603,12 +2722,83 @@ mod tests {
         assert_eq!(plan.offset, 3 * MB);
         assert_eq!(plan.end, None, "the live body runs to EOF, not to a bound");
         assert_eq!(source.primary_offset(), 4 * MB);
+        // The label the feeder logs, pinned at the one point where BOTH kinds
+        // of plan come out of the same call in the same test. It is not
+        // decoration: a body open that takes five seconds is a dropout when it
+        // is `reader-request` and a background fetch nobody waited on when it
+        // is `gap-fill`, the log line is otherwise identical, and the choice of
+        // which starvation fix to build rests on telling them apart. A silent
+        // mislabel here would send that decision the wrong way with no symptom.
+        assert_eq!(plan.origin, PlanOrigin::ReaderRequest);
+        assert!(plan.origin.is_live_demand());
         feed(&writer, plan, &[3u8; MB as usize + 16]);
         handle.join().unwrap();
 
         // What is left of the hole is what backfill picks up next.
         let gap = writer.next_plan().unwrap();
         assert_eq!((gap.offset, gap.end), (MB, Some(3 * MB)));
+        assert_eq!(gap.origin, PlanOrigin::GapFill);
+        assert!(
+            !gap.origin.is_live_demand(),
+            "a backfilled hole has nobody waiting on it"
+        );
+    }
+
+    /// The number the feeder logs beside a slow body open, pinned past the two
+    /// ways the obvious implementation reads 0 forever.
+    ///
+    /// Anchored on `primary_offset` this asserted 0 on both counts: that field
+    /// holds the byte a reader could not read, and `trim_behind_readers` drops
+    /// every segment more than `SEEK_LOOKBEHIND_BYTES` behind the reader, so a
+    /// reader past that point finds no segment there at all. Either way the log
+    /// would report a starving reader while megabytes sat ahead of it — an
+    /// invented dropout, in the one field added to tell real ones apart.
+    #[test]
+    fn the_logged_lead_is_measured_from_where_the_reader_actually_is() {
+        const MB: u64 = 1024 * 1024;
+        let config = StreamingConfig {
+            initial_buffer_bytes: 4,
+            window_bytes: 8 * MB as usize,
+        };
+        let (source, writer) = BufferedMediaSource::new_seekable(config, Some(8 * MB));
+
+        // 6 MB from byte 0, then read far enough in that the window trims the
+        // start of the track — which is where the `primary_offset` anchor
+        // stopped finding a segment and collapsed to 0.
+        writer.begin_at(0).unwrap();
+        writer.push_chunk(&vec![7u8; 6 * MB as usize]).unwrap();
+
+        let mut reader = source.create_reader();
+        let mut sink = vec![0u8; 3 * MB as usize];
+        reader.read_exact(&mut sink).expect("3 MB is buffered");
+
+        let lead = writer.reader_lead_bytes().expect("lock is healthy");
+        assert_eq!(
+            lead,
+            3 * MB,
+            "the reader is 3 MB in with 6 MB fetched, so 3 MB remain ahead of it"
+        );
+        assert!(
+            lead > 0,
+            "a non-zero lead is the whole point: 0 reads as an imminent dropout"
+        );
+    }
+
+    /// A broken body re-opened where it died keeps WHO was waiting. Promoting a
+    /// re-opened gap-fill to live demand would make the logs report a stall
+    /// nobody was blocked on, and any policy that later reads `is_live_demand`
+    /// would prioritise housekeeping over playback.
+    #[test]
+    fn a_resumed_plan_keeps_whether_anyone_was_waiting() {
+        assert_eq!(PlanOrigin::GapFill.as_resumed(), PlanOrigin::GapFill);
+        assert!(!PlanOrigin::GapFill.as_resumed().is_live_demand());
+        assert_eq!(
+            PlanOrigin::ReaderRequest.as_resumed(),
+            PlanOrigin::Resume,
+            "a reader is still waiting after the body broke"
+        );
+        assert!(PlanOrigin::ReaderRequest.as_resumed().is_live_demand());
+        assert!(PlanOrigin::Initial.as_resumed().is_live_demand());
     }
 
     #[test]
@@ -2683,7 +2873,8 @@ mod tests {
         assert_eq!(
             FetchPlan {
                 offset: 100,
-                end: Some(200)
+                end: Some(200),
+                origin: PlanOrigin::GapFill,
             }
             .range_header(),
             "bytes=100-199"
@@ -2692,7 +2883,8 @@ mod tests {
         assert_eq!(
             FetchPlan {
                 offset: 100,
-                end: Some(100)
+                end: Some(100),
+                origin: PlanOrigin::GapFill,
             }
             .range_header(),
             "bytes=100-"

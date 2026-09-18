@@ -187,17 +187,24 @@ pub async fn probe_remote_stream_info(url: &str) -> Result<RemoteStreamInfo, Str
     // the number parsed out of it.
     //
     // Second: that sharing one client buys a warm connection. A fresh
-    // connection to this CDN measures ~150 ms (see the body-open note below), so
-    // this is the cold cost paid once per track; the body open that follows on a
-    // pooled connection should come in far under it. `x-cache` keeps our
-    // client's cost separable from the edge filling its own cache.
+    // connection to this CDN measures ~130 ms (tcp ~15 ms + tls ~115 ms,
+    // measured from the Pi), so a probe well under that opened on a POOLED
+    // connection.
+    //
+    // This used to print `x-cache`, on the strength of a comment claiming it
+    // says TCP_HIT vs TCP_MISS. It does not: a full header dump from the Pi
+    // shows this edge sends `Server: AkamaiGHost`, `Akamai-Request-BC` and
+    // `Akamai-Mon-Iucid-Del` and NO `X-Cache` at all — which is why every line
+    // it ever printed read `[x-cache: -]`. `Akamai-Request-BC` exists and names
+    // the edge region that served us, so it is at least a real handle on WHICH
+    // edge was slow.
     let status = range_response.status();
     log::info!(
-        "[remote-stream/PROBE] {} headers in {}ms, content-range: {} [x-cache: {}]",
+        "[remote-stream/PROBE] {} headers in {}ms, content-range: {} [edge: {}]",
         status.as_u16(),
         headers_ms,
         header_str(range_response.headers(), "content-range"),
-        header_str(range_response.headers(), "x-cache"),
+        header_str(range_response.headers(), "akamai-request-bc"),
     );
 
     let content_length = total_length_from(status, range_response.headers()).ok_or_else(|| {
@@ -419,28 +426,49 @@ pub async fn download_and_stream_remote_track(
         // came back unranged has no such bound - it is the whole file.
         let plan_limit = if honors_range { plan.byte_len() } else { None };
 
-        // A ranged read at an offset the edge does not hold has measured
-        // ~5 s of time-to-first-byte on this CDN, while a fresh connection
-        // to it costs 150 ms — so the wait is the edge filling its cache,
-        // not our client. `x-cache` says which it was (TCP_HIT vs
-        // TCP_MISS), and pairing it with the elapsed time is what makes
-        // that attributable rather than guessed at.
+        // A ranged read at an offset the edge does not hold has measured ~5 s
+        // of time-to-first-byte on this CDN, against ~130 ms for a fresh
+        // connection and ~20-40 ms on a pooled one — so the wait is the edge,
+        // not our client. (Measured twice on the Pi at 5122 ms and 5099 ms. The
+        // constancy ruled out variable latency; an IPv6-blackhole fallback was
+        // then ruled out too — both stacks connect in ~12 ms from that box.)
+        //
         // The FIRST body of a track is logged unconditionally, which it was not
         // before: it is the whole-file open on a connection the probe just left
-        // in the pool, so its elapsed time is the direct read on whether sharing
-        // one client is doing anything. Against the ~150 ms a fresh connection
-        // costs, a reused one should be a small fraction of it — and a first
-        // open still sitting at 150 ms means the pool is not being hit at all.
+        // in the pool, so its elapsed time is the direct read on whether the
+        // shared client is doing anything.
+        //
+        // Two fields earn their place beside the timing, because without them a
+        // slow open cannot be judged at all:
+        //
+        //   origin — WHO is waiting. A `reader-request` open that takes 5 s is a
+        //     stalled decoder and, if the lead runs out, an audible dropout. A
+        //     `gap-fill` open that takes 5 s is speculative housekeeping nobody
+        //     was waiting on. They are the same line otherwise, and the fix for
+        //     one is not the fix for the other.
+        //   lead — how much contiguous audio the reader still has. 5 s with 4 MB
+        //     of lead is a non-event; 5 s with 30 KB is the dropout. The earlier
+        //     logs could not tell these apart, so every slow open looked equally
+        //     alarming.
+        //
+        // `x-cache` used to be printed here: this edge does not send it (a full
+        // header dump shows AkamaiGHost + Akamai-Request-BC and no X-Cache), so
+        // it always read `-`. Replaced by the region header, which is real.
         let first_body = bytes_received == 0;
         if first_body || !plan.is_whole_file() || opened_ms > 1000 {
             log::info!(
-                "[{}/STREAMING] Track {} body open at byte {} ({}) in {}ms [x-cache: {}]",
+                "[{}/STREAMING] Track {} body open at byte {} ({}) in {}ms [{}, lead {}, edge: {}]",
                 log_tag,
                 track_id,
                 plan.offset,
                 plan.range_header(),
                 opened_ms,
-                header_str(response.headers(), "x-cache")
+                plan.origin.label(),
+                writer
+                    .reader_lead_bytes()
+                    .map(|b| format!("{} KB", b / 1024))
+                    .unwrap_or_else(|| "?".to_string()),
+                header_str(response.headers(), "akamai-request-bc")
             );
         }
 
@@ -576,6 +604,10 @@ pub async fn download_and_stream_remote_track(
                             let resumed = FetchPlan {
                                 offset: resume_from,
                                 end: plan.end,
+                                // A broken body re-opened where it died keeps
+                                // whatever it was serving: a reader waiting on
+                                // a gap-fill is still not waiting.
+                                origin: plan.origin.as_resumed(),
                             };
                             writer
                                 .begin_at(resumed.offset)
