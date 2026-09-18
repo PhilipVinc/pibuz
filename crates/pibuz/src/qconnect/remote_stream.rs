@@ -175,7 +175,7 @@ pub async fn probe_remote_stream_info(url: &str) -> Result<RemoteStreamInfo, Str
         ));
     }
 
-    let content_length = total_length_from(range_response.headers())
+    let content_length = total_length_from(range_response.status(), range_response.headers())
         .ok_or_else(|| "probe could not determine the track size".to_string())?;
 
     let initial_bytes = range_response
@@ -219,18 +219,32 @@ pub async fn probe_remote_stream_info(url: &str) -> Result<RemoteStreamInfo, Str
 /// the whole streaming config against 64 KB. A server that ignored the `Range`
 /// answers `200`, has no `Content-Range`, and then `Content-Length` IS the total.
 ///
-/// `bytes 0-65535/*` means the server does not know the size. That is a `None`,
-/// not a fall-through to `Content-Length`: falling through would confidently
-/// report 64 KB.
-fn total_length_from(headers: &reqwest::header::HeaderMap) -> Option<u64> {
-    if let Some(range) = headers
+/// Which is why this takes the STATUS, not just the headers. A `206` with no
+/// `Content-Range` violates RFC 9110 §14.4, but an edge or a proxy can still
+/// produce one, and falling back to `Content-Length` there would hand back
+/// 65536 with total confidence — the streaming config would be built for a
+/// 64 KB track and the first track would end a fraction of a second in. On a
+/// `206` the `Content-Range` is the only acceptable answer; absent, this is a
+/// clean `None` and the caller falls back to the full download.
+///
+/// `bytes 0-65535/*` means the server does not know the size, and is a `None`
+/// for the same reason.
+fn total_length_from(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+) -> Option<u64> {
+    let content_range = headers
         .get(reqwest::header::CONTENT_RANGE)
-        .and_then(|value| value.to_str().ok())
-    {
+        .and_then(|value| value.to_str().ok());
+
+    if let Some(range) = content_range {
         return range
             .rsplit('/')
             .next()
             .and_then(|total| total.trim().parse::<u64>().ok());
+    }
+    if status == reqwest::StatusCode::PARTIAL_CONTENT {
+        return None;
     }
     headers
         .get(reqwest::header::CONTENT_LENGTH)
@@ -647,6 +661,7 @@ pub fn is_header_flood_error(message: &str) -> bool {
 mod tests {
     use super::total_length_from;
     use reqwest::header::{HeaderMap, HeaderValue, CONTENT_LENGTH, CONTENT_RANGE};
+    use reqwest::StatusCode;
 
     fn headers(pairs: &[(reqwest::header::HeaderName, &str)]) -> HeaderMap {
         let mut map = HeaderMap::new();
@@ -665,7 +680,10 @@ mod tests {
             (CONTENT_RANGE, "bytes 0-65535/48717824"),
             (CONTENT_LENGTH, "65536"),
         ]);
-        assert_eq!(total_length_from(&map), Some(48_717_824));
+        assert_eq!(
+            total_length_from(StatusCode::PARTIAL_CONTENT, &map),
+            Some(48_717_824)
+        );
     }
 
     /// A server that ignores `Range` sends the whole body with no
@@ -673,7 +691,7 @@ mod tests {
     #[test]
     fn a_whole_body_response_falls_back_to_content_length() {
         let map = headers(&[(CONTENT_LENGTH, "48717824")]);
-        assert_eq!(total_length_from(&map), Some(48_717_824));
+        assert_eq!(total_length_from(StatusCode::OK, &map), Some(48_717_824));
     }
 
     /// `/*` means the server does not know the size. It must NOT fall through
@@ -684,11 +702,22 @@ mod tests {
             (CONTENT_RANGE, "bytes 0-65535/*"),
             (CONTENT_LENGTH, "65536"),
         ]);
-        assert_eq!(total_length_from(&map), None);
+        assert_eq!(total_length_from(StatusCode::PARTIAL_CONTENT, &map), None);
+    }
+
+    /// A `206` with no `Content-Range` at all violates RFC 9110, but an edge or
+    /// a proxy can still emit one — and `Content-Length` there is the 64 KB
+    /// SLICE. Falling back to it would build the whole streaming config for a
+    /// 64 KB track, so the first track would end a fraction of a second in. It
+    /// has to be a clean `None`, which sends the caller to the full download.
+    #[test]
+    fn a_partial_response_without_content_range_is_none_not_the_slice_length() {
+        let map = headers(&[(CONTENT_LENGTH, "65536")]);
+        assert_eq!(total_length_from(StatusCode::PARTIAL_CONTENT, &map), None);
     }
 
     #[test]
     fn a_response_with_neither_header_is_none() {
-        assert_eq!(total_length_from(&HeaderMap::new()), None);
+        assert_eq!(total_length_from(StatusCode::OK, &HeaderMap::new()), None);
     }
 }

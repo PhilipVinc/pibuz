@@ -47,6 +47,21 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// design whenever the buffer window is full.
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How long an idle pooled connection may be handed out again.
+///
+/// The cost of a LONG-LIVED pool, which a per-request client never had: the CDN
+/// closes an idle keep-alive connection on its own schedule, and a pool that
+/// still believes in it hands out a socket the far end has already dropped. That
+/// surfaces as an intermittent "connection closed before message completed" on
+/// a request that did nothing wrong.
+///
+/// Well under a typical CDN keep-alive, so the pool gives up on a connection
+/// before the edge does. It costs almost nothing: the reuse that matters is
+/// within one track — the probe and the feeder open the same url milliseconds
+/// apart, and the CMAF fetcher walks segments back to back — while consecutive
+/// tracks are minutes apart and would find an evicted connection either way.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
+
 static CDN_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
 /// The shared CDN client.
@@ -63,6 +78,7 @@ pub fn client() -> Result<&'static reqwest::Client, String> {
         .user_agent(CDN_USER_AGENT)
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(READ_TIMEOUT)
+        .pool_idle_timeout(POOL_IDLE_TIMEOUT)
         .build()
         .map_err(|e| format!("CDN client error: {e}"))?;
     Ok(CDN_CLIENT.get_or_init(|| built))
