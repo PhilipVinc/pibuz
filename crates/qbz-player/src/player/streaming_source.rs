@@ -1218,10 +1218,16 @@ impl Seek for BufferedMediaSource {
         // first iteration turns that into a request for exactly this
         // offset, so the wait is one round trip instead of however much
         // file sits in between.
+        //
+        // Completion does not end the conversation, for the same reason
+        // `should_request` spells out and `read` already honors: the feeder
+        // walked the whole file, the window kept a sliding piece of it, and a
+        // seek into a region this buffer never held — one opened mid-file
+        // never held byte 0 — is a request away, not out of bounds.
         while state.segment_at(new_pos).is_none()
             && !state.at_eof(new_pos)
-            && !state.download_complete
             && state.download_error.is_none()
+            && (!state.download_complete || state.should_request(new_pos))
         {
             self.request_range(&mut state, new_pos);
             state = self.shared.wait(state)?;
