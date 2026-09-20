@@ -66,4 +66,4 @@ systemctl --user status pibuz
 
 This binary is built on ubuntu-22.04 (glibc 2.35) specifically so it runs on
 Raspberry Pi OS bookworm (glibc 2.36) and similarly-aged distros without a
-rebuild — see `qbz-nix-docs/qbz-daemon/01-architecture.md` (D13).
+rebuild.

@@ -603,7 +603,7 @@ pub async fn download_and_stream_remote_track(
 pub fn describe_reqwest_error(err: &reqwest::Error) -> String {
     // Chain-expanded AND redacted: `reqwest::Error`'s Display embeds the signed
     // stream URL, and every caller here puts the result in a log line or an API
-    // error string (vicrodh/qbz#780 item 10).
+    // error string (upstream#780 item 10).
     qbz_qobuz::redact::describe_reqwest(err)
 }
 

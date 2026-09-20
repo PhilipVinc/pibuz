@@ -8,14 +8,14 @@ tags on `main`.
 ### Fixed
 
 - `playback.quality` now caps the cast path, not just local playback — on a
-  cast-only daemon it was inert (vicrodh/qbz#693). Advertised as a capability
-  and clamped at both load seams; read fresh per load.
+  cast-only daemon it was inert. Advertised as a capability and clamped at both
+  load seams; read fresh per load.
 - The loudness cache no longer panics on a full or read-only card, killing
-  playback for the life of the process (vicrodh/qbz#780). It degrades to memory,
-  opens on first use, and honors `--profile`; a stale
-  `~/.local/share/qbz/loudness_cache.db` can be deleted.
+  playback for the life of the process. It degrades to memory, opens on first
+  use, and honors `--profile`; a stale `~/.local/share/qbz/loudness_cache.db`
+  can be deleted.
 - Signed stream URLs are redacted in logs. They are bearer credentials, and
-  `reqwest` errors put them in `pibuz.log` (vicrodh/qbz#780).
+  `reqwest` errors put them in `pibuz.log`.
 - `bump-version.sh` opens the new CHANGELOG section again.
 - The 2.4.0 *Removed* entry is corrected: quality did not come from
   `playback.quality`.

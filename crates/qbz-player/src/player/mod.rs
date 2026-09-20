@@ -2022,7 +2022,7 @@ impl Player {
             // Infallible by construction, and opened on first use. This used
             // to `panic!` on a disk error — on the audio thread, before a note
             // had played — so a full or read-only card meant total silence
-            // rather than normalization without a cache (vicrodh/qbz#780
+            // rather than normalization without a cache (upstream#780
             // item 1). `LoudnessCache` now degrades to memory instead.
             let loudness_cache = Arc::new(match thread_data_root {
                 Some(root) => LoudnessCache::open_at(root),

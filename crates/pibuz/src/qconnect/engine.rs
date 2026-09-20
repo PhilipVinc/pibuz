@@ -592,7 +592,7 @@ impl QconnectRendererEngine for DaemonRendererEngine {
         }
     }
 
-    /// The daemon's own ceiling: `playback.quality` (vicrodh/qbz#693).
+    /// The daemon's own ceiling: `playback.quality` (upstream#693).
     ///
     /// Read fresh on every load rather than captured at connect, so a
     /// `pibuz settings set playback.quality cd` binds the NEXT track without a

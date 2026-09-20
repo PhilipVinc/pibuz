@@ -52,7 +52,7 @@ pub fn reqwest_is_transient(e: &reqwest::Error) -> bool {
 /// *status*, not a transport error.
 pub fn classify_reqwest(e: &reqwest::Error, context: &str) -> FetchError {
     // Redacted, not raw: this wraps the CMAF segment fetch, whose URL carries
-    // the signed token, and the message is logged (vicrodh/qbz#780 item 10).
+    // the signed token, and the message is logged (upstream#780 item 10).
     // The host is kept, so classification and diagnosis are unchanged.
     FetchError::Transient(format!(
         "{}: {}",

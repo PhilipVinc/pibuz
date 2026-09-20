@@ -306,7 +306,7 @@ fn load_persisted_device_name() -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// The local quality cap on the cast path (vicrodh/qbz#693).
+// The local quality cap on the cast path (upstream#693).
 //
 // `playback.quality` (daemon_prefs.streaming_quality) used to bind only the
 // local playback path (`api/playback.rs::resolve_quality`). As a QConnect
@@ -859,7 +859,7 @@ mod tests {
         assert_eq!(uuid, "env-override-uuid-123");
     }
 
-    /// vicrodh/qbz#693 — what the daemon ADVERTISES has to be the configured
+    /// upstream#693 — what the daemon ADVERTISES has to be the configured
     /// cap, not a constant. A controller that respects the capability never
     /// offers above it, which is the half of the fix that keeps hi-res off the
     /// wire instead of merely off the DAC.
