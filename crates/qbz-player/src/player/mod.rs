@@ -956,33 +956,46 @@ fn create_output_stream_with_config(
         buffer_size: BufferSize::Default,
     };
 
-    // Check if device supports this configuration
-    let supported_configs = device
-        .supported_output_configs()
-        .map_err(|e| format!("Failed to get supported configs: {}", e))?;
+    // Check if device supports this configuration.
+    //
+    // Advisory only — the branch below attempts the rate either way. Skip it
+    // for a PCM whose hw-param probe can `abort()` the process (a plugin
+    // chain like moOde's `_audioout`); see
+    // `qbz_audio::device_filter::is_probe_safe_pcm_id`.
+    let probe_safe = qbz_audio::device_filter::is_probe_safe_device(&device);
 
-    let mut found_matching = false;
-    for range in supported_configs {
-        if range.channels() == channels
-            && sample_rate >= range.min_sample_rate()
-            && sample_rate <= range.max_sample_rate()
-        {
-            found_matching = true;
-            log::info!(
-                "Device supports {}Hz (range: {}-{}Hz)",
-                sample_rate,
-                range.min_sample_rate(),
-                range.max_sample_rate()
-            );
-            break;
+    if !probe_safe {
+        log::info!("Device is a plugin PCM — not probing its rates, opening at {sample_rate}Hz");
+    } else {
+        // PROBE. Guarded by the `probe_safe` check above.
+        #[allow(clippy::disallowed_methods)]
+        let supported_configs = device
+            .supported_output_configs()
+            .map_err(|e| format!("Failed to get supported configs: {}", e))?;
+
+        let mut found_matching = false;
+        for range in supported_configs {
+            if range.channels() == channels
+                && sample_rate >= range.min_sample_rate()
+                && sample_rate <= range.max_sample_rate()
+            {
+                found_matching = true;
+                log::info!(
+                    "Device supports {}Hz (range: {}-{}Hz)",
+                    sample_rate,
+                    range.min_sample_rate(),
+                    range.max_sample_rate()
+                );
+                break;
+            }
         }
-    }
 
-    if !found_matching {
-        log::warn!(
-            "Device may not support {}Hz, attempting anyway",
-            sample_rate
-        );
+        if !found_matching {
+            log::warn!(
+                "Device may not support {}Hz, attempting anyway",
+                sample_rate
+            );
+        }
     }
 
     // Create SupportedStreamConfig
@@ -1006,7 +1019,12 @@ fn create_output_stream_with_config(
     };
     log::info!("Buffer size: {:?}", cpal_buffer_size);
 
-    // Create MixerDeviceSink with custom config
+    // Create MixerDeviceSink with custom config.
+    //
+    // PROBE (rodio reads the device's default config). Safe because the
+    // legacy path that feeds this function refuses named config PCMs before
+    // resolving a device — see `must_not_reach_rodio` in `init_device`.
+    #[allow(clippy::disallowed_methods)]
     match DeviceSinkBuilder::from_device(device) {
         Ok(builder) => {
             // rodio's default error callback only eprintln!s a live stream
@@ -2069,11 +2087,20 @@ impl Player {
             // Get the audio host
             let host = rodio::cpal::default_host();
 
-            // Helper to validate a device has supported output configs
+            // Helper to validate a device has supported output configs.
+            //
+            // A plugin PCM is reported valid WITHOUT being probed: libasound
+            // answers a hw-param probe of one with `abort()`, and "valid"
+            // here only decides whether to prefer the named device over the
+            // default — the open is the real test either way.
             let is_device_valid = |d: &rodio::cpal::Device| -> bool {
-                d.supported_output_configs()
-                    .map(|configs| configs.count() > 0)
-                    .unwrap_or(false)
+                if !qbz_audio::device_filter::is_probe_safe_device(d) {
+                    return true;
+                }
+                // PROBE. Guarded by the early return directly above.
+                #[allow(clippy::disallowed_methods)]
+                let configs = d.supported_output_configs();
+                configs.map(|c| c.count() > 0).unwrap_or(false)
             };
 
             // Helper to find and initialize audio device
@@ -2139,7 +2166,25 @@ impl Player {
                     }
                 }
 
-                // Legacy CPAL path
+                // Legacy CPAL path.
+                //
+                // A named ALSA config PCM cannot come down here: everything
+                // below ends in rodio, which asks cpal for the device's
+                // default config, which reads the PCM's hardware-parameter
+                // space — and libasound answers a plugin chain with abort().
+                // Fall back to the system default instead of taking the
+                // daemon down.
+                let name = match &name {
+                    Some(n) if qbz_audio::device_filter::must_not_reach_rodio(n) => {
+                        log::warn!(
+                            "'{n}' is an ALSA plugin PCM and the backend path declined it; \
+                             the legacy CPAL path cannot open one, falling back to the default device"
+                        );
+                        &None
+                    }
+                    other => other,
+                };
+
                 let device = if let Some(ref name) = name {
                     log::info!("Looking for audio device: {}", name);
                     let found = host.output_devices().ok().and_then(|mut devices| {
@@ -2183,8 +2228,13 @@ impl Player {
                     }
                 };
 
-                match DeviceSinkBuilder::from_device(device).and_then(|b| b.open_sink_or_fallback())
-                {
+                // PROBE (rodio reads the device's default config). Safe
+                // because the named-config-PCM rejection above means `device`
+                // is either a card-backed PCM or the host default.
+                #[allow(clippy::disallowed_methods)]
+                let opened =
+                    DeviceSinkBuilder::from_device(device).and_then(|b| b.open_sink_or_fallback());
+                match opened {
                     Ok(mixer_sink) => {
                         log::info!("Audio output initialized successfully");
                         Some(StreamType::rodio(mixer_sink))
@@ -3507,8 +3557,25 @@ impl Player {
                                                 ResumeInput::Memory(data)
                                             }
                                             None => {
-                                                log::warn!("Audio thread: cannot resume - streaming source complete but data unavailable");
-                                                return;
+                                                // Completion says the feeder has nothing left to
+                                                // fetch, not that the buffer holds the whole file.
+                                                // A stream opened mid-file -- a QConnect session
+                                                // handed over at a position -- never held byte 0,
+                                                // and a windowed one drops what the reader has
+                                                // passed, so `take_complete_data` refuses either
+                                                // way. The bytes under the resume point are still
+                                                // there, and a range feeder can fetch whatever
+                                                // else the decoder asks for.
+                                                if streaming_src.supports_range_requests() {
+                                                    log::info!(
+                                                        "Resume: complete stream holds no whole-file copy ({} bytes buffered) - seeking instead",
+                                                        streaming_src.buffer_size()
+                                                    );
+                                                    ResumeInput::Ranged(streaming_src.clone())
+                                                } else {
+                                                    log::warn!("Audio thread: cannot resume - streaming source complete but data unavailable");
+                                                    return;
+                                                }
                                             }
                                         }
                                     } else if streaming_src.supports_range_requests() {

@@ -24,6 +24,59 @@ tags on `main`.
   behaviour, same `audio.cache_to_disk false` if you want no disk at all, and
   the reported cache size still counts audio rather than file bytes.
 
+### Fixed
+
+- **pibuz no longer crash-loops when PeppyALSA is on** (moodeaudio.org #4660).
+  Turning PeppyALSA on inserts a `softvol` → `meter` plugin chain into the ALSA
+  namespace and repoints `_audioout` at it. The `status` endpoint — which
+  moOde's watchdog polls every few seconds — asked libasound what every PCM in
+  the namespace supported, and libasound answers that question about a plugin
+  chain by aborting the process
+  (`snd1_pcm_hw_param_get_min: Assertion '!snd_interval_empty(i)' failed`).
+  The daemon died within seconds of every start, forever. Plugin PCMs are now
+  never probed, and never handed to rodio, which probes them in turn.
+  (The `Cannot get card index for Loopback` line above the crash is unrelated
+  noise from `trx_send.conf`; it appears on every enumeration.)
+- **The daemon no longer asks a plugin chain for a format its VU meter cannot
+  read.** With the crash above out of the way, audio played on moOde but the
+  PeppyALSA needles sat at zero at any volume. The direct ALSA path offered
+  `S24_3LE` first — right for a raw card, where the SMSL-class USB DACs need
+  it, but wrong behind a plug layer, which accepts every format, so the first
+  entry always won. moOde's `_audioout` is one: with PeppyALSA on it resolves
+  to `peppy` (`type plug`) → `softvol_and_peppyalsa` → `peppyalsa` (`type
+  meter`) → `_peppyout` → `plughw:0,0`, and softvol's format mask includes
+  `S24_3LE`, so the whole chain ran packed. alsa-lib's meter plugin has no S16
+  conversion for a packed format (`s16_enable` in `pcm_meter.c`), so the `s16`
+  scope peppyalsa reads through was left disabled — silently, because moOde
+  patches the abort that would otherwise have followed into a zeroed buffer
+  (`alsa_lib_scope_no_abort.patch`). Behind a plug the daemon now leads with
+  the widest container a meter can read; a raw card still probes packed 24-bit
+  first, and packed 24-bit still outranks 16-bit everywhere, so a packed-only
+  DAC cannot lose depth to this. The chosen format is logged with its position
+  in the offer list and which regime picked it, and picking an unreadable one
+  behind a plug now logs a warning naming the consequence.
+  Reasoned from `pcm_meter.c`, moOde's ALSA config and the report; **the fix
+  itself has not yet been confirmed on hardware.**
+- `status` no longer walks the ALSA namespace on a poll at all: with the ALSA
+  backend, `device_present` is answered from `/proc/asound`. Enumerating meant
+  resolving every drop-in in `/etc/alsa/conf.d`, and opening the DAC behind
+  them, for the life of the daemon.
+- ALSA devices report their measured sample rates again. The CPAL lookup was
+  keyed on the device's human description rather than its PCM id, so it never
+  matched and every card fell back to an assumed ceiling.
+- `device_present` is no longer permanently false for PipeWire users. It
+  enumerated through CPAL, which on Linux is always the ALSA host and never
+  yields the `alsa_output.*` node names the PipeWire backend stores.
+- libasound's own messages reach the log with a timestamp. The error handler
+  was installed by the first playback, so anything before that — including the
+  crash above — went to stderr raw.
+
+### Added
+
+- A clippy `disallowed-methods` gate on the three cpal/rodio calls that probe a
+  PCM's hardware parameters. Each of the 13 call sites now records why its
+  device is safe to ask; a new probe cannot be added without that sentence.
+
 ## 2.4.1 — 2026-09-16
 
 ### Fixed

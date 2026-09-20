@@ -567,6 +567,19 @@ impl AudioBackend for CpalDefaultBackend {
             );
         }
 
+        // Same rule as the ALSA backend: rodio reads the PCM's hardware
+        // parameters to pick a default config, and libasound answers that on a
+        // plugin chain with `abort()`. "System" cannot open one of those at
+        // all, so say so rather than dying trying.
+        if let Some(device_id) = effective_device_id {
+            if crate::device_filter::must_not_reach_rodio(device_id) {
+                return Err(format!(
+                    "'{device_id}' is an ALSA plugin PCM; the System output cannot open one. \
+                     Select the ALSA backend, which opens it directly."
+                ));
+            }
+        }
+
         let device = if let Some(device_id) = effective_device_id {
             self.host
                 .output_devices()
@@ -583,6 +596,9 @@ impl AudioBackend for CpalDefaultBackend {
                 .ok_or_else(|| "No default output device found".to_string())?
         };
 
+        // PROBE (rodio reads the device's default config). Safe because
+        // `must_not_reach_rodio` turned the named config PCMs away above.
+        #[allow(clippy::disallowed_methods)]
         let builder = DeviceSinkBuilder::from_device(device)
             .map_err(|e| format!("Failed to create device sink builder: {}", e))?;
 
@@ -698,6 +714,8 @@ impl CpalDefaultBackend {
             let override_config =
                 Self::shared_mode_nominal_stream_config(&device, effective_device_name);
 
+            // PROBE. macOS-only path: CoreAudio, no libasound, no assert.
+            #[allow(clippy::disallowed_methods)]
             let builder = DeviceSinkBuilder::from_device(device)
                 .map_err(|e| format!("Failed to create device sink builder: {}", e))?;
 
@@ -770,12 +788,15 @@ impl CpalDefaultBackend {
         effective_device_name: Option<&str>,
     ) -> Option<rodio::cpal::SupportedStreamConfig> {
         let nominal_rate = Self::current_macos_nominal_rate(effective_device_name)?;
+        // PROBE x2. macOS-only fn: CoreAudio, no libasound, no assert.
+        #[allow(clippy::disallowed_methods)]
         let default_config = device.default_output_config().ok()?;
         let default_rate = default_config.sample_rate();
         if nominal_rate == default_rate {
             return None;
         }
 
+        #[allow(clippy::disallowed_methods)]
         let supported_configs: Vec<_> = device.supported_output_configs().ok()?.collect();
         let matching_config = supported_configs
             .iter()

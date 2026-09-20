@@ -40,6 +40,14 @@ pub struct BootedRuntime {
 pub async fn run(roots: ProfileRoots, cfg: PibuzConfig, warns: Vec<String>) -> Result<i32, String> {
     // 1. argv parse happened in main(). 2. logging:
     qbz_log::install(&cfg.log.level);
+    // …including libasound's, which otherwise writes straight to stderr. It
+    // used to be installed only by `BackendManager::create_backend`, i.e. not
+    // until something played — so every libasound message before the first
+    // track landed in moOde's log raw, with no timestamp and no level, next to
+    // lines that have both. Installing it here puts them all in one stream.
+    // Idempotent (`Once`), so the later call stays a no-op.
+    #[cfg(target_os = "linux")]
+    qbz_audio::alsa_error_handler::install_once();
     // 3. config: surface unknown-key warnings (they never abort — D14).
     for w in &warns {
         log::warn!("[config] unknown key: {w}");

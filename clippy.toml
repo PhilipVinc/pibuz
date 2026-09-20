@@ -1,0 +1,22 @@
+# Asking a PCM what it supports can kill the process.
+#
+# `snd_pcm_hw_params_get_*` asserts the parameter interval is non-empty, and on
+# a plugin chain it can be empty — `snd1_pcm_hw_param_get_min: Assertion
+# '!snd_interval_empty(i)' failed`, an `assert()` inside C, so `abort()`, which
+# Rust cannot catch. That is what crash-looped pibuz on moOde with PeppyALSA on
+# (forum #4660): the `status` poll probed every PCM in the namespace, and one of
+# them answered by killing the daemon.
+#
+# So these three are gated. Every call site must carry
+# `#[allow(clippy::disallowed_methods)]` and, beside it, the reason THIS device
+# is safe to ask — either `device_filter::is_probe_safe_device` returned true,
+# or `must_not_reach_rodio` already turned the plugin PCMs away. A new probe
+# cannot be added without writing that sentence down.
+#
+# `rodio::DeviceSinkBuilder::from_device` is on the list because it is a probe
+# in disguise: it calls `default_output_config()`, which is the same assert.
+disallowed-methods = [
+  { path = "cpal::traits::DeviceTrait::supported_output_configs", reason = "probes hw params; abort()s on a plugin PCM — check device_filter::is_probe_safe_device first, then allow with a reason" },
+  { path = "cpal::traits::DeviceTrait::default_output_config", reason = "calls supported_output_configs internally; same abort — check device_filter::is_probe_safe_device first, then allow with a reason" },
+  { path = "rodio::DeviceSinkBuilder::from_device", reason = "calls default_output_config on the device; refuse named config PCMs with device_filter::must_not_reach_rodio first, then allow with a reason" },
+]

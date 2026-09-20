@@ -123,23 +123,34 @@ fn find_best_fallback_rate(requested: u32, supported: &[u32]) -> u32 {
     supported.iter().copied().max().unwrap_or(48000)
 }
 
-/// Return `true` when the given CPAL/ALSA PCM name matches one of the ID
-/// shapes our `/proc/asound`-driven enumeration ever looks up.
+/// Return `true` when the given ALSA PCM id matches one of the ID shapes our
+/// `/proc/asound`-driven enumeration ever looks up AND is safe to probe.
 ///
 /// Used by `build_cpal_device_map` to drop virtual PCMs (dmix, route,
-/// surround*, pulse, null, …) whose probing only produces noise.
+/// surround*, pulse, null, …) whose probing only produces noise — and, since
+/// the probe can `abort()` the process on a plugin PCM, to drop those too.
+///
+/// `default` is NOT here even though the enumeration looks it up: any distro
+/// may point `pcm.!default` at a plugin chain of its own, and a probe of one
+/// of those is what crash-looped the daemon on moOde. The `default` row keeps
+/// the assumed ceiling it has always fallen back to.
 fn is_known_pcm_id(name: &str) -> bool {
-    name == "default"
-        || name.starts_with("sysdefault:CARD=")
+    (name.starts_with("sysdefault:CARD=")
         || name.starts_with("front:CARD=")
         || name.starts_with("hdmi:CARD=")
-        || name.starts_with("iec958:CARD=")
+        || name.starts_with("iec958:CARD="))
+        && crate::device_filter::is_probe_safe_pcm_id(name)
 }
 
-/// Extract supported sample rates from a CPAL device
+/// Extract supported sample rates from a CPAL device.
+///
+/// PROBE. Safe because the only devices that reach here come out of
+/// `build_cpal_device_map`, which admits nothing but card-backed PCM ids
+/// (`is_known_pcm_id`, itself gated on `is_probe_safe_pcm_id`).
 fn get_supported_sample_rates(device: &rodio::cpal::Device) -> Option<Vec<u32>> {
     use rodio::cpal::traits::DeviceTrait;
 
+    #[allow(clippy::disallowed_methods)]
     let configs = device.supported_output_configs().ok()?;
     let configs_vec: Vec<_> = configs.collect();
 
@@ -444,6 +455,47 @@ fn is_card_present_in_proc(device_id: &str) -> bool {
         .is_some()
 }
 
+/// True for the ALSA id shapes that name a kernel card, as opposed to a named
+/// PCM from `/etc/alsa/conf.d` or a redefinable alias.
+///
+/// Kept separate from [`extract_card_name_from_device`] because that one
+/// returns `None` both for "this is not a card-backed id" and for "this IS a
+/// card-backed id naming a card that is not registered" — two answers a
+/// presence check has to tell apart.
+fn is_card_backed_id(device_id: &str) -> bool {
+    device_id.starts_with("hw:")
+        || device_id.starts_with("plughw:")
+        || device_id.starts_with("front:CARD=")
+        || device_id.starts_with("sysdefault:CARD=")
+        || device_id.starts_with("iec958:CARD=")
+        || device_id.starts_with("hdmi:CARD=")
+}
+
+/// Whether a configured ALSA device id is present, decided from
+/// `/proc/asound` alone — **no libasound, no PCM opens.**
+///
+/// This is what the `status` endpoint asks, and `status` is polled every few
+/// seconds for as long as the daemon runs (moOde's watchdog does exactly
+/// that). It must not answer by enumerating: `snd_device_name_hint` resolves
+/// every PCM definition in the namespace and opens the ones whose config does
+/// not declare a direction — which on a moOde box means walking the whole of
+/// `/etc/alsa/conf.d` and opening the DAC behind it, forever, while it plays.
+///
+/// A card-backed id is present exactly when its card is registered. Anything
+/// else — a named PCM (`_audioout`), `default`, a server alias — resolves
+/// through a config chain whose validity is only knowable by opening it, so
+/// it is reported present and the open is left to say otherwise.
+pub fn alsa_device_present(device_id: &str) -> bool {
+    let device_id = device_id.trim();
+    if device_id.is_empty() {
+        return false;
+    }
+    if is_card_backed_id(device_id) {
+        return is_card_present_in_proc(device_id);
+    }
+    true
+}
+
 /// Read hardware-supported sample rates from /proc/asound/cardN/stream0.
 /// Returns None if rates cannot be determined (treat as "try anyway").
 fn get_hw_supported_rates(card_name: &str) -> Option<Vec<u32>> {
@@ -553,21 +605,20 @@ impl AlsaBackend {
             cpal_devices.len()
         );
 
-        // Add system default device
-        let default_sample_rates = cpal_devices
-            .get("default")
-            .and_then(get_supported_sample_rates);
-        let default_max_rate = default_sample_rates
-            .as_ref()
-            .and_then(|rates| rates.iter().max().copied());
-
+        // Add system default device.
+        //
+        // No rate probe: `default` is whatever `pcm.!default` resolves to on
+        // this box, which a distro is free to point at a plugin chain — and
+        // probing one of those `abort()`s the process (is_known_pcm_id). It
+        // reports the assumed ceiling, which is what it reported anyway
+        // whenever the probe came back empty.
         devices.push(AudioDevice {
             id: "default".to_string(),
             name: "default".to_string(),
             description: None, // Frontend shows "System Default"
             is_default: true,
-            max_sample_rate: default_max_rate.or(Some(384000)),
-            supported_sample_rates: default_sample_rates,
+            max_sample_rate: Some(384000),
+            supported_sample_rates: None,
             device_bus: None,
             is_hardware: false,
         });
@@ -676,21 +727,27 @@ impl AlsaBackend {
     /// This is OPTIONAL enrichment — devices may be missing if in exclusive use.
     ///
     /// Only the PCM name patterns we actually look up downstream are kept:
-    /// `default`, `sysdefault:CARD=…`, and `{front,hdmi,iec958}:CARD=…,DEV=…`.
-    /// Virtual PCMs (`dmix:`, `route:`, `surround51:` and the like) are
-    /// dropped — we never query them, and letting them reach a later
+    /// `sysdefault:CARD=…` and `{front,hdmi,iec958}:CARD=…,DEV=…`. Virtual
+    /// PCMs (`dmix:`, `route:`, `surround51:` and the like) are dropped — we
+    /// never query them, and letting them reach a later
     /// `supported_output_configs()` call just invites spurious libasound
     /// errors ("unable to open slave", "no matching channel map") on systems
-    /// where PipeWire or another client holds the underlying hardware.
+    /// where PipeWire or another client holds the underlying hardware, or,
+    /// on a plugin PCM, an `abort()` that takes the daemon with it.
+    ///
+    /// Keyed by the RAW PCM id, which is what the caller looks up.
+    /// `description().name()` is the human label ("IQaudIODAC, IQaudIO DAC
+    /// HiFi pcm512x-hifi-0"), and keying on that silently emptied this map —
+    /// every card then reported the hardcoded fallback ceiling instead of its
+    /// measured rates.
     fn build_cpal_device_map(&self) -> HashMap<String, rodio::cpal::Device> {
         let mut map = HashMap::new();
 
         if let Ok(output_devices) = self.host.output_devices() {
             for device in output_devices {
-                if let Ok(description) = device.description() {
-                    let name = description.name().to_string();
-                    if is_known_pcm_id(&name) {
-                        map.insert(name, device);
+                if let Some(pcm_id) = crate::device_filter::cpal_pcm_id(&device) {
+                    if is_known_pcm_id(&pcm_id) {
+                        map.insert(pcm_id, device);
                     }
                 }
             }
@@ -1092,6 +1149,23 @@ impl AudioBackend for AlsaBackend {
         // (e.g. front:CARD=X,DEV=Y when CPAL only yields hw:CARD=X,DEV=Y for
         // the raw device). Surface that distinction in the error so users
         // don't chase ghosts wondering why their DAC "disappeared".
+        // A named config PCM never reaches rodio. `DeviceSinkBuilder::from_device`
+        // below asks cpal for the device's default config, cpal answers by
+        // reading the PCM's hardware-parameter space, and libasound answers a
+        // plugin chain whose space refines to empty by `abort()`ing us. The
+        // direct path owns these PCMs and has already had its turn, so there is
+        // nothing here to fall back TO — only a daemon to lose.
+        if let Some(device_id) = &config.device_id {
+            if crate::device_filter::must_not_reach_rodio(device_id) {
+                return Err(format!(
+                    "'{device_id}' is an ALSA plugin PCM. Only the direct path can open one, and it \
+                     declined this configuration ({}Hz, {}ch) — check what the chain behind \
+                     '{device_id}' accepts, or select the card itself.",
+                    config.sample_rate, config.channels
+                ));
+            }
+        }
+
         let device = if let Some(device_id) = &config.device_id {
             log::info!("[ALSA Backend] Looking for device: {}", device_id);
             let primary = self
@@ -1166,26 +1240,47 @@ impl AudioBackend for AlsaBackend {
             .unwrap_or_else(|_| "unknown".to_string());
         log::info!("[ALSA Backend] Using device: {}", device_name);
 
-        // Check if device supports this configuration
-        let supported_configs = device
-            .supported_output_configs()
-            .map_err(|e| format!("Failed to get supported configs: {}", e))?;
+        // Check if device supports this configuration.
+        //
+        // Only for a PCM it is safe to ask. A plugin chain
+        // (`_audioout` -> softvol -> meter -> `plughw:`, which is what moOde
+        // builds) answers the hw-param probe by `abort()`ing the process —
+        // see `device_filter::is_probe_safe_pcm_id`. For those the requested
+        // rate stands and the OPEN is the test, which is what the fallback
+        // below would conclude anyway when it cannot read the rates.
+        let probe_id =
+            crate::device_filter::cpal_pcm_id(&device).unwrap_or_else(|| device_name.clone());
+        let probe_safe = crate::device_filter::is_probe_safe_device(&device);
 
-        let mut found_matching = false;
-        for range in supported_configs {
-            if range.channels() == config.channels
-                && config.sample_rate >= range.min_sample_rate()
-                && config.sample_rate <= range.max_sample_rate()
-            {
-                found_matching = true;
-                log::info!(
-                    "[ALSA Backend] Device supports {}Hz (range: {}-{}Hz)",
-                    config.sample_rate,
-                    range.min_sample_rate(),
-                    range.max_sample_rate()
-                );
-                break;
+        let mut found_matching = !probe_safe;
+        if probe_safe {
+            // PROBE. Guarded by the `probe_safe` check two lines up.
+            #[allow(clippy::disallowed_methods)]
+            let supported_configs = device
+                .supported_output_configs()
+                .map_err(|e| format!("Failed to get supported configs: {}", e))?;
+
+            for range in supported_configs {
+                if range.channels() == config.channels
+                    && config.sample_rate >= range.min_sample_rate()
+                    && config.sample_rate <= range.max_sample_rate()
+                {
+                    found_matching = true;
+                    log::info!(
+                        "[ALSA Backend] Device supports {}Hz (range: {}-{}Hz)",
+                        config.sample_rate,
+                        range.min_sample_rate(),
+                        range.max_sample_rate()
+                    );
+                    break;
+                }
             }
+        } else {
+            log::info!(
+                "[ALSA Backend] '{}' is a plugin PCM — not probing its rates; opening at {}Hz",
+                probe_id,
+                config.sample_rate
+            );
         }
 
         // If device doesn't support the requested rate, find best fallback
@@ -1237,7 +1332,12 @@ impl AudioBackend for AlsaBackend {
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
 
-        // Create MixerDeviceSink with custom config
+        // Create MixerDeviceSink with custom config.
+        //
+        // PROBE (rodio asks the device for its default config). Safe because
+        // `must_not_reach_rodio` turned the named config PCMs away at the top
+        // of this function.
+        #[allow(clippy::disallowed_methods)]
         let mixer_sink = DeviceSinkBuilder::from_device(device)
             .map_err(|e| {
                 if config.exclusive_mode {
@@ -1376,6 +1476,48 @@ mod tests {
         assert_eq!(extract_card_name_from_device(""), None);
     }
 
+    /// A named PCM from `/etc/alsa/conf.d` cannot be disproved without opening
+    /// it, so it reports present — moOde's `_audioout` is the whole reason
+    /// this branch exists, and reporting it absent would make every `status`
+    /// poll claim the configured output had vanished.
+    #[test]
+    fn named_pcms_and_aliases_report_present_without_touching_libasound() {
+        assert!(alsa_device_present("_audioout"));
+        assert!(alsa_device_present("peppy"));
+        assert!(alsa_device_present("camilladsp"));
+        assert!(alsa_device_present("default"));
+        assert!(alsa_device_present("pipewire"));
+    }
+
+    /// An empty id is not a device. A card-backed id naming a card that is not
+    /// registered is absent — and must NOT fall through to the "cannot tell,
+    /// say present" branch, which is what `extract_card_name_from_device`
+    /// returning `None` for both cases would have caused.
+    #[test]
+    fn missing_cards_and_empty_ids_report_absent() {
+        assert!(!alsa_device_present(""));
+        assert!(!alsa_device_present("   "));
+        assert!(!alsa_device_present("front:CARD=NoSuchCardHere,DEV=0"));
+        assert!(!alsa_device_present("hw:99,0"));
+    }
+
+    #[test]
+    fn card_backed_shapes_are_recognised() {
+        for id in [
+            "hw:2,0",
+            "plughw:CARD=IQaudIODAC,DEV=0",
+            "front:CARD=PCH,DEV=0",
+            "sysdefault:CARD=PCH",
+            "iec958:CARD=PCH,DEV=0",
+            "hdmi:CARD=vc4hdmi0,DEV=0",
+        ] {
+            assert!(is_card_backed_id(id), "{id} names a kernel card");
+        }
+        for id in ["_audioout", "peppy", "default", "pulse", "null", ""] {
+            assert!(!is_card_backed_id(id), "{id} does not name a kernel card");
+        }
+    }
+
     #[test]
     fn is_card_present_in_proc_short_circuits_on_unparseable_ids() {
         // For inputs without a CARD= component, the helper must short-
@@ -1390,7 +1532,6 @@ mod tests {
     #[test]
     fn is_known_pcm_id_keeps_only_lookup_targets() {
         // Positive: every shape downstream code actually queries.
-        assert!(is_known_pcm_id("default"));
         assert!(is_known_pcm_id("sysdefault:CARD=PCH"));
         assert!(is_known_pcm_id("front:CARD=Generic,DEV=0"));
         assert!(is_known_pcm_id("hdmi:CARD=HDMI,DEV=3"));
