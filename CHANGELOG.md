@@ -7,6 +7,26 @@ tags on `main`.
 
 ### Changed
 
+- **The CMAF seed is read from the webplayer bundle instead of being compiled
+  in.** It used to be a constant in `auth.rs`, carried in the source and in
+  every published binary. It is now collected from the live bundle alongside
+  `app_id` and the app secrets, which is where it came from in the first
+  place, and cached with them under the bundle version.
+
+  The bundle gives the value no label to match on, so extraction cannot
+  identify it directly: it scores every 32-hex literal by the CMAF vocabulary
+  around it and hands the best few to the client, which settles the question
+  by signing a real `session/start` with each in turn — the same
+  candidates-plus-probe shape `secret()` has always used. The winner is
+  registered for log redaction before it is returned, and the probe runs once
+  per process.
+
+  Two practical effects. A seed rotation upstream now resolves itself at the
+  next bundle refresh rather than needing a release. And when no candidate
+  works — a bundle that hides it, or an extraction that has gone stale —
+  playback falls back to the legacy `/track/getFileUrl` path, which needs no
+  seed, instead of failing.
+
 - **The disk cache is encrypted, and no longer survives a restart.**
   `~/.cache/qbz/playback/` held playable Hi-Res FLACs: the CMAF path decrypts
   each segment before it assembles, the legacy path downloads plaintext, and

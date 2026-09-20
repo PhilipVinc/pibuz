@@ -13,6 +13,13 @@ pub enum ApiError {
     #[error("Invalid app secret")]
     InvalidAppSecret,
 
+    /// No CMAF seed in the current webplayer bundle validated against
+    /// `session/start`. NOT fatal: every CMAF entry point treats this as "CMAF
+    /// is unavailable on this bundle" and falls back to the legacy
+    /// `/track/getFileUrl` path, which needs no seed.
+    #[error("No usable CMAF seed in the current bundle")]
+    NoCmafSeed,
+
     #[error("Failed to extract bundle tokens: {0}")]
     BundleExtractionError(String),
 

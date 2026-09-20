@@ -9,6 +9,9 @@ repository.workspace = true
 [dependencies]
 qbz-models = { path = "../qbz-models" }
 qbz-cmaf = { path = "../qbz-cmaf" }
+# The validated CMAF seed is registered as a secret the moment it is resolved,
+# so it can never reach a log line (see `client.rs::cmaf_seed`).
+qbz-log = { path = "../qbz-log" }
 
 # Async
 tokio = { workspace = true }

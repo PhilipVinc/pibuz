@@ -11,7 +11,8 @@
 //! 1. `/file/url` returns `{ url_template, key (wrapped), n_segments, ... }`
 //! 2. `/session/start` returns `{ session_id, infos }` — the `infos` string
 //!    is the HKDF salt needed to derive the per-session AES key
-//! 3. Session key = `HKDF(CMAF_SEED, infos)`
+//! 3. Session key = `HKDF(seed, infos)`, where `seed` comes from the live
+//!    webplayer bundle via `QobuzClient::cmaf_seed` — see `bundle.rs`
 //! 4. Content key = unwrap(session_key, key) — this is the per-track AES key
 //! 5. Fetch init segment (s=0) → parse FLAC header + segment table
 //! 6. For each s=1..n_segments: fetch → parse crypto boxes → decrypt frames
@@ -93,8 +94,10 @@ pub struct CmafStreamingInfo {
 /// - `content_key` is the 16-byte AES key unwrapped from the session key;
 ///   it must be stored **encrypted at rest** on the caller's side.
 /// - `infos` is the original `session/start` infos string. With the
-///   `CMAF_SEED` constant this is enough to re-derive `session_key` and
-///   re-unwrap the content key if we ever need to audit or migrate.
+///   bundle seed this is enough to re-derive `session_key` and re-unwrap
+///   the content key if we ever need to audit or migrate — though note the
+///   seed is resolved per bundle version, so an archived `infos` outlives
+///   the seed that made sense of it.
 ///
 /// The intent is that an attacker who copies the user's offline directory
 /// out without also extracting the OS-keyring wrapped `content_key` gets
@@ -135,7 +138,11 @@ pub async fn setup_streaming(
         .await
         .map_err(|e| format!("ensure_cmaf_session failed: {}", e))?;
 
-    let session_key = qbz_cmaf::derive_session_key(crate::auth::CMAF_SEED, &infos)
+    let seed = client
+        .cmaf_seed()
+        .await
+        .map_err(|e| format!("No CMAF seed available: {}", e))?;
+    let session_key = qbz_cmaf::derive_session_key(&seed, &infos)
         .map_err(|e| format!("Session key derivation failed: {}", e))?;
     let content_key = qbz_cmaf::unwrap_content_key(&session_key, key_str)
         .map_err(|e| format!("Content key unwrap failed: {}", e))?;
@@ -754,7 +761,7 @@ pub async fn download_full_with_quality_progress(
 /// 1. Persisting `init_bytes` + `segments` to disk as bit-identical blobs
 /// 2. Wrapping `content_key` with a device-bound key before storing it
 /// 3. Storing `infos` (either wrapped or as plaintext — it's only a salt,
-///    useless without `CMAF_SEED` + `content_key`)
+///    useless without the bundle seed + `content_key`)
 ///
 /// At playback time, the caller feeds `init_bytes` through
 /// [`qbz_cmaf::parse_init_segment`] to recover the FLAC header + segment
@@ -793,7 +800,11 @@ pub async fn download_raw_with_progress(
         .await
         .map_err(|e| format!("ensure_cmaf_session failed: {}", e))?;
 
-    let session_key = qbz_cmaf::derive_session_key(crate::auth::CMAF_SEED, &infos)
+    let seed = client
+        .cmaf_seed()
+        .await
+        .map_err(|e| format!("No CMAF seed available: {}", e))?;
+    let session_key = qbz_cmaf::derive_session_key(&seed, &infos)
         .map_err(|e| format!("Session key derivation failed: {}", e))?;
     let content_key = qbz_cmaf::unwrap_content_key(&session_key, key_str)
         .map_err(|e| format!("Content key unwrap failed: {}", e))?;

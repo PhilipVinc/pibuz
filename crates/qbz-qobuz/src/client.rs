@@ -54,6 +54,18 @@ pub struct QobuzClient {
     /// `Authorization: Bearer <jwt>` instead.
     bearer_api_jwt: Arc<RwLock<Option<String>>>,
     validated_secret: Arc<RwLock<Option<String>>>,
+    /// The bundle CMAF seed candidate that actually signed a `session/start`,
+    /// once one has. `None` means "not settled yet"; a settled FAILURE is
+    /// `Some(None)` on the inner option of `cmaf_seed_probe_done` rather than
+    /// here, so a bundle with no usable seed is probed once per process and not
+    /// once per track.
+    validated_cmaf_seed: Arc<RwLock<Option<String>>>,
+    /// Set once the candidate list has been walked, whatever the outcome.
+    /// Without it, a bundle with no working seed re-probes
+    /// `MAX_CMAF_SEED_CANDIDATES` times on EVERY track load — the legacy
+    /// fallback would still play, silently, at the cost of a burst of doomed
+    /// requests per track.
+    cmaf_seed_probe_done: Arc<RwLock<bool>>,
     locale: Arc<RwLock<String>>,
     cmaf_session: Arc<RwLock<Option<CmafSession>>>,
     /// Backs off the hot streaming/favorites paths after repeated 403s so a
@@ -70,6 +82,8 @@ impl Clone for QobuzClient {
             session: Arc::clone(&self.session),
             bearer_api_jwt: Arc::clone(&self.bearer_api_jwt),
             validated_secret: Arc::clone(&self.validated_secret),
+            validated_cmaf_seed: Arc::clone(&self.validated_cmaf_seed),
+            cmaf_seed_probe_done: Arc::clone(&self.cmaf_seed_probe_done),
             locale: Arc::clone(&self.locale),
             cmaf_session: Arc::clone(&self.cmaf_session),
             forbidden_breaker: Arc::clone(&self.forbidden_breaker),
@@ -95,6 +109,8 @@ impl QobuzClient {
             session: Arc::new(RwLock::new(None)),
             bearer_api_jwt: Arc::new(RwLock::new(None)),
             validated_secret: Arc::new(RwLock::new(None)),
+            validated_cmaf_seed: Arc::new(RwLock::new(None)),
+            cmaf_seed_probe_done: Arc::new(RwLock::new(false)),
             locale: Arc::new(RwLock::new("en".to_string())),
             cmaf_session: Arc::new(RwLock::new(None)),
             forbidden_breaker: Arc::new(ForbiddenBreaker::new()),
@@ -262,6 +278,113 @@ impl QobuzClient {
             .await?;
 
         Ok(response.status() != StatusCode::BAD_REQUEST)
+    }
+
+    /// The bundle seed that CMAF request signing and key derivation run on.
+    ///
+    /// Same shape as [`Self::secret`]: the bundle hands over candidates, the
+    /// live endpoint decides. The difference is that failing to find one is
+    /// NOT fatal — `Err(NoCmafSeed)` means every CMAF entry point falls back
+    /// to the legacy `/track/getFileUrl` path, which needs no seed at all.
+    ///
+    /// The winner is registered with `qbz_log::register_secret` before it is
+    /// returned, so it cannot reach a log line from any caller.
+    pub(crate) async fn cmaf_seed(&self) -> Result<String> {
+        if let Some(seed) = self.validated_cmaf_seed.read().await.clone() {
+            return Ok(seed);
+        }
+        if *self.cmaf_seed_probe_done.read().await {
+            return Err(ApiError::NoCmafSeed);
+        }
+
+        // Clone the candidates and drop the guard: the probes below are network
+        // round-trips, and holding the token lock across them would block a
+        // background bundle refresh for the duration.
+        let candidates: Vec<String> = {
+            let tokens = self.tokens.read().await;
+            let tokens = tokens.as_ref().ok_or_else(|| {
+                ApiError::BundleExtractionError("Client not initialized".to_string())
+            })?;
+            tokens.cmaf_seeds.clone()
+        };
+
+        if candidates.is_empty() {
+            *self.cmaf_seed_probe_done.write().await = true;
+            log::info!("[CMAF] Bundle exposed no seed candidates; CMAF unavailable");
+            return Err(ApiError::NoCmafSeed);
+        }
+
+        for (index, seed) in candidates.iter().enumerate() {
+            // An Err here is an INCONCLUSIVE answer (403, auth, transport), not
+            // a rejection. Propagate without latching `probe_done`, so a probe
+            // that ran during an outage is retried later instead of disabling
+            // CMAF for the life of the process.
+            if self.test_cmaf_seed(seed).await? {
+                log::info!(
+                    "[CMAF] Seed candidate {}/{} accepted by session/start",
+                    index + 1,
+                    candidates.len()
+                );
+                qbz_log::register_secret(seed.clone());
+                *self.validated_cmaf_seed.write().await = Some(seed.clone());
+                *self.cmaf_seed_probe_done.write().await = true;
+                return Ok(seed.clone());
+            }
+        }
+
+        *self.cmaf_seed_probe_done.write().await = true;
+        log::info!(
+            "[CMAF] None of the {} bundle seed candidates signed a session/start; \
+             falling back to the legacy path for this session",
+            candidates.len()
+        );
+        Err(ApiError::NoCmafSeed)
+    }
+
+    /// Probe one CMAF seed candidate by signing a real `session/start`.
+    ///
+    /// `Ok(true)` accepted, `Ok(false)` rejected (a bad signature is a 400,
+    /// same convention as [`Self::test_secret`]), `Err` inconclusive — the
+    /// caller must stop rather than walk the rest of the list, because a 403 or
+    /// an auth failure answers every candidate identically and firing the
+    /// remaining probes would feed the 403 breaker for nothing (issue #637).
+    async fn test_cmaf_seed(&self, seed: &str) -> Result<bool> {
+        self.forbidden_guard()?;
+        let timestamp = get_timestamp();
+        let sig = sign_session_start(timestamp, seed);
+        let url = endpoints::build_url(paths::SESSION_START);
+
+        let response = self
+            .http()?
+            .post(&url)
+            .headers(self.authenticated_headers().await?)
+            .form(&[
+                ("profile", "qbz-1"),
+                ("request_ts", &timestamp.to_string()),
+                ("request_sig", &sig),
+            ])
+            .send()
+            .await?;
+
+        let status = response.status();
+        // Feed the breaker only on the conclusive answers. A 400 is this
+        // probe's expected "no", and must not count as either.
+        if status.is_success() {
+            self.note_forbidden_status(status);
+            return Ok(true);
+        }
+        if status == StatusCode::BAD_REQUEST {
+            return Ok(false);
+        }
+        self.note_forbidden_status(status);
+        if status == StatusCode::FORBIDDEN {
+            let preview = body_preview(response).await;
+            return Err(ApiError::Forbidden(preview));
+        }
+        Err(ApiError::ApiResponse(format!(
+            "session/start seed probe failed with status {}",
+            status
+        )))
     }
 
     /// Login with email and password
@@ -995,9 +1118,18 @@ impl QobuzClient {
         // the network if the 403 breaker is open (issue #637) — a cached
         // session above is still served; only the network POST is gated.
         self.forbidden_guard()?;
+        // Resolved here rather than at the top of the method: the fast path
+        // above serves a live session without needing a seed at all.
+        //
+        // This runs under the session write guard, so on a cold cache the
+        // probe loop is serialized with it — which is what we want. Concurrent
+        // track loads then share ONE walk of the candidate list instead of
+        // each starting their own. `cmaf_seed` touches neither `cmaf_session`
+        // nor anything that leads back to it, so the nesting is safe.
+        let seed = self.cmaf_seed().await?;
         log::info!("[CMAF] Starting new session");
         let timestamp = get_timestamp();
-        let sig = sign_session_start(timestamp);
+        let sig = sign_session_start(timestamp, &seed);
 
         let url = endpoints::build_url(paths::SESSION_START);
         let response = self
@@ -1070,11 +1202,14 @@ impl QobuzClient {
                 let url = url.clone();
                 async move {
                     let (session_id, _infos) = self.ensure_cmaf_session().await?;
+                    // Already settled by `ensure_cmaf_session` above — this is
+                    // the cached read, not a second probe.
+                    let seed = self.cmaf_seed().await?;
 
                     // Fresh timestamp + signature per attempt — the request
                     // signature is time-bound and would expire across retries.
                     let timestamp = get_timestamp();
-                    let sig = sign_file_url(track_id, format_id, timestamp);
+                    let sig = sign_file_url(track_id, format_id, timestamp, &seed);
 
                     let mut headers = self.authenticated_headers().await?;
                     headers.insert(

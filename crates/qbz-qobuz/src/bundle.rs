@@ -29,6 +29,13 @@ pub struct BundleTokens {
     /// OAuth private key used for the /oauth/callback exchange.
     /// Present in recent bundle versions; None on older bundles.
     pub private_key: Option<String>,
+    /// CMAF seed CANDIDATES, best-scoring first — see
+    /// [`extract_cmaf_seed_candidates`]. The bundle gives no label to match on,
+    /// so the winner is decided by `QobuzClient::cmaf_seed`, which signs a
+    /// `session/start` with each in turn exactly as `secret()` does with
+    /// `test_secret`. Empty means no CMAF on this bundle; the legacy path
+    /// needs none.
+    pub cmaf_seeds: Vec<String>,
 }
 
 /// On-disk cache of the extracted tokens, keyed by the Qobuz bundle version
@@ -41,6 +48,11 @@ pub struct CachedBundle {
     pub secrets: Vec<String>,
     #[serde(default)]
     pub private_key: Option<String>,
+    /// `default` so a cache file written before CMAF seeds were extracted still
+    /// deserializes — it just reports no candidates, and the next bundle
+    /// rotation refills it.
+    #[serde(default)]
+    pub cmaf_seeds: Vec<String>,
     /// Unix seconds when these tokens were fetched (freshness only; not a TTL).
     pub fetched_at: i64,
 }
@@ -51,6 +63,7 @@ impl From<CachedBundle> for BundleTokens {
             app_id: c.app_id,
             secrets: c.secrets,
             private_key: c.private_key,
+            cmaf_seeds: c.cmaf_seeds,
         }
     }
 }
@@ -160,11 +173,24 @@ async fn extract_bundle_tokens_once(client: &Client) -> Result<(BundleTokens, St
         log::debug!("OAuth private_key not found in bundle (older bundle version)");
     }
 
+    // Step 6: Collect CMAF seed candidates (optional). None found is not an
+    // error — it costs the CMAF path, and the legacy path carries on.
+    let cmaf_seeds = extract_cmaf_seed_candidates(&bundle_content, &secrets);
+    if cmaf_seeds.is_empty() {
+        log::info!("[Bundle] No CMAF seed candidates in bundle; CMAF playback unavailable");
+    } else {
+        log::info!(
+            "[Bundle] {} CMAF seed candidate(s) extracted; the first to sign a session/start wins",
+            cmaf_seeds.len()
+        );
+    }
+
     Ok((
         BundleTokens {
             app_id,
             secrets,
             private_key,
+            cmaf_seeds,
         },
         version,
     ))
@@ -187,6 +213,7 @@ pub async fn extract_and_cache_bundle_tokens(client: &Client) -> Result<BundleTo
                     app_id: tokens.app_id.clone(),
                     secrets: tokens.secrets.clone(),
                     private_key: tokens.private_key.clone(),
+                    cmaf_seeds: tokens.cmaf_seeds.clone(),
                     fetched_at: now_unix(),
                 });
                 return Ok(tokens);
@@ -382,6 +409,109 @@ fn extract_secrets(bundle: &str) -> Result<Vec<String>> {
     Ok(secrets)
 }
 
+/// How many candidates `QobuzClient::cmaf_seed` may spend a `session/start`
+/// probe on. Each costs one request, but only on a cold cache or after Qobuz
+/// rotates the bundle — the winner is cached by bundle version.
+pub const MAX_CMAF_SEED_CANDIDATES: usize = 8;
+
+/// Bytes either side of a literal that count as its context when scoring.
+const CMAF_SEED_CONTEXT: usize = 512;
+
+/// Tokens that suggest a nearby 32-hex literal is the CMAF seed, and what each
+/// is worth. `cmaf` and `qbz-1` are the strong ones: `qbz-1` is the profile
+/// name posted to `session/start` and appears essentially nowhere else.
+const CMAF_SEED_HINTS: &[(&str, u32)] = &[
+    ("cmaf", 10),
+    ("qbz-1", 8),
+    ("sessionstart", 6),
+    ("session/start", 6),
+    ("fileurl", 4),
+    ("file/url", 4),
+    ("hkdf", 4),
+    ("seed", 3),
+    ("request_sig", 2),
+];
+
+/// Snap `[lo, hi)` outwards to the nearest char boundaries so a slice of a
+/// minified bundle can't split a multi-byte character.
+fn char_bounded(s: &str, lo: usize, hi: usize) -> &str {
+    let mut lo = lo.min(s.len());
+    let mut hi = hi.min(s.len());
+    while lo > 0 && !s.is_char_boundary(lo) {
+        lo -= 1;
+    }
+    while hi < s.len() && !s.is_char_boundary(hi) {
+        hi += 1;
+    }
+    &s[lo..hi]
+}
+
+/// CMAF seed candidates from the bundle, best-scoring first.
+///
+/// Unlike `appId` and `appSecret`, the seed carries no label to anchor a regex
+/// on — the value is just a 32-hex string literal, and a 7 MB minified bundle
+/// holds plenty of those. So this does not try to identify it: it collects
+/// every 32-hex literal, scores each by what appears NEAR it
+/// ([`CMAF_SEED_HINTS`]), and returns the best few for
+/// `QobuzClient::cmaf_seed` to settle against the live endpoint. That mirrors
+/// how `secret()` already picks among `secrets` with `test_secret`, and it is
+/// why a hint list being slightly wrong costs a wasted probe rather than a
+/// broken CMAF path.
+///
+/// `known_secrets` are filtered out: the legacy app secrets are also 32 hex
+/// and would otherwise burn probe slots.
+///
+/// An empty result is a normal outcome, not an error — it means this bundle
+/// exposes no seed in a shape this sees, and CMAF is simply unavailable.
+pub fn extract_cmaf_seed_candidates(bundle: &str, known_secrets: &[String]) -> Vec<String> {
+    let re = Regex::new(r#""([0-9a-f]{32})""#).expect("Invalid regex");
+
+    // Best score wins per distinct value: the same literal can appear more than
+    // once, and only its most promising neighbourhood matters.
+    let mut scored: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+
+    for caps in re.captures_iter(bundle) {
+        let Some(m) = caps.get(1) else { continue };
+        let value = m.as_str();
+        if known_secrets.iter().any(|s| s == value) {
+            continue;
+        }
+
+        let context = char_bounded(
+            bundle,
+            m.start().saturating_sub(CMAF_SEED_CONTEXT),
+            m.end() + CMAF_SEED_CONTEXT,
+        )
+        .to_ascii_lowercase();
+
+        let score = CMAF_SEED_HINTS
+            .iter()
+            .filter(|(token, _)| context.contains(token))
+            .map(|(_, weight)| weight)
+            .sum();
+
+        let slot = scored.entry(value.to_string()).or_insert(0);
+        *slot = (*slot).max(score);
+    }
+
+    // A literal with no hint at all anywhere near it is just one of the
+    // bundle's many hashes. Keeping those would fill every probe slot with
+    // noise on a bundle that has no seed to find.
+    let mut candidates: Vec<(String, u32)> =
+        scored.into_iter().filter(|(_, score)| *score > 0).collect();
+    // Score first, then the value itself, so the order is stable across runs
+    // (HashMap iteration is not) and a cached candidate list matches a
+    // re-extracted one.
+    candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    candidates.truncate(MAX_CMAF_SEED_CANDIDATES);
+
+    log::debug!(
+        "[Bundle] {} CMAF seed candidate(s) after scoring",
+        candidates.len()
+    );
+    candidates.into_iter().map(|(value, _)| value).collect()
+}
+
 fn extract_private_key(bundle: &str) -> Option<String> {
     // Pattern: privateKey:"VALUE" (the static OAuth key used in /oauth/callback)
     let re = Regex::new(r#"privateKey:\s*"(?P<key>[A-Za-z0-9]{6,30})""#).expect("Invalid regex");
@@ -409,5 +539,79 @@ mod tests {
         let result = extract_app_id(bundle);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "123456789");
+    }
+
+    /// A 32-hex literal with no CMAF vocabulary near it is one of the bundle's
+    /// many hashes. Scoring those in would fill every probe slot with noise.
+    #[test]
+    fn cmaf_seed_candidates_ignore_unhinted_hex() {
+        let bundle = r#"var a={etag:"0123456789abcdef0123456789abcdef",x:1}"#;
+        assert!(extract_cmaf_seed_candidates(bundle, &[]).is_empty());
+    }
+
+    /// The fixture value here is invented, and must stay that way: putting a
+    /// real seed in a test would re-commit to this repository the exact thing
+    /// this module exists to stop shipping.
+    #[test]
+    fn cmaf_seed_candidates_find_a_hinted_literal() {
+        let fake_seed = "0f1e2d3c4b5a69788796a5b4c3d2e1f0";
+        let bundle = format!(r#"cmafProfile:"qbz-1",k:"{fake_seed}""#);
+        assert_eq!(
+            extract_cmaf_seed_candidates(&bundle, &[]),
+            vec![fake_seed.to_string()]
+        );
+    }
+
+    /// The whole point of scoring: the bundle holds many 32-hex literals and
+    /// the seed is not labelled, so the one in CMAF company must sort first.
+    #[test]
+    fn cmaf_seed_candidates_rank_by_context() {
+        let near = "a".repeat(32);
+        let far = "b".repeat(32).replace('b', "c");
+        let bundle = format!(
+            r#"{{hash:"{far}",note:"seed"}} ... cmaf:{{profile:"qbz-1",sessionstart:1,k:"{near}"}}"#
+        );
+        let got = extract_cmaf_seed_candidates(&bundle, &[]);
+        assert_eq!(got.first(), Some(&near), "got {got:?}");
+    }
+
+    /// The legacy app secrets are 32 hex too, and are already known to be
+    /// something else — they must not burn probe slots.
+    #[test]
+    fn cmaf_seed_candidates_exclude_known_secrets() {
+        let secret = "d".repeat(32);
+        let bundle = format!(r#"cmaf:{{appSecret:"{secret}"}}"#);
+        assert!(extract_cmaf_seed_candidates(&bundle, &[secret]).is_empty());
+    }
+
+    #[test]
+    fn cmaf_seed_candidates_are_capped_and_deterministic() {
+        // Twice the cap, all equally hinted, so only the tie-break on value
+        // decides the order.
+        let mut bundle = String::from("cmaf:{");
+        for i in 0..(MAX_CMAF_SEED_CANDIDATES * 2) {
+            bundle.push_str(&format!(r#"k{i}:"{:032x}","#, i));
+        }
+        bundle.push('}');
+
+        let first = extract_cmaf_seed_candidates(&bundle, &[]);
+        assert_eq!(first.len(), MAX_CMAF_SEED_CANDIDATES);
+        assert_eq!(first, extract_cmaf_seed_candidates(&bundle, &[]));
+    }
+
+    /// The context window is sliced out of a 7 MB minified bundle by byte
+    /// offset; a multi-byte character straddling the edge must not panic.
+    #[test]
+    fn cmaf_seed_candidates_survive_multibyte_context() {
+        let bundle = format!(
+            r#"{}cmaf:"{}"{}"#,
+            "é".repeat(400),
+            "e".repeat(32),
+            "ü".repeat(400)
+        );
+        assert_eq!(
+            extract_cmaf_seed_candidates(&bundle, &[]),
+            vec!["e".repeat(32)]
+        );
     }
 }
