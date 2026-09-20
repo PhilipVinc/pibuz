@@ -3561,8 +3561,25 @@ impl Player {
                                                 ResumeInput::Memory(data)
                                             }
                                             None => {
-                                                log::warn!("Audio thread: cannot resume - streaming source complete but data unavailable");
-                                                return;
+                                                // Completion says the feeder has nothing left to
+                                                // fetch, not that the buffer holds the whole file.
+                                                // A stream opened mid-file -- a QConnect session
+                                                // handed over at a position -- never held byte 0,
+                                                // and a windowed one drops what the reader has
+                                                // passed, so `take_complete_data` refuses either
+                                                // way. The bytes under the resume point are still
+                                                // there, and a range feeder can fetch whatever
+                                                // else the decoder asks for.
+                                                if streaming_src.supports_range_requests() {
+                                                    log::info!(
+                                                        "Resume: complete stream holds no whole-file copy ({} bytes buffered) - seeking instead",
+                                                        streaming_src.buffer_size()
+                                                    );
+                                                    ResumeInput::Ranged(streaming_src.clone())
+                                                } else {
+                                                    log::warn!("Audio thread: cannot resume - streaming source complete but data unavailable");
+                                                    return;
+                                                }
                                             }
                                         }
                                     } else if streaming_src.supports_range_requests() {
