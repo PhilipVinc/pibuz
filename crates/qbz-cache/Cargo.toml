@@ -8,6 +8,10 @@ repository.workspace = true
 license.workspace = true
 
 [dependencies]
+# The L2 cache is sealed at rest; the cipher lives with the rest of the
+# crypto (see qbz_cmaf::vault).
+qbz-cmaf = { path = "../qbz-cmaf" }
+
 # Logging
 log = "0.4"
 

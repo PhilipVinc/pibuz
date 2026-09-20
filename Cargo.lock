@@ -2942,6 +2942,7 @@ dependencies = [
  "dirs 6.0.0",
  "filetime",
  "log",
+ "qbz-cmaf",
  "serde",
 ]
 
@@ -2956,6 +2957,7 @@ dependencies = [
  "hkdf",
  "log",
  "md-5",
+ "rand 0.10.1",
  "sha2",
  "thiserror 2.0.18",
 ]

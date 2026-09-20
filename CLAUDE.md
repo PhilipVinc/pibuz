@@ -141,6 +141,44 @@ fails the track loudly, by comparing each decrypted segment against the length
 the table declared; a silent mismatch would serve audio at offsets it does not
 belong to, which decodes as noise rather than as an error.
 
+## The L2 disk cache is sealed, and the key dies with the process
+
+Everything the daemon writes to `~/.cache/qbz/playback/` used to be a playable
+FLAC: the CMAF path decrypts each segment before it assembles, and the legacy
+path downloads plaintext to begin with. It is now AES-128-CTR'd on the way to
+the card — `crates/qbz-cmaf/src/vault.rs`, which has the full reasoning — under
+a key `PlaybackCache` generates at construction and never writes down.
+
+Four things follow, and each is load-bearing:
+
+- **There are exactly three writers, and all three seal.** `DiskTee`
+  (`qbz-player`, used by the CMAF feeder and the remote body pump),
+  `write_track_to_disk` (`qbz-qobuz`, the straight-to-disk full download) and
+  `PlaybackCache::insert` (an L1 track spilling to L2). A fourth route into
+  that directory is a plaintext leak; there is no test that would catch one but
+  the reader refusing it later, loudly, on someone's Pi.
+- **The cache cannot survive a restart**, so `PlaybackCache::with_path` WIPES
+  the directory instead of adopting it. A file from a previous run is
+  ciphertext under a key that no longer exists. On moOde that is every renderer
+  toggle, because `stopQobuz()` kills the daemon — the trade was made
+  deliberately over a key file, which would have sat on the same card as the
+  ciphertext and protected nothing.
+- **Two kinds of size.** The index, the budget and `/api/status` count AUDIO
+  bytes; a file is `SEAL_HEADER_LEN` longer than the audio in it. `commit_write`
+  subtracts, `insert`'s "already on the card?" check adds, and the CMAF
+  writeback hints shift their offsets. Mixing them is a 32-byte drift per track
+  that nothing will fail on.
+- **A path is no longer enough to read a track.** `qbz_cache::CachedFile`
+  carries the key with the path, and every read site takes one: the rodio
+  decoder, symphonia's bisecting seek (`InMemorySource::from_cached_file`), the
+  tag head, the resume re-read. Reaching for `std::fs::read` on a cache path
+  gets you noise, not audio.
+
+CTR rather than a block mode because the cache is SEEKED, not streamed: audio
+byte `p` is always file byte `p + SEAL_HEADER_LEN` and decrypting it needs only
+the counter at `p`. That is what keeps `read_head` at 256 KB of a 220 MB track
+and symphonia's seek at a handful of reads.
+
 ## The controller-sync tests
 
 `crates/qconnect-app/src/controller_harness.rs` puts a scripted phone in a test.
@@ -297,6 +335,9 @@ adding the import.
   `QconnectHandle::shutdown()`** before `drop(booted)` — `crates/pibuz/src/qconnect/mod.rs`.
   This is the #521 clock-release ordering: a surviving clone holds the ALSA device
   open and the next start fails. Adding a task means adding its teardown.
+- **Nothing writes plaintext audio to the card.** Every route into the L2 cache
+  goes through a `SealWriter` — see the sealed-cache section above. This is the
+  one rule here with no CI gate behind it.
 - **`pibuz` must never resolve Slint.** CI gates on it in both workflows. Nothing in
   the tree pulls it today; the gate exists so a crates.io dependency cannot
   reintroduce it.

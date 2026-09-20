@@ -464,8 +464,8 @@ pub async fn run_driver<A: FrontendAdapter + Send + Sync + 'static>(
                         continue;
                     }
                     match fetched {
-                        Some(qbz_player::TrackAudio::File(path)) => {
-                            if let Err(e) = player.play_next_file(path, *id) {
+                        Some(qbz_player::TrackAudio::File(cached)) => {
+                            if let Err(e) = player.play_next_file(cached, *id) {
                                 log::warn!("[pibuz] driver: gapless from disk failed: {e}");
                             }
                         }

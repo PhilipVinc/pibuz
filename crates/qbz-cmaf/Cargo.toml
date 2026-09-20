@@ -10,6 +10,7 @@ repository.workspace = true
 aes = "0.8"
 cbc = "0.1"
 ctr = "0.9"
+rand = { workspace = true }
 hkdf = "0.12"
 sha2 = "0.10"
 base64 = { workspace = true }

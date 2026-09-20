@@ -194,7 +194,15 @@ pub enum TrackDestination {
     Memory,
     /// Write straight to this path as the download proceeds. The caller owns
     /// publishing it (rename into place, index it) once this returns.
-    File(std::path::PathBuf),
+    ///
+    /// `key` seals the file: the L2 cache holds no plaintext audio, so a track
+    /// that never passes through memory still has to be encrypted on its way to
+    /// the card. It is the cache's own key — `PlaybackCache::key` — so the file
+    /// this writes is readable by the same `CachedFile` as every other entry.
+    File {
+        path: std::path::PathBuf,
+        key: qbz_cmaf::SealKey,
+    },
     /// Do not download this track at all.
     ///
     /// The size is the whole point: a caller that has nowhere to put 200 MB —
@@ -399,7 +407,7 @@ pub async fn download_full_sized(
             );
             Ok(DownloadedTrack::Memory(output.into_arc()?))
         }
-        TrackDestination::File(path) => {
+        TrackDestination::File { path, key } => {
             // The writer lives on a BLOCKING thread with a bounded channel in
             // front of it, for two reasons.
             //
@@ -415,8 +423,9 @@ pub async fn download_full_sized(
             let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(2);
             let writer_path = path.clone();
             let header = setup.flac_header.clone();
-            let writer =
-                tokio::task::spawn_blocking(move || write_track_to_disk(&writer_path, header, rx));
+            let writer = tokio::task::spawn_blocking(move || {
+                write_track_to_disk(&writer_path, key, header, rx)
+            });
 
             let fetch = fetch_decrypt_in_order(
                 &http,
@@ -491,8 +500,12 @@ pub async fn download_full_sized(
 /// 37.6 s write, the card monopolised while the decoder needed it.
 ///
 /// Non-Linux has neither syscall; there the flush alone is the whole of it.
+/// Returns the count of AUDIO bytes written. The file on the card is
+/// [`qbz_cmaf::SEAL_HEADER_LEN`] longer, and the caller's "did we write the
+/// whole track" check is about the audio.
 fn write_track_to_disk(
     path: &std::path::Path,
+    key: qbz_cmaf::SealKey,
     header: Vec<u8>,
     mut rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
 ) -> std::result::Result<usize, String> {
@@ -500,7 +513,13 @@ fn write_track_to_disk(
 
     let file = std::fs::File::create(path)
         .map_err(|e| format!("create {} for streaming download: {e}", path.display()))?;
-    let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
+    // Sealed, because this lands in the L2 cache and nothing there is
+    // plaintext. The cipher is a keystream, so this costs one XOR pass over
+    // bytes that are about to be copied to the card anyway — and the writeback
+    // hints below still address the same ranges, shifted by the seal header.
+    let mut writer =
+        qbz_cmaf::SealWriter::new(key, std::io::BufWriter::with_capacity(1 << 20, file))
+            .map_err(|e| format!("seal {}: {e}", path.display()))?;
 
     writer
         .write_all(&header)
@@ -519,16 +538,17 @@ fn write_track_to_disk(
             .flush()
             .map_err(|e| format!("flush {}: {e}", path.display()))?;
 
-        start_writeback(&writer, start, written - start);
+        start_writeback(writer.get_ref(), start, written - start);
         if let Some((off, len)) = in_flight.replace((start, written - start)) {
-            finish_writeback(&writer, off, len);
+            finish_writeback(writer.get_ref(), off, len);
         }
     }
 
     if let Some((off, len)) = in_flight {
-        finish_writeback(&writer, off, len);
+        finish_writeback(writer.get_ref(), off, len);
     }
     let file = writer
+        .into_inner()
         .into_inner()
         .map_err(|e| format!("flush {}: {e}", path.display()))?;
     // Cheap by now: the ranges above are already out, so this only settles the
@@ -540,12 +560,18 @@ fn write_track_to_disk(
 }
 
 /// Ask the kernel to begin writing `[offset, offset+len)` out. Returns at once.
+///
+/// `offset` is an AUDIO offset — what the caller counts — and the file is
+/// sealed, so it is shifted past the seal header here. Getting this wrong would
+/// not corrupt anything; it would just hint at the wrong pages, which is the
+/// kind of bug that never shows up in a test.
 #[cfg(target_os = "linux")]
 fn start_writeback(writer: &std::io::BufWriter<std::fs::File>, offset: usize, len: usize) {
     use std::os::unix::io::AsRawFd;
     if len == 0 {
         return;
     }
+    let offset = offset + qbz_cmaf::SEAL_HEADER_LEN as usize;
     // Best effort throughout: a kernel or filesystem that refuses these leaves
     // the write correct, just less considerate.
     unsafe {
@@ -565,6 +591,7 @@ fn finish_writeback(writer: &std::io::BufWriter<std::fs::File>, offset: usize, l
     if len == 0 {
         return;
     }
+    let offset = offset + qbz_cmaf::SEAL_HEADER_LEN as usize;
     let fd = writer.get_ref().as_raw_fd();
     unsafe {
         libc::sync_file_range(
@@ -1241,9 +1268,11 @@ mod segment_assembly_tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(2);
         let writer_path = path.clone();
+        let seal = qbz_cmaf::SealKey::random();
         // No FLAC header: the comparison is over segment payloads alone.
-        let writer =
-            tokio::task::spawn_blocking(move || write_track_to_disk(&writer_path, Vec::new(), rx));
+        let writer = tokio::task::spawn_blocking(move || {
+            write_track_to_disk(&writer_path, seal, Vec::new(), rx)
+        });
         {
             let mut sink = Sink::File { tx };
             for (i, seg) in segments.iter().enumerate() {
@@ -1260,15 +1289,28 @@ mod segment_assembly_tests {
         std::fs::remove_dir_all(&dir).ok();
 
         assert!(!in_memory.filled().is_empty(), "fixture produced no audio");
-        assert_eq!(
+        // The file is SEALED — this path lands in the L2 cache, which holds no
+        // plaintext audio — so the comparison is against what it unseals to.
+        assert_ne!(
             in_memory.filled(),
             on_disk,
+            "the straight-to-disk path wrote the audio in the clear"
+        );
+        let unsealed = qbz_cmaf::vault::unseal_in_place(seal, on_disk.clone()).expect("unseal");
+        assert_eq!(
+            in_memory.filled(),
+            unsealed,
             "disk and memory assembly diverged"
         );
         assert_eq!(
             written,
-            on_disk.len(),
-            "byte count must match what was written"
+            unsealed.len(),
+            "the count is of AUDIO bytes, not of file bytes"
+        );
+        assert_eq!(
+            on_disk.len() as u64,
+            written as u64 + qbz_cmaf::SEAL_HEADER_LEN,
+            "the file is the audio plus one seal header"
         );
     }
 

@@ -41,5 +41,5 @@ pub use player::{
     DiskTee, FetchPlan, IncrementalStreamingSource, PlaybackEvent, PlaybackState, Player,
     SharedState, StreamSeekMode, StreamingConfig, TrackAudio,
 };
-pub use qbz_cache::{AudioCache, PlaybackCache, TrackBytes};
+pub use qbz_cache::{AudioCache, CachedFile, PlaybackCache, TrackBytes};
 pub use queue::QueueManager;

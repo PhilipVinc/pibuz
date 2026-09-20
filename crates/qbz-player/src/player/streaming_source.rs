@@ -1783,6 +1783,40 @@ impl MediaSource for InMemoryMediaSource {
     }
 }
 
+/// A sealed L2 cache file, as something symphonia can bisect.
+///
+/// The file on the card is ciphertext; [`qbz_cmaf::SealReader`] presents it in
+/// AUDIO coordinates, so everything above this line — the probe, the seek, the
+/// decoder's reads — addresses the FLAC and never learns there is a cipher
+/// under it. `byte_len` is the audio length for the same reason: symphonia
+/// bisects against it, and handing it the file length would aim every seek 32
+/// bytes past where it meant.
+struct SealedFileSource {
+    inner: qbz_cmaf::SealReader<std::fs::File>,
+}
+
+impl Read for SealedFileSource {
+    fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl Seek for SealedFileSource {
+    fn seek(&mut self, pos: SeekFrom) -> IoResult<u64> {
+        self.inner.seek(pos)
+    }
+}
+
+impl MediaSource for SealedFileSource {
+    fn is_seekable(&self) -> bool {
+        true
+    }
+
+    fn byte_len(&self) -> Option<u64> {
+        Some(self.inner.len())
+    }
+}
+
 /// Symphonia-backed decoder for fully-in-memory audio bytes, with native
 /// seek support.
 ///
@@ -1813,9 +1847,9 @@ impl InMemorySource {
         Self::from_media_source(source, "in-memory source")
     }
 
-    /// The same decoder over a FILE, for a track handed over as a path rather
-    /// than a buffer (the disk gapless path, taken whenever two of the track
-    /// would not fit the L1 budget).
+    /// The same decoder over a sealed L2 FILE, for a track handed over as a
+    /// cache entry rather than a buffer (the disk gapless path, taken whenever
+    /// two of the track would not fit the L1 budget).
     ///
     /// Exists so seeking such a track is a SEEK. rodio's generic `try_seek`
     /// succeeds on these files but, with no SEEKTABLE — and Qobuz FLACs carry
@@ -1824,12 +1858,17 @@ impl InMemorySource {
     /// the same seek on the in-memory streaming path. Symphonia over a seekable
     /// `MediaSource` bisects instead, which on local storage is a handful of
     /// small reads.
-    pub fn from_file(path: &std::path::Path) -> Result<Self, String> {
-        let file = std::fs::File::open(path)
-            .map_err(|e| format!("open {} for seeking: {e}", path.display()))?;
-        // symphonia implements `MediaSource` for `File`, and reports it
-        // seekable — which is the whole point.
-        Self::from_media_source(Box::new(file) as Box<dyn MediaSource>, "cached file")
+    pub fn from_cached_file(file: &qbz_cache::CachedFile) -> Result<Self, String> {
+        let reader = file
+            .open()
+            .map_err(|e| format!("open {} for seeking: {e}", file.path().display()))?;
+        // The seal is transparent and still seekable — which is the whole
+        // point. rodio's generic seek over the same file would decode forward
+        // instead.
+        Self::from_media_source(
+            Box::new(SealedFileSource { inner: reader }) as Box<dyn MediaSource>,
+            "cached file",
+        )
     }
 
     fn from_media_source(source: Box<dyn MediaSource>, what: &str) -> Result<Self, String> {
@@ -2001,12 +2040,16 @@ mod tests {
         w
     }
 
-    fn temp_wav(name: &str, bytes: &[u8]) -> std::path::PathBuf {
+    /// A cache entry holding `bytes`, SEALED the way the L2 cache seals
+    /// everything — which is the only shape these tests should be decoding,
+    /// since it is the only shape the daemon writes.
+    fn temp_wav(name: &str, bytes: &[u8]) -> qbz_cache::CachedFile {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!("qbz-{name}-{n}.wav"));
-        std::fs::write(&path, bytes).unwrap();
-        path
+        let key = qbz_cmaf::SealKey::random();
+        std::fs::write(&path, qbz_cmaf::vault::seal_to_vec(key, bytes)).unwrap();
+        qbz_cache::CachedFile::new(path, key)
     }
 
     const RAMP_RATE: u32 = 8_000;
@@ -2015,11 +2058,11 @@ mod tests {
 
     #[test]
     fn a_file_backed_source_decodes_from_the_start() {
-        let path = temp_wav(
+        let file = temp_wav(
             "start",
             &ramp_wav(RAMP_RATE, RAMP_RATE * RAMP_SECS, RAMP_PEAK),
         );
-        let mut src = InMemorySource::from_file(&path).unwrap();
+        let mut src = InMemorySource::from_cached_file(&file).unwrap();
         assert_eq!(src.sample_rate, RAMP_RATE);
         assert_eq!(src.channels, 1);
         // The ramp starts at zero, and the whole file is there.
@@ -2027,16 +2070,16 @@ mod tests {
         assert!(first.abs() < 0.01, "first sample was {first}");
         let total = 1 + src.count();
         assert_eq!(total as u32, RAMP_RATE * RAMP_SECS);
-        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(file.path()).ok();
     }
 
     #[test]
     fn a_file_backed_seek_lands_at_the_target_and_not_by_decoding_forward() {
-        let path = temp_wav(
+        let file = temp_wav(
             "seek",
             &ramp_wav(RAMP_RATE, RAMP_RATE * RAMP_SECS, RAMP_PEAK),
         );
-        let mut src = InMemorySource::from_file(&path).unwrap();
+        let mut src = InMemorySource::from_cached_file(&file).unwrap();
         src.seek_to(Duration::from_secs(2)).unwrap();
 
         // A seek lands on a packet boundary, so allow a quarter second of
@@ -2058,21 +2101,33 @@ mod tests {
             remaining.abs_diff(want) < slack_frames as usize,
             "{remaining} samples left after the seek, expected ~{want}"
         );
-        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(file.path()).ok();
     }
 
     #[test]
     fn a_missing_or_unprobeable_file_is_an_error_not_a_panic() {
-        let missing = std::env::temp_dir().join("qbz-does-not-exist-at-all.wav");
-        let err = InMemorySource::from_file(&missing).err().unwrap();
+        let missing = qbz_cache::CachedFile::new(
+            std::env::temp_dir().join("qbz-does-not-exist-at-all.wav"),
+            qbz_cmaf::SealKey::random(),
+        );
+        let err = InMemorySource::from_cached_file(&missing).err().unwrap();
         assert!(err.contains("qbz-does-not-exist-at-all"), "{err}");
 
         // Not audio at all: the caller falls back to rodio on this, so it has
         // to come back as an Err naming the file case.
-        let path = temp_wav("garbage", b"this is not a media file");
-        let err = InMemorySource::from_file(&path).err().unwrap();
+        let file = temp_wav("garbage", b"this is not a media file");
+        let err = InMemorySource::from_cached_file(&file).err().unwrap();
         assert!(err.contains("cached file"), "{err}");
-        std::fs::remove_file(&path).ok();
+
+        // A file this process did not seal — a plaintext leftover from an
+        // older build, or one sealed by a previous run — is an error too,
+        // rather than noise handed to the decoder.
+        let plain = std::env::temp_dir().join("qbz-plaintext-leftover.wav");
+        std::fs::write(&plain, ramp_wav(RAMP_RATE, 64, RAMP_PEAK)).unwrap();
+        let stale = qbz_cache::CachedFile::new(plain.clone(), qbz_cmaf::SealKey::random());
+        assert!(InMemorySource::from_cached_file(&stale).is_err());
+        std::fs::remove_file(&plain).ok();
+        std::fs::remove_file(file.path()).ok();
     }
 
     #[test]

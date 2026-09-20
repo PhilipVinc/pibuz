@@ -141,14 +141,17 @@ enum AudioCommand {
 /// player holding the whole thing in RAM.
 pub enum TrackAudio {
     Memory(TrackBytes),
-    File(std::path::PathBuf),
+    /// A sealed entry in the L2 cache. The handle carries the key as well as
+    /// the path, because a path on its own no longer reads back as audio —
+    /// see [`qbz_cmaf::vault`].
+    File(qbz_cache::CachedFile),
 }
 
 impl TrackAudio {
     fn describe(&self) -> String {
         match self {
             Self::Memory(data) => format!("{} bytes in memory", data.len()),
-            Self::File(path) => format!("file {}", path.display()),
+            Self::File(file) => format!("file {}", file.path().display()),
         }
     }
 }
@@ -382,24 +385,14 @@ fn extract_audio_metadata_full(data: &TrackBytes) -> Result<AudioMetadata, Strin
 /// Hi-Res track.
 const HEAD_BYTES: usize = 256 * 1024;
 
-/// The first `len` bytes of `path`, for the readers that take bytes.
+/// The first `len` bytes of a cached track's AUDIO, for the readers that take
+/// bytes.
 ///
-/// `None` if the file cannot be read at all; a SHORT read is returned as-is,
-/// since every caller either parses a header out of it or gives up gracefully.
-fn read_head(path: &std::path::Path, len: usize) -> Option<TrackBytes> {
-    use std::io::Read;
-    let mut file = std::fs::File::open(path).ok()?;
-    let mut buf = vec![0u8; len];
-    let mut filled = 0usize;
-    while filled < len {
-        match file.read(&mut buf[filled..]) {
-            Ok(0) => break,
-            Ok(n) => filled += n,
-            Err(_) => return None,
-        }
-    }
-    buf.truncate(filled);
-    Some(TrackBytes::from(buf))
+/// `None` if the file cannot be read or was not sealed by this process; a
+/// SHORT read is returned as-is, since every caller either parses a header out
+/// of it or gives up gracefully.
+fn read_head(file: &qbz_cache::CachedFile, len: usize) -> Option<TrackBytes> {
+    file.head(len).map(TrackBytes::from)
 }
 
 fn cached_quality_below_requested(data: &TrackBytes, requested: Quality) -> bool {
@@ -418,8 +411,8 @@ fn cached_quality_below_requested(data: &TrackBytes, requested: Quality) -> bool
 ///
 /// Note the `unwrap_or(false)`: a head we cannot parse is treated as unusable
 /// and re-fetched, which is the safe direction but is also silent.
-pub(crate) fn l2_copy_is_usable(path: &std::path::Path, requested: Quality) -> bool {
-    read_head(path, HEAD_BYTES)
+pub(crate) fn l2_copy_is_usable(file: &qbz_cache::CachedFile, requested: Quality) -> bool {
+    read_head(file, HEAD_BYTES)
         .map(|head| !cached_quality_below_requested(&head, requested))
         .unwrap_or(false)
 }
@@ -785,16 +778,17 @@ fn destination_chooser(
             host_can_hold_whole_track,
         );
         if plan == SuccessorPlan::OnDisk {
-            if let Some(part) = spill_cache
-                .as_ref()
-                .and_then(|cache| cache.begin_write(track_id, total as u64))
-            {
+            if let Some((part, key)) = spill_cache.as_ref().and_then(|cache| {
+                cache
+                    .begin_write(track_id, total as u64)
+                    .map(|part| (part, cache.key()))
+            }) {
                 log::info!(
                     "[{tag}] Track {track_id} is {:.1} MB — streaming it to disk (L1 budget {:.1} MB)",
                     mb(total),
                     mb(budget),
                 );
-                return qbz_qobuz::TrackDestination::File(part);
+                return qbz_qobuz::TrackDestination::File { path: part, key };
             }
             log::warn!("[{tag}] Track {track_id}: the disk cache would not take it");
         }
@@ -859,32 +853,32 @@ fn cmaf_take_request(
 }
 
 fn decode_file_with_fallback(
-    path: &std::path::Path,
+    file: &qbz_cache::CachedFile,
 ) -> Result<Box<dyn Source<Item = f32> + Send>, String> {
-    let file = std::fs::File::open(path)
-        .map_err(|e| format!("open cached track {}: {e}", path.display()))?;
+    // Through the seal, not the raw file: what is on the card is ciphertext,
+    // and the reader presents the audio at the offsets the decoder expects.
+    let reader = file
+        .open()
+        .map_err(|e| format!("open cached track {}: {e}", file.path().display()))?;
 
-    let attempt = panic::catch_unwind(AssertUnwindSafe(|| Decoder::new(BufReader::new(file))));
+    let attempt = panic::catch_unwind(AssertUnwindSafe(|| Decoder::new(BufReader::new(reader))));
 
     match attempt {
         Ok(Ok(decoder)) => Ok(Box::new(decoder)),
-        Ok(Err(err)) => Err(format!("decode cached track {}: {err}", path.display())),
-        Err(_) => Err(format!("decode of {} panicked", path.display())),
+        Ok(Err(err)) => Err(format!(
+            "decode cached track {}: {err}",
+            file.path().display()
+        )),
+        Err(_) => Err(format!("decode of {} panicked", file.path().display())),
     }
 }
 
 /// The head of a cached file, for tag reads (ReplayGain lives in the FLAC
 /// metadata blocks at the start). Bounded so a 220 MB track costs kilobytes.
-fn read_tag_head(path: &std::path::Path) -> Option<TrackBytes> {
-    use std::io::Read;
+fn read_tag_head(file: &qbz_cache::CachedFile) -> Option<TrackBytes> {
     const TAG_HEAD_BYTES: usize = 1024 * 1024;
 
-    let file = std::fs::File::open(path).ok()?;
-    let mut head = Vec::with_capacity(TAG_HEAD_BYTES.min(1024 * 64));
-    file.take(TAG_HEAD_BYTES as u64)
-        .read_to_end(&mut head)
-        .ok()?;
-    Some(TrackBytes::from(head.as_slice()))
+    read_head(file, TAG_HEAD_BYTES)
 }
 
 fn decode_with_fallback(data: &TrackBytes) -> Result<Box<dyn Source<Item = f32> + Send>, String> {
@@ -2228,7 +2222,7 @@ impl Player {
             // gapless hand-off that decoded straight from the L2 cache file
             // (see `TrackAudio::File`). Resume re-opens it rather than holding
             // 120-220 MB of Hi-Res in RAM for the whole track.
-            let mut current_audio_file: Option<std::path::PathBuf> = None;
+            let mut current_audio_file: Option<qbz_cache::CachedFile> = None;
             // Store streaming source for resume (when download completes, we can get the data)
             let mut current_streaming_source: Option<Arc<BufferedMediaSource>> = None;
             // Track consecutive sink creation failures to detect broken streams
@@ -2254,7 +2248,7 @@ impl Player {
                 |command: AudioCommand,
                  current_engine: &mut Option<PlaybackEngine>,
                  current_audio_data: &mut Option<TrackBytes>,
-                 current_audio_file: &mut Option<std::path::PathBuf>,
+                 current_audio_file: &mut Option<qbz_cache::CachedFile>,
                  current_streaming_source: &mut Option<Arc<BufferedMediaSource>>,
                  stream_opt: &mut Option<StreamType>,
                  current_device_name: &mut Option<String>,
@@ -2591,9 +2585,9 @@ impl Player {
                                     *current_audio_data = Some(data.clone());
                                     *current_audio_file = None;
                                 }
-                                TrackAudio::File(path) => {
+                                TrackAudio::File(file) => {
                                     *current_audio_data = None;
-                                    *current_audio_file = Some(path.clone());
+                                    *current_audio_file = Some(file.clone());
                                 }
                             }
                             release_streaming_source(current_streaming_source); // Clear streaming source for non-streaming playback
@@ -2714,7 +2708,7 @@ impl Player {
                                     // pull 116 MB off the card to find it.
                                     let rg_gain = match &audio {
                                         TrackAudio::Memory(data) => extract_replaygain(data),
-                                        TrackAudio::File(path) => read_head(path, HEAD_BYTES)
+                                        TrackAudio::File(file) => read_head(file, HEAD_BYTES)
                                             .and_then(|head| extract_replaygain(&head)),
                                     }
                                     .map(|rg| calculate_gain_factor(&rg, target_lufs));
@@ -3477,17 +3471,19 @@ impl Player {
 
                                 let resume_input = if let Some(ref data) = *current_audio_data {
                                     ResumeInput::Memory(data.clone())
-                                } else if let Some(ref path) = *current_audio_file {
+                                } else if let Some(ref file) = *current_audio_file {
                                     // A track that arrived through a gapless
                                     // hand-off decoded from the L2 cache file and
                                     // deliberately kept no copy in RAM. Reading it
                                     // back here is a one-off on a user action, not
-                                    // a resident cost.
-                                    match std::fs::read(path) {
+                                    // a resident cost. It comes back unsealed: the
+                                    // decoder downstream takes audio, not what is
+                                    // on the card.
+                                    match file.read_all() {
                                         Ok(bytes) => {
                                             log::info!(
                                                 "Resume: re-reading {} ({} bytes) for the gapless-loaded track",
-                                                path.display(),
+                                                file.path().display(),
                                                 bytes.len()
                                             );
                                             ResumeInput::Memory(TrackBytes::from(bytes.as_slice()))
@@ -3495,7 +3491,7 @@ impl Player {
                                         Err(e) => {
                                             log::warn!(
                                                 "Audio thread: cannot resume - cached file {} unreadable: {e}",
-                                                path.display()
+                                                file.path().display()
                                             );
                                             return;
                                         }
@@ -3994,7 +3990,7 @@ impl Player {
                                         return;
                                     }
                                 }
-                            } else if let Some(path) = current_audio_file.as_ref() {
+                            } else if let Some(file) = current_audio_file.as_ref() {
                                 // Disk gapless hand-off: the bytes are a file, not
                                 // a buffer. Before this, the guard above refused
                                 // the seek outright ("cannot seek - no audio data")
@@ -4008,7 +4004,7 @@ impl Player {
                                 // 676 s of a 96 kHz track on a Pi, against ~200 ms
                                 // for the same seek on the streaming path.
                                 // Symphonia bisects the file instead.
-                                let native = match InMemorySource::from_file(path) {
+                                let native = match InMemorySource::from_cached_file(file) {
                                     Ok(mut s) => match s.seek_to(skip_duration) {
                                         Ok(()) => {
                                             Some(Box::new(s) as Box<dyn Source<Item = f32> + Send>)
@@ -4032,10 +4028,10 @@ impl Player {
                                     // rodio's decoders cover a few formats
                                     // Symphonia cannot probe (MP4/AAC), so keep the
                                     // slow path rather than refusing the seek.
-                                    None => match decode_file_with_fallback(path) {
+                                    None => match decode_file_with_fallback(file) {
                                         Ok(mut src) => match src.try_seek(skip_duration) {
                                             Ok(()) => src,
-                                            Err(_) => match decode_file_with_fallback(path) {
+                                            Err(_) => match decode_file_with_fallback(file) {
                                                 Ok(fb) => Box::new(fb.skip_duration(skip_duration)),
                                                 Err(e) => {
                                                     seek_abort(
@@ -4301,8 +4297,8 @@ impl Player {
                                 TrackAudio::Memory(data) => {
                                     (decode_with_fallback(data), Some(data.clone()))
                                 }
-                                TrackAudio::File(path) => {
-                                    (decode_file_with_fallback(path), read_tag_head(path))
+                                TrackAudio::File(file) => {
+                                    (decode_file_with_fallback(file), read_tag_head(file))
                                 }
                             };
                             let source = match decoded {
@@ -4678,11 +4674,11 @@ impl Player {
                                             current_audio_data = Some(data.clone());
                                             current_audio_file = None;
                                         }
-                                        TrackAudio::File(path) => {
+                                        TrackAudio::File(file) => {
                                             // Nothing to hold: the decoder is reading
                                             // this file, and Resume re-opens it.
                                             current_audio_data = None;
-                                            current_audio_file = Some(path.clone());
+                                            current_audio_file = Some(file.clone());
                                         }
                                     }
                                     current_normalization_gain = pending.normalization_gain;
@@ -5168,24 +5164,24 @@ impl Player {
         // Played as a FILE, not read back into memory: the decoder streams it
         // off the card, which is both faster to first sample than loading
         // 116 MB and the only version that fits on a 1 GB host.
-        if let Some(path) = self
+        if let Some(file) = self
             .audio_cache
             .get_playback_cache()
-            .and_then(|l2| l2.path_if_present(track_id))
+            .and_then(|l2| l2.file_if_present(track_id))
         {
             // Same quality gate as the L1 hit above, from the header alone.
-            let head_ok = l2_copy_is_usable(&path, quality);
+            let head_ok = l2_copy_is_usable(&file, quality);
             if head_ok {
                 if !self.is_current_play(gen) {
                     log::info!("Player: L2-hit play for track {track_id} superseded (gen {gen})");
                     return Some(Ok(()));
                 }
-                match self.apply_play_file(&path, track_id, start_position_secs) {
+                match self.apply_play_file(&file, track_id, start_position_secs) {
                     Ok(()) => {
                         log::info!(
                             "[CACHE HIT] Track {} — playing from the disk cache ({}), from {}s",
                             track_id,
-                            path.display(),
+                            file.path().display(),
                             start_position_secs
                         );
                         return Some(Ok(()));
@@ -5825,12 +5821,12 @@ impl Player {
         // buffer would put the whole track in RAM again, which is the cost the
         // disk copy exists to avoid.
         if let Some(playback_cache) = self.audio_cache.get_playback_cache() {
-            if let Some(path) = playback_cache.path_if_present(track_id) {
+            if let Some(file) = playback_cache.file_if_present(track_id) {
                 log::info!(
                     "[GAPLESS] Track {track_id} from DISK cache ({})",
-                    path.display()
+                    file.path().display()
                 );
-                return Some(TrackAudio::File(path));
+                return Some(TrackAudio::File(file));
             }
         }
 
@@ -5844,12 +5840,11 @@ impl Player {
 
         match qbz_qobuz::cmaf::download_full_sized(client, track_id, quality, None, choose).await {
             Ok(qbz_qobuz::DownloadedTrack::File(_)) => {
-                return match self
-                    .audio_cache
-                    .get_playback_cache()
-                    .and_then(|c| c.commit_write(track_id))
-                {
-                    Some(path) => Some(TrackAudio::File(path)),
+                return match self.audio_cache.get_playback_cache().and_then(|c| {
+                    c.commit_write(track_id)
+                        .map(|path| qbz_cache::CachedFile::new(path, c.key()))
+                }) {
+                    Some(file) => Some(TrackAudio::File(file)),
                     None => {
                         log::warn!("[GAPLESS] Track {track_id} could not be published to disk");
                         None
@@ -6233,18 +6228,18 @@ impl Player {
     /// free to fall back to the network.
     fn apply_play_file(
         &self,
-        path: &std::path::Path,
+        file: &qbz_cache::CachedFile,
         track_id: u64,
         start_position_secs: u64,
     ) -> Result<(), String> {
-        let probe = decode_file_with_fallback(path)?;
+        let probe = decode_file_with_fallback(file)?;
         let sample_rate: u32 = probe.sample_rate().into();
         let channels: u16 = probe.channels().into();
         drop(probe);
 
         // Bit depth for the reported stream quality comes from the header, the
         // same place the in-memory path reads it; 24 is not assumed.
-        let bit_depth = read_head(path, HEAD_BYTES)
+        let bit_depth = read_head(file, HEAD_BYTES)
             .and_then(|head| extract_audio_metadata_full(&head).ok())
             .and_then(|meta| meta.bit_depth)
             .unwrap_or(16);
@@ -6260,7 +6255,7 @@ impl Player {
 
         self.tx
             .send(AudioCommand::Play {
-                audio: TrackAudio::File(path.to_path_buf()),
+                audio: TrackAudio::File(file.clone()),
                 track_id,
                 start_position_secs,
                 duration_secs: 0, // Will be determined by decoder
@@ -6334,11 +6329,11 @@ impl Player {
     /// Hi-Res in RAM until the transition buys nothing. The caller picks this
     /// when the file exists and the host is short of memory; on failure it can
     /// still fall back to the in-memory path.
-    pub fn play_next_file(&self, path: std::path::PathBuf, track_id: u64) -> Result<(), String> {
+    pub fn play_next_file(&self, file: qbz_cache::CachedFile, track_id: u64) -> Result<(), String> {
         // Probe the format the same way the decoder will read it, so a file we
         // cannot decode fails HERE rather than at the transition, where the
         // fallback is a gap.
-        let probe = decode_file_with_fallback(&path)?;
+        let probe = decode_file_with_fallback(&file)?;
         let sample_rate: u32 = probe.sample_rate().into();
         let channels: u16 = probe.channels().into();
         drop(probe);
@@ -6348,12 +6343,12 @@ impl Player {
             track_id,
             sample_rate,
             channels,
-            path.display()
+            file.path().display()
         );
 
         self.tx
             .send(AudioCommand::PlayNext {
-                audio: TrackAudio::File(path),
+                audio: TrackAudio::File(file),
                 track_id,
                 sample_rate,
                 channels,
@@ -7022,21 +7017,24 @@ mod tests {
 mod read_head_tests {
     use super::{read_head, HEAD_BYTES};
 
-    fn temp_file(name: &str, bytes: &[u8]) -> std::path::PathBuf {
+    /// A SEALED cache entry holding `bytes` — the only shape the L2 cache
+    /// contains, and therefore the only shape `read_head` has to answer for.
+    fn temp_file(name: &str, bytes: &[u8]) -> qbz_cache::CachedFile {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!("qbz-head-{name}-{n}.bin"));
-        std::fs::write(&path, bytes).unwrap();
-        path
+        let key = qbz_cmaf::SealKey::random();
+        std::fs::write(&path, qbz_cmaf::vault::seal_to_vec(key, bytes)).unwrap();
+        qbz_cache::CachedFile::new(path, key)
     }
 
     #[test]
     fn a_long_file_gives_exactly_the_head() {
-        let path = temp_file("long", &vec![7u8; HEAD_BYTES * 2]);
-        let head = read_head(&path, 1024).unwrap();
+        let file = temp_file("long", &vec![7u8; HEAD_BYTES * 2]);
+        let head = read_head(&file, 1024).unwrap();
         assert_eq!(head.len(), 1024);
-        assert!(head.iter().all(|&b| b == 7));
-        std::fs::remove_file(&path).ok();
+        assert!(head.iter().all(|&b| b == 7), "the head came back sealed");
+        std::fs::remove_file(file.path()).ok();
     }
 
     #[test]
@@ -7044,23 +7042,42 @@ mod read_head_tests {
         // Every caller parses a header out of this or gives up gracefully, so
         // a file shorter than the window is not an error — and a cache file
         // still being written is exactly that.
-        let path = temp_file("short", b"only twenty-four bytes!!");
-        let head = read_head(&path, HEAD_BYTES).unwrap();
-        assert_eq!(head.len(), 24);
-        std::fs::remove_file(&path).ok();
+        let file = temp_file("short", b"only twenty-four bytes!!");
+        let head = read_head(&file, HEAD_BYTES).unwrap();
+        assert_eq!(&head[..], b"only twenty-four bytes!!");
+        std::fs::remove_file(file.path()).ok();
     }
 
     #[test]
     fn an_empty_file_reads_as_empty_not_as_an_error() {
-        let path = temp_file("empty", b"");
-        assert_eq!(read_head(&path, HEAD_BYTES).unwrap().len(), 0);
-        std::fs::remove_file(&path).ok();
+        let file = temp_file("empty", b"");
+        assert_eq!(read_head(&file, HEAD_BYTES).unwrap().len(), 0);
+        std::fs::remove_file(file.path()).ok();
     }
 
     #[test]
     fn a_missing_file_is_none_so_the_caller_falls_back_to_the_network() {
-        let missing = std::env::temp_dir().join("qbz-head-definitely-not-here.bin");
+        let missing = qbz_cache::CachedFile::new(
+            std::env::temp_dir().join("qbz-head-definitely-not-here.bin"),
+            qbz_cmaf::SealKey::random(),
+        );
         assert!(read_head(&missing, HEAD_BYTES).is_none());
+    }
+
+    /// A file this process did not seal reads as nothing, rather than as the
+    /// bytes it happens to hold. That covers a plaintext file from a build
+    /// before the seal and a file a previous run left behind; the cache sweeps
+    /// both at startup, and this is the second line.
+    #[test]
+    fn a_file_this_process_did_not_seal_is_none() {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("qbz-head-plain-{n}.bin"));
+        std::fs::write(&path, b"fLaC and then some audio").unwrap();
+
+        let as_if_sealed = qbz_cache::CachedFile::new(path.clone(), qbz_cmaf::SealKey::random());
+        assert!(read_head(&as_if_sealed, HEAD_BYTES).is_none());
+        std::fs::remove_file(&path).ok();
     }
 }
 
@@ -7133,10 +7150,27 @@ mod cached_quality_tests {
     /// and because the quality gate returns its `Err` default of `false` on any
     /// parse failure, they passed while proving nothing. The guard assertion
     /// below exists so that cannot happen again quietly.
-    fn fixture(name: &str) -> std::path::PathBuf {
+    fn fixture_path(name: &str) -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("testdata")
             .join(name)
+    }
+
+    /// The fixture as the L2 cache would hold it: sealed, under a temp name.
+    /// `l2_copy_is_usable` reads through the seal like every other reader, so
+    /// handing it the raw fixture would test a path the daemon does not have.
+    ///
+    /// A fixture that is not there seals nothing and stays absent, which is
+    /// what `a_missing_file_is_not_usable` needs.
+    fn fixture(name: &str) -> qbz_cache::CachedFile {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let key = qbz_cmaf::SealKey::random();
+        let path = std::env::temp_dir().join(format!("qbz-l2-fixture-{n}-{name}"));
+        if let Ok(bytes) = std::fs::read(fixture_path(name)) {
+            std::fs::write(&path, qbz_cmaf::vault::seal_to_vec(key, &bytes)).unwrap();
+        }
+        qbz_cache::CachedFile::new(path, key)
     }
 
     /// THE CACHE BUG. Most hi-res masters are 24/96, and a tier is a ceiling
@@ -7183,35 +7217,47 @@ mod cached_quality_tests {
 
     #[test]
     fn a_24_96_file_on_disk_is_usable_for_hi_res_plus() {
-        let path = fixture("hires-24-96.flac");
+        let file = fixture("hires-24-96.flac");
 
         // If the fixture does not parse, the gate returns its `Err` default of
         // "usable" and the assertion below proves nothing. This is not
         // hypothetical: two earlier drafts of this test hand-built a FLAC
         // header, symphonia rejected it, and every assertion passed.
-        let bytes: qbz_cache::TrackBytes = std::fs::read(&path).expect("fixture").as_slice().into();
+        //
+        // Read back THROUGH the seal, which also pins that the sealed copy is
+        // byte-identical to the fixture it was made from.
+        let bytes: qbz_cache::TrackBytes = file.read_all().expect("fixture").as_slice().into();
+        assert_eq!(
+            &bytes[..],
+            std::fs::read(fixture_path("hires-24-96.flac"))
+                .expect("fixture")
+                .as_slice(),
+            "the sealed copy did not round-trip"
+        );
         let meta = super::extract_audio_metadata_full(&bytes).expect("fixture must parse");
         assert_eq!(meta.sample_rate, 96_000);
         assert_eq!(meta.bit_depth, Some(24));
 
         assert!(
-            l2_copy_is_usable(&path, Quality::UltraHiRes),
+            l2_copy_is_usable(&file, Quality::UltraHiRes),
             "a 24/96 copy is the best Qobuz has for most hi-res tracks — refusing it \
              means the disk cache is never used at all"
         );
-        assert!(l2_copy_is_usable(&path, Quality::HiRes));
+        assert!(l2_copy_is_usable(&file, Quality::HiRes));
+        std::fs::remove_file(file.path()).ok();
     }
 
     #[test]
     fn a_16_44_file_on_disk_is_not_usable_for_hi_res() {
-        let path = fixture("lossless-16-44.flac");
-        let bytes: qbz_cache::TrackBytes = std::fs::read(&path).expect("fixture").as_slice().into();
+        let file = fixture("lossless-16-44.flac");
+        let bytes: qbz_cache::TrackBytes = file.read_all().expect("fixture").as_slice().into();
         let meta = super::extract_audio_metadata_full(&bytes).expect("fixture must parse");
         assert_eq!(meta.bit_depth, Some(16));
 
-        assert!(!l2_copy_is_usable(&path, Quality::UltraHiRes));
-        assert!(!l2_copy_is_usable(&path, Quality::HiRes));
-        assert!(l2_copy_is_usable(&path, Quality::Lossless));
+        assert!(!l2_copy_is_usable(&file, Quality::UltraHiRes));
+        assert!(!l2_copy_is_usable(&file, Quality::HiRes));
+        assert!(l2_copy_is_usable(&file, Quality::Lossless));
+        std::fs::remove_file(file.path()).ok();
     }
 
     /// A file that is not there is not usable — the `unwrap_or(false)` arm.

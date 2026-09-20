@@ -56,7 +56,9 @@
 //! ```
 
 mod audio_cache;
+mod cached_file;
 mod playback_cache;
 
 pub use audio_cache::{AudioCache, CacheStats, CachedTrack, TrackBytes};
+pub use cached_file::CachedFile;
 pub use playback_cache::{PlaybackCache, PlaybackCacheStats};

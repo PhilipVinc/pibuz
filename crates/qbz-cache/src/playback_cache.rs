@@ -2,6 +2,19 @@
 //!
 //! Secondary cache for audio data evicted from memory.
 //! Provides faster access than re-downloading from network.
+//!
+//! **Nothing here is written in the clear.** Every file is sealed with a key
+//! that is generated when this cache is constructed and never leaves the
+//! process — see [`qbz_cmaf::vault`] for the cipher and for why the key is
+//! ephemeral. Two consequences run through this file:
+//!
+//! * The cache CANNOT survive a restart, so the directory is wiped on the way
+//!   up rather than adopted. A file from a previous run is ciphertext nothing
+//!   alive can read.
+//! * Sizes come in two flavours. The cache accounts in AUDIO bytes — that is
+//!   what a budget about music should mean, and it is what `/api/status`
+//!   reports — while a file on the card is [`qbz_cmaf::SEAL_HEADER_LEN`] longer
+//!   than the audio it holds. Every place the two meet says which it means.
 
 use std::collections::HashMap;
 use std::fs;
@@ -9,6 +22,10 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::SystemTime;
+
+use qbz_cmaf::{SealKey, SealWriter, SEAL_HEADER_LEN};
+
+use crate::CachedFile;
 
 /// Entry metadata for tracking cache usage
 #[derive(Debug, Clone)]
@@ -46,6 +63,9 @@ pub struct PlaybackCache {
     cache_dir: PathBuf,
     /// Maximum cache size in bytes
     max_size_bytes: u64,
+    /// The key every file here is sealed with. Fresh per cache, which is per
+    /// daemon start, and never written down.
+    key: SealKey,
 }
 
 impl PlaybackCache {
@@ -92,36 +112,20 @@ impl PlaybackCache {
             }),
             cache_dir,
             max_size_bytes,
+            key: SealKey::random(),
         };
 
-        // Scan existing files to rebuild state
-        cache.rebuild_state();
+        // Start empty, every time.
+        cache.sweep_previous_run();
 
-        // Then bring it back under the cap.
-        //
-        // `rebuild_state` adopts whatever is on the card and reports the total;
-        // it never used to act on it. Eviction only ran from `begin_write` and
-        // `insert`, so a cache that was over budget at startup — because the
-        // cap was lowered, because a `.part` completed after the last eviction,
-        // or because the daemon was killed mid-write — stayed over budget until
-        // the next track happened to be written. Observed on the Pi at 862 MB
-        // against an 800 MB cap, across a restart, with no write due.
-        //
-        // That matters more than the arithmetic suggests: the cap is what keeps
-        // the cache off the rest of a 15 GB SD card that also holds the OS.
-        let over = {
-            let state = cache.state.lock().unwrap();
-            state.current_size.saturating_sub(max_size_bytes)
-        };
-        if over > 0 {
-            log::info!(
-                "Playback cache is {} MB over its {} MB cap on startup — evicting",
-                over / (1024 * 1024),
-                max_size_bytes / (1024 * 1024)
-            );
-            cache.evict_if_needed(0);
-        }
-
+        // There is deliberately no startup eviction pass any more. It existed
+        // because `rebuild_state` adopted whatever was on the card and never
+        // acted on the total, so a cache that was over budget at startup — cap
+        // lowered, a `.part` completed after the last eviction, the daemon
+        // killed mid-write — stayed over budget until the next write happened
+        // to trigger one. Measured on the Pi at 862 MB against an 800 MB cap,
+        // held across a restart. The sweep above subsumes it: the cache starts
+        // at zero bytes, so it cannot start over its cap.
         log::info!(
             "Playback cache initialized at {:?} (max {} MB)",
             cache.cache_dir,
@@ -131,54 +135,49 @@ impl PlaybackCache {
         Ok(cache)
     }
 
-    /// Rebuild cache state from existing files on disk
-    fn rebuild_state(&self) {
-        let mut state = self.state.lock().unwrap();
-        state.entries.clear();
-        state.current_size = 0;
+    /// Delete everything a previous run left behind.
+    ///
+    /// The cache used to ADOPT those files, which is what made an L2 hit
+    /// survive a restart. It cannot any more: they are sealed with a key that
+    /// died with the process that wrote them, so there is nothing to adopt and
+    /// keeping them would only hold the budget against tracks nothing can
+    /// play. The trade was made knowingly — a key that outlives the process
+    /// would have to live on the same card as the ciphertext, which is not a
+    /// key so much as a formality.
+    ///
+    /// Interrupted `.part` writes go the same way, as they always did.
+    /// Anything else in the directory is left alone: this is a dedicated
+    /// directory, and deleting a file we do not recognise is not ours to do.
+    fn sweep_previous_run(&self) {
+        let mut swept = 0usize;
+        let mut bytes = 0u64;
 
         if let Ok(entries) = fs::read_dir(&self.cache_dir) {
             for entry in entries.flatten() {
-                if let Ok(metadata) = entry.metadata() {
-                    if metadata.is_file() {
-                        // Sweep a write that a crash or power cut interrupted.
-                        if entry
-                            .file_name()
-                            .to_str()
-                            .is_some_and(|n| n.ends_with(".part"))
-                        {
-                            let _ = fs::remove_file(entry.path());
-                            continue;
-                        }
-                        // Parse track ID from filename (format: {track_id}.audio)
-                        if let Some(filename) = entry.file_name().to_str() {
-                            if let Some(id_str) = filename.strip_suffix(".audio") {
-                                if let Ok(track_id) = id_str.parse::<u64>() {
-                                    let size = metadata.len();
-                                    let last_accessed =
-                                        metadata.accessed().unwrap_or_else(|_| SystemTime::now());
-
-                                    state.entries.insert(
-                                        track_id,
-                                        CacheEntry {
-                                            size_bytes: size,
-                                            last_accessed,
-                                        },
-                                    );
-                                    state.current_size += size;
-                                }
-                            }
-                        }
-                    }
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                if !(name.ends_with(".audio") || name.ends_with(".part")) {
+                    continue;
+                }
+                if !entry.metadata().map(|m| m.is_file()).unwrap_or(false) {
+                    continue;
+                }
+                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                if fs::remove_file(entry.path()).is_ok() {
+                    swept += 1;
+                    bytes += size;
                 }
             }
         }
 
-        log::info!(
-            "Playback cache rebuilt: {} tracks, {} MB",
-            state.entries.len(),
-            state.current_size / (1024 * 1024)
-        );
+        if swept > 0 {
+            log::info!(
+                "Playback cache: discarded {} file(s) ({} MB) from a previous run — they are \
+                 sealed with a key that did not survive it",
+                swept,
+                bytes / (1024 * 1024)
+            );
+        }
     }
 
     /// Get file path for a track
@@ -206,6 +205,20 @@ impl PlaybackCache {
         path.exists().then_some(path)
     }
 
+    /// The key this cache's files are sealed with, for the two writers that
+    /// own their own file handle — the disk tee and the straight-to-disk CMAF
+    /// download — and for anything building a [`CachedFile`] of its own.
+    pub fn key(&self) -> SealKey {
+        self.key
+    }
+
+    /// The cached track for `track_id` as something that can actually be READ:
+    /// the path plus the key that opens it.
+    pub fn file_if_present(&self, track_id: u64) -> Option<CachedFile> {
+        self.path_if_present(track_id)
+            .map(|path| CachedFile::new(path, self.key))
+    }
+
     /// Get a track from the cache
     pub fn get(&self, track_id: u64) -> Option<Vec<u8>> {
         let path = self.track_path(track_id);
@@ -222,8 +235,12 @@ impl PlaybackCache {
 
         match fs::File::open(&path) {
             Ok(mut file) => {
-                let mut data = Vec::new();
-                if file.read_to_end(&mut data).is_ok() {
+                let mut sealed = Vec::new();
+                let unsealed = file
+                    .read_to_end(&mut sealed)
+                    .ok()
+                    .and_then(|_| qbz_cmaf::vault::unseal_in_place(self.key, sealed).ok());
+                if let Some(data) = unsealed {
                     // Update last accessed time
                     let mut state = self.state.lock().unwrap();
                     if let Some(entry) = state.entries.get_mut(&track_id) {
@@ -270,7 +287,13 @@ impl PlaybackCache {
     /// The cache keeps ownership of what it should own: eviction happens here,
     /// the write goes to `<id>.part`, and only [`Self::commit_write`] renames it
     /// into place and indexes it — so a crash mid-write leaves a `.part` that
-    /// `rebuild_index` sweeps, exactly as for [`Self::insert`].
+    /// the startup sweep clears, exactly as for [`Self::insert`].
+    ///
+    /// The caller writes through a [`SealWriter`] built on [`Self::key`] — see
+    /// `DiskTee` and the CMAF straight-to-disk path. Nothing publishes an
+    /// unsealed file: [`Self::commit_write`] sizes the entry by subtracting the
+    /// seal header, so a plaintext file would be accounted wrong even if the
+    /// reader could somehow make sense of it.
     ///
     /// `None` when the track cannot fit the cache at all.
     pub fn begin_write(&self, track_id: u64, expected_size: u64) -> Option<PathBuf> {
@@ -310,8 +333,13 @@ impl PlaybackCache {
         // The file itself is the authority on how big it is — the caller would
         // only be repeating what it wrote, and a mismatch there would silently
         // corrupt the size accounting.
+        //
+        // Less the seal header, because the index counts AUDIO bytes: that is
+        // what `insert` counts, what the budget is expressed in and what
+        // `/api/status` reports, and a cache where the two writers disagreed by
+        // 32 bytes a track would drift.
         let actual_size = match fs::metadata(&part) {
-            Ok(m) => m.len(),
+            Ok(m) => m.len().saturating_sub(SEAL_HEADER_LEN),
             Err(e) => {
                 log::warn!("No staged file to publish for track {}: {}", track_id, e);
                 return None;
@@ -380,9 +408,14 @@ impl PlaybackCache {
         // Size-matched, not just present: a short `<id>.audio` from an older
         // build is exactly the corruption the temp-file-and-rename below exists
         // to prevent, so a length mismatch must still overwrite.
+        //
+        // The comparison is against the FILE length, which is the audio plus
+        // the seal header. Comparing the bytes themselves is not an option any
+        // more — two seals of one track differ, by design — but the length was
+        // always the check that mattered here.
         {
             let path = self.track_path(track_id);
-            let same_size = fs::metadata(&path).is_ok_and(|m| m.len() == size);
+            let same_size = fs::metadata(&path).is_ok_and(|m| m.len() == size + SEAL_HEADER_LEN);
             if same_size {
                 let mut state = self.state.lock().unwrap();
                 if let Some(entry) = state.entries.get_mut(&track_id) {
@@ -418,16 +451,22 @@ impl PlaybackCache {
         // `rebuild_index` sweeps.
         let temp_path = path.with_extension("part");
         match fs::File::create(&temp_path) {
-            Ok(mut file) => {
-                let written = file.write_all(data).is_ok()
-                    // Reach the platter before the rename: the point of the
-                    // rename is that whatever is under the real name is
-                    // complete, and on a power cut an unsynced write is not.
-                    && file.sync_all().is_ok()
-                    && {
-                        drop(file);
-                        fs::rename(&temp_path, &path).is_ok()
-                    };
+            Ok(file) => {
+                // Sealed on the way out, like every other route into this
+                // directory. `SealWriter` writes its header on construction, so
+                // even a write that fails immediately leaves a file that cannot
+                // be mistaken for audio.
+                let written = SealWriter::new(self.key, file).is_ok_and(|mut sealed| {
+                    sealed.write_all(data).is_ok()
+                        // Reach the platter before the rename: the point of the
+                        // rename is that whatever is under the real name is
+                        // complete, and on a power cut an unsynced write is not.
+                        && sealed.get_ref().sync_all().is_ok()
+                        && {
+                            drop(sealed);
+                            fs::rename(&temp_path, &path).is_ok()
+                        }
+                });
                 if !written {
                     let _ = fs::remove_file(&temp_path);
                 }
@@ -563,46 +602,49 @@ mod tests {
     /// the whole directory — fail on another test's in-flight `.part`.
     static TEMP_DIR_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-    /// A cache that starts over its cap must come back under it, without
-    /// waiting for a write to trigger eviction.
+    /// Nothing a previous run wrote survives into this one — not the tracks,
+    /// not an interrupted write.
     ///
-    /// `rebuild_state` adopted whatever was on the card and only reported the
-    /// total; eviction ran solely from `begin_write`/`insert`. So a cache that
-    /// was over budget at startup — cap lowered, a `.part` completed after the
-    /// last eviction, the daemon killed mid-write — stayed over budget
-    /// indefinitely. Measured on the Pi at 862 MB against an 800 MB cap, held
-    /// across a restart with no write due.
+    /// This is the whole point of the sealed cache. The files are ciphertext
+    /// under a key that died with the process that wrote them, so adopting
+    /// them would hold the budget against tracks nothing can play; and leaving
+    /// them would leave a cache directory full of a previous session's
+    /// listening on a card that is handed around.
+    ///
+    /// It also subsumes the startup-eviction case this test used to cover — a
+    /// cache that was over its cap at startup and stayed there, measured on
+    /// the Pi at 862 MB against an 800 MB cap. A cache that starts at zero
+    /// cannot start over its cap.
     #[test]
-    fn a_cache_over_its_cap_at_startup_is_trimmed() {
+    fn a_previous_runs_files_do_not_survive_the_next_start() {
         let seq = TEMP_DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let dir =
             std::env::temp_dir().join(format!("qbz-l2-startup-{}-{}", std::process::id(), seq));
         std::fs::create_dir_all(&dir).expect("make dir");
 
-        // Four 1 KB tracks on the card, against a cap that fits two.
+        // A previous run's cache: four tracks and a write it never finished.
         for id in 1u64..=4 {
             std::fs::write(dir.join(format!("{id}.audio")), vec![0u8; 1024]).expect("seed");
         }
+        std::fs::write(dir.join("999.part"), vec![0u8; 512]).expect("seed");
+        // Something that is not ours stays put.
+        std::fs::write(dir.join("README"), b"not mine").expect("seed");
 
-        let cache = PlaybackCache::with_path(dir.clone(), 2048).expect("open");
-        let stats = cache.stats();
-        assert!(
-            stats.current_size_bytes <= 2048,
-            "cache holds {} bytes against a 2048 byte cap — startup did not evict",
-            stats.current_size_bytes
-        );
+        let cache = PlaybackCache::with_path(dir.clone(), 1024 * 1024).expect("open");
 
-        // And the eviction is real: the files are gone, not just the index.
-        let on_disk: u64 = std::fs::read_dir(&dir)
-            .expect("read dir")
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().is_some_and(|x| x == "audio"))
-            .filter_map(|e| e.metadata().ok())
-            .map(|m| m.len())
-            .sum();
+        assert_eq!(cache.stats().cached_tracks, 0, "a previous run was adopted");
+        assert_eq!(cache.stats().current_size_bytes, 0);
+        for id in 1u64..=4 {
+            assert!(
+                !dir.join(format!("{id}.audio")).exists(),
+                "track {id} survived the sweep"
+            );
+            assert!(!cache.contains(id));
+        }
+        assert!(!dir.join("999.part").exists(), "the partial file is swept");
         assert!(
-            on_disk <= 2048,
-            "{on_disk} bytes still on the card after startup eviction"
+            dir.join("README").exists(),
+            "a file that is not ours was deleted"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -634,18 +676,30 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// The startup scan sweeps an interrupted write instead of adopting it. A
-    /// truncated `<id>.audio` used to be indexed as a complete track and decoded
-    /// as garbage on every later play.
+    /// A second cache over the same directory starts empty, because its key is
+    /// a different key. Nothing is inherited — not a complete file, not a
+    /// `.part` an interrupted write left behind.
+    ///
+    /// The `.part` half of this predates the seal: a truncated `<id>.audio`
+    /// used to be indexed as a complete track and decoded as garbage on every
+    /// later play.
     #[test]
-    fn rebuild_sweeps_an_interrupted_write() {
+    fn a_second_cache_over_the_same_directory_inherits_nothing() {
         let (cache, dir) = temp_cache(10 * 1024 * 1024);
         cache.insert(1, &vec![1u8; 1024]);
         fs::write(dir.join("999.part"), vec![0u8; 512]).unwrap();
+        assert!(cache.contains(1));
 
         let reopened = PlaybackCache::with_path(dir.clone(), 10 * 1024 * 1024).expect("reopen");
 
-        assert!(reopened.contains(1), "the complete track is adopted");
+        assert!(
+            !reopened.contains(1),
+            "a file sealed by another cache was adopted"
+        );
+        assert!(
+            !dir.join("1.audio").exists(),
+            "it is gone from the card too"
+        );
         assert!(!dir.join("999.part").exists(), "the partial file is swept");
         fs::remove_dir_all(&dir).ok();
     }
@@ -748,6 +802,40 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    /// What the seal is FOR: a cache file is not the audio, and the budget
+    /// still counts the audio.
+    ///
+    /// Asserted against the bytes on the card rather than through `get`,
+    /// because `get` would pass either way — it is the file someone copies off
+    /// the SD card that this is about.
+    #[test]
+    fn nothing_on_the_card_is_playable_audio() {
+        let (cache, dir) = temp_cache(10 * 1024 * 1024);
+        let mut track = b"fLaC".to_vec();
+        track.extend(std::iter::repeat_n(0xABu8, 4_092));
+        cache.insert(1, &track);
+
+        let on_card = fs::read(dir.join("1.audio")).expect("read the file back");
+        assert_eq!(
+            on_card.len() as u64,
+            track.len() as u64 + SEAL_HEADER_LEN,
+            "the file is the audio plus one seal header"
+        );
+        assert!(
+            !on_card.windows(4).any(|w| w == b"fLaC"),
+            "a FLAC signature reached the card"
+        );
+        assert!(
+            !on_card.windows(64).any(|w| w.iter().all(|&b| b == 0xAB)),
+            "a run of the track reached the card verbatim"
+        );
+
+        // And the cache still reads it back, and still accounts in audio bytes.
+        assert_eq!(cache.get(1), Some(track.clone()));
+        assert_eq!(cache.stats().current_size_bytes, track.len() as u64);
+        fs::remove_dir_all(&dir).ok();
+    }
+
     /// Present but the WRONG length is the truncated-write case, and it must
     /// still be overwritten — that file decodes as garbage.
     #[test]
@@ -756,7 +844,7 @@ mod tests {
         cache.insert(1, &vec![7u8; 4096]);
         cache.insert(1, &vec![9u8; 2048]);
 
-        assert_eq!(fs::read(dir.join("1.audio")).unwrap(), vec![9u8; 2048]);
+        assert_eq!(cache.get(1), Some(vec![9u8; 2048]));
         assert_eq!(cache.stats().current_size_bytes, 2048);
         fs::remove_dir_all(&dir).ok();
     }
