@@ -3,6 +3,27 @@
 Notable changes per release. Versions are plain semver; releases are `vX.Y.Z`
 tags on `main`.
 
+## 2.4.2 — unreleased
+
+### Changed
+
+- **The disk cache is encrypted, and no longer survives a restart.**
+  `~/.cache/qbz/playback/` held playable Hi-Res FLACs: the CMAF path decrypts
+  each segment before it assembles, the legacy path downloads plaintext, and
+  both landed on the card as-is. Every route into the cache — the streaming
+  tee, the straight-to-disk download and an in-memory track spilling out — now
+  seals its file with AES-128-CTR.
+
+  The key is generated when the daemon starts and never written down, so the
+  cache cannot be read across a restart and the directory is wiped on the way
+  up. On moOde that is every renderer toggle, because `stopQobuz()` kills the
+  daemon: a toggle now means re-fetching whatever was cached. A key stored
+  beside the ciphertext would protect nothing, so this was the trade taken.
+
+  Nothing else changes — same budget (`audio.disk_cache_mb`), same cap
+  behaviour, same `audio.cache_to_disk false` if you want no disk at all, and
+  the reported cache size still counts audio rather than file bytes.
+
 ## 2.4.1 — 2026-09-16
 
 ### Fixed
