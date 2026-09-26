@@ -1070,11 +1070,21 @@ impl BufferedMediaSource {
     /// Check if minimum buffer for playback is available
     ///
     /// Returns true when `initial_buffer_bytes` are buffered contiguously
-    /// from the offset playback starts at, or the download is complete.
+    /// ahead of the reader, or the download is complete.
+    ///
+    /// Measured by `ahead_bytes`, not from `primary_offset`, for the reasons
+    /// `BufferWriter::reader_lead_bytes` spells out: after a resume seek the
+    /// decoder reads on from the target, the trim drops the run holding it,
+    /// and `contiguous_from(primary_offset)` reads 0 with a full window ahead
+    /// — which held a cast joined mid-track silent for the resume's whole
+    /// 30 s refill timeout. Before any reader has read, the two agree.
+    ///
+    /// Capped at the window too: the feeder parks there, so a target above it
+    /// would be the same wait by a different route.
     pub fn has_min_buffer(&self) -> bool {
         if let Ok(state) = self.shared.state.lock() {
-            state.contiguous_from(state.primary_offset) >= self.config.initial_buffer_bytes as u64
-                || state.download_complete
+            let target = (self.config.initial_buffer_bytes as u64).min(state.window_bytes);
+            state.ahead_bytes() >= target || state.download_complete
         } else {
             false
         }
@@ -3054,6 +3064,31 @@ mod buffer_behaviour_tests {
         pace: Option<Duration>,
         log: Arc<FeedLog>,
     ) {
+        feed_until(writer, total, chunk, pace, log, false).await
+    }
+
+    /// [`feed`], but still up once the file has been walked, answering seeks
+    /// the way the real feeder does from `wait_for_request`. Not the default
+    /// because a case that awaits its feeder would then wait for the source it
+    /// still holds to be dropped.
+    async fn feed_serving_seeks(
+        writer: BufferWriter,
+        total: u64,
+        chunk: usize,
+        pace: Option<Duration>,
+        log: Arc<FeedLog>,
+    ) {
+        feed_until(writer, total, chunk, pace, log, true).await
+    }
+
+    async fn feed_until(
+        writer: BufferWriter,
+        total: u64,
+        chunk: usize,
+        pace: Option<Duration>,
+        log: Arc<FeedLog>,
+        serve_seeks: bool,
+    ) {
         let mut plan = writer.initial_plan();
         'bodies: loop {
             log.bodies.fetch_add(1, AtomicOrdering::SeqCst);
@@ -3093,6 +3128,10 @@ mod buffer_behaviour_tests {
 
             match writer.next_plan() {
                 Some(next) => plan = next,
+                None if serve_seeks => match writer.wait_for_request().await {
+                    Some(next) => plan = next,
+                    None => return,
+                },
                 None => return,
             }
         }
@@ -3482,6 +3521,145 @@ mod buffer_behaviour_tests {
             log.fetched(),
             TOTAL
         );
+    }
+
+    /// A stream opened mid-file, which is what a QConnect session handed over
+    /// at a position is, and then resumed after the feeder has finished.
+    ///
+    /// Such a buffer never holds the whole file, so once the download is
+    /// complete the resume cannot replay it from memory and has to seek into
+    /// bytes it does not hold. The seek answered `Seek position beyond end of
+    /// stream` instead of asking for them: completion was taken to mean
+    /// "everything that will ever exist is here". On a phone that was a track
+    /// shown playing to its end in silence, until a skip.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stream_joined_mid_file_can_be_resumed_after_it_completes() {
+        const TOTAL: u64 = 8 * MB as u64;
+        const JOIN_AT: u64 = 6 * MB as u64;
+        let log = Arc::new(FeedLog::default());
+        let (source, writer) = BufferedMediaSource::new_seekable(
+            StreamingConfig {
+                initial_buffer_bytes: 16 * KB,
+                window_bytes: 2 * MB,
+            },
+            Some(TOTAL),
+        );
+        let source = Arc::new(source);
+        let mut reader = source.create_reader();
+
+        let feeder = tokio::spawn(feed_serving_seeks(
+            writer,
+            TOTAL,
+            32 * KB,
+            None,
+            log.clone(),
+        ));
+        let (mut reader, read) = tokio::task::spawn_blocking(move || {
+            let mut header = vec![0u8; 32 * KB];
+            reader.read_exact(&mut header).expect("read the header");
+            reader
+                .seek(SeekFrom::Start(JOIN_AT))
+                .expect("join mid-file");
+            let read = drain_verifying(&mut reader, JOIN_AT);
+            (reader, read)
+        })
+        .await
+        .expect("reader thread");
+        assert_eq!(read, TOTAL - JOIN_AT);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !source.is_complete() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "feeder never completed"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            source.take_complete_data().is_none(),
+            "the premise: a mid-file join holds no whole-file copy to replay"
+        );
+        let bodies_before_resume = log.bodies();
+
+        // The resume: back to a point the window does not hold.
+        const RESUME_AT: u64 = 3 * MB as u64;
+        let resumed = tokio::task::spawn_blocking(move || {
+            reader
+                .seek(SeekFrom::Start(RESUME_AT))
+                .expect("a completed stream must still seek into bytes it can fetch");
+            let mut buf = vec![0u8; 32 * KB];
+            reader
+                .read_exact(&mut buf)
+                .expect("read at the resume point");
+            buf
+        })
+        .await
+        .expect("reader thread");
+        feeder.abort();
+
+        assert_eq!(resumed, track_bytes(RESUME_AT, 32 * KB));
+        assert!(
+            log.bodies() > bodies_before_resume,
+            "the resume must have re-opened a body at the bytes it lacked"
+        );
+    }
+
+    /// The buffer is ready once there is lead AHEAD OF THE READER, wherever
+    /// the seek that started it pointed.
+    ///
+    /// After a resume seek the player waits for `has_min_buffer` before handing
+    /// the source to the engine. That measured from `primary_offset` — the seek
+    /// target — while the decoder, landing, had already read on from there; once
+    /// it was `SEEK_LOOKBEHIND_BYTES` past, the trim dropped the run holding the
+    /// target, the measure read 0 forever, and the wait sat out its 30 s
+    /// timeout with a full window ahead of the reader. On the Pi, a cast joined
+    /// mid-track:
+    ///
+    ///   Resume: landed on 370s in 5568ms (byte offset 186119804, 1048576 bytes held)
+    ///   Streaming feeder PARKED: 4194304 bytes contiguous from the reader anchor 188596379
+    ///   Resume: buffered 5242880 bytes from the resume point in 30000ms
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reader_past_its_seek_target_still_counts_its_lead() {
+        const TOTAL: u64 = 16 * MB as u64;
+        const TARGET: u64 = 6 * MB as u64;
+        let log = Arc::new(FeedLog::default());
+        let (source, writer) = BufferedMediaSource::new_seekable(
+            StreamingConfig {
+                initial_buffer_bytes: 512 * KB,
+                window_bytes: 2 * MB,
+            },
+            Some(TOTAL),
+        );
+        let source = Arc::new(source);
+        let mut reader = source.create_reader();
+
+        let feeder = tokio::spawn(feed(writer, TOTAL, 32 * KB, None, log.clone()));
+        // Held to the end: a live decoder is what anchors the window.
+        let _reader = tokio::task::spawn_blocking(move || {
+            let mut header = vec![0u8; 32 * KB];
+            reader.read_exact(&mut header).expect("read the header");
+            reader.seek(SeekFrom::Start(TARGET)).expect("resume seek");
+            // The decoder landing and reading on, past the look-behind.
+            let mut landing = vec![0u8; SEEK_LOOKBEHIND_BYTES as usize + 256 * KB];
+            reader
+                .read_exact(&mut landing)
+                .expect("read past the target");
+            reader
+        })
+        .await
+        .expect("reader thread");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !source.has_min_buffer() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the window is full ahead of the reader ({} bytes held) and the \
+                 buffer still does not count as ready",
+                source.buffer_size()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        feeder.abort();
     }
 
     // =========================================================================
