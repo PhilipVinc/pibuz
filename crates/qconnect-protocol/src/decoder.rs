@@ -422,14 +422,8 @@ fn resolve_renderer_message_type(message: &QConnectMessage) -> Option<i32> {
 fn map_srvr_rndr_set_state(
     payload: RendererSetStateMessage,
 ) -> Result<RendererServerCommand, ProtocolError> {
-    let current_track = payload
-        .current_track
-        .map(queue_track_with_context_to_json)
-        .transpose()?;
-    let next_track = payload
-        .next_track
-        .map(queue_track_with_context_to_json)
-        .transpose()?;
+    let current_track = renderer_occurrence_to_json(payload.current_track)?;
+    let next_track = renderer_occurrence_to_json(payload.next_track)?;
     let queue_version = queue_version_opt(payload.queue_version)?;
 
     Ok(RendererServerCommand {
@@ -1014,6 +1008,20 @@ fn queue_track_to_json(
     }))
 }
 
+/// A SET_STATE's `current_track` / `next_track`. The cloud marks "no track
+/// here" with `queue_item_id = -1` rather than by leaving the field out: it
+/// sends `next_track` that way whenever the current track is the last in the
+/// queue, so every single-track album. Rejecting it as a negative id failed the
+/// whole batch, and the tap that started the album was dropped with it.
+fn renderer_occurrence_to_json(
+    track: Option<QueueTrackWithContext>,
+) -> Result<Option<Value>, ProtocolError> {
+    match track {
+        Some(track) if track.queue_item_id.is_some_and(|id| id < 0) => Ok(None),
+        track => track.map(queue_track_with_context_to_json).transpose(),
+    }
+}
+
 fn queue_track_with_context_to_json(track: QueueTrackWithContext) -> Result<Value, ProtocolError> {
     let track_id = track.track_id.map(|v| v as u64).ok_or_else(|| {
         ProtocolError::InvalidPayload(
@@ -1373,6 +1381,48 @@ mod tests {
             126_886_862
         );
         assert_eq!(commands[0].payload["next_track"]["queue_item_id"], 1);
+    }
+
+    #[test]
+    fn a_negative_next_queue_item_id_means_no_next_track() {
+        // What the cloud sends to play the last track of a queue — every
+        // single-track album: the successor slot is filled in with id -1.
+        let message = QConnectMessage {
+            message_type: Some(QConnectMessageType::MessageTypeSrvrRndrSetState as i32),
+            srvr_rndr_set_state: Some(RendererSetStateMessage {
+                playing_state: Some(2),
+                current_position: Some(0),
+                queue_version: Some(QueueVersionRef {
+                    major: Some(3),
+                    minor: Some(0),
+                }),
+                current_track: Some(QueueTrackWithContext {
+                    queue_item_id: Some(0),
+                    track_id: Some(126_886_862),
+                    context_uuid: None,
+                }),
+                next_track: Some(QueueTrackWithContext {
+                    queue_item_id: Some(-1),
+                    track_id: None,
+                    context_uuid: None,
+                }),
+            }),
+            ..Default::default()
+        };
+        let batch = QConnectMessages {
+            messages_time: Some(1),
+            messages_id: Some(6),
+            messages: vec![message],
+        };
+
+        let commands = decode_renderer_server_commands(&batch.encode_to_vec())
+            .expect("a last-in-queue SET_STATE must decode");
+        assert_eq!(commands.len(), 1);
+        assert_eq!(
+            commands[0].payload["current_track"]["track_id"],
+            126_886_862
+        );
+        assert!(commands[0].payload["next_track"].is_null());
     }
 
     #[test]
