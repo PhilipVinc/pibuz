@@ -3,7 +3,7 @@
 Notable changes per release. Versions are plain semver; releases are `vX.Y.Z`
 tags on `main`.
 
-## 2.4.2 — unreleased
+## 2.5.0 — 2026-09-26
 
 ### Changed
 
@@ -46,6 +46,26 @@ tags on `main`.
 
 ### Fixed
 
+- **Single-track albums play over Qobuz Connect** (moodeaudio.org #4660). To
+  play the last track of a queue — which a one-track album always is — the
+  cloud does not leave `next_track` out of its `SET_STATE`: it sends it with
+  `queue_item_id = -1`. The decoder rejected that as a negative id and dropped
+  the whole batch, so tapping the album did nothing at all. A negative id in
+  either track slot now means "no track there".
+- **A cast joined mid-track no longer waits 30 s before it plays.** After the
+  resume seek the player waits for a buffer's worth of audio, and it measured
+  that from the seek target rather than from where the decoder was. The
+  decoder reads on from the target as it lands; once it was a megabyte past,
+  the bytes behind it were trimmed, the measure read zero with the window full
+  ahead of it, and only the refill's 30 s timeout let playback start. On a
+  Pi 3B, a mid-track cast took 35.6 s to first sound before and 5.5 s after.
+  What remains is almost all one ranged request to the CDN, which has measured
+  a steady ~5 s at a cold offset; that is untouched here.
+- **Pausing on the phone, then casting mid-track, no longer plays silence to
+  the end of the track** (contributed, #1). A stream opened at a position
+  never holds byte 0, so once the download finished the resume found no
+  whole-file copy and gave up. It now seeks instead. This shipped in the tree
+  before this release without a test; it has one now.
 - **pibuz no longer crash-loops when PeppyALSA is on** (moodeaudio.org #4660).
   Turning PeppyALSA on inserts a `softvol` → `meter` plugin chain into the ALSA
   namespace and repoints `_audioout` at it. The `status` endpoint — which
