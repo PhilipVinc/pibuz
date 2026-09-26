@@ -495,8 +495,29 @@ impl QconnectRendererEngine for DaemonRendererEngine {
             .await
             .map_err(|err| format!("resolve stream url for remote track {track_id}: {err}"))?;
 
-        // stop the previous track's download before starting the
-        // next one (see `current_feeder`).
+        // Stop the previous track's download before starting the next one (see
+        // `current_feeder`) — AFTER the resolve above, deliberately.
+        //
+        // Moving it before the resolve was tried, to stop a skipped-past track
+        // pulling bytes while the next one starts, and reverted: aborting the
+        // feeder does not merely stop the download, it POISONS the buffer.
+        // `FailGuard::drop` in `remote_stream.rs` calls `writer.error(..)`, and
+        // `BufferedMediaSource::read` checks `download_error` BEFORE it will
+        // serve bytes it already holds — so the outgoing track goes silent
+        // within one decode read even with megabytes buffered. `get_stream_url`
+        // is also not one round trip: it walks `Quality::fallback_order()`,
+        // each rung a signed API call. So the early abort bought a silence gap
+        // on every track change, and permanent silence whenever the resolve
+        // failed, since the caller only logs that error.
+        //
+        // The contention it was meant to fix is small in any case: the outgoing
+        // feeder is window-parked and rate-matched to playback, and the body it
+        // was observed opening mid-skip was serving the decoder that was still
+        // audible.
+        //
+        // A safe version would cancel the feeder task WITHOUT arming the
+        // FailGuard, leaving the buffered audio playable. That needs a new
+        // cancellation path, not a reordering.
         self.abort_current_feeder();
 
         // tell the controller we are loading. The stream is not
@@ -521,7 +542,21 @@ impl QconnectRendererEngine for DaemonRendererEngine {
         let stream_err = match stream_result {
             Ok(feeder) => {
                 if let Ok(mut guard) = self.current_feeder.lock() {
-                    *guard = Some(feeder);
+                    // Abort whatever this displaces rather than dropping it.
+                    // Dropping a `JoinHandle` DETACHES the task, it does not
+                    // stop it — so an overlapping load that stored its feeder
+                    // while this one was still resolving would be silently
+                    // unabortable from here on, downloading into a buffer no
+                    // reader drains. Every route in is serialized by the single
+                    // transport event loop today, so this is a guard on an
+                    // invariant held elsewhere, not a live bug: cheap, and it
+                    // fails closed if that ever stops being true.
+                    if let Some(displaced) = guard.replace(feeder) {
+                        log::warn!(
+                            "[QConnect] a concurrent load displaced a live feeder for track {track_id} — aborting it"
+                        );
+                        displaced.abort();
+                    }
                 }
                 return Ok(());
             }
@@ -610,9 +645,13 @@ impl QconnectRendererEngine for DaemonRendererEngine {
 }
 
 async fn download_remote_audio(url: &str) -> Result<Vec<u8>, String> {
-    let response = reqwest::Client::new()
+    // Shared process-wide client (`qbz_qobuz::cdn`). This used to be a bare
+    // `Client::new()`, which carries NO connect timeout and NO read timeout —
+    // a CDN that accepted the connection and then went quiet hung this fallback
+    // forever, with the latch already armed and the controller showing a
+    // spinner. It inherits both bounds now.
+    let response = qbz_qobuz::cdn::client()?
         .get(url)
-        .header("User-Agent", "Mozilla/5.0")
         .send()
         .await
         .map_err(|err| {

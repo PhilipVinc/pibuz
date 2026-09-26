@@ -115,49 +115,49 @@ pub async fn stream_remote_track_into_player(
     Ok(feeder)
 }
 
-/// HEAD for content-length, then a small `Range: bytes=0-65535` GET to (a)
-/// measure throughput and (b) parse the FLAC `STREAMINFO` block for the real
-/// sample rate / channels / bit depth. Never defaults silently for FLAC (a
-/// wrong sample rate would silently resample hi-res).
+/// One small `Range: bytes=0-65535` GET that answers everything the streaming
+/// config needs: the total size (from `Content-Range`), the throughput estimate,
+/// and the FLAC `STREAMINFO` block giving the real sample rate / channels / bit
+/// depth. Never defaults silently for FLAC (a wrong sample rate would silently
+/// resample hi-res).
+///
+/// There used to be a `HEAD` in front of this, purely for `Content-Length`. A
+/// 206 already carries the total as the tail of `Content-Range:
+/// bytes 0-65535/TOTAL`, so the HEAD bought one extra round trip and nothing
+/// else — on the critical path of the first note of every track.
+///
+/// A server that ignores `Range` answers `200` with the whole body instead. Then
+/// `Content-Length` IS the total, and the bytes still start at 0, so the probe
+/// reads exactly the same. (`download_and_stream_remote_track` handles the same
+/// case for the body itself — see `honors_range` there.)
+///
+/// NOT DONE, and the next thing worth doing here: these 64 KB are DISCARDED.
+/// The feeder below re-opens the url and downloads them again, so every track
+/// pays for its first 64 KB twice and playback starts one round trip later than
+/// it has to. Handing this body straight to the feeder — one GET, no Range, read
+/// the STREAMINFO off the front of it and let the same response keep going —
+/// removes the second request entirely. It is a bigger change than it sounds:
+/// the feeder owns its offset through `BufferWriter::initial_plan()` and re-opens
+/// at whatever byte a reader jumps to, so a pre-opened body has to be threaded
+/// into that machinery rather than handed to it. It also changes what
+/// `speed_mbps` measures. Worth a measurement first — see the buffer-ladder note
+/// in `Player::play_streaming_dynamic`, which reads the same estimate.
 pub async fn probe_remote_stream_info(url: &str) -> Result<RemoteStreamInfo, String> {
     use std::time::Instant;
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .connect_timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|err| format!("create stream probe client: {err}"))?;
-
-    let head_response = client
-        .head(url)
-        .header("User-Agent", "Mozilla/5.0")
-        .send()
-        .await
-        .map_err(|err| {
-            format!(
-                "probe HEAD request failed: {}",
-                describe_reqwest_error(&err)
-            )
-        })?;
-
-    if !head_response.status().is_success() {
-        return Err(format!(
-            "probe HEAD request failed with status {}",
-            head_response.status()
-        ));
-    }
-
-    let content_length = head_response
-        .headers()
-        .get("content-length")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-        .ok_or_else(|| "probe missing content-length header".to_string())?;
+    // Shared process-wide client (`qbz_qobuz::cdn`): the download below reopens
+    // this very url, so the pool hands it a connection that is already open and
+    // a TLS session it can resume. A per-probe client could never do either.
+    let client = qbz_qobuz::cdn::client()?;
 
     let start_time = Instant::now();
     let range_response = client
         .get(url)
-        .header("User-Agent", "Mozilla/5.0")
+        // The probe is small and bounded, so it keeps a TOTAL deadline. This
+        // overrides the shared client's stall-only policy for this request
+        // alone — never widen it to the client, or streamed bodies get severed
+        // (see `qbz_qobuz::cdn`).
+        .timeout(Duration::from_secs(30))
         .header("Range", "bytes=0-65535")
         .send()
         .await
@@ -168,12 +168,52 @@ pub async fn probe_remote_stream_info(url: &str) -> Result<RemoteStreamInfo, Str
             )
         })?;
 
+    let headers_ms = start_time.elapsed().as_millis();
+
     if !range_response.status().is_success() {
         return Err(format!(
             "probe range request failed with status {}",
             range_response.status()
         ));
     }
+
+    // The evidence line for two claims this path RESTS on but cannot prove from
+    // inside itself.
+    //
+    // First: that dropping the HEAD is sound, which needs this CDN to send
+    // `Content-Range` on its 206 — RFC 9110 §14.4 requires it, but requiring is
+    // not observing, and if it ever stops, the size resolve fails and every
+    // track detours to the full download. The RAW header is printed, not just
+    // the number parsed out of it.
+    //
+    // Second: that sharing one client buys a warm connection. A fresh
+    // connection to this CDN measures ~130 ms (tcp ~15 ms + tls ~115 ms,
+    // measured from the Pi), so a probe well under that opened on a POOLED
+    // connection.
+    //
+    // This used to print `x-cache`, on the strength of a comment claiming it
+    // says TCP_HIT vs TCP_MISS. It does not: a full header dump from the Pi
+    // shows this edge sends `Server: AkamaiGHost`, `Akamai-Request-BC` and
+    // `Akamai-Mon-Iucid-Del` and NO `X-Cache` at all — which is why every line
+    // it ever printed read `[x-cache: -]`. `Akamai-Request-BC` exists and names
+    // the edge region that served us, so it is at least a real handle on WHICH
+    // edge was slow.
+    let status = range_response.status();
+    log::info!(
+        "[remote-stream/PROBE] {} headers in {}ms, content-range: {} [edge: {}]",
+        status.as_u16(),
+        headers_ms,
+        header_str(range_response.headers(), "content-range"),
+        header_str(range_response.headers(), "akamai-request-bc"),
+    );
+
+    let content_length = total_length_from(status, range_response.headers()).ok_or_else(|| {
+        format!(
+            "probe could not determine the track size from a {} (content-range: {})",
+            status.as_u16(),
+            header_str(range_response.headers(), "content-range")
+        )
+    })?;
 
     let initial_bytes = range_response
         .bytes()
@@ -207,6 +247,46 @@ pub async fn probe_remote_stream_info(url: &str) -> Result<RemoteStreamInfo, Str
         bit_depth,
         speed_mbps,
     })
+}
+
+/// The track's TOTAL size, from whichever header the response actually carries.
+///
+/// A `206` answers `Content-Range: bytes 0-65535/TOTAL`, where `Content-Length`
+/// is only the slice we asked for — reading the slice as the total would size
+/// the whole streaming config against 64 KB. A server that ignored the `Range`
+/// answers `200`, has no `Content-Range`, and then `Content-Length` IS the total.
+///
+/// Which is why this takes the STATUS, not just the headers. A `206` with no
+/// `Content-Range` violates RFC 9110 §14.4, but an edge or a proxy can still
+/// produce one, and falling back to `Content-Length` there would hand back
+/// 65536 with total confidence — the streaming config would be built for a
+/// 64 KB track and the first track would end a fraction of a second in. On a
+/// `206` the `Content-Range` is the only acceptable answer; absent, this is a
+/// clean `None` and the caller falls back to the full download.
+///
+/// `bytes 0-65535/*` means the server does not know the size, and is a `None`
+/// for the same reason.
+fn total_length_from(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+) -> Option<u64> {
+    let content_range = headers
+        .get(reqwest::header::CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok());
+
+    if let Some(range) = content_range {
+        return range
+            .rsplit('/')
+            .next()
+            .and_then(|total| total.trim().parse::<u64>().ok());
+    }
+    if status == reqwest::StatusCode::PARTIAL_CONTENT {
+        return None;
+    }
+    headers
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
 }
 
 /// One response header as a string for logging, or `-` when absent.
@@ -281,16 +361,13 @@ pub async fn download_and_stream_remote_track(
     };
     let writer = &guard.writer;
 
-    // `read_timeout`, NOT `timeout`. reqwest's `timeout` is a TOTAL deadline
-    // covering the streamed body, and the buffer window now rate-matches the
-    // download to playback — so a five-minute track takes five minutes and a
-    // total deadline severs every one of them. What we actually want to catch
-    // is a stall, which is what a read timeout measures.
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .read_timeout(Duration::from_secs(60))
-        .build()
-        .map_err(|err| format!("create remote streaming client: {err}"))?;
+    // Shared process-wide client (`qbz_qobuz::cdn`), which is where the
+    // `read_timeout`-not-`timeout` reasoning this feeder depends on now lives:
+    // a total deadline would sever every track longer than it, because the
+    // buffer window rate-matches the download to playback. The probe just
+    // opened this same url on this same client, so the first body here starts
+    // on a warm connection.
+    let client = qbz_qobuz::cdn::client()?;
 
     let mut tee = DiskTee::open(disk_cache, track_id, content_length);
     // Set once the whole file has been walked, so the completion work (publish
@@ -349,21 +426,49 @@ pub async fn download_and_stream_remote_track(
         // came back unranged has no such bound - it is the whole file.
         let plan_limit = if honors_range { plan.byte_len() } else { None };
 
-        // A ranged read at an offset the edge does not hold has measured
-        // ~5 s of time-to-first-byte on this CDN, while a fresh connection
-        // to it costs 150 ms — so the wait is the edge filling its cache,
-        // not our client. `x-cache` says which it was (TCP_HIT vs
-        // TCP_MISS), and pairing it with the elapsed time is what makes
-        // that attributable rather than guessed at.
-        if !plan.is_whole_file() || opened_ms > 1000 {
+        // A ranged read at an offset the edge does not hold has measured ~5 s
+        // of time-to-first-byte on this CDN, against ~130 ms for a fresh
+        // connection and ~20-40 ms on a pooled one — so the wait is the edge,
+        // not our client. (Measured twice on the Pi at 5122 ms and 5099 ms. The
+        // constancy ruled out variable latency; an IPv6-blackhole fallback was
+        // then ruled out too — both stacks connect in ~12 ms from that box.)
+        //
+        // The FIRST body of a track is logged unconditionally, which it was not
+        // before: it is the whole-file open on a connection the probe just left
+        // in the pool, so its elapsed time is the direct read on whether the
+        // shared client is doing anything.
+        //
+        // Two fields earn their place beside the timing, because without them a
+        // slow open cannot be judged at all:
+        //
+        //   origin — WHO is waiting. A `reader-request` open that takes 5 s is a
+        //     stalled decoder and, if the lead runs out, an audible dropout. A
+        //     `gap-fill` open that takes 5 s is speculative housekeeping nobody
+        //     was waiting on. They are the same line otherwise, and the fix for
+        //     one is not the fix for the other.
+        //   lead — how much contiguous audio the reader still has. 5 s with 4 MB
+        //     of lead is a non-event; 5 s with 30 KB is the dropout. The earlier
+        //     logs could not tell these apart, so every slow open looked equally
+        //     alarming.
+        //
+        // `x-cache` used to be printed here: this edge does not send it (a full
+        // header dump shows AkamaiGHost + Akamai-Request-BC and no X-Cache), so
+        // it always read `-`. Replaced by the region header, which is real.
+        let first_body = bytes_received == 0;
+        if first_body || !plan.is_whole_file() || opened_ms > 1000 {
             log::info!(
-                "[{}/STREAMING] Track {} body open at byte {} ({}) in {}ms [x-cache: {}]",
+                "[{}/STREAMING] Track {} body open at byte {} ({}) in {}ms [{}, lead {}, edge: {}]",
                 log_tag,
                 track_id,
                 plan.offset,
                 plan.range_header(),
                 opened_ms,
-                header_str(response.headers(), "x-cache")
+                plan.origin.label(),
+                writer
+                    .reader_lead_bytes()
+                    .map(|b| format!("{} KB", b / 1024))
+                    .unwrap_or_else(|| "?".to_string()),
+                header_str(response.headers(), "akamai-request-bc")
             );
         }
 
@@ -499,6 +604,10 @@ pub async fn download_and_stream_remote_track(
                             let resumed = FetchPlan {
                                 offset: resume_from,
                                 end: plan.end,
+                                // A broken body re-opened where it died keeps
+                                // whatever it was serving: a reader waiting on
+                                // a gap-fill is still not waiting.
+                                origin: plan.origin.as_resumed(),
                             };
                             writer
                                 .begin_at(resumed.offset)
@@ -615,4 +724,69 @@ pub fn describe_reqwest_error(err: &reqwest::Error) -> String {
 pub fn is_header_flood_error(message: &str) -> bool {
     let haystack = message.to_ascii_lowercase();
     haystack.contains("message head is too large") || haystack.contains("too many headers")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::total_length_from;
+    use reqwest::header::{HeaderMap, HeaderValue, CONTENT_LENGTH, CONTENT_RANGE};
+    use reqwest::StatusCode;
+
+    fn headers(pairs: &[(reqwest::header::HeaderName, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(name.clone(), HeaderValue::from_str(value).unwrap());
+        }
+        map
+    }
+
+    /// The 206 case, which is what the probe gets ~always. `Content-Length` is
+    /// the 64 KB slice; the total lives after the slash. Reading the wrong one
+    /// is how the whole streaming config would end up sized for a 64 KB track.
+    #[test]
+    fn a_partial_response_reports_the_total_not_the_slice() {
+        let map = headers(&[
+            (CONTENT_RANGE, "bytes 0-65535/48717824"),
+            (CONTENT_LENGTH, "65536"),
+        ]);
+        assert_eq!(
+            total_length_from(StatusCode::PARTIAL_CONTENT, &map),
+            Some(48_717_824)
+        );
+    }
+
+    /// A server that ignores `Range` sends the whole body with no
+    /// `Content-Range` — there `Content-Length` is the total.
+    #[test]
+    fn a_whole_body_response_falls_back_to_content_length() {
+        let map = headers(&[(CONTENT_LENGTH, "48717824")]);
+        assert_eq!(total_length_from(StatusCode::OK, &map), Some(48_717_824));
+    }
+
+    /// `/*` means the server does not know the size. It must NOT fall through
+    /// to `Content-Length`, which would confidently report the 64 KB slice.
+    #[test]
+    fn an_unknown_total_is_none_rather_than_the_slice_length() {
+        let map = headers(&[
+            (CONTENT_RANGE, "bytes 0-65535/*"),
+            (CONTENT_LENGTH, "65536"),
+        ]);
+        assert_eq!(total_length_from(StatusCode::PARTIAL_CONTENT, &map), None);
+    }
+
+    /// A `206` with no `Content-Range` at all violates RFC 9110, but an edge or
+    /// a proxy can still emit one — and `Content-Length` there is the 64 KB
+    /// SLICE. Falling back to it would build the whole streaming config for a
+    /// 64 KB track, so the first track would end a fraction of a second in. It
+    /// has to be a clean `None`, which sends the caller to the full download.
+    #[test]
+    fn a_partial_response_without_content_range_is_none_not_the_slice_length() {
+        let map = headers(&[(CONTENT_LENGTH, "65536")]);
+        assert_eq!(total_length_from(StatusCode::PARTIAL_CONTENT, &map), None);
+    }
+
+    #[test]
+    fn a_response_with_neither_header_is_none() {
+        assert_eq!(total_length_from(StatusCode::OK, &HeaderMap::new()), None);
+    }
 }

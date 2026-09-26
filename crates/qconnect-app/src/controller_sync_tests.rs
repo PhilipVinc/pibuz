@@ -1116,3 +1116,65 @@ async fn the_same_intent_lands_the_same_way_whichever_route_it_arrives_by() {
         "and all three must land on track 101, playing, at its start"
     );
 }
+
+/// A release with exactly ONE track must play, and must be named on the wire by
+/// the id the cloud's own queue uses for it: 0, not the placeholder.
+///
+/// The cloud mints the head of a freshly-pushed queue with the track's catalog
+/// id where the queue item id belongs, and the renderer has to answer 0 there.
+/// Whether the head IS a placeholder was decided by looking for a LATER item
+/// with a smaller id — a test a queue of one can never pass, because it has no
+/// later item. So a single release reported its catalog id as the queue item id,
+/// the controller could not match that against any row of the queue it holds,
+/// and the play button spun forever with the renderer sitting paused
+/// (vicrodh/qbz#794, "Blister Sunrise" by M83).
+#[tokio::test]
+async fn a_one_track_release_plays_and_names_its_item_the_way_the_cloud_does() {
+    let harness = ControllerHarness::new().await;
+    harness.become_active_renderer().await;
+
+    harness
+        .controller()
+        .push_fresh_release_and_play(&TRACKS[..1], 0)
+        .await;
+    harness.report_tick().await;
+
+    assert_eq!(
+        harness.view().transport,
+        Transport::Playing,
+        "a one-track release must start; timeline:\n{}",
+        harness.rendered_timeline()
+    );
+    assert_eq!(
+        harness.view().track_id,
+        Some(0),
+        "the placeholder head must be reported as queue item 0, not as its \
+         catalog id; timeline:\n{}",
+        harness.rendered_timeline()
+    );
+    harness.assert_invariants();
+}
+
+/// The same release with a second track behind it — the case that always
+/// worked, pinned so a fix for the one-track queue cannot be a special case that
+/// drifts away from it.
+#[tokio::test]
+async fn a_multi_track_release_names_its_placeholder_head_the_same_way() {
+    let harness = ControllerHarness::new().await;
+    harness.become_active_renderer().await;
+
+    harness
+        .controller()
+        .push_fresh_release_and_play(&TRACKS, 0)
+        .await;
+    harness.report_tick().await;
+
+    assert_eq!(harness.view().transport, Transport::Playing);
+    assert_eq!(
+        harness.view().track_id,
+        Some(0),
+        "timeline:\n{}",
+        harness.rendered_timeline()
+    );
+    harness.assert_invariants();
+}
