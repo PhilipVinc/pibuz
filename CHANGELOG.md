@@ -95,8 +95,8 @@ tags on `main`.
   DAC cannot lose depth to this. The chosen format is logged with its position
   in the offer list and which regime picked it, and picking an unreadable one
   behind a plug now logs a warning naming the consequence.
-  Reasoned from `pcm_meter.c`, moOde's ALSA config and the report; **the fix
-  itself has not yet been confirmed on hardware.**
+  Reasoned from `pcm_meter.c`, moOde's ALSA config and the report, and
+  confirmed on hardware by the moOde maintainer: the needles move.
 - `status` no longer walks the ALSA namespace on a poll at all: with the ALSA
   backend, `device_present` is answered from `/proc/asound`. Enumerating meant
   resolving every drop-in in `/etc/alsa/conf.d`, and opening the DAC behind
