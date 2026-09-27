@@ -3,7 +3,46 @@
 Notable changes per release. Versions are plain semver; releases are `vX.Y.Z`
 tags on `main`.
 
-## Unreleased
+## 2.5.0 — 2026-09-27
+
+### Changed
+
+- **The CMAF seed is read from the webplayer bundle instead of being compiled
+  in.** It used to be a constant in `auth.rs`, carried in the source and in
+  every published binary. It is now collected from the live bundle alongside
+  `app_id` and the app secrets, which is where it came from in the first
+  place, and cached with them under the bundle version.
+
+  The bundle gives the value no label to match on, so extraction cannot
+  identify it directly: it scores every 32-hex literal by the CMAF vocabulary
+  around it and hands the best few to the client, which settles the question
+  by signing a real `session/start` with each in turn — the same
+  candidates-plus-probe shape `secret()` has always used. The winner is
+  registered for log redaction before it is returned, and the probe runs once
+  per process.
+
+  Two practical effects. A seed rotation upstream now resolves itself at the
+  next bundle refresh rather than needing a release. And when no candidate
+  works — a bundle that hides it, or an extraction that has gone stale —
+  playback falls back to the legacy `/track/getFileUrl` path, which needs no
+  seed, instead of failing.
+
+- **The disk cache is encrypted, and no longer survives a restart.**
+  `~/.cache/qbz/playback/` held playable Hi-Res FLACs: the CMAF path decrypts
+  each segment before it assembles, the legacy path downloads plaintext, and
+  both landed on the card as-is. Every route into the cache — the streaming
+  tee, the straight-to-disk download and an in-memory track spilling out — now
+  seals its file with AES-128-CTR.
+
+  The key is generated when the daemon starts and never written down, so the
+  cache cannot be read across a restart and the directory is wiped on the way
+  up. On moOde that is every renderer toggle, because `stopQobuz()` kills the
+  daemon: a toggle now means re-fetching whatever was cached. A key stored
+  beside the ciphertext would protect nothing, so this was the trade taken.
+
+  Nothing else changes — same budget (`audio.disk_cache_mb`), same cap
+  behaviour, same `audio.cache_to_disk false` if you want no disk at all, and
+  the reported cache size still counts audio rather than file bytes.
 
 ### Fixed
 
@@ -34,8 +73,8 @@ tags on `main`.
   request with `410 Gone`. The feeder had already finished the download and
   switched off its failure reporting, so it died without telling the buffer.
   The resume's seek then waited for ever, on the audio thread, and every later
-  command queued behind it. 2.5.0 made this reachable: that is the release
-  that lets a finished stream be seeked into again.
+  command queued behind it. It was reachable in the first 2.5.0 build, which
+  let a finished stream be seeked into again without this protection.
 
   Three layers now keep it from happening again:
   - The buffer knows when its feeder has gone, however the feeder ends (a
@@ -81,58 +120,6 @@ tags on `main`.
   `pibuz run` rotated `qbz.log` before checking whether another daemon held the
   lock. moOde starts the daemon twice in quick succession after a watchdog
   restart, so the log of the run that had just failed was lost every time.
-
-### Added
-
-- **`/api/status` reports what the audio thread is doing.** The new
-  `audio.command_in_flight` and `audio.command_in_flight_ms` fields name the
-  command in progress and how long it has run. `pibuz status` shows a stuck
-  thread without `--verbose` and exits 6, and the daemon logs an error once a
-  single command has run for 90 s. Until now, a wedged audio thread looked
-  healthy in every field.
-
-## 2.5.0 — 2026-09-26
-
-### Changed
-
-- **The CMAF seed is read from the webplayer bundle instead of being compiled
-  in.** It used to be a constant in `auth.rs`, carried in the source and in
-  every published binary. It is now collected from the live bundle alongside
-  `app_id` and the app secrets, which is where it came from in the first
-  place, and cached with them under the bundle version.
-
-  The bundle gives the value no label to match on, so extraction cannot
-  identify it directly: it scores every 32-hex literal by the CMAF vocabulary
-  around it and hands the best few to the client, which settles the question
-  by signing a real `session/start` with each in turn — the same
-  candidates-plus-probe shape `secret()` has always used. The winner is
-  registered for log redaction before it is returned, and the probe runs once
-  per process.
-
-  Two practical effects. A seed rotation upstream now resolves itself at the
-  next bundle refresh rather than needing a release. And when no candidate
-  works — a bundle that hides it, or an extraction that has gone stale —
-  playback falls back to the legacy `/track/getFileUrl` path, which needs no
-  seed, instead of failing.
-
-- **The disk cache is encrypted, and no longer survives a restart.**
-  `~/.cache/qbz/playback/` held playable Hi-Res FLACs: the CMAF path decrypts
-  each segment before it assembles, the legacy path downloads plaintext, and
-  both landed on the card as-is. Every route into the cache — the streaming
-  tee, the straight-to-disk download and an in-memory track spilling out — now
-  seals its file with AES-128-CTR.
-
-  The key is generated when the daemon starts and never written down, so the
-  cache cannot be read across a restart and the directory is wiped on the way
-  up. On moOde that is every renderer toggle, because `stopQobuz()` kills the
-  daemon: a toggle now means re-fetching whatever was cached. A key stored
-  beside the ciphertext would protect nothing, so this was the trade taken.
-
-  Nothing else changes — same budget (`audio.disk_cache_mb`), same cap
-  behaviour, same `audio.cache_to_disk false` if you want no disk at all, and
-  the reported cache size still counts audio rather than file bytes.
-
-### Fixed
 
 - **Single-track albums play over Qobuz Connect** (moodeaudio.org #4660). To
   play the last track of a queue — which a one-track album always is — the
@@ -200,6 +187,13 @@ tags on `main`.
   crash above — went to stderr raw.
 
 ### Added
+
+- **`/api/status` reports what the audio thread is doing.** The new
+  `audio.command_in_flight` and `audio.command_in_flight_ms` fields name the
+  command in progress and how long it has run. `pibuz status` shows a stuck
+  thread without `--verbose` and exits 6, and the daemon logs an error once a
+  single command has run for 90 s. Until now, a wedged audio thread looked
+  healthy in every field.
 
 - A clippy `disallowed-methods` gate on the three cpal/rodio calls that probe a
   PCM's hardware parameters. Each of the 13 call sites now records why its
