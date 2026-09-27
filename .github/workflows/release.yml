@@ -1,15 +1,18 @@
-# pibuz standalone release.
+# pibuz release.
 #
 # This is the only workflow that publishes anything:
 #   - triggers on `v*` tags (`v2.1.0`);
 #   - releases ONLY from `main`: the `guard` job refuses a tag whose commit is
 #     not an ancestor of main, so a tag pushed on a topic branch fails loudly
 #     instead of publishing a release nobody can reproduce from the trunk;
-#   - builds the pibuz binary and ships a stable asset shape consumers pin
-#     against: pibuz-<version>-linux-<arch>.tar.gz containing
-#     pibuz-<version>-linux-<arch>/pibuz, with a .sha256 beside it;
 #   - publishes a GitHub Release on the tag: a full release, and Latest, for a
 #     plain `v2.4.0`; a prerelease for a suffixed `v2.4.0-rc.3`.
+#
+# SOURCE ONLY. A release carries the source archives GitHub attaches to every
+# tag and nothing else: no binaries are built or uploaded. The binary build
+# and its tarball (`pibuz-<version>-linux-<arch>.tar.gz`) are commented out
+# below rather than deleted, so turning them back on is uncommenting the
+# `build` job and restoring the `release` job's `needs`/download/`files`.
 #
 # Tag `v2.1.0` -> version `2.1.0`. Plain semver: no distro suffixes.
 
@@ -24,10 +27,8 @@ on:
   push:
     tags:
       - "v*"
-  # Dispatch builds whatever ref you pick, at its Cargo.toml version, and
-  # publishes nothing (the release job needs a tag ref). There is deliberately
-  # no version input: it never checked the named tag out, it only relabelled
-  # the build, which is how you get a tarball whose name and contents disagree.
+  # Dispatch runs the checks on whatever ref you pick and publishes nothing
+  # (the release job needs a tag ref).
   workflow_dispatch:
 
 concurrency:
@@ -37,10 +38,9 @@ concurrency:
 jobs:
   # Releases are cut from main, and only from main. A release tag anywhere
   # else (a topic branch, a detached build) stops here before anything is
-  # built or published. workflow_dispatch without a tag is a plain test build
-  # and is exempt — it publishes nothing.
+  # published. workflow_dispatch without a tag is exempt — it publishes nothing.
   guard:
-    name: tag must be on main
+    name: tag must be on main and agree with Cargo.toml
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -69,39 +69,14 @@ jobs:
           fi
           echo "$REF_NAME ($GITHUB_SHA) is on main."
 
-  build:
-    needs: guard
-    strategy:
-      matrix:
-        include:
-          - runner: ubuntu-22.04-arm
-            arch: aarch64
-          - runner: ubuntu-22.04
-            arch: amd64
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Resolve version
-        id: release
+      # Moved here from the (disabled) build job: a `pibuz --version` built from
+      # the tagged source must say what the tag says, whoever builds it.
+      - name: tag must agree with Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
           set -euo pipefail
           VERSION="$(awk '/^\[workspace\.package\]/{f=1; next} f && /^version = /{gsub(/version = "|"/,""); print; exit}' Cargo.toml)"
           [ -n "$VERSION" ] || { echo "::error::no [workspace.package] version in Cargo.toml"; exit 1; }
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
-      # The binary reports its Cargo version, and the tarball is named after the
-      # tag, so a tag that disagrees with Cargo.toml ships an asset whose name
-      # and contents differ. CONTRIBUTING has always told you to "tag what
-      # Cargo.toml already says"; nothing checked it, and the retired moOde tag
-      # series drifted a whole minor version doing exactly that.
-      - name: tag must agree with Cargo.toml
-        if: startsWith(github.ref, 'refs/tags/')
-        env:
-          VERSION: ${{ steps.release.outputs.version }}
-        run: |
-          set -euo pipefail
           TAG="${GITHUB_REF#refs/tags/v}"
           echo "tag:        $TAG"
           echo "Cargo.toml: $VERSION"
@@ -110,87 +85,132 @@ jobs:
             exit 1
           fi
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: system deps
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
-
-      # pibuz must never resolve Slint.
-      - name: slint-free dep-graph gate
-        run: |
-          set -euo pipefail
-          hits=$(cargo tree -p pibuz -e normal \
-                 | grep -E '\bslint[a-z-]* v' || true)
-          [ -z "$hits" ] || { echo "::error::pibuz graph resolves Slint:"; echo "$hits"; exit 1; }
-
-      # No PIBUZ_BUILD_ID here. It exists so a build can report a version
-      # Cargo.toml cannot hold, and it used to carry the `.moodeN` suffix; with
-      # that retired and the tag pinned to Cargo.toml above, stamping would set
-      # the value `CARGO_PKG_VERSION` already has. `scripts/pibuz-to-pi.sh`
-      # still uses it, for the one case that is genuinely unrepresentable:
-      # `2.4.0.local-<sha>-dirty` on a Pi built straight from a working tree.
-      - name: build
-        run: cargo build --release -p pibuz
-
-      # Empirical gate: the binary must run on glibc 2.35
-      # boxes (Ubuntu 22.04 / Bookworm-era moOde images).
-      - name: glibc floor gate (objdump)
-        run: |
-          set -euo pipefail
-          floor=$(objdump -T target/release/pibuz \
-                  | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -Vu | tail -1)
-          echo "glibc floor: $floor"
-          highest=$(printf '%s\n' "$floor" "GLIBC_2.35" | sort -V | tail -1)
-          [ "$highest" = "GLIBC_2.35" ] || { echo "::error::floor $floor exceeds 2.35"; exit 1; }
-
-      # Release asset shape. Consumers pin this, so changing it is a breaking
-      # change for them: pibuz-<version>-linux-<arch>.tar.gz unpacking to a
-      # single versioned directory holding the binary, its unit file, shell
-      # completions and a README.
-      - name: tarball
-        env:
-          VERSION: ${{ steps.release.outputs.version }}
-          ARCH: ${{ matrix.arch }}
-        run: |
-          set -euo pipefail
-          cp target/release/pibuz ./pibuz
-          DIR="pibuz-${VERSION}-linux-${ARCH}"
-          mkdir -p "staging/${DIR}/completions"
-          cp pibuz "staging/${DIR}/pibuz"
-          chmod +x "staging/${DIR}/pibuz"
-          cp crates/pibuz/service/pibuz.service "staging/${DIR}/pibuz.service"
-          ./pibuz completions bash > "staging/${DIR}/completions/pibuz.bash"
-          ./pibuz completions zsh  > "staging/${DIR}/completions/pibuz.zsh"
-          ./pibuz completions fish > "staging/${DIR}/completions/pibuz.fish"
-          cp packaging/linux/pibuz-standalone-README.md "staging/${DIR}/README.md"
-          mkdir -p dist
-          tar -czf "dist/${DIR}.tar.gz" -C staging "${DIR}"
-          ( cd dist && sha256sum "${DIR}.tar.gz" > "${DIR}.tar.gz.sha256" )
-          ls -la dist
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: pibuz-${{ matrix.arch }}
-          path: dist/*
-
-  # Single publisher so the two matrix legs never race on Release creation.
+  # ── DISABLED: binary build ───────────────────────────────────────────────
+  # Releases publish source only. Kept, commented, so it can be restored.
+  #
+  #build:
+  #  needs: guard
+  #  strategy:
+  #    matrix:
+  #      include:
+  #        - runner: ubuntu-22.04-arm
+  #          arch: aarch64
+  #        - runner: ubuntu-22.04
+  #          arch: amd64
+  #  runs-on: ${{ matrix.runner }}
+  #  timeout-minutes: 30
+  #  steps:
+  #    - uses: actions/checkout@v7
+  #
+  #    - name: Resolve version
+  #      id: release
+  #      run: |
+  #        set -euo pipefail
+  #        VERSION="$(awk '/^\[workspace\.package\]/{f=1; next} f && /^version = /{gsub(/version = "|"/,""); print; exit}' Cargo.toml)"
+  #        [ -n "$VERSION" ] || { echo "::error::no [workspace.package] version in Cargo.toml"; exit 1; }
+  #        echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+  #
+  #    # The binary reports its Cargo version, and the tarball is named after the
+  #    # tag, so a tag that disagrees with Cargo.toml ships an asset whose name
+  #    # and contents differ. CONTRIBUTING has always told you to "tag what
+  #    # Cargo.toml already says"; nothing checked it, and the retired moOde tag
+  #    # series drifted a whole minor version doing exactly that.
+  #    - name: tag must agree with Cargo.toml
+  #      if: startsWith(github.ref, 'refs/tags/')
+  #      env:
+  #        VERSION: ${{ steps.release.outputs.version }}
+  #      run: |
+  #        set -euo pipefail
+  #        TAG="${GITHUB_REF#refs/tags/v}"
+  #        echo "tag:        $TAG"
+  #        echo "Cargo.toml: $VERSION"
+  #        if [ "$TAG" != "$VERSION" ]; then
+  #          echo "::error::tag says $TAG, Cargo.toml says $VERSION — run scripts/bump-version.sh and tag what it sets"
+  #          exit 1
+  #        fi
+  #
+  #    - uses: dtolnay/rust-toolchain@stable
+  #
+  #    - name: system deps
+  #      run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+  #
+  #    # pibuz must never resolve Slint.
+  #    - name: slint-free dep-graph gate
+  #      run: |
+  #        set -euo pipefail
+  #        hits=$(cargo tree -p pibuz -e normal \
+  #               | grep -E '\bslint[a-z-]* v' || true)
+  #        [ -z "$hits" ] || { echo "::error::pibuz graph resolves Slint:"; echo "$hits"; exit 1; }
+  #
+  #    # No PIBUZ_BUILD_ID here. It exists so a build can report a version
+  #    # Cargo.toml cannot hold, and it used to carry the `.moodeN` suffix; with
+  #    # that retired and the tag pinned to Cargo.toml above, stamping would set
+  #    # the value `CARGO_PKG_VERSION` already has. `scripts/pibuz-to-pi.sh`
+  #    # still uses it, for the one case that is genuinely unrepresentable:
+  #    # `2.4.0.local-<sha>-dirty` on a Pi built straight from a working tree.
+  #    - name: build
+  #      run: cargo build --release -p pibuz
+  #
+  #    # Empirical gate: the binary must run on glibc 2.35
+  #    # boxes (Ubuntu 22.04 / Bookworm-era moOde images).
+  #    - name: glibc floor gate (objdump)
+  #      run: |
+  #        set -euo pipefail
+  #        floor=$(objdump -T target/release/pibuz \
+  #                | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -Vu | tail -1)
+  #        echo "glibc floor: $floor"
+  #        highest=$(printf '%s\n' "$floor" "GLIBC_2.35" | sort -V | tail -1)
+  #        [ "$highest" = "GLIBC_2.35" ] || { echo "::error::floor $floor exceeds 2.35"; exit 1; }
+  #
+  #    # Release asset shape. Consumers pin this, so changing it is a breaking
+  #    # change for them: pibuz-<version>-linux-<arch>.tar.gz unpacking to a
+  #    # single versioned directory holding the binary, its unit file, shell
+  #    # completions and a README.
+  #    - name: tarball
+  #      env:
+  #        VERSION: ${{ steps.release.outputs.version }}
+  #        ARCH: ${{ matrix.arch }}
+  #      run: |
+  #        set -euo pipefail
+  #        cp target/release/pibuz ./pibuz
+  #        DIR="pibuz-${VERSION}-linux-${ARCH}"
+  #        mkdir -p "staging/${DIR}/completions"
+  #        cp pibuz "staging/${DIR}/pibuz"
+  #        chmod +x "staging/${DIR}/pibuz"
+  #        cp crates/pibuz/service/pibuz.service "staging/${DIR}/pibuz.service"
+  #        ./pibuz completions bash > "staging/${DIR}/completions/pibuz.bash"
+  #        ./pibuz completions zsh  > "staging/${DIR}/completions/pibuz.zsh"
+  #        ./pibuz completions fish > "staging/${DIR}/completions/pibuz.fish"
+  #        cp packaging/linux/pibuz-standalone-README.md "staging/${DIR}/README.md"
+  #        mkdir -p dist
+  #        tar -czf "dist/${DIR}.tar.gz" -C staging "${DIR}"
+  #        ( cd dist && sha256sum "${DIR}.tar.gz" > "${DIR}.tar.gz.sha256" )
+  #        ls -la dist
+  #
+  #    - uses: actions/upload-artifact@v7
+  #      with:
+  #        name: pibuz-${{ matrix.arch }}
+  #        path: dist/*
+  #
+  # Single publisher.
   release:
-    needs: build
+    needs: guard
+    # needs: build   # restore with the build job
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v8
-        with:
-          pattern: pibuz-*
-          merge-multiple: true
-          path: dist
+      # - uses: actions/download-artifact@v8
+      #   with:
+      #     pattern: pibuz-*
+      #     merge-multiple: true
+      #     path: dist
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v3
         with:
-          files: dist/*
+          # files: dist/*   # no binaries: GitHub attaches the source archives
           # A pre-release tag carries a suffix — `v2.4.0-rc.3`; a final release
           # is plain semver. Publishing every tag as a prerelease that is never
           # Latest was right while only rcs existed, and wrong the moment 2.4.0
@@ -202,9 +222,9 @@ jobs:
           body: |
             Pibuz — standalone headless Qobuz Connect daemon.
 
-            Each asset unpacks to `pibuz-<version>-linux-<arch>/` holding the
-            `pibuz` binary, `pibuz.service`, shell completions and a README.
-            Verify with the `.sha256` beside it.
+            Source release: no prebuilt binaries are published. Build with
+            `cargo build --release -p pibuz` (see the README), or
+            `./scripts/build-aarch64-pibuz.sh` for a Raspberry Pi.
 
             Upgrading from a `qbzd` build: the daemon keeps reading an existing
             `~/.config/qbzd` / `~/.local/share/qbzd` profile, so the Connect

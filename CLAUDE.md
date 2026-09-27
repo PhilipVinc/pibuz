@@ -355,10 +355,11 @@ adding the import.
 - **`pibuz` must never resolve Slint.** CI gates on it in both workflows. Nothing in
   the tree pulls it today; the gate exists so a crates.io dependency cannot
   reintroduce it.
-- **The release asset shape is an API.** `pibuz-<version>-linux-<arch>.tar.gz`
-  unpacks to one versioned directory holding `pibuz`, `pibuz.service`,
-  `completions/` and `README.md`, with a `.sha256` beside it. Installers pin
-  this; reshaping it breaks them.
+- **Releases are source only.** `release.yml` publishes a GitHub Release on the
+  tag with no binaries attached; its `build` job (the
+  `pibuz-<version>-linux-<arch>.tar.gz` tarball) is commented out, not deleted.
+  If it is ever turned back on, that asset shape is an API again: installers
+  pinned it.
 
 ## Versioning
 

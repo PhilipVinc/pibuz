@@ -71,8 +71,9 @@ own source never said.
 CHANGELOG agree before you tag.
 
 
-`release.yml` builds the aarch64 + amd64 tarballs and publishes a
-prerelease GitHub Release. Its first job refuses any release tag whose commit is
+`release.yml` publishes a GitHub Release carrying the source only — no
+binaries are built or attached (the build job is kept, commented out, in the
+workflow). Its first job refuses any release tag whose commit is
 not an ancestor of `main`, so tagging a topic branch fails loudly instead of
 publishing something that is not on the trunk.
 
