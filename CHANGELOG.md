@@ -3,6 +3,16 @@
 Notable changes per release. Versions are plain semver; releases are `vX.Y.Z`
 tags on `main`.
 
+## 2.5.1 — 2026-09-27
+
+A packaging release: the same code as 2.5.0, under a version no earlier build
+could have carried, so installers and moOde pick it up as an upgrade.
+
+### Changed
+
+- Documentation: two comments about CMAF seed discovery and a build-ID example
+  in the contributor notes had gone stale.
+
 ## 2.5.0 — 2026-09-27
 
 ### Changed

@@ -33,8 +33,8 @@ pub struct BundleTokens {
     /// [`extract_cmaf_seed_candidates`]. The bundle gives no label to match on,
     /// so the winner is decided by `QobuzClient::cmaf_seed`, which signs a
     /// `session/start` with each in turn exactly as `secret()` does with
-    /// `test_secret`. Empty means no CMAF on this bundle; the legacy path
-    /// needs none.
+    /// `test_secret`. Empty is not the end of CMAF: the client probes the
+    /// decoded `secrets` after these (`client::cmaf_seed_candidates`).
     pub cmaf_seeds: Vec<String>,
 }
 
@@ -49,8 +49,8 @@ pub struct CachedBundle {
     #[serde(default)]
     pub private_key: Option<String>,
     /// `default` so a cache file written before CMAF seeds were extracted still
-    /// deserializes — it just reports no candidates, and the next bundle
-    /// rotation refills it.
+    /// deserializes. It reports no candidates, which no longer costs CMAF: the
+    /// client falls back to probing the decoded `secrets`.
     #[serde(default)]
     pub cmaf_seeds: Vec<String>,
     /// Unix seconds when these tokens were fetched (freshness only; not a TTL).

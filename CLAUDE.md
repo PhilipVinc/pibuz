@@ -373,7 +373,7 @@ A release build reports the Cargo version, full stop — CI refuses a tag that
 disagrees with it, so there is nothing to override. `PIBUZ_BUILD_ID` (compile
 time, `option_env!` in `crates/pibuz/src/main.rs`) covers the one case
 Cargo.toml cannot express: `scripts/pibuz-to-pi.sh` stamps
-`2.4.0.local-<sha>-dirty` so a Pi running a working-tree build can be
+`<version>.local-<sha>[-dirty]` so a Pi running a working-tree build can be
 identified later.
 
 It is the ONLY `QBZD_*` name that was renamed. The others — `QBZD_HOOK`,
