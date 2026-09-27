@@ -101,7 +101,13 @@ enum AudioCommand {
     /// Pause playback
     Pause,
     /// Resume playback
-    Resume,
+    Resume {
+        /// The playing track's sealed copy in the L2 cache, if it has one.
+        /// Looked up on the sending side because the audio thread has no
+        /// handle on the cache; used only when it is the same file the stream
+        /// was serving (see the handler).
+        cached: Option<qbz_cache::CachedFile>,
+    },
     /// Stop playback
     Stop,
     /// Set volume (0.0 - 1.0)
@@ -122,6 +128,41 @@ enum AudioCommand {
         sample_rate: u32,
         channels: u16,
     },
+}
+
+impl AudioCommand {
+    /// For [`SharedState::audio_thread_busy`].
+    fn label(&self) -> &'static str {
+        match self {
+            AudioCommand::Play { .. } => "Play",
+            AudioCommand::PlayStreaming { .. } => "PlayStreaming",
+            AudioCommand::Pause => "Pause",
+            AudioCommand::Resume { .. } => "Resume",
+            AudioCommand::Stop => "Stop",
+            AudioCommand::SetVolume(_) => "SetVolume",
+            AudioCommand::Seek(_) => "Seek",
+            AudioCommand::ReinitDevice { .. } => "ReinitDevice",
+            AudioCommand::ReleaseDevice => "ReleaseDevice",
+            AudioCommand::PlayNext { .. } => "PlayNext",
+        }
+    }
+}
+
+/// Marks the audio thread busy with one command for as long as it lives, so
+/// every early `return` in the handler clears it too.
+struct AudioThreadBusy<'a>(&'a SharedState);
+
+impl<'a> AudioThreadBusy<'a> {
+    fn new(state: &'a SharedState, command: &AudioCommand) -> Self {
+        state.set_audio_thread_busy(Some(command.label()));
+        Self(state)
+    }
+}
+
+impl Drop for AudioThreadBusy<'_> {
+    fn drop(&mut self) {
+        self.0.set_audio_thread_busy(None);
+    }
 }
 
 /// Where a gapless-queued track's audio lives between the prefetch and the
@@ -466,6 +507,36 @@ pub(crate) fn quality_below_requested(
 /// `None` when Symphonia cannot probe the format (rodio-only MP4/AAC) or
 /// the seek fails; the caller then falls back to `decode_with_fallback` +
 /// `skip_duration`, which always works.
+/// The stream's own bytes, on the card, if the L2 cache holds them.
+///
+/// The disk tee stages exactly the file the stream serves, and resuming from
+/// it needs no URL at all — on the Pi, 2026-09-26, a resume went to the network
+/// with a signed URL two hours dead while the whole track sat sealed on the
+/// card. Matched on SIZE (audio bytes, not the sealed file's): an entry left by
+/// an earlier play at another quality is another file, at a rate the output
+/// device was not opened for.
+fn card_copy_of_stream(
+    cached: Option<&qbz_cache::CachedFile>,
+    stream_total: Option<u64>,
+) -> Option<qbz_cache::CachedFile> {
+    let file = cached?;
+    let len = file.open().ok()?.len();
+    if Some(len) != stream_total {
+        log::info!(
+            "Resume: the card holds {} bytes of this track, the stream {:?} - not the same file, not using it",
+            len,
+            stream_total
+        );
+        return None;
+    }
+    log::info!(
+        "Resume: the track is on the card ({} bytes) - resuming from {} instead of the network",
+        len,
+        file.path().display()
+    );
+    Some(file.clone())
+}
+
 fn seek_in_memory(
     data: &TrackBytes,
     position: Duration,
@@ -1637,6 +1708,9 @@ pub struct SharedState {
     /// allocate a whole track on a board that cannot hold one. Set once by
     /// `Player::new`, after the cache it describes has been built.
     disk_spill_available: Arc<AtomicBool>,
+    /// The command the audio thread is handling right now, and since when.
+    /// `None` while it is waiting for one. See [`SharedState::audio_thread_busy`].
+    audio_thread_busy: Arc<std::sync::Mutex<Option<(Instant, &'static str)>>>,
 }
 
 impl Default for SharedState {
@@ -1659,6 +1733,7 @@ impl SharedState {
             current_device: Arc::new(std::sync::RwLock::new(None)),
             stream_error: Arc::new(AtomicBool::new(false)),
             stream_error_message: Arc::new(std::sync::RwLock::new(None)),
+            audio_thread_busy: Arc::new(std::sync::Mutex::new(None)),
             sample_rate: Arc::new(AtomicU32::new(0)),
             bit_depth: Arc::new(AtomicU32::new(0)),
             output_sample_rate: Arc::new(AtomicU32::new(0)),
@@ -1703,6 +1778,26 @@ impl SharedState {
         self.stream_error.store(true, Ordering::SeqCst);
         if let Ok(mut m) = self.stream_error_message.write() {
             *m = Some(message.into());
+        }
+    }
+
+    /// Which command the audio thread is handling, and for how long it has
+    /// been at it. `None` while it is idle, waiting for the next one.
+    ///
+    /// The audio thread handles one command at a time, so a command that never
+    /// finishes wedges every command behind it — play, pause, seek, stop — while
+    /// everything around it looks healthy. On the Pi, 2026-09-26, a resume's
+    /// seek waited 18 hours on a dead feeder and `/api/status` showed a live
+    /// driver tick throughout: nothing that watched the daemon could see it.
+    /// This is what lets it.
+    pub fn audio_thread_busy(&self) -> Option<(&'static str, Duration)> {
+        let busy = *self.audio_thread_busy.lock().ok()?;
+        busy.map(|(since, command)| (command, since.elapsed()))
+    }
+
+    fn set_audio_thread_busy(&self, command: Option<&'static str>) {
+        if let Ok(mut busy) = self.audio_thread_busy.lock() {
+            *busy = command.map(|c| (Instant::now(), c));
         }
     }
 
@@ -2311,6 +2406,7 @@ impl Player {
                  current_gain_atomic: &mut Option<Arc<AtomicU32>>,
                  gapless_pending: &mut Option<GaplessPending>,
                  gapless_request_armed: &mut bool| {
+                    let _busy = AudioThreadBusy::new(&thread_state, &command);
                     match command {
                         AudioCommand::Play {
                             audio,
@@ -3499,7 +3595,7 @@ impl Player {
                                 );
                             }
                         }
-                        AudioCommand::Resume => {
+                        AudioCommand::Resume { cached } => {
                             *pause_suspend_deadline = None;
                             if current_engine.is_none() {
                                 // Where the rebuilt engine gets its samples.
@@ -3518,10 +3614,39 @@ impl Player {
                                     /// position is one request away instead of
                                     /// a whole-file download away.
                                     Ranged(Arc<BufferedMediaSource>),
+                                    /// The sealed copy on the card, decoded
+                                    /// straight from the file with a real seek:
+                                    /// no network, and no whole track in RAM.
+                                    File(qbz_cache::CachedFile),
                                 }
+
+                                // A resume that cannot happen must SAY so. These
+                                // used to log and return, so the controller saw a
+                                // play that never started and nothing the daemon
+                                // could act on; the driver latches this.
+                                let fail = |message: String| {
+                                    log::error!("Resume: {message}");
+                                    thread_state.is_playing.store(false, Ordering::SeqCst);
+                                    thread_state.record_stream_error(message);
+                                };
+
+                                let card_copy_of = |streaming_src: &BufferedMediaSource| {
+                                    card_copy_of_stream(
+                                        cached.as_ref(),
+                                        streaming_src.total_bytes(),
+                                    )
+                                };
 
                                 let resume_input = if let Some(ref data) = *current_audio_data {
                                     ResumeInput::Memory(data.clone())
+                                } else if let Some(file) = current_audio_file
+                                    .as_ref()
+                                    .filter(|_| thread_state.duration.load(Ordering::SeqCst) > 0)
+                                {
+                                    // Seek the file itself. Reading it back whole
+                                    // (below) is 120-220 MB at Hi-Res held for the
+                                    // rest of the track, on boards with 439-905.
+                                    ResumeInput::File(file.clone())
                                 } else if let Some(ref file) = *current_audio_file {
                                     // A track that arrived through a gapless
                                     // hand-off decoded from the L2 cache file and
@@ -3567,18 +3692,22 @@ impl Player {
                                                 // way. The bytes under the resume point are still
                                                 // there, and a range feeder can fetch whatever
                                                 // else the decoder asks for.
-                                                if streaming_src.supports_range_requests() {
+                                                if let Some(file) = card_copy_of(streaming_src) {
+                                                    ResumeInput::File(file)
+                                                } else if streaming_src.supports_range_requests() {
                                                     log::info!(
                                                         "Resume: complete stream holds no whole-file copy ({} bytes buffered) - seeking instead",
                                                         streaming_src.buffer_size()
                                                     );
                                                     ResumeInput::Ranged(streaming_src.clone())
                                                 } else {
-                                                    log::warn!("Audio thread: cannot resume - streaming source complete but data unavailable");
+                                                    fail("the streaming source is complete but its data is unavailable".to_string());
                                                     return;
                                                 }
                                             }
                                         }
+                                    } else if let Some(file) = card_copy_of(streaming_src) {
+                                        ResumeInput::File(file)
                                     } else if streaming_src.supports_range_requests() {
                                         log::info!(
                                             "Resume: streaming incomplete ({} bytes buffered) but the feeder serves ranges - seeking instead of waiting",
@@ -3586,16 +3715,26 @@ impl Player {
                                         );
                                         ResumeInput::Ranged(streaming_src.clone())
                                     } else {
-                                        log::warn!("Audio thread: cannot resume - streaming not complete yet ({} bytes buffered)",
-                                        streaming_src.buffer_size());
+                                        fail(format!(
+                                            "streaming not complete yet ({} bytes buffered)",
+                                            streaming_src.buffer_size()
+                                        ));
                                         return;
                                     }
                                 } else {
-                                    log::warn!(
-                                        "Audio thread: cannot resume - no audio data available"
-                                    );
+                                    fail("no audio data available".to_string());
                                     return;
                                 };
+
+                                // Resuming from the card: the stream is not needed
+                                // any more, and later seeks should go to the card
+                                // too, which is what `current_audio_file` does.
+                                if let ResumeInput::File(ref file) = resume_input {
+                                    if current_audio_file.is_none() {
+                                        release_streaming_source(current_streaming_source);
+                                        *current_audio_file = Some(file.clone());
+                                    }
+                                }
 
                                 if stream_opt.is_none() {
                                     // Use last known sample rate/channels to maintain DAC passthrough
@@ -3611,9 +3750,7 @@ impl Player {
                                 }
 
                                 let Some(ref stream) = *stream_opt else {
-                                    log::error!(
-                                        "Audio thread: cannot resume - no audio device available"
-                                    );
+                                    fail("no audio device available".to_string());
                                     return;
                                 };
 
@@ -3623,10 +3760,7 @@ impl Player {
                                     } => match PlaybackEngine::new_rodio(mixer_sink.mixer()) {
                                         Ok(e) => e,
                                         Err(e) => {
-                                            log::error!(
-                                                "Failed to create engine for resume: {}",
-                                                e
-                                            );
+                                            fail(format!("failed to create the engine: {e}"));
                                             return;
                                         }
                                     },
@@ -3682,18 +3816,16 @@ impl Player {
                                             match seeked {
                                                 Some(source) => source,
                                                 None => {
-                                                    let source = match decode_with_fallback(
-                                                        &audio_data,
-                                                    ) {
-                                                        Ok(s) => s,
-                                                        Err(e) => {
-                                                            log::error!(
-                                                                "Failed to decode audio for resume: {}",
-                                                                e
-                                                            );
-                                                            return;
-                                                        }
-                                                    };
+                                                    let source =
+                                                        match decode_with_fallback(&audio_data) {
+                                                            Ok(s) => s,
+                                                            Err(e) => {
+                                                                fail(format!(
+                                                                "failed to decode the audio: {e}"
+                                                            ));
+                                                                return;
+                                                            }
+                                                        };
 
                                                     // Must read total_duration() BEFORE
                                                     // skip_duration consumes `source`.
@@ -3730,10 +3862,9 @@ impl Player {
                                             let mut source = match rebuilt {
                                                 Ok(s) => s,
                                                 Err(e) => {
-                                                    log::error!(
-                                                        "Resume: failed to rebuild the streaming decoder: {}",
-                                                        e
-                                                    );
+                                                    fail(format!(
+                                                        "failed to rebuild the streaming decoder: {e}"
+                                                    ));
                                                     return;
                                                 }
                                             };
@@ -3741,11 +3872,17 @@ impl Player {
                                                 if let Err(e) =
                                                     source.seek_to(Duration::from_secs(resume_pos))
                                                 {
-                                                    log::error!(
-                                                        "Resume: streaming seek to {}s failed: {}",
-                                                        resume_pos,
-                                                        e
+                                                    // The feeder is dead or the CDN
+                                                    // refused the bytes: this source
+                                                    // cannot play again, so do not
+                                                    // leave it for the next Resume.
+                                                    release_streaming_source(
+                                                        current_streaming_source,
                                                     );
+                                                    thread_state.set_loaded_audio(false);
+                                                    fail(format!(
+                                                        "streaming seek to {resume_pos}s failed: {e}"
+                                                    ));
                                                     return;
                                                 }
                                             }
@@ -3770,6 +3907,31 @@ impl Player {
                                             );
                                             Box::new(source)
                                         }
+                                        ResumeInput::File(file) => {
+                                            let mut source =
+                                                match InMemorySource::from_cached_file(&file) {
+                                                    Ok(s) => s,
+                                                    Err(e) => {
+                                                        fail(format!(
+                                                            "cannot decode {}: {e}",
+                                                            file.path().display()
+                                                        ));
+                                                        return;
+                                                    }
+                                                };
+                                            if resume_pos > 0 {
+                                                if let Err(e) =
+                                                    source.seek_to(Duration::from_secs(resume_pos))
+                                                {
+                                                    fail(format!(
+                                                        "seek to {resume_pos}s in {} failed: {e}",
+                                                        file.path().display()
+                                                    ));
+                                                    return;
+                                                }
+                                            }
+                                            Box::new(source)
+                                        }
                                     };
 
                                 // Wrap source with diagnostic capture and normalization
@@ -3782,7 +3944,7 @@ impl Player {
                                     &analyzer_enabled,
                                 );
                                 if let Err(e) = engine.append(skipped_source, resume_pos) {
-                                    log::error!("Failed to append source for resume: {}", e);
+                                    fail(format!("failed to append the source: {e}"));
                                     return;
                                 }
                                 thread_state.start_playback_timer(resume_pos);
@@ -5467,6 +5629,13 @@ impl Player {
                 let disk_cache = self.disk_cache_for_streaming(track_id);
 
                 tokio::spawn(async move {
+                    // Every failure reaches the buffer from here, including the
+                    // ones met after completion, when the feeder's own
+                    // fail-guard is disarmed but it is still serving seeks —
+                    // the same hole the remote feeder had (`spawn_remote_feeder`
+                    // in pibuz). The buffer notices the feeder going away on
+                    // its own too (`FeederAlive`); this is for the reason.
+                    let errors = buffer_writer.clone();
                     match Self::cmaf_stream_segments(
                         &url_template,
                         n_segments,
@@ -5480,7 +5649,12 @@ impl Player {
                     .await
                     {
                         Ok(()) => log::info!("[CMAF-STREAM COMPLETE] Track {}", track_id),
-                        Err(e) => log::error!("[CMAF-STREAM ERROR] Track {}: {}", track_id, e),
+                        Err(e) => {
+                            // The first recorded error wins, so a specific one
+                            // recorded inside is kept over this.
+                            let _ = errors.error(e.clone());
+                            log::error!("[CMAF-STREAM ERROR] Track {}: {}", track_id, e)
+                        }
                     }
                 });
 
@@ -6757,8 +6931,13 @@ impl Player {
 
     /// Resume playback
     pub fn resume(&self) -> Result<(), String> {
+        let track_id = self.state.current_track_id();
+        let cached = (track_id != 0)
+            .then(|| self.audio_cache.get_playback_cache())
+            .flatten()
+            .and_then(|l2| l2.file_if_present(track_id));
         self.tx
-            .send(AudioCommand::Resume)
+            .send(AudioCommand::Resume { cached })
             .map_err(|e| format!("Failed to send resume command: {}", e))
     }
 
@@ -7638,6 +7817,97 @@ mod memory_policy_tests {
             plan_successor(HIRES, pi3b, true, true),
             SuccessorPlan::OnDisk,
             "and with a card it still prefers the card: the pair has to fit"
+        );
+    }
+}
+
+#[cfg(test)]
+mod card_copy_tests {
+    use super::card_copy_of_stream;
+
+    /// A sealed L2 entry holding `len` audio bytes — sealed, because that is
+    /// the only shape on the card and the size that matters is the AUDIO's.
+    fn sealed(len: usize) -> qbz_cache::CachedFile {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("qbz-card-copy-{}-{n}.audio", std::process::id()));
+        let key = qbz_cmaf::SealKey::random();
+        std::fs::write(&path, qbz_cmaf::vault::seal_to_vec(key, &vec![7u8; len])).unwrap();
+        qbz_cache::CachedFile::new(path, key)
+    }
+
+    /// The Pi's resume: the stream's own bytes are on the card, so resume
+    /// from them and never ask the CDN.
+    #[test]
+    fn the_streams_own_file_on_the_card_is_used() {
+        let file = sealed(4096);
+        let picked = card_copy_of_stream(Some(&file), Some(4096));
+        assert_eq!(
+            picked.map(|f| f.path().to_path_buf()),
+            Some(file.path().to_path_buf())
+        );
+    }
+
+    /// Sized by audio, not by what is on disk: the sealed file is
+    /// `SEAL_HEADER_LEN` longer, and comparing that against the stream would
+    /// refuse every real match.
+    #[test]
+    fn the_match_is_on_audio_bytes_not_the_sealed_files_length() {
+        let file = sealed(4096);
+        let on_disk = std::fs::metadata(file.path()).unwrap().len();
+        assert_ne!(on_disk, 4096, "the premise: the seal adds a header");
+        assert!(card_copy_of_stream(Some(&file), Some(on_disk)).is_none());
+        assert!(card_copy_of_stream(Some(&file), Some(4096)).is_some());
+    }
+
+    /// An entry from an earlier play at another quality is another file, at a
+    /// rate the device was not opened for. Leave it alone.
+    #[test]
+    fn a_card_copy_of_a_different_size_is_not_used() {
+        let file = sealed(4096);
+        assert!(card_copy_of_stream(Some(&file), Some(8192)).is_none());
+        assert!(card_copy_of_stream(Some(&file), None).is_none());
+        assert!(card_copy_of_stream(None, Some(4096)).is_none());
+    }
+}
+
+#[cfg(test)]
+mod audio_thread_busy_tests {
+    use super::{AudioCommand, AudioThreadBusy, SharedState};
+
+    /// The handler returns early from dozens of places. The guard is what
+    /// makes every one of them clear the flag, so a finished command never
+    /// reads as a wedged one.
+    #[test]
+    fn a_command_is_in_flight_exactly_while_its_handler_runs() {
+        let state = SharedState::new();
+        assert!(state.audio_thread_busy().is_none(), "idle at rest");
+
+        let handle = |state: &SharedState, bail_early: bool| {
+            let _busy = AudioThreadBusy::new(state, &AudioCommand::Resume { cached: None });
+            let (command, _) = state.audio_thread_busy().expect("busy while handling");
+            assert_eq!(command, "Resume");
+            if bail_early {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let (_, age) = state.audio_thread_busy().unwrap();
+            assert!(
+                age >= std::time::Duration::from_millis(5),
+                "and the age grows"
+            );
+        };
+
+        handle(&state, false);
+        assert!(
+            state.audio_thread_busy().is_none(),
+            "cleared on the way out"
+        );
+        handle(&state, true);
+        assert!(
+            state.audio_thread_busy().is_none(),
+            "cleared by an early return too"
         );
     }
 }

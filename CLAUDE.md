@@ -127,6 +127,20 @@ a stalled body, or this CDN's ~5 s cold-offset time-to-first-byte; and an
 unpaced feeder means "as fast as this machine allows", which is useful for
 ratios and meaningless for absolute timings.
 
+The first limit has a partial answer for the remote feeder:
+`pibuz/src/qconnect/remote_stream.rs` → `mod feeder_tests` runs the REAL
+`spawn_remote_feeder` against `FakeCdn`, a loopback HTTP/1.1 server that serves
+ranges and can `410` a path on demand. Use it for anything about statuses, URL
+expiry and refresh, or how the feeder ends. It has no CMAF twin yet.
+
+**A hang in this layer is a wedged AUDIO THREAD**: every seek and read runs
+there, and it takes one command at a time. So a test whose regression is a hang
+must run the blocking call under `returns_within` (or a `recv_timeout`), never
+a bare `join`/`await`, or the regression hangs the suite instead of failing
+it. The buffer's own guarantee is `FeederAlive`: when the last `BufferWriter`
+drops, waits for bytes nobody will fetch fail. Do not route a writer anywhere
+but a feeder, or that guarantee stops meaning anything.
+
 ## The CMAF segment table is a byte index
 
 `crates/qbz-cmaf/src/map.rs` has the evidence in full, and it is load-bearing:

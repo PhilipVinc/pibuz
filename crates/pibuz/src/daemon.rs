@@ -38,7 +38,22 @@ pub struct BootedRuntime {
 /// gracefully. Returns the process exit code (0 = clean shutdown). `warns` are
 /// the unknown-key warnings surfaced by [`PibuzConfig::load`] in `main`.
 pub async fn run(roots: ProfileRoots, cfg: PibuzConfig, warns: Vec<String>) -> Result<i32, String> {
-    // 1. argv parse happened in main(). 2. logging:
+    // 1. argv parse happened in main().
+    //
+    // 2. instance lock on the DATA ROOT, taken BEFORE any port bind (§8.3): it,
+    //    not the port, protects the single-device_uuid / single-session.db
+    //    invariants. A second daemon on the same root is diagnosed → exit 3.
+    //
+    //    And before LOGGING, because installing the logger rotates `qbz.log`
+    //    to `qbz.log.prev`: a second start that is about to be refused used to
+    //    rotate the LIVE daemon's log out from under it — the live process kept
+    //    writing into `.prev` through its descriptor, and the previous run's
+    //    log was gone. moOde starts the daemon twice in quick succession after
+    //    a watchdog restart, so on a Pi this destroyed the one log that showed
+    //    why the watchdog had fired. The refusal prints to stderr, which is all
+    //    it ever needed.
+    let _lock = InstanceLock::acquire(&roots.data).map_err(diagnose_lock)?;
+    // 3. logging:
     qbz_log::install(&cfg.log.level);
     // …including libasound's, which otherwise writes straight to stderr. It
     // used to be installed only by `BackendManager::create_backend`, i.e. not
@@ -48,14 +63,10 @@ pub async fn run(roots: ProfileRoots, cfg: PibuzConfig, warns: Vec<String>) -> R
     // Idempotent (`Once`), so the later call stays a no-op.
     #[cfg(target_os = "linux")]
     qbz_audio::alsa_error_handler::install_once();
-    // 3. config: surface unknown-key warnings (they never abort — D14).
+    // 4. config: surface unknown-key warnings (they never abort — D14).
     for w in &warns {
         log::warn!("[config] unknown key: {w}");
     }
-    // 4. instance lock on the DATA ROOT, taken BEFORE any port bind (§8.3): it,
-    //    not the port, protects the single-device_uuid / single-session.db
-    //    invariants. A second daemon on the same root is diagnosed → exit 3.
-    let _lock = InstanceLock::acquire(&roots.data).map_err(diagnose_lock)?;
     // 5. port bind + foreign-occupant diagnosis — STATELESS, so it runs BEFORE
     //    stores (6) and runtime composition (7) per the §8.1 order. On a bind
     //    conflict the occupant is probed with GET /api/ping: a pibuz answer means

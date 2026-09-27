@@ -399,6 +399,12 @@ pub struct DriverDeps {
     pub on_tick: Arc<dyn Fn() + Send + Sync>,
 }
 
+/// How long one audio-thread command may run before the driver calls it stuck.
+/// The longest legitimate wait inside one is the initial stream buffer, which
+/// the player bounds at 60 s. Mirrors `AUDIO_THREAD_STUCK_MS` in pibuz's
+/// `status` CLI.
+const AUDIO_THREAD_STUCK: Duration = Duration::from_secs(90);
+
 /// The 450 ms IO shell. Each tick: read the player event, drain the stream-error
 /// latch, project the queue, `plan_tick`, execute the actions, then
 /// `advance_state`. Breaks when `shutdown` flips to `true`; the loop is thin by
@@ -410,6 +416,8 @@ pub async fn run_driver<A: FrontendAdapter + Send + Sync + 'static>(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut state = DriverState::default();
+    // Whether the current audio-thread wedge has been reported already.
+    let mut reported_stuck = false;
     let mut ticker = tokio::time::interval(Duration::from_millis(TICK_MS));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -427,6 +435,27 @@ pub async fn run_driver<A: FrontendAdapter + Send + Sync + 'static>(
         let core = runtime.core();
         let player = core.player();
         let ev = player.get_playback_event();
+
+        // The audio thread takes one command at a time, so one that never
+        // finishes silences everything queued behind it — and this loop keeps
+        // ticking regardless, which is why nothing noticed for 18 hours on a
+        // Pi. Say so, once per wedge, where someone reading the log will see it.
+        match player.state.audio_thread_busy() {
+            Some((command, age)) if age >= AUDIO_THREAD_STUCK && !reported_stuck => {
+                log::error!(
+                    "[pibuz] driver: the audio thread has been stuck in {command} for {}s — \
+                     every later play, pause and seek is queued behind it",
+                    age.as_secs()
+                );
+                reported_stuck = true;
+            }
+            None if reported_stuck => {
+                log::warn!("[pibuz] driver: the audio thread is taking commands again");
+                reported_stuck = false;
+            }
+            _ => {}
+        }
+
         // Drain-once stream-error message (playback.rs:4111).
         let stream_error = player.state.take_stream_error_message();
         let queue = queue_snapshot(core).await;

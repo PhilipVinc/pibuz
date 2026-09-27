@@ -139,3 +139,72 @@ fn every_setting_moode_writes_is_still_accepted() {
         failures.join("\n")
     );
 }
+
+/// A second `pibuz run` that is refused must leave the LIVE daemon's log alone.
+///
+/// Installing the logger rotates `qbz.log` to `qbz.log.prev`, and it used to
+/// run before the instance lock: a refused second start rotated the running
+/// daemon's log out from under it (the live process kept writing into `.prev`
+/// through its descriptor) and destroyed the previous run's. moOde starts the
+/// daemon twice in quick succession after a watchdog restart, so on a Pi that
+/// was the one log showing why the watchdog had fired — lost on 2026-09-27.
+///
+/// The live daemon is played by this test holding the instance lock, which is
+/// all a second start can see of it.
+#[cfg(unix)]
+#[test]
+fn a_refused_second_start_leaves_the_live_log_alone() {
+    use std::os::unix::io::AsRawFd;
+
+    let home = tempfile::tempdir().unwrap();
+    // `dirs` resolves the data root from HOME on macOS and XDG on Linux.
+    let data_dir = if cfg!(target_os = "macos") {
+        home.path().join("Library/Application Support")
+    } else {
+        home.path().join(".local/share")
+    };
+    let logs = data_dir.join("qbz/logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    std::fs::write(logs.join("qbz.log"), "the live daemon's log\n").unwrap();
+    std::fs::write(logs.join("qbz.log.prev"), "the previous run's log\n").unwrap();
+
+    let root = data_dir.join("pibuz");
+    std::fs::create_dir_all(&root).unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(root.join("pibuz.lock"))
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0,
+        "the test plays the live daemon by holding its lock"
+    );
+
+    let out = Command::new(env!("CARGO_BIN_EXE_pibuz"))
+        .arg("run")
+        .env("HOME", home.path())
+        .env("XDG_DATA_HOME", home.path().join(".local/share"))
+        .env("XDG_CONFIG_HOME", home.path().join(".config"))
+        .env("XDG_CACHE_HOME", home.path().join(".cache"))
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "the second start is refused: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(logs.join("qbz.log")).unwrap(),
+        "the live daemon's log\n",
+        "the live daemon's log was rotated away by a start that never ran"
+    );
+    assert_eq!(
+        std::fs::read_to_string(logs.join("qbz.log.prev")).unwrap(),
+        "the previous run's log\n",
+        "the previous run's log was overwritten"
+    );
+}

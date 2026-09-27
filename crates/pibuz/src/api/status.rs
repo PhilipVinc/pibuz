@@ -124,6 +124,16 @@ pub struct AudioStatus {
     /// something in the chain resamples (a shared PipeWire/Pulse/CPAL path,
     /// or an ALSA config that pins a rate). None before any stream exists.
     pub output_sample_rate: Option<u32>,
+    /// The command the audio thread is handling right now ("Resume", "Seek",
+    /// "PlayStreaming", ...), `null` while it waits for one. It handles one at
+    /// a time, so a command that never finishes blocks every command behind
+    /// it while the rest of this document looks healthy — as `driver_tick_age_ms`
+    /// did for 18 hours on a Pi whose audio thread was stuck in a resume.
+    pub command_in_flight: Option<String>,
+    /// How long `command_in_flight` has been running. Commands take
+    /// milliseconds; a buffer wait can legitimately take tens of seconds; much
+    /// more than a minute is a wedge.
+    pub command_in_flight_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -259,6 +269,7 @@ fn assemble_live(state: &super::ApiState) -> StatusDoc {
     //    is a read, not a detection; `cache_report` takes each tier's lock
     //    briefly and drops it before returning.
     let cache = player.cache_report();
+    let busy = player.state.audio_thread_busy();
     let profile = qbz_models::system_capabilities::memory_profile();
 
     // 6. playback block. `stopped` when nothing is loaded and the queue has no
@@ -293,6 +304,8 @@ fn assemble_live(state: &super::ApiState) -> StatusDoc {
             sample_rate: ev.sample_rate,
             bit_depth: ev.bit_depth,
             output_sample_rate: ev.output_sample_rate,
+            command_in_flight: busy.map(|(command, _)| command.to_string()),
+            command_in_flight_ms: busy.map(|(_, age)| age.as_millis() as u64),
         },
         playback: PlaybackStatus {
             state: pstate.to_string(),
@@ -526,6 +539,8 @@ mod tests {
                 sample_rate: None,
                 bit_depth: None,
                 output_sample_rate: None,
+                command_in_flight: None,
+                command_in_flight_ms: None,
             },
             playback: PlaybackStatus {
                 state: "stopped".into(),
@@ -707,6 +722,8 @@ mod tests {
             "bit_perfect",
             "sample_rate",
             "bit_depth",
+            "command_in_flight",
+            "command_in_flight_ms",
         ] {
             assert!(audio.contains_key(key), "missing audio key: {key}");
         }

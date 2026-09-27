@@ -528,6 +528,20 @@ impl QconnectRendererEngine for DaemonRendererEngine {
             .begin(track_id, start_position_secs, duration_secs);
         self.report_notify.notify_one();
 
+        // The feeder outlives its signed URL whenever a track is paused for
+        // long enough, and re-resolves through this. Same call, same quality,
+        // so it names the same file; the feeder refuses one that does not.
+        let refresh_core = Arc::clone(self.core());
+        let refresh_url: super::remote_stream::UrlRefresher = Arc::new(move || {
+            let core = Arc::clone(&refresh_core);
+            Box::pin(async move {
+                core.get_stream_url(track_id, quality)
+                    .await
+                    .map(|fresh| fresh.url)
+                    .map_err(|err| err.to_string())
+            })
+        });
+
         let player = self.core().player();
         let stream_result = super::remote_stream::stream_remote_track_into_player(
             &player,
@@ -535,6 +549,7 @@ impl QconnectRendererEngine for DaemonRendererEngine {
             duration_secs,
             start_position_secs,
             &stream_url.url,
+            Some(refresh_url),
             "QConnect",
         )
         .await;

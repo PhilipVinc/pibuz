@@ -336,6 +336,11 @@ struct BufferState {
     download_complete: bool,
     /// Error from download, if any
     download_error: Option<String>,
+    /// True once every clone of the feeder's [`BufferWriter`] has been
+    /// dropped: nothing will ever push another byte or answer another request.
+    /// Set by [`FeederAlive`], whatever the feeder did or forgot to do on the
+    /// way out — see there.
+    feeder_gone: bool,
     /// Total expected size (from Content-Length), if known
     total_size: Option<u64>,
     /// Where playback reads from: 0 normally, the seek target after a range
@@ -426,7 +431,7 @@ impl BufferState {
     /// Should the feeder be asked to re-open at `pos`, or are those bytes
     /// close enough behind the download head to be worth waiting for?
     fn should_request(&self, pos: u64) -> bool {
-        if self.seek_mode != StreamSeekMode::RangeRequests {
+        if self.seek_mode != StreamSeekMode::RangeRequests || self.feeder_gone {
             return false;
         }
         if self.pending_request.is_some() {
@@ -872,6 +877,7 @@ impl BufferedMediaSource {
                 range_start: 0,
                 download_complete: false,
                 download_error: None,
+                feeder_gone: false,
                 total_size,
                 primary_offset: 0,
                 pending_request: None,
@@ -898,7 +904,10 @@ impl BufferedMediaSource {
             reader_id: 0,
         };
 
-        let writer = BufferWriter { shared };
+        let writer = BufferWriter {
+            alive: Arc::new(FeederAlive(Arc::clone(&shared))),
+            shared,
+        };
 
         (source, writer)
     }
@@ -946,6 +955,16 @@ impl BufferedMediaSource {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         self.shared.space.notify_one();
         self.shared.ready.notify_all();
+    }
+
+    /// The whole file's size, when the feeder was told it. For a range stream
+    /// this is exact (`Content-Length`, or the CMAF segment table).
+    pub fn total_bytes(&self) -> Option<u64> {
+        self.shared
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.total_size)
     }
 
     pub fn is_complete(&self) -> bool {
@@ -1110,6 +1129,18 @@ impl BufferedMediaSource {
             return;
         }
         if !state.should_request(pos) {
+            // Waiting for bytes the body in hand is supposed to bring. Anchor
+            // the window HERE, where this reader now is, for the same reason
+            // the request path below does: measured from where it last read,
+            // the window can be full, the feeder parked on it, and the bytes
+            // never on their way. A forward seek just past a parked write head
+            // hung like that — see `a_forward_seek_just_past_a_parked_feeder_lands`.
+            if state.reader_positions.get(&self.reader_id) != Some(&pos) {
+                state.reader_positions.insert(self.reader_id, pos);
+                if state.feeder_parked && !state.should_park() {
+                    self.shared.space.notify_one();
+                }
+            }
             return;
         }
         // Reading backwards into a region we skipped means the decoder is
@@ -1235,10 +1266,10 @@ impl Read for BufferedMediaSource {
                 return Ok(0);
             }
 
-            if state.download_complete && !state.should_request(read_pos) {
+            if state.feeder_gone || (state.download_complete && !state.should_request(read_pos)) {
                 // Nothing is coming and we are not allowed to ask: either the
                 // feeder cannot serve ranges at all, or the buffer was torn
-                // down under us.
+                // down under us, or the feeder is gone (see `FeederAlive`).
                 return Err(IoError::new(
                     ErrorKind::UnexpectedEof,
                     format!("stream byte {read_pos} is not buffered and the feeder has stopped"),
@@ -1297,9 +1328,16 @@ impl Seek for BufferedMediaSource {
         // walked the whole file, the window kept a sliding piece of it, and a
         // seek into a region this buffer never held — one opened mid-file
         // never held byte 0 — is a request away, not out of bounds.
+        //
+        // It ends, too, when nothing can ever satisfy it: the source was
+        // abandoned, or the feeder is gone. Both used to be missing here while
+        // `read` honoured them, and a seek is what the resume path calls ON THE
+        // AUDIO THREAD — see `FeederAlive` for the 18 hours that cost.
         while state.segment_at(new_pos).is_none()
             && !state.at_eof(new_pos)
             && state.download_error.is_none()
+            && !state.feeder_gone
+            && !self.shared.abandoned.load(Ordering::SeqCst)
             && (!state.download_complete || state.should_request(new_pos))
         {
             self.request_range(&mut state, new_pos);
@@ -1308,6 +1346,21 @@ impl Seek for BufferedMediaSource {
 
         if let Some(ref err) = state.download_error {
             return Err(IoError::other(err.clone()));
+        }
+
+        if state.segment_at(new_pos).is_none() && !state.at_eof(new_pos) {
+            if self.shared.abandoned.load(Ordering::SeqCst) {
+                return Err(IoError::new(
+                    ErrorKind::Interrupted,
+                    "seek abandoned: nobody is listening to this stream any more",
+                ));
+            }
+            if state.feeder_gone {
+                return Err(IoError::new(
+                    ErrorKind::UnexpectedEof,
+                    format!("stream byte {new_pos} is not buffered and the feeder has stopped"),
+                ));
+            }
         }
 
         // After download complete, check bounds
@@ -1352,6 +1405,53 @@ impl MediaSource for BufferedMediaSource {
 #[derive(Clone)]
 pub struct BufferWriter {
     shared: Arc<SharedBuffer>,
+    /// Shared by every clone; the buffer learns the feeder is gone when the
+    /// last one drops. Never read, only dropped.
+    #[allow(dead_code)] // held for its Drop, which is the whole point
+    alive: Arc<FeederAlive>,
+}
+
+/// The buffer's own knowledge that its feeder has gone away.
+///
+/// A reader that cannot read waits on a condvar for the feeder to push bytes,
+/// record an error, or complete. A feeder that returns without doing any of
+/// those leaves the reader waiting for ever — and the reader is on the AUDIO
+/// THREAD, so every later command queues behind it. That is not hypothetical:
+/// on the Pi, 2026-09-26, the remote feeder completed, disarmed its
+/// fail-guard, stayed up to serve seeks, and two hours later died on a
+/// `410 Gone` for the resume's range request without a word to the buffer.
+/// The renderer then accepted casts it could never play for 18 hours.
+///
+/// Relying on every exit path of every feeder to remember `error()` is what
+/// failed there, so this does not: it is dropped with the last
+/// [`BufferWriter`] clone — on a `return`, a `?`, a panic, or a
+/// `JoinHandle::abort` alike — and tells the buffer.
+///
+/// Before completion that is an error: the bytes a reader is waiting for are
+/// not coming. After completion it is not — a feeder with nothing left to
+/// serve may leave, and the bytes still held stay readable — but no request
+/// will be answered any more, so a wait for unheld bytes fails instead of
+/// sleeping. A feeder that TOOK a request (`wait_for_request` clears
+/// completion when it does) and then died is the "before" case again, which is
+/// exactly the Pi's.
+struct FeederAlive(Arc<SharedBuffer>);
+
+impl Drop for FeederAlive {
+    fn drop(&mut self) {
+        // Poisoned or not, the readers still need to hear about it.
+        let mut state = match self.0.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.feeder_gone = true;
+        if !state.download_complete && state.download_error.is_none() {
+            state.download_error =
+                Some("the stream feeder stopped before delivering the rest of the track".into());
+        }
+        state.pending_request = None;
+        drop(state);
+        self.0.ready.notify_all();
+    }
 }
 
 impl BufferWriter {
@@ -2514,6 +2614,45 @@ mod tests {
         );
     }
 
+    /// `abandon` wakes a SEEK blocked on bytes, too — not only a read.
+    ///
+    /// Symphonia's seek on a FLAC stream is a bisection of `seek` + `read`
+    /// calls, and the resume path calls `seek_to` on the audio thread itself.
+    /// The seek's wait loop checked for an error and for completion but not
+    /// for `abandoned`, so a seek into bytes nobody would fetch outlived every
+    /// attempt to give up on it.
+    #[test]
+    fn abandon_wakes_a_blocked_seek() {
+        let config = StreamingConfig {
+            initial_buffer_bytes: 4,
+            window_bytes: DEFAULT_WINDOW_BYTES,
+        };
+        // A range source whose writer is alive but serves nothing: the request
+        // the seek posts is never answered.
+        let (source, writer) = BufferedMediaSource::new_seekable(config, Some(1 << 20));
+        writer.push_chunk(b"head").unwrap();
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let mut reader_source = source.create_reader();
+        let seeker = thread::spawn(move || {
+            let _ = done_tx.send(reader_source.seek(SeekFrom::Start(512 * 1024)));
+        });
+        thread::sleep(Duration::from_millis(100));
+        assert!(
+            !seeker.is_finished(),
+            "the seek should still be waiting for its bytes at this point"
+        );
+
+        source.abandon();
+
+        let seek = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("abandon must wake the blocked seek — it is still waiting");
+        seeker.join().expect("the seeking thread must unwind");
+        assert!(seek.is_err(), "an abandoned seek did not land: {seek:?}");
+        drop(writer);
+    }
+
     /// The same wake, through the public door the audio thread uses.
     #[test]
     fn release_of_a_streaming_source_abandons_it() {
@@ -3064,7 +3203,7 @@ mod buffer_behaviour_tests {
         pace: Option<Duration>,
         log: Arc<FeedLog>,
     ) {
-        feed_until(writer, total, chunk, pace, log, false).await
+        feed_until(writer, total, chunk, pace, log, AfterWalk::Exit).await
     }
 
     /// [`feed`], but still up once the file has been walked, answering seeks
@@ -3078,7 +3217,33 @@ mod buffer_behaviour_tests {
         pace: Option<Duration>,
         log: Arc<FeedLog>,
     ) {
-        feed_until(writer, total, chunk, pace, log, true).await
+        feed_until(writer, total, chunk, pace, log, AfterWalk::ServeSeeks).await
+    }
+
+    /// [`feed_serving_seeks`] whose URL has EXPIRED by the time the first seek
+    /// after completion arrives, and which dies on it without a word to the
+    /// buffer — exactly what `download_and_stream_remote_track` did on the Pi:
+    /// its fail-guard is disarmed at completion, so the `410 Gone` it got for a
+    /// resume two hours after the pause was logged and nothing else.
+    async fn feed_until_the_url_expires(
+        writer: BufferWriter,
+        total: u64,
+        chunk: usize,
+        log: Arc<FeedLog>,
+    ) {
+        feed_until(writer, total, chunk, None, log, AfterWalk::DieOnNextRequest).await
+    }
+
+    /// What a scripted feeder does once it has walked the whole file.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum AfterWalk {
+        /// Return, the way a feeder with nothing left to serve does.
+        Exit,
+        /// Park on `wait_for_request` and serve every seek, as the real one does.
+        ServeSeeks,
+        /// Park on `wait_for_request`, then return without recording anything
+        /// when a request arrives.
+        DieOnNextRequest,
     }
 
     async fn feed_until(
@@ -3087,7 +3252,7 @@ mod buffer_behaviour_tests {
         chunk: usize,
         pace: Option<Duration>,
         log: Arc<FeedLog>,
-        serve_seeks: bool,
+        after_walk: AfterWalk,
     ) {
         let mut plan = writer.initial_plan();
         'bodies: loop {
@@ -3128,11 +3293,12 @@ mod buffer_behaviour_tests {
 
             match writer.next_plan() {
                 Some(next) => plan = next,
-                None if serve_seeks => match writer.wait_for_request().await {
+                None if after_walk == AfterWalk::Exit => return,
+                None => match writer.wait_for_request().await {
+                    Some(_) if after_walk == AfterWalk::DieOnNextRequest => return,
                     Some(next) => plan = next,
                     None => return,
                 },
-                None => return,
             }
         }
     }
@@ -3660,6 +3826,266 @@ mod buffer_behaviour_tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         feeder.abort();
+    }
+
+    /// A forward seek that lands just past a PARKED feeder's write head.
+    ///
+    /// `should_request` treats a target within `FORWARD_WAIT_BYTES` of the
+    /// write head as "on its way" and posts nothing, so the reader waits. But
+    /// the feeder is parked — the window is full measured from where the
+    /// reader last READ — and a wait moved nothing, so it stayed parked and the
+    /// bytes were never on their way at all. On the Pi the window is ~8 s of
+    /// audio and the band another 2 MB, so a seek some 8-19 s ahead of the
+    /// playhead hung the audio thread. Found by the fake-CDN tests in
+    /// `pibuz/src/qconnect/remote_stream.rs`, whose join-mid-file set-up is
+    /// exactly this shape.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_forward_seek_just_past_a_parked_feeder_lands() {
+        const TOTAL: u64 = 8 * MB as u64;
+        const WINDOW: usize = 512 * KB;
+        let log = Arc::new(FeedLog::default());
+        let (source, writer) = BufferedMediaSource::new_seekable(
+            StreamingConfig {
+                initial_buffer_bytes: 16 * KB,
+                window_bytes: WINDOW,
+            },
+            Some(TOTAL),
+        );
+        let source = Arc::new(source);
+        let mut reader = source.create_reader();
+        let feeder = tokio::spawn(feed(writer, TOTAL, 32 * KB, None, log.clone()));
+
+        let mut header = vec![0u8; 32 * KB];
+        let mut reader = tokio::task::spawn_blocking(move || {
+            reader.read_exact(&mut header).expect("read the header");
+            reader
+        })
+        .await
+        .expect("reader thread");
+        // Let the feeder fill the window and park.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while source.buffer_size() < WINDOW {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the window never filled"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let held = log.fetched();
+        assert!(
+            held < TOTAL / 2,
+            "the premise: the feeder parked ({held} bytes fetched)"
+        );
+
+        // Past the write head, inside the band `should_request` waits out.
+        let target = held + FORWARD_WAIT_BYTES / 2;
+        let landed = returns_within(5, move || {
+            reader.seek(SeekFrom::Start(target))?;
+            let mut buf = vec![0u8; 32 * KB];
+            reader.read_exact(&mut buf).map(|_| buf)
+        })
+        .expect("the seek is waiting for bytes a parked feeder will never send");
+        assert_eq!(
+            landed.expect("the seek lands"),
+            track_bytes(target, 32 * KB)
+        );
+        feeder.abort();
+    }
+
+    /// Run `f` on its own thread and give up on it after `secs`.
+    ///
+    /// For cases whose regression is a HANG: a `join` or an `await` would hang
+    /// the test binary instead of failing it. `None` means `f` never returned;
+    /// its thread is leaked, which is the lesser evil in a test process.
+    fn returns_within<T: Send + 'static>(
+        secs: u64,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> Option<T> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(Duration::from_secs(secs)).ok()
+    }
+
+    /// Walk a mid-file-joined stream to completion, as the Pi had by the time
+    /// it paused, and hand back the reader and the source.
+    async fn join_mid_file_and_complete(
+        feeder: impl FnOnce(BufferWriter, Arc<FeedLog>) -> tokio::task::JoinHandle<()>,
+        total: u64,
+        join_at: u64,
+    ) -> (
+        BufferedMediaSource,
+        Arc<BufferedMediaSource>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let log = Arc::new(FeedLog::default());
+        let (source, writer) = BufferedMediaSource::new_seekable(
+            StreamingConfig {
+                initial_buffer_bytes: 16 * KB,
+                window_bytes: 2 * MB,
+            },
+            Some(total),
+        );
+        let source = Arc::new(source);
+        let mut reader = source.create_reader();
+        let feeder = feeder(writer, log);
+        let reader = tokio::task::spawn_blocking(move || {
+            let mut header = vec![0u8; 32 * KB];
+            reader.read_exact(&mut header).expect("read the header");
+            reader
+                .seek(SeekFrom::Start(join_at))
+                .expect("join mid-file");
+            assert_eq!(drain_verifying(&mut reader, join_at), total - join_at);
+            reader
+        })
+        .await
+        .expect("reader thread");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !source.is_complete() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "feeder never completed"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        (reader, source, feeder)
+    }
+
+    /// THE PI, 2026-09-26. A cast joined mid-track, played to the pause, and
+    /// the feeder completed and stayed up to serve seeks. Two hours later the
+    /// resume seeked back into bytes the window had dropped; the feeder asked
+    /// the CDN with a signed URL that had expired, got `410 Gone`, and died
+    /// without telling the buffer. The seek waited on a condvar nothing would
+    /// ever notify — on the AUDIO THREAD, so every later command queued behind
+    /// it and the renderer took casts it could never play, for 18 hours:
+    ///
+    ///   15:26:03.190  Resume: complete stream holds no whole-file copy - seeking instead
+    ///   15:26:03.267  Streaming buffer: requesting range from byte 96456078
+    ///   15:26:03.314  Track 426803516 failed while streaming: ... 410 Gone
+    ///   (the audio thread never logs again)
+    ///
+    /// A feeder that is gone is a feeder that will not answer. The buffer has to
+    /// know that on its own, whatever the feeder remembered to say on the way
+    /// out, because a feeder that forgets is exactly the one that hangs it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_seek_into_a_feeder_that_died_after_completing_fails_instead_of_hanging() {
+        const TOTAL: u64 = 8 * MB as u64;
+        let (mut reader, _source, feeder) = join_mid_file_and_complete(
+            |writer, log| tokio::spawn(feed_until_the_url_expires(writer, TOTAL, 32 * KB, log)),
+            TOTAL,
+            6 * MB as u64,
+        )
+        .await;
+
+        let seek = returns_within(5, move || reader.seek(SeekFrom::Start(3 * MB as u64)))
+            .expect("the resume seek is still waiting on a feeder that has exited");
+        assert!(
+            seek.is_err(),
+            "no feeder is left to fetch those bytes, so the seek cannot succeed: {seek:?}"
+        );
+        feeder.await.expect("feeder task");
+    }
+
+    /// The same death, met by a READ. A decoder that has landed and is reading
+    /// forward runs off the end of what the window holds, asks, and waits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_read_waiting_on_a_feeder_that_died_after_completing_fails_instead_of_hanging() {
+        const TOTAL: u64 = 8 * MB as u64;
+        let (_reader, source, feeder) = join_mid_file_and_complete(
+            |writer, log| tokio::spawn(feed_until_the_url_expires(writer, TOTAL, 32 * KB, log)),
+            TOTAL,
+            6 * MB as u64,
+        )
+        .await;
+
+        // A decoder rebuilt over the buffer, the way a resume builds one: it
+        // reads the pinned header from memory and then reads on past it, into
+        // bytes the window dropped long ago.
+        let mut reader = source.create_reader();
+        let read = returns_within(5, move || {
+            let mut buf = vec![0u8; 2 * HEADER_PIN_BYTES as usize];
+            reader.read_exact(&mut buf)
+        })
+        .expect("the read is still waiting on a feeder that has exited");
+        assert!(read.is_err(), "{read:?}");
+        feeder.await.expect("feeder task");
+    }
+
+    /// A feeder aborted mid-body — the qconnect engine's `abort_current_feeder`,
+    /// a tokio shutdown, a panic in the task — drops its writer mid-download.
+    /// The real feeders arm a guard for that; this pins that the BUFFER copes
+    /// when one does not, and that it says so through `download_error`, which is
+    /// what every buffer-wait loop in the player polls to give up early.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reader_is_woken_with_an_error_when_its_feeder_is_dropped_mid_download() {
+        const TOTAL: u64 = 8 * MB as u64;
+        let log = Arc::new(FeedLog::default());
+        let (source, writer) = BufferedMediaSource::new_seekable(config(16 * KB), Some(TOTAL));
+        let source = Arc::new(source);
+        let mut reader = source.create_reader();
+        // One chunk, then a very long stall: the reader drains it and waits.
+        let feeder = tokio::spawn(feed(
+            writer,
+            TOTAL,
+            64 * KB,
+            Some(Duration::from_secs(3600)),
+            log.clone(),
+        ));
+        while log.fetched() == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done_tx.send(std::io::copy(&mut reader, &mut std::io::sink()));
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            done_rx.try_recv().is_err(),
+            "the premise: the reader is waiting for bytes the stalled feeder has not sent"
+        );
+
+        feeder.abort();
+        let read = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the reader is still waiting on a feeder that was dropped");
+        assert!(read.is_err(), "a short track is not EOF: {read:?}");
+        assert!(
+            source.download_error().is_some(),
+            "and the buffer-wait loops see it too, instead of sitting out their timeouts"
+        );
+    }
+
+    /// Completion followed by a feeder that simply goes away is ordinary — the
+    /// last reader left, or the feeder has nothing it can serve. That must not
+    /// poison what the buffer still holds: a reader inside the window keeps
+    /// reading it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_feeder_leaving_after_completion_leaves_held_bytes_readable() {
+        const TOTAL: u64 = 8 * MB as u64;
+        const JOIN_AT: u64 = 6 * MB as u64;
+        let (mut reader, source, feeder) = join_mid_file_and_complete(
+            |writer, log| tokio::spawn(feed(writer, TOTAL, 32 * KB, None, log)),
+            TOTAL,
+            JOIN_AT,
+        )
+        .await;
+        feeder.await.expect("feeder task");
+        assert!(source.download_error().is_none());
+
+        let tail = TOTAL - 64 * KB as u64;
+        let read = returns_within(5, move || {
+            reader.seek(SeekFrom::Start(tail))?;
+            let mut buf = vec![0u8; 32 * KB];
+            reader.read_exact(&mut buf).map(|_| buf)
+        })
+        .expect("a read of held bytes must not wait");
+        assert_eq!(
+            read.expect("held bytes stay readable"),
+            track_bytes(tail, 32 * KB)
+        );
     }
 
     // =========================================================================

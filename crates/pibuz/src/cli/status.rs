@@ -82,7 +82,11 @@ pub async fn status(host: Option<String>, json: bool, verbose: bool, roots: &Pro
     exit_from_state(&payload)
 }
 
-/// 5 configured device not present · else 0.
+/// 5 configured device not present · 6 audio thread stuck · else 0.
+///
+/// Exit 6 is for the monitors: a wedged audio thread plays nothing while every
+/// other field reads healthy, which is how a Pi took casts it could not play
+/// for 18 hours with a watchdog polling it the whole time.
 ///
 /// Exit 4 (`needs_auth`) is gone with the account path. It fired whenever the
 /// daemon had no Qobuz login — which, for a renderer that gets its credentials
@@ -99,6 +103,13 @@ fn exit_from_state(p: &Value) -> i32 {
         .unwrap_or(true);
     if configured && !present {
         return 5;
+    }
+    let stuck = p
+        .pointer("/audio/command_in_flight_ms")
+        .and_then(|v| v.as_u64())
+        .is_some_and(|ms| ms >= AUDIO_THREAD_STUCK_MS);
+    if stuck {
+        return 6;
     }
     0
 }
@@ -217,6 +228,30 @@ fn audio_section(b: &mut Block, p: &Value) {
         dev.push_str(" · open");
     }
     b.row("device", dev);
+
+    // Shown even without --verbose once it looks stuck: the audio thread takes
+    // one command at a time, so a wedged one means nothing plays however
+    // healthy every other line of this looks.
+    if let Some(ms) = p
+        .pointer("/audio/command_in_flight_ms")
+        .and_then(|v| v.as_u64())
+    {
+        let command = str_at(p, &["audio", "command_in_flight"]);
+        if ms >= AUDIO_THREAD_STUCK_MS {
+            b.row(
+                "thread",
+                format!(
+                    "STUCK in {command} for {} — nothing will play until the daemon restarts",
+                    fmt_uptime(ms / 1000)
+                ),
+            );
+        } else if ms >= 1000 {
+            b.row(
+                "thread",
+                format!("busy in {command} for {:.1} s", ms as f64 / 1000.0),
+            );
+        }
+    }
 
     // A named PCM is opened directly, but whatever its chain does next is
     // invisible from here — with CamillaDSP or an equalizer behind the name the
@@ -580,6 +615,10 @@ fn fmt_mmss(secs: u64) -> String {
     format!("{}:{:02}", secs / 60, secs % 60)
 }
 
+/// How long one audio-thread command may run before `status` calls it stuck.
+/// The longest legitimate wait is the initial stream buffer, bounded at 60 s.
+const AUDIO_THREAD_STUCK_MS: u64 = 90_000;
+
 fn fmt_uptime(secs: u64) -> String {
     let days = secs / 86_400;
     let hours = (secs % 86_400) / 3_600;
@@ -631,6 +670,33 @@ mod tests {
     #[test]
     fn healthy_status_exits_zero() {
         assert_eq!(exit_from_state(&healthy_payload()), 0);
+    }
+
+    /// The Pi, 2026-09-26: the audio thread sat in one Resume for 18 hours
+    /// while the driver ticked, the device read open and the session read
+    /// connected. The only field that tells is the command in flight, so it
+    /// has to reach both the exit code and the block without `--verbose`.
+    #[test]
+    fn a_stuck_audio_thread_exits_six_and_says_so() {
+        let mut p = healthy_payload();
+        p["audio"]["command_in_flight"] = serde_json::json!("Resume");
+        p["audio"]["command_in_flight_ms"] = serde_json::json!(18 * 3_600_000u64);
+        assert_eq!(exit_from_state(&p), 6);
+        let text = render(&p, "moode", false);
+        assert!(text.contains("STUCK in Resume for 18h"), "{text}");
+    }
+
+    /// A command that is merely slow — the initial buffer of a cold stream,
+    /// bounded at 60 s — is not a wedge.
+    #[test]
+    fn a_busy_audio_thread_is_not_stuck() {
+        let mut p = healthy_payload();
+        p["audio"]["command_in_flight"] = serde_json::json!("PlayStreaming");
+        p["audio"]["command_in_flight_ms"] = serde_json::json!(5_400);
+        assert_eq!(exit_from_state(&p), 0);
+        let text = render(&p, "moode", false);
+        assert!(!text.contains("STUCK"), "{text}");
+        assert!(text.contains("busy in PlayStreaming for 5.4 s"), "{text}");
     }
 
     #[test]

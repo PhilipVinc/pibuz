@@ -3,6 +3,55 @@
 Notable changes per release. Versions are plain semver; releases are `vX.Y.Z`
 tags on `main`.
 
+## Unreleased
+
+### Fixed
+
+- **A resume after a long pause no longer wedges the renderer until a
+  restart.** Pause a cast track for about two hours, press play, and the
+  daemon went silent for good: it kept accepting casts from every controller
+  and played none of them until the renderer was toggled. The stream's signed
+  URL had expired during the pause, and the CDN answered the resume's first
+  request with `410 Gone`. The feeder had already finished the download and
+  switched off its failure reporting, so it died without telling the buffer.
+  The resume's seek then waited for ever, on the audio thread, and every later
+  command queued behind it. 2.5.0 made this reachable: that is the release
+  that lets a finished stream be seeked into again.
+
+  Three layers now keep it from happening again:
+  - The buffer knows when its feeder has gone, however the feeder ends (a
+    return, an error, a panic, or being aborted), and fails the wait instead
+    of sleeping.
+  - Both feeders report every failure, including the ones after the download
+    completes.
+  - The Qobuz Connect feeder fetches a fresh URL when the old one has expired
+    (401/403/410) and carries on. It refuses a URL that now serves a file of a
+    different size, since splicing another file's bytes in would decode as
+    noise.
+
+  A resume now also prefers the track's copy in the disk cache when it is the
+  same file, so it needs no network at all, and a resume that fails says so
+  instead of leaving the controller spinning.
+
+- **A forward seek just past the downloaded part of a track no longer hangs.**
+  A seek landing up to 2 MB beyond what had been downloaded, which on a Pi is
+  roughly 8-19 s ahead of the playhead, waited for bytes the paused download
+  would never fetch. Found while writing tests for the fix above.
+
+- **A refused second start no longer destroys the running daemon's log.**
+  `pibuz run` rotated `qbz.log` before checking whether another daemon held the
+  lock. moOde starts the daemon twice in quick succession after a watchdog
+  restart, so the log of the run that had just failed was lost every time.
+
+### Added
+
+- **`/api/status` reports what the audio thread is doing.** The new
+  `audio.command_in_flight` and `audio.command_in_flight_ms` fields name the
+  command in progress and how long it has run. `pibuz status` shows a stuck
+  thread without `--verbose` and exits 6, and the daemon logs an error once a
+  single command has run for 90 s. Until now, a wedged audio thread looked
+  healthy in every field.
+
 ## 2.5.0 — 2026-09-26
 
 ### Changed

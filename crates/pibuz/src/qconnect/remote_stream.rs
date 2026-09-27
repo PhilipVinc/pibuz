@@ -21,9 +21,29 @@
 //! the audio backend (`pipewire_backend.rs`, `init_device`, `audio_settings.rs`)
 //! is untouched.
 
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use qbz_player::{BufferWriter, DiskTee, FetchPlan, Player, StreamSeekMode};
+
+/// Mints a fresh signed URL for the track a feeder is serving.
+///
+/// The CDN's URLs expire — on the Pi one was dead two hours after it was
+/// resolved — and a feeder outlives that easily: it stays up after completion
+/// to serve seeks, and a paused track keeps its feeder for as long as the
+/// pause lasts. Without this, the first request after the expiry is the end of
+/// the track.
+pub type UrlRefresher =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> + Send + Sync>;
+
+/// Statuses a signed CDN URL answers with once it has expired. `410` is what
+/// Qobuz's edge sent on the Pi; `401`/`403` are what token-auth edges send in
+/// general, and a refresh costs one API call if it turns out to be neither.
+fn means_the_url_expired(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 401 | 403 | 410)
+}
 
 /// Format/size facts sniffed from a remote audio URL before streaming.
 pub struct RemoteStreamInfo {
@@ -50,6 +70,7 @@ pub async fn stream_remote_track_into_player(
     duration_secs: u64,
     start_position_secs: u64,
     url: &str,
+    refresh_url: Option<UrlRefresher>,
     log_tag: &str,
 ) -> Result<tokio::task::JoinHandle<()>, String> {
     let stream_info = probe_remote_stream_info(url).await?;
@@ -89,12 +110,43 @@ pub async fn stream_remote_track_into_player(
         )
         .map_err(|err| format!("start streaming remote track {track_id}: {err}"))?;
 
-    let url = url.to_string();
-    let content_length = stream_info.content_length;
-    let log_tag = log_tag.to_string();
-    let feeder = tokio::spawn(async move {
+    Ok(spawn_remote_feeder(
+        url.to_string(),
+        refresh_url,
+        writer,
+        track_id,
+        stream_info.content_length,
+        log_tag.to_string(),
+        disk_cache,
+    ))
+}
+
+/// Run [`download_and_stream_remote_track`] as a task, and make sure the
+/// buffer hears how it ended.
+///
+/// Every failure is recorded on the buffer here, at the one place they all
+/// pass through, rather than on each exit path inside: the feeder's own
+/// fail-guard is disarmed once the file has been walked, so the errors it
+/// meets while staying up to serve seeks used to be logged and nothing else.
+/// On the Pi that was a `410 Gone` for a resume's range request, and a seek
+/// that waited for ever on the audio thread. (The buffer now also notices the
+/// feeder going away on its own — `FeederAlive` in `streaming_source.rs` — so
+/// this is for the log line the player prints, which should name the CDN's
+/// answer rather than "the feeder stopped".)
+fn spawn_remote_feeder(
+    url: String,
+    refresh_url: Option<UrlRefresher>,
+    writer: BufferWriter,
+    track_id: u64,
+    content_length: u64,
+    log_tag: String,
+    disk_cache: Option<std::sync::Arc<qbz_player::PlaybackCache>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let errors = writer.clone();
         if let Err(err) = download_and_stream_remote_track(
             &url,
+            refresh_url,
             writer,
             track_id,
             content_length,
@@ -103,6 +155,9 @@ pub async fn stream_remote_track_into_player(
         )
         .await
         {
+            // The first recorded error wins, so a specific one recorded inside
+            // is kept over this.
+            let _ = errors.error(err.clone());
             log::error!(
                 "[{}/STREAMING] Track {} failed while streaming: {}",
                 log_tag,
@@ -110,9 +165,7 @@ pub async fn stream_remote_track_into_player(
                 err
             );
         }
-    });
-
-    Ok(feeder)
+    })
 }
 
 /// One small `Range: bytes=0-65535` GET that answers everything the streaming
@@ -333,6 +386,7 @@ enum BodyEnd {
 #[allow(clippy::too_many_arguments)]
 pub async fn download_and_stream_remote_track(
     url: &str,
+    refresh_url: Option<UrlRefresher>,
     writer: BufferWriter,
     track_id: u64,
     content_length: u64,
@@ -382,9 +436,14 @@ pub async fn download_and_stream_remote_track(
     // one is a hiccup worth re-opening for; a streak means the offset is
     // not being served and we would spin forever.
     let mut barren_bodies = 0u32;
+    // The signed URL, which a refresh replaces. See `UrlRefresher`.
+    let mut url = url.to_string();
+    // Whether the URL has been refreshed since a body last delivered anything.
+    // One refresh per expiry: a fresh URL that is refused too is not expiry.
+    let mut refreshed_since_progress = false;
 
     'plans: loop {
-        let mut request = client.get(url).header("User-Agent", "Mozilla/5.0");
+        let mut request = client.get(&url).header("User-Agent", "Mozilla/5.0");
         if !plan.is_whole_file() {
             request = request.header("Range", plan.range_header());
         }
@@ -398,11 +457,41 @@ pub async fn download_and_stream_remote_track(
         })?;
         let opened_ms = sent.elapsed().as_millis();
 
-        if !response.status().is_success() {
+        let status = response.status();
+        if means_the_url_expired(status) && !refreshed_since_progress {
+            if let Some(refresh) = refresh_url.as_ref() {
+                log::warn!(
+                    "[{}/STREAMING] Track {} got {} for {} - the signed URL has expired, re-resolving it",
+                    log_tag,
+                    track_id,
+                    status,
+                    plan.range_header()
+                );
+                url = refresh().await.map_err(|err| {
+                    format!("the stream URL expired ({status}) and re-resolving it failed: {err}")
+                })?;
+                refreshed_since_progress = true;
+                continue 'plans;
+            }
+        }
+        if !status.is_success() {
             return Err(format!(
-                "remote streaming request failed with status {}",
-                response.status()
+                "remote streaming request failed with status {status}"
             ));
+        }
+
+        // Every byte offset this buffer holds and every range it asks for is
+        // an offset into ONE file. A URL that answers for a different one —
+        // a refresh that resolved another format after a rights change, say —
+        // would splice its bytes in at offsets they do not belong to, and that
+        // decodes as noise rather than failing. Refuse it instead.
+        if let Some(total) = total_length_from(status, response.headers()) {
+            if content_length > 0 && total != content_length {
+                return Err(format!(
+                    "the stream URL now serves a {total}-byte file where the track was \
+                     {content_length} bytes; refusing to splice a different file in"
+                ));
+            }
         }
 
         // Only a 206 actually starts where we asked. Anything else is the
@@ -560,6 +649,7 @@ pub async fn download_and_stream_remote_track(
 
         if body_bytes > 0 {
             barren_bodies = 0;
+            refreshed_since_progress = false;
         } else {
             barren_bodies += 1;
         }
@@ -788,5 +878,310 @@ mod tests {
     #[test]
     fn a_response_with_neither_header_is_none() {
         assert_eq!(total_length_from(StatusCode::OK, &HeaderMap::new()), None);
+    }
+}
+
+/// The REAL feeder against a CDN in miniature.
+///
+/// `buffer_behaviour_tests` in `streaming_source.rs` drives the buffer with a
+/// scripted stand-in for this feeder, which is what lets it vary rates freely —
+/// and what let this feeder's own exit paths go untested: the stand-in cannot
+/// die the way the real one did on the Pi, because it is not the real one.
+/// These run `spawn_remote_feeder` itself over a loopback socket, so the
+/// statuses, the refresh and the error recording are the production code's.
+///
+/// The server speaks just enough HTTP/1.1: one request per connection,
+/// `Range: bytes=a-` / `bytes=a-b`, `206` with `Content-Range`, and `410 Gone`
+/// for a path that has been expired. File bytes follow `byte_at`, so a read can
+/// prove it got the right bytes at the right offset.
+#[cfg(test)]
+mod feeder_tests {
+    use super::*;
+    use qbz_player::{BufferedMediaSource, StreamingConfig};
+    use std::collections::HashMap;
+    use std::io::{Read, Seek, SeekFrom};
+    use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * 1024;
+
+    fn byte_at(offset: u64) -> u8 {
+        (offset % 251) as u8
+    }
+
+    #[derive(Clone, Copy)]
+    struct FakeFile {
+        len: u64,
+        expired: bool,
+    }
+
+    #[derive(Clone)]
+    struct FakeCdn {
+        base: String,
+        files: Arc<Mutex<HashMap<String, FakeFile>>>,
+        /// Paths requested, in order.
+        requests: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl FakeCdn {
+        async fn start() -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let cdn = FakeCdn {
+                base: format!("http://{}", listener.local_addr().unwrap()),
+                files: Arc::new(Mutex::new(HashMap::new())),
+                requests: Arc::new(Mutex::new(Vec::new())),
+            };
+            let served = cdn.clone();
+            tokio::spawn(async move {
+                while let Ok((conn, _)) = listener.accept().await {
+                    tokio::spawn(served.clone().answer(conn));
+                }
+            });
+            cdn
+        }
+
+        fn serve(&self, path: &str, len: u64) -> String {
+            self.files.lock().unwrap().insert(
+                path.to_string(),
+                FakeFile {
+                    len,
+                    expired: false,
+                },
+            );
+            format!("{}{}", self.base, path)
+        }
+
+        fn expire(&self, path: &str) {
+            self.files.lock().unwrap().get_mut(path).unwrap().expired = true;
+        }
+
+        fn requested(&self, path: &str) -> bool {
+            self.requests.lock().unwrap().iter().any(|p| p == path)
+        }
+
+        async fn answer(self, mut conn: tokio::net::TcpStream) {
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                if conn.read(&mut byte).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                head.push(byte[0]);
+            }
+            let head = String::from_utf8_lossy(&head).to_string();
+            let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+            self.requests.lock().unwrap().push(path.clone());
+            let range = head.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("range")
+                    .then(|| value.trim().trim_start_matches("bytes=").to_string())
+            });
+
+            let file = self.files.lock().unwrap().get(&path).copied();
+            let Some(file) = file.filter(|f| !f.expired) else {
+                let _ = conn
+                    .write_all(
+                        b"HTTP/1.1 410 Gone\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                return;
+            };
+            let (start, end) = match range.as_deref().and_then(|r| r.split_once('-')) {
+                Some((a, b)) => (
+                    a.parse::<u64>().unwrap(),
+                    b.parse::<u64>()
+                        .map(|b| b + 1)
+                        .unwrap_or(file.len)
+                        .min(file.len),
+                ),
+                None => (0, file.len),
+            };
+            let status = if range.is_some() {
+                format!(
+                    "206 Partial Content\r\nContent-Range: bytes {}-{}/{}",
+                    start,
+                    end - 1,
+                    file.len
+                )
+            } else {
+                "200 OK".to_string()
+            };
+            let header = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                end - start
+            );
+            if conn.write_all(header.as_bytes()).await.is_err() {
+                return;
+            }
+            let mut at = start;
+            while at < end {
+                let n = (16 * KB).min(end - at);
+                let chunk: Vec<u8> = (at..at + n).map(byte_at).collect();
+                // A feeder that parks stops reading; the write blocks, exactly
+                // as TCP back-pressure holds the real CDN. A dropped body
+                // errors it and ends this task.
+                if conn.write_all(&chunk).await.is_err() {
+                    return;
+                }
+                at += n;
+            }
+        }
+    }
+
+    /// Run `f` on its own thread and give up after `secs` — the regression
+    /// these guard against is a HANG, which a join would turn into a hung
+    /// test binary rather than a failure.
+    fn returns_within<T: Send + 'static>(
+        secs: u64,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> Option<T> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(Duration::from_secs(secs)).ok()
+    }
+
+    /// The Pi's session up to the pause: a cast joined mid-track, the feeder
+    /// walked the rest of the file into a window far smaller than it, and
+    /// completed. Hands back the reader, parked at EOF, and the source.
+    async fn joined_mid_track_and_completed(
+        url: String,
+        len: u64,
+        refresh: Option<UrlRefresher>,
+    ) -> (BufferedMediaSource, Arc<BufferedMediaSource>) {
+        qbz_app::ensure_crypto_provider();
+        let (source, writer) = BufferedMediaSource::new_seekable(
+            StreamingConfig {
+                initial_buffer_bytes: 16 * KB as usize,
+                window_bytes: 512 * KB as usize,
+            },
+            Some(len),
+        );
+        let source = Arc::new(source);
+        let mut reader = source.create_reader();
+        spawn_remote_feeder(url, refresh, writer, 1, len, "test".into(), None);
+
+        let join_at = len / 2;
+        let reader = tokio::task::spawn_blocking(move || {
+            let mut header = vec![0u8; 32 * KB as usize];
+            reader.read_exact(&mut header).expect("read the header");
+            reader
+                .seek(SeekFrom::Start(join_at))
+                .expect("join mid-track");
+            let mut rest = Vec::new();
+            reader.read_to_end(&mut rest).expect("play to the end");
+            assert_eq!(rest.len() as u64, len - join_at);
+            assert!(rest
+                .iter()
+                .enumerate()
+                .all(|(i, b)| *b == byte_at(join_at + i as u64)));
+            reader
+        })
+        .await
+        .expect("reader thread");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !source.is_complete() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the feeder never completed"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        (reader, source)
+    }
+
+    /// THE PI, 2026-09-26: paused, the URL expired, the resume seeked back into
+    /// bytes the window had dropped, and the CDN answered `410 Gone` — to a
+    /// feeder whose fail-guard was already disarmed. The seek waited for ever,
+    /// on the audio thread. With nothing to re-resolve the URL, the seek must
+    /// FAIL, and say why.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_resume_after_the_url_expired_fails_with_the_cdns_answer_instead_of_hanging() {
+        let cdn = FakeCdn::start().await;
+        let url = cdn.serve("/track", 4 * MB);
+        let (mut reader, _source) = joined_mid_track_and_completed(url, 4 * MB, None).await;
+
+        cdn.expire("/track");
+        let seek = returns_within(10, move || reader.seek(SeekFrom::Start(MB)))
+            .expect("the resume seek is still waiting on a feeder the CDN turned away");
+        let err = seek.expect_err("the CDN refused the bytes, so the seek cannot land");
+        assert!(
+            err.to_string().contains("410"),
+            "the error names the CDN's answer: {err}"
+        );
+    }
+
+    /// The same expiry, with the refresher the qconnect engine passes: the
+    /// feeder re-resolves the URL and the resume simply lands.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_resume_after_the_url_expired_re_resolves_it_and_lands() {
+        let cdn = FakeCdn::start().await;
+        let url = cdn.serve("/signed-at-13h29", 4 * MB);
+        let fresh = cdn.serve("/signed-at-15h26", 4 * MB);
+        let refresh: UrlRefresher = Arc::new(move || {
+            let fresh = fresh.clone();
+            Box::pin(async move { Ok(fresh) })
+        });
+        let (mut reader, _source) =
+            joined_mid_track_and_completed(url, 4 * MB, Some(refresh)).await;
+
+        cdn.expire("/signed-at-13h29");
+        let landed = returns_within(10, move || {
+            reader.seek(SeekFrom::Start(MB))?;
+            let mut buf = vec![0u8; 32 * KB as usize];
+            reader.read_exact(&mut buf).map(|_| buf)
+        })
+        .expect("the resume seek is still waiting");
+        let buf = landed.expect("a re-resolved URL serves the resume");
+        assert!(
+            buf.iter()
+                .enumerate()
+                .all(|(i, b)| *b == byte_at(MB + i as u64)),
+            "and the bytes are the track's, at the resume offset"
+        );
+        assert!(cdn.requested("/signed-at-15h26"));
+    }
+
+    /// A refresh that comes back with a DIFFERENT file — another format after a
+    /// rights change, say — must not be spliced in: its bytes at the buffer's
+    /// offsets would decode as noise, not fail. The resume fails instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_re_resolved_url_for_a_different_file_is_refused() {
+        let cdn = FakeCdn::start().await;
+        let url = cdn.serve("/hires", 4 * MB);
+        let other = cdn.serve("/cd-quality", 3 * MB);
+        let refresh: UrlRefresher = Arc::new(move || {
+            let other = other.clone();
+            Box::pin(async move { Ok(other) })
+        });
+        let (mut reader, _source) =
+            joined_mid_track_and_completed(url, 4 * MB, Some(refresh)).await;
+
+        cdn.expire("/hires");
+        let seek = returns_within(10, move || reader.seek(SeekFrom::Start(MB)))
+            .expect("the resume seek is still waiting");
+        let err = seek.expect_err("a different file must not be served");
+        assert!(err.to_string().contains("refusing"), "{err}");
+    }
+
+    /// A refresher that fails leaves the resume failing with ITS reason, not
+    /// hanging and not retrying for ever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_re_resolve_fails_the_resume_with_its_reason() {
+        let cdn = FakeCdn::start().await;
+        let url = cdn.serve("/track", 4 * MB);
+        let refresh: UrlRefresher =
+            Arc::new(|| Box::pin(async { Err("the API is down".to_string()) }));
+        let (mut reader, _source) =
+            joined_mid_track_and_completed(url, 4 * MB, Some(refresh)).await;
+
+        cdn.expire("/track");
+        let seek = returns_within(10, move || reader.seek(SeekFrom::Start(MB)))
+            .expect("the resume seek is still waiting");
+        let err = seek.expect_err("nothing can serve the bytes");
+        assert!(err.to_string().contains("the API is down"), "{err}");
     }
 }
