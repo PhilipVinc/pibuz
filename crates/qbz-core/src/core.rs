@@ -392,12 +392,34 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
         quality: Quality,
         start_position_secs: u64,
     ) -> Result<(), String> {
+        // A CMAF feeder keeps its signed URL template for as long as a pause
+        // lasts, and outlives it; this is how it gets a fresh one. It re-runs
+        // the whole setup — the key comes with the template — and the feeder
+        // refuses the result unless its segment table matches.
+        let client_slot = Arc::clone(&self.client);
+        let refresh: qbz_player::CmafRefresher = Arc::new(move || {
+            let client_slot = Arc::clone(&client_slot);
+            Box::pin(async move {
+                let guard = client_slot.read().await;
+                let client = guard
+                    .as_ref()
+                    .ok_or_else(|| "No Qobuz client available".to_string())?;
+                qbz_qobuz::cmaf::setup_streaming(client, track_id, quality).await
+            })
+        });
+
         let guard = self.client.read().await;
         let client = guard
             .as_ref()
             .ok_or_else(|| "No Qobuz client available".to_string())?;
         self.player
-            .play_track(client, track_id, quality, start_position_secs)
+            .play_track(
+                client,
+                track_id,
+                quality,
+                start_position_secs,
+                Some(refresh),
+            )
             .await
     }
 

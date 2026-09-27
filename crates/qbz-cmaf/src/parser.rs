@@ -9,7 +9,7 @@ const QBZ_SEGMENT_UUID: [u8; 16] = [
 const FLAC_MAGIC: &[u8; 4] = b"fLaC";
 
 /// Info about one segment from the init segment's segment table.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentTableEntry {
     /// Byte size of this segment's decrypted FLAC frame data.
     pub byte_len: u32,

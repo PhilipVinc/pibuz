@@ -43,6 +43,12 @@ rodio = { version = "0.22", features = ["symphonia-all"] }
 
 # HTTP client for streaming
 reqwest = { workspace = true }
+# The body type of a CMAF segment fetch (`cmaf_fetch`); already in the tree via reqwest.
+bytes = "1"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# The CDN client needs a process-level CryptoProvider; `cmaf_fetch` tests build one.
+rustls = { version = "0.23", features = ["aws_lc_rs"] }

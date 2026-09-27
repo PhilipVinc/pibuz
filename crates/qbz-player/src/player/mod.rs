@@ -10,10 +10,12 @@
 //! Uses a dedicated audio thread since rodio's OutputStream is not Send.
 //! Supports both rodio (PipeWire/Pulse) and direct ALSA (hw: devices).
 
+mod cmaf_fetch;
 mod disk_tee;
 mod playback_engine;
 mod streaming_source;
 
+pub use cmaf_fetch::CmafRefresher;
 pub use disk_tee::DiskTee;
 pub use streaming_source::{
     max_initial_buffer_bytes, set_max_initial_buffer_bytes, BufferWriter, BufferedMediaSource,
@@ -3401,6 +3403,12 @@ impl Player {
                             let mut resumed_by_seek = false;
                             if ranged_resume {
                                 let seek_start = Instant::now();
+                                // A skip or stop while this waits on the network
+                                // gets through instead of queueing behind it.
+                                let _interrupt = source.interrupt_when_superseded(
+                                    Arc::clone(&thread_state.play_generation),
+                                    play_gen,
+                                );
                                 match incremental_source
                                     .seek_to(Duration::from_secs(start_position_secs))
                                 {
@@ -3413,6 +3421,13 @@ impl Player {
                                             source.primary_offset(),
                                             source.buffer_size()
                                         );
+                                    }
+                                    Err(_) if !thread_state.is_current_play(play_gen) => {
+                                        log::info!(
+                                            "Streaming: play of track {} superseded during the resume seek",
+                                            track_id
+                                        );
+                                        return;
                                     }
                                     Err(e) => {
                                         // No usable seek table, or the request
@@ -3868,10 +3883,21 @@ impl Player {
                                                     return;
                                                 }
                                             };
+                                            let resume_gen = thread_state.current_play_generation();
+                                            let _interrupt = buffer.interrupt_when_superseded(
+                                                Arc::clone(&thread_state.play_generation),
+                                                resume_gen,
+                                            );
                                             if resume_pos > 0 {
                                                 if let Err(e) =
                                                     source.seek_to(Duration::from_secs(resume_pos))
                                                 {
+                                                    if !thread_state.is_current_play(resume_gen) {
+                                                        log::info!(
+                                                            "Resume: superseded by a newer play during the seek"
+                                                        );
+                                                        return;
+                                                    }
                                                     // The feeder is dead or the CDN
                                                     // refused the bytes: this source
                                                     // cannot play again, so do not
@@ -4203,7 +4229,19 @@ impl Player {
                             {
                                 match IncrementalStreamingSource::new(stream_src.clone()) {
                                     Ok(mut s) => {
+                                        let seek_gen = thread_state.current_play_generation();
+                                        let _interrupt = stream_src.interrupt_when_superseded(
+                                            Arc::clone(&thread_state.play_generation),
+                                            seek_gen,
+                                        );
                                         if let Err(e) = s.seek_to(skip_duration) {
+                                            if !thread_state.is_current_play(seek_gen) {
+                                                log::info!(
+                                                    "Audio thread: seek to {}s superseded by a newer play",
+                                                    position_secs
+                                                );
+                                                return;
+                                            }
                                             seek_abort(
                                                 &thread_state,
                                                 &format!("streaming native seek failed: {e}"),
@@ -5490,6 +5528,7 @@ impl Player {
         track_id: u64,
         quality: Quality,
         start_position_secs: u64,
+        refresh: Option<cmaf_fetch::CmafRefresher>,
     ) -> Result<(), String> {
         // Supersede any earlier in-flight play_track for a different intent.
         let gen = self.begin_play();
@@ -5617,8 +5656,11 @@ impl Player {
 
                 // Spawn the background task that fetches + decrypts + pushes
                 // audio segments to the buffer.
-                let url_template = cmaf_info.url_template.clone();
-                let content_key = cmaf_info.content_key;
+                let cmaf_source = cmaf_fetch::CmafSource {
+                    url_template: cmaf_info.url_template.clone(),
+                    content_key: cmaf_info.content_key,
+                    segment_table: cmaf_info.segment_table.clone(),
+                };
                 let flac_header = cmaf_info.flac_header;
                 let n_segments = cmaf_info.n_segments;
                 // The L2 cache to stage this track into as it streams, if
@@ -5637,9 +5679,9 @@ impl Player {
                     // its own too (`FeederAlive`); this is for the reason.
                     let errors = buffer_writer.clone();
                     match Self::cmaf_stream_segments(
-                        &url_template,
+                        cmaf_source,
+                        refresh,
                         n_segments,
-                        content_key,
                         flac_header,
                         map,
                         buffer_writer,
@@ -6180,10 +6222,11 @@ impl Player {
     /// * The track is no longer resident at the end, so it cannot be handed to
     ///   the in-memory cache from the buffer. It is staged to L2 as it goes
     ///   past instead, which is what [`DiskTee`] is for.
+    #[allow(clippy::too_many_arguments)] // one feeder's whole context; a struct would only rename it
     async fn cmaf_stream_segments(
-        url_template: &str,
+        mut source: cmaf_fetch::CmafSource,
+        refresh: Option<cmaf_fetch::CmafRefresher>,
         n_segments: u8,
-        content_key: [u8; 16],
         flac_header: Vec<u8>,
         map: qbz_cmaf::SegmentMap,
         writer: BufferWriter,
@@ -6286,16 +6329,16 @@ impl Player {
                     continue 'plans;
                 }
 
-                let seg_url = url_template.replace("$SEGMENT$", &seg.to_string());
-                let seg_data = client
-                    .get(&seg_url)
-                    .header("User-Agent", "Mozilla/5.0")
-                    .send()
-                    .await
-                    .map_err(|e| format!("CMAF segment {} fetch: {}", seg, e))?
-                    .bytes()
-                    .await
-                    .map_err(|e| format!("CMAF segment {} read: {}", seg, e))?;
+                // Status-checked, retried in transit, and renewed on expiry:
+                // see `cmaf_fetch`.
+                let seg_data = cmaf_fetch::fetch_cmaf_segment(
+                    client,
+                    &mut source,
+                    seg,
+                    refresh.as_ref(),
+                    track_id,
+                )
+                .await?;
 
                 // Decrypt the whole segment into the scratch buffer in one
                 // pass: one copy instead of three, zero per-frame allocations.
@@ -6303,7 +6346,7 @@ impl Player {
                 if let Err(e) = qbz_qobuz::cmaf::decrypt_segment_into(
                     &seg_data,
                     seg,
-                    &content_key,
+                    &source.content_key,
                     &mut scratch,
                 ) {
                     let msg = format!("CMAF segment {} decrypt: {e}", seg);

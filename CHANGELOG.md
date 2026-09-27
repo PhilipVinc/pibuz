@@ -33,6 +33,26 @@ tags on `main`.
   same file, so it needs no network at all, and a resume that fails says so
   instead of leaving the controller spinning.
 
+- **The CMAF path gets the same treatment.** A segment fetch now:
+  - checks the status. An error page used to be handed to the decryptor and
+    fail there, with an error that named the decryptor;
+  - retries failures in transit;
+  - renews an expired URL by re-running the stream setup. The new URL is used
+    only if its segment table is identical, since that table is the byte
+    index every buffered offset rests on.
+
+- **A brief network failure no longer ends the track.** A connection that
+  fails or drops before answering, or an edge returning 500/502/503/504, is
+  retried three times (after 0.5 s, 1.5 s and 4 s) before the feeder gives up
+  with the reason. It used to give up on the first failure, at a seek, at a
+  resume, or when re-opening a body the CDN had closed during a pause.
+
+- **Skip and stop get through while a seek waits on the network.** A seek the
+  audio thread runs (a resume, a seek, a cast joined mid-track) gives up as
+  soon as a newer play or a stop arrives, instead of holding every command
+  behind it through retries and renewals. The track still playing is left
+  alone until the new command stops it.
+
 - **A forward seek just past the downloaded part of a track no longer hangs.**
   A seek landing up to 2 MB beyond what had been downloaded, which on a Pi is
   roughly 8-19 s ahead of the playhead, waited for bytes the paused download

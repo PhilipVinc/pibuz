@@ -45,6 +45,29 @@ fn means_the_url_expired(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 401 | 403 | 410)
 }
 
+/// Statuses an edge answers with when it is struggling rather than refusing.
+fn is_transient_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 500 | 502 | 503 | 504)
+}
+
+/// How long the feeder waits before each retry of a request that failed in
+/// transit — no connection, a connection dropped before the response, a
+/// 5xx — and so how many retries it makes before giving up on the track.
+///
+/// The feeder used to give up on the FIRST one. That was the end of the track
+/// for a WiFi blip at the wrong moment: at a seek, at a resume, or when a body
+/// the CDN closed during a long pause was re-opened. Short in tests, which
+/// only care how many.
+const TRANSIENT_RETRY_DELAYS: [Duration; 3] = if cfg!(test) {
+    [Duration::from_millis(10); 3]
+} else {
+    [
+        Duration::from_millis(500),
+        Duration::from_millis(1500),
+        Duration::from_secs(4),
+    ]
+};
+
 /// Format/size facts sniffed from a remote audio URL before streaming.
 pub struct RemoteStreamInfo {
     pub content_length: u64,
@@ -441,6 +464,8 @@ pub async fn download_and_stream_remote_track(
     // Whether the URL has been refreshed since a body last delivered anything.
     // One refresh per expiry: a fresh URL that is refused too is not expiry.
     let mut refreshed_since_progress = false;
+    // Requests in a row that failed in transit. See `TRANSIENT_RETRY_DELAYS`.
+    let mut transient_failures = 0usize;
 
     'plans: loop {
         let mut request = client.get(&url).header("User-Agent", "Mozilla/5.0");
@@ -449,12 +474,44 @@ pub async fn download_and_stream_remote_track(
         }
 
         let sent = Instant::now();
-        let response = request.send().await.map_err(|err| {
-            format!(
-                "start remote streaming request failed: {}",
-                describe_reqwest_error(&err)
-            )
-        })?;
+        let response = match request.send().await {
+            Ok(response) if !is_transient_status(response.status()) => response,
+            outcome => {
+                let why = match outcome {
+                    Ok(response) => format!("status {}", response.status()),
+                    Err(err) => describe_reqwest_error(&err),
+                };
+                // A header flood fails the same way every time; the engine
+                // has its own fallback for it, and waiting would only delay it.
+                let delay = TRANSIENT_RETRY_DELAYS
+                    .get(transient_failures)
+                    .filter(|_| !is_header_flood_error(&why));
+                let Some(delay) = delay else {
+                    return Err(format!(
+                        "start remote streaming request failed after {} attempt(s): {why}",
+                        transient_failures + 1
+                    ));
+                };
+                transient_failures += 1;
+                log::warn!(
+                    "[{}/STREAMING] Track {} request for {} failed ({}) - retry {} of {} in {} ms",
+                    log_tag,
+                    track_id,
+                    plan.range_header(),
+                    why,
+                    transient_failures,
+                    TRANSIENT_RETRY_DELAYS.len(),
+                    delay.as_millis()
+                );
+                tokio::time::sleep(*delay).await;
+                // A reader that jumped while we waited wins, as it always does.
+                if let Some(next) = writer.take_request() {
+                    plan = next;
+                }
+                continue 'plans;
+            }
+        };
+        transient_failures = 0;
         let opened_ms = sent.elapsed().as_millis();
 
         let status = response.status();
@@ -916,10 +973,20 @@ mod feeder_tests {
         expired: bool,
     }
 
+    /// A failure the fake CDN serves to the next request, in place of the file.
+    #[derive(Clone, Copy)]
+    enum Outage {
+        /// Close the connection without answering: a WiFi blip mid-request.
+        Hangup,
+        /// Answer with this status and no body: a struggling edge.
+        Status(u16),
+    }
+
     #[derive(Clone)]
     struct FakeCdn {
         base: String,
         files: Arc<Mutex<HashMap<String, FakeFile>>>,
+        outages: Arc<Mutex<std::collections::VecDeque<Outage>>>,
         /// Paths requested, in order.
         requests: Arc<Mutex<Vec<String>>>,
     }
@@ -930,6 +997,7 @@ mod feeder_tests {
             let cdn = FakeCdn {
                 base: format!("http://{}", listener.local_addr().unwrap()),
                 files: Arc::new(Mutex::new(HashMap::new())),
+                outages: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 requests: Arc::new(Mutex::new(Vec::new())),
             };
             let served = cdn.clone();
@@ -956,6 +1024,11 @@ mod feeder_tests {
             self.files.lock().unwrap().get_mut(path).unwrap().expired = true;
         }
 
+        /// Serve `outages`, in order, to the next requests.
+        fn fail_next(&self, outages: &[Outage]) {
+            self.outages.lock().unwrap().extend(outages.iter().copied());
+        }
+
         fn requested(&self, path: &str) -> bool {
             self.requests.lock().unwrap().iter().any(|p| p == path)
         }
@@ -978,6 +1051,22 @@ mod feeder_tests {
                     .then(|| value.trim().trim_start_matches("bytes=").to_string())
             });
 
+            let outage = self.outages.lock().unwrap().pop_front();
+            match outage {
+                Some(Outage::Hangup) => return,
+                Some(Outage::Status(code)) => {
+                    let _ = conn
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 {code} Outage\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                    return;
+                }
+                None => {}
+            }
             let file = self.files.lock().unwrap().get(&path).copied();
             let Some(file) = file.filter(|f| !f.expired) else {
                 let _ = conn
@@ -1183,5 +1272,53 @@ mod feeder_tests {
             .expect("the resume seek is still waiting");
         let err = seek.expect_err("nothing can serve the bytes");
         assert!(err.to_string().contains("the API is down"), "{err}");
+    }
+
+    /// A blip at the moment of a resume — the connection dropped, then an edge
+    /// answering 503 — is ridden out: the seek lands on the right bytes. It
+    /// used to be the end of the track at the first failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_resume_rides_out_a_brief_outage() {
+        let cdn = FakeCdn::start().await;
+        let url = cdn.serve("/track", 4 * MB);
+        let (mut reader, _source) = joined_mid_track_and_completed(url, 4 * MB, None).await;
+
+        cdn.fail_next(&[Outage::Hangup, Outage::Status(503)]);
+        let landed = returns_within(10, move || {
+            reader.seek(SeekFrom::Start(MB))?;
+            let mut buf = vec![0u8; 32 * KB as usize];
+            reader.read_exact(&mut buf).map(|_| buf)
+        })
+        .expect("the resume seek is still waiting");
+        let buf = landed.expect("two failures in transit are retried, not fatal");
+        assert!(buf
+            .iter()
+            .enumerate()
+            .all(|(i, b)| *b == byte_at(MB + i as u64)));
+    }
+
+    /// An outage that does not end is given up on — after a bounded number of
+    /// tries, with the reason — rather than retried for ever with the audio
+    /// thread waiting on it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_resume_through_a_lasting_outage_fails_after_bounded_retries() {
+        let cdn = FakeCdn::start().await;
+        let url = cdn.serve("/track", 4 * MB);
+        let (mut reader, _source) = joined_mid_track_and_completed(url, 4 * MB, None).await;
+
+        cdn.fail_next(&[Outage::Status(502); 16]);
+        let seek = returns_within(10, move || reader.seek(SeekFrom::Start(MB)))
+            .expect("the resume seek is still waiting on an outage that never ends");
+        let err = seek.expect_err("nothing can serve the bytes");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("after 4 attempt(s)") && msg.contains("502"),
+            "{msg}"
+        );
+        assert!(
+            cdn.outages.lock().unwrap().len() == 12,
+            "exactly one try plus {} retries",
+            TRANSIENT_RETRY_DELAYS.len()
+        );
     }
 }

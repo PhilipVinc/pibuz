@@ -341,6 +341,9 @@ struct BufferState {
     /// Set by [`FeederAlive`], whatever the feeder did or forgot to do on the
     /// way out — see there.
     feeder_gone: bool,
+    /// Armed by [`BufferedMediaSource::interrupt_when_superseded`]: the reader
+    /// whose waits should give up once `generation` moves past `expected`.
+    interrupt: Option<Interrupt>,
     /// Total expected size (from Content-Length), if known
     total_size: Option<u64>,
     /// Where playback reads from: 0 normally, the seek target after a range
@@ -694,6 +697,43 @@ fn take_unsatisfied(state: &mut BufferState) -> Option<u64> {
     state.segment_at(offset).is_none().then_some(offset)
 }
 
+/// See [`BufferedMediaSource::interrupt_when_superseded`].
+struct Interrupt {
+    reader: u64,
+    generation: Arc<AtomicU64>,
+    expected: u64,
+}
+
+impl BufferState {
+    /// Has a newer play intent replaced the one `reader` is waiting for?
+    fn superseded(&self, reader: u64) -> bool {
+        self.interrupt.as_ref().is_some_and(|interrupt| {
+            interrupt.reader == reader
+                && interrupt.generation.load(Ordering::SeqCst) != interrupt.expected
+        })
+    }
+}
+
+/// Disarms [`BufferedMediaSource::interrupt_when_superseded`] when dropped.
+pub struct InterruptGuard {
+    shared: Arc<SharedBuffer>,
+}
+
+impl Drop for InterruptGuard {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.shared.state.lock() {
+            state.interrupt = None;
+        }
+    }
+}
+
+fn superseded_error() -> IoError {
+    IoError::new(
+        ErrorKind::Interrupted,
+        "superseded: a newer play replaced the one this wait was for",
+    )
+}
+
 /// Buffer plus the two wake-ups around it: `ready` for the synchronous
 /// readers on the audio thread, `wanted` for the async feeder task.
 struct SharedBuffer {
@@ -733,10 +773,22 @@ impl SharedBuffer {
     /// or when someone calls [`BufferedMediaSource::abandon`] — which is the
     /// only way out for a reader nobody is listening to any more, and why that
     /// method exists.
+    ///
+    /// With an interrupt armed it wakes on a short timer as well, because what
+    /// ends that wait is a play generation changing elsewhere, which nothing
+    /// here is notified of. The callers loop and re-check, so a timed wake is
+    /// only a re-check, never a short read.
     fn wait<'a>(
         &'a self,
         guard: std::sync::MutexGuard<'a, BufferState>,
     ) -> IoResult<std::sync::MutexGuard<'a, BufferState>> {
+        if guard.interrupt.is_some() {
+            return self
+                .ready
+                .wait_timeout(guard, Duration::from_millis(100))
+                .map(|(guard, _)| guard)
+                .map_err(|_| IoError::other("Condition variable wait failed"));
+        }
         self.ready
             .wait(guard)
             .map_err(|_| IoError::other("Condition variable wait failed"))
@@ -878,6 +930,7 @@ impl BufferedMediaSource {
                 download_complete: false,
                 download_error: None,
                 feeder_gone: false,
+                interrupt: None,
                 total_size,
                 primary_offset: 0,
                 pending_request: None,
@@ -965,6 +1018,39 @@ impl BufferedMediaSource {
             .lock()
             .ok()
             .and_then(|state| state.total_size)
+    }
+
+    /// Make the NEWEST reader's waits give up, with `ErrorKind::Interrupted`,
+    /// once `generation` is no longer `expected` — for as long as the guard
+    /// lives.
+    ///
+    /// For the seeks the audio thread runs itself: a resume, a seek command, a
+    /// cast joined at a position. Each one can wait on the network — a CDN's
+    /// cold time-to-first-byte, retries, a URL renewal, a stalled body's read
+    /// timeout — and while it does, every later command is queued behind it,
+    /// so a listener's skip or stop could not get through. The player bumps
+    /// its play generation on exactly those, and this lets the wait see it.
+    ///
+    /// Arm it right after building the decoder that is about to seek, whose
+    /// reader is then the newest. Scoped to that reader on purpose: the
+    /// decoder still AUDIBLE is an older reader over the same buffer, and
+    /// interrupting it would cut the old track off mid-note — the new command
+    /// stops it properly a moment later.
+    pub fn interrupt_when_superseded(
+        &self,
+        generation: Arc<AtomicU64>,
+        expected: u64,
+    ) -> InterruptGuard {
+        if let Ok(mut state) = self.shared.state.lock() {
+            state.interrupt = Some(Interrupt {
+                reader: state.reader_epoch,
+                generation,
+                expected,
+            });
+        }
+        InterruptGuard {
+            shared: Arc::clone(&self.shared),
+        }
     }
 
     pub fn is_complete(&self) -> bool {
@@ -1266,6 +1352,10 @@ impl Read for BufferedMediaSource {
                 return Ok(0);
             }
 
+            if state.superseded(self.reader_id) {
+                return Err(superseded_error());
+            }
+
             if state.feeder_gone || (state.download_complete && !state.should_request(read_pos)) {
                 // Nothing is coming and we are not allowed to ask: either the
                 // feeder cannot serve ranges at all, or the buffer was torn
@@ -1338,6 +1428,7 @@ impl Seek for BufferedMediaSource {
             && state.download_error.is_none()
             && !state.feeder_gone
             && !self.shared.abandoned.load(Ordering::SeqCst)
+            && !state.superseded(self.reader_id)
             && (!state.download_complete || state.should_request(new_pos))
         {
             self.request_range(&mut state, new_pos);
@@ -1354,6 +1445,9 @@ impl Seek for BufferedMediaSource {
                     ErrorKind::Interrupted,
                     "seek abandoned: nobody is listening to this stream any more",
                 ));
+            }
+            if state.superseded(self.reader_id) {
+                return Err(superseded_error());
             }
             if state.feeder_gone {
                 return Err(IoError::new(
@@ -2650,6 +2744,72 @@ mod tests {
             .expect("abandon must wake the blocked seek — it is still waiting");
         seeker.join().expect("the seeking thread must unwind");
         assert!(seek.is_err(), "an abandoned seek did not land: {seek:?}");
+        drop(writer);
+    }
+
+    /// A seek the audio thread is running gives up when a newer play intent
+    /// arrives — and ONLY that seek: the older reader over the same buffer is
+    /// the decoder still audible, and it keeps waiting as before.
+    ///
+    /// Without this, a resume or seek waiting on the network — cold CDN
+    /// time-to-first-byte, retries, a URL renewal, a stalled body — held every
+    /// later command, so a skip or a stop could not get through until it
+    /// finished.
+    #[test]
+    fn a_newer_play_interrupts_the_seek_it_superseded_and_nothing_else() {
+        let config = StreamingConfig {
+            initial_buffer_bytes: 4,
+            window_bytes: DEFAULT_WINDOW_BYTES,
+        };
+        let (source, writer) = BufferedMediaSource::new_seekable(config, Some(1 << 20));
+        writer.push_chunk(b"head").unwrap();
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(7));
+
+        // The audible decoder: blocked reading past what is held.
+        let (audible_tx, audible_rx) = std::sync::mpsc::channel();
+        let mut audible = source.create_reader();
+        thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            let _ = audible.read(&mut buf);
+            let _ = audible_tx.send(audible.read(&mut buf));
+        });
+
+        // The decoder the audio thread built to seek with — the newest reader.
+        let (seek_tx, seek_rx) = std::sync::mpsc::channel();
+        let mut seeking = source.create_reader();
+        let guard = source.interrupt_when_superseded(Arc::clone(&generation), 7);
+        thread::spawn(move || {
+            let _ = seek_tx.send(seeking.seek(SeekFrom::Start(512 * 1024)));
+        });
+        thread::sleep(Duration::from_millis(150));
+        assert!(
+            seek_rx.try_recv().is_err(),
+            "the premise: the seek is waiting"
+        );
+
+        generation.fetch_add(1, Ordering::SeqCst);
+
+        let seek = seek_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the superseded seek is still waiting");
+        assert_eq!(
+            seek.expect_err("a superseded seek does not land").kind(),
+            ErrorKind::Interrupted
+        );
+        assert!(
+            audible_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "the audible decoder must not be cut off by someone else's interrupt"
+        );
+
+        drop(guard);
+        source.abandon();
+        assert_eq!(
+            audible_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("abandon wakes it")
+                .unwrap(),
+            0
+        );
         drop(writer);
     }
 
