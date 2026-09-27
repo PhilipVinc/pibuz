@@ -18,6 +18,14 @@ tags on `main`.
   CMAF, with the card copy sealed as always. A successor at a different
   sample rate, which gapless cannot bridge, is not fetched at all.
 
+- **Another account taking over the renderer no longer makes it vanish from
+  the new controller.** A takeover stops the old queue for a second or two
+  before the new one loads, and the hook script heard that as `stopped`.
+  moOde treats `stopped` as the session ending and restarts the renderer, so
+  the renderer dropped off the new listener's app mid-session and came back
+  about 30 s later. The hook script now hears `stopped` only once it has
+  lasted 5 s. SSE and MPRIS still see every state as it happens.
+
 - **A resume after a long pause no longer wedges the renderer until a
   restart.** Pause a cast track for about two hours, press play, and the
   daemon went silent for good: it kept accepting casts from every controller

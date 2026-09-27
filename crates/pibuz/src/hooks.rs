@@ -46,26 +46,111 @@ pub fn script(roots: &ProfileRoots) -> Option<PathBuf> {
 pub fn spawn(script: PathBuf, mut rx: broadcast::Receiver<CoreEvent>) -> JoinHandle<()> {
     use broadcast::error::RecvError;
     tokio::spawn(async move {
+        let mut gate = StopSettle::default();
         loop {
-            let ev = match rx.recv().await {
-                Ok(ev) => ev,
-                Err(RecvError::Lagged(_)) => continue,
-                Err(RecvError::Closed) => return,
-            };
-            let Some(vars) = hook_env(&ev) else { continue };
-            let mut cmd = tokio::process::Command::new(&script);
-            cmd.envs(vars).stdin(std::process::Stdio::null());
-            match cmd.spawn() {
-                Ok(mut child) => {
-                    // Detached reaper: never block the recv loop on the script.
-                    tokio::spawn(async move {
-                        let _ = child.wait().await;
-                    });
+            let due = gate.due();
+            let ev = tokio::select! {
+                received = rx.recv() => match received {
+                    Ok(ev) => ev,
+                    Err(RecvError::Lagged(_)) => continue,
+                    Err(RecvError::Closed) => return,
+                },
+                _ = async {
+                    match due {
+                        Some(at) => tokio::time::sleep_until(at.into()).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(stop) = gate.settle(std::time::Instant::now()) {
+                        run(&script, &stop);
+                    }
+                    continue;
                 }
-                Err(e) => log::warn!("[hooks] could not run {}: {e}", script.display()),
+            };
+            for ev in gate.offer(ev, std::time::Instant::now()) {
+                run(&script, &ev);
             }
         }
     })
+}
+
+fn run(script: &std::path::Path, ev: &CoreEvent) {
+    let Some(vars) = hook_env(ev) else { return };
+    let mut cmd = tokio::process::Command::new(script);
+    cmd.envs(vars).stdin(std::process::Stdio::null());
+    match cmd.spawn() {
+        Ok(mut child) => {
+            // Detached reaper: never block the recv loop on the script.
+            tokio::spawn(async move {
+                let _ = child.wait().await;
+            });
+        }
+        Err(e) => log::warn!("[hooks] could not run {}: {e}", script.display()),
+    }
+}
+
+/// How long a `stopped` must last before the hook script hears it.
+const STOP_SETTLE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Holds a `stopped` back until it has lasted [`STOP_SETTLE`].
+///
+/// The player is briefly "stopped" in the middle of things that are not the
+/// end of anything: a new cast replacing the queue tears the old one down
+/// before the new track loads, and an account taking the renderer over from
+/// another does the same. Integrators read `stopped` as "the session is over"
+/// — moOde's hook marks the renderer inactive on it, and moOde's worker then
+/// RESTARTS the renderer — so a two-second gap in a takeover became a restart
+/// in the middle of the new listener's session. On the Pi, 2026-09-27, 18:14:
+/// a takeover, `stopped` for two seconds, a full stop/start of the daemon, and
+/// the renderer vanished from the new controller's app until it rejoined.
+///
+/// Only the HOOK is held back. SSE and MPRIS still see every state as it
+/// happens; a script that forks per event is the consumer that acts on a
+/// flicker. A genuine stop reaches it [`STOP_SETTLE`] late, which is noise
+/// next to how long a stopped session stays stopped.
+#[derive(Default)]
+struct StopSettle {
+    /// The held `stopped`, and when it may go out.
+    pending: Option<(std::time::Instant, CoreEvent)>,
+}
+
+impl StopSettle {
+    /// Take one bus event; return what should reach the script now.
+    fn offer(&mut self, ev: CoreEvent, now: std::time::Instant) -> Vec<CoreEvent> {
+        match ev {
+            CoreEvent::PlaybackStateChanged {
+                state: PlaybackState::Stopped,
+            } => {
+                // A second stop while one is held keeps the ORIGINAL deadline:
+                // it is the same stop, and restarting the clock would let a
+                // chatty sequence hold it back for ever.
+                if self.pending.is_none() {
+                    self.pending = Some((now + STOP_SETTLE, ev));
+                }
+                Vec::new()
+            }
+            CoreEvent::PlaybackStateChanged { .. } => {
+                // Anything else within the window means it was a gap, not an
+                // end: the held stop is dropped, never delivered.
+                self.pending = None;
+                vec![ev]
+            }
+            other => vec![other],
+        }
+    }
+
+    /// When the held stop falls due, if one is held.
+    fn due(&self) -> Option<std::time::Instant> {
+        self.pending.as_ref().map(|(at, _)| *at)
+    }
+
+    /// The held stop, once it has lasted long enough to be real.
+    fn settle(&mut self, now: std::time::Instant) -> Option<CoreEvent> {
+        match &self.pending {
+            Some((at, _)) if *at <= now => self.pending.take().map(|(_, ev)| ev),
+            _ => None,
+        }
+    }
 }
 
 fn state_label(state: PlaybackState) -> &'static str {
@@ -270,6 +355,80 @@ mod tests {
             operation: "x".into()
         })
         .is_none());
+    }
+
+    fn state(state: PlaybackState) -> CoreEvent {
+        CoreEvent::PlaybackStateChanged { state }
+    }
+
+    fn is_stop(ev: &CoreEvent) -> bool {
+        matches!(
+            ev,
+            CoreEvent::PlaybackStateChanged {
+                state: PlaybackState::Stopped
+            }
+        )
+    }
+
+    /// The Pi, 2026-09-27, 18:14:38-40: a takeover stopped the old queue and
+    /// loaded the new one two seconds later. The script must never hear that
+    /// stop — moOde restarted the whole renderer on it, mid-session.
+    #[test]
+    fn a_stop_that_turns_into_loading_never_reaches_the_script() {
+        let mut gate = StopSettle::default();
+        let t0 = std::time::Instant::now();
+        assert!(gate.offer(state(PlaybackState::Stopped), t0).is_empty());
+        let out = gate.offer(
+            state(PlaybackState::Loading),
+            t0 + std::time::Duration::from_secs(2),
+        );
+        assert_eq!(out.len(), 1, "loading goes out as usual");
+        assert!(!is_stop(&out[0]));
+        assert!(
+            gate.due().is_none(),
+            "and the stop is gone, not merely late"
+        );
+        assert!(gate.settle(t0 + STOP_SETTLE * 2).is_none());
+    }
+
+    /// A stop that LASTS is a real one, and goes out once it has.
+    #[test]
+    fn a_stop_that_lasts_is_delivered_after_the_settle() {
+        let mut gate = StopSettle::default();
+        let t0 = std::time::Instant::now();
+        assert!(gate.offer(state(PlaybackState::Stopped), t0).is_empty());
+        assert_eq!(gate.due(), Some(t0 + STOP_SETTLE));
+        assert!(gate.settle(t0 + STOP_SETTLE / 2).is_none(), "not yet");
+        let out = gate.settle(t0 + STOP_SETTLE).expect("delivered");
+        assert!(is_stop(&out));
+        assert!(gate.due().is_none());
+    }
+
+    /// Other events are not held while a stop is: the volume restore and the
+    /// session-changed events moOde reacts to still arrive in time, and they
+    /// do not cancel the stop either.
+    #[test]
+    fn other_events_pass_straight_through_a_held_stop() {
+        let mut gate = StopSettle::default();
+        let t0 = std::time::Instant::now();
+        gate.offer(state(PlaybackState::Stopped), t0);
+        let out = gate.offer(CoreEvent::VolumeChanged { volume: 0.4 }, t0);
+        assert_eq!(out.len(), 1);
+        assert!(gate.due().is_some(), "the stop is still held");
+    }
+
+    /// A repeated stop is the same stop: the deadline does not move, or a
+    /// chatty sequence could hold a real stop back indefinitely.
+    #[test]
+    fn a_repeated_stop_keeps_its_original_deadline() {
+        let mut gate = StopSettle::default();
+        let t0 = std::time::Instant::now();
+        gate.offer(state(PlaybackState::Stopped), t0);
+        gate.offer(
+            state(PlaybackState::Stopped),
+            t0 + std::time::Duration::from_secs(3),
+        );
+        assert_eq!(gate.due(), Some(t0 + STOP_SETTLE));
     }
 
     #[test]
