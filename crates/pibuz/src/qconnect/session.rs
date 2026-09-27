@@ -149,8 +149,7 @@ impl SessionLoopHost for DaemonSessionLoopHost {
             }
         }
         if let Ok(mut s) = self.shared.lock() {
-            s.qconnect.state = "exhausted".to_string();
-            s.qconnect.session_active = false;
+            s.latch_qconnect_session_down("exhausted");
             // 01 §9.3: reconnect-exhausted is a real network-class failure —
             // latch `network.online` false (the success side latches true in
             // `latch_lifecycle_into_shared` on the next `Connected` transition).

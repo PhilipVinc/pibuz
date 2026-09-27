@@ -218,12 +218,13 @@ pub async fn publish_local_volume_if_changed(
         if !is_local_renderer_active(&state.session) {
             return;
         }
-        let theirs = state
+        let renderer = state
             .session
             .local_renderer_id
-            .and_then(|id| state.session_renderer_states.get(&id))
-            .and_then(|renderer| renderer.volume);
-        if volume_report_is_redundant(ours, theirs) {
+            .and_then(|id| state.session_renderer_states.get(&id));
+        let theirs = renderer.and_then(|renderer| renderer.volume);
+        let muted = renderer.and_then(|renderer| renderer.muted) == Some(true);
+        if volume_report_is_redundant(ours, theirs, muted) {
             return;
         }
     }
@@ -241,8 +242,13 @@ pub async fn publish_local_volume_if_changed(
 
 /// Whether the controller already shows `ours`. An unknown view (`None`) is
 /// NOT redundant: the controller has told us nothing, so tell it.
-fn volume_report_is_redundant(ours: i32, theirs: Option<i32>) -> bool {
-    theirs == Some(ours)
+///
+/// A mute is the controller's too: it arrives as `MuteVolume`, which the
+/// player carries out as a level of 0 while the cloud keeps the pre-mute level
+/// and a `muted` flag. Reporting that 0 as a volume would drag the phone's
+/// slider to the bottom, and unmuting would then report the old level back.
+fn volume_report_is_redundant(ours: i32, theirs: Option<i32>, muted: bool) -> bool {
+    theirs == Some(ours) || (muted && ours == 0)
 }
 
 /// The volume-publish subscriber: coalesces `CoreEvent::VolumeChanged` bursts
@@ -286,16 +292,23 @@ mod tests {
         // The controller's own SetVolume lands here too (the player emits
         // VolumeChanged for it); the cloud's echo has already told us it
         // shows that level, so a report would be a duplicate.
-        assert!(volume_report_is_redundant(40, Some(40)));
+        assert!(volume_report_is_redundant(40, Some(40), false));
     }
 
     #[test]
     fn a_local_change_is_reported() {
-        assert!(!volume_report_is_redundant(25, Some(40)));
+        assert!(!volume_report_is_redundant(25, Some(40), false));
+    }
+
+    #[test]
+    fn the_controllers_own_mute_is_not_reported_as_a_level_of_zero() {
+        assert!(volume_report_is_redundant(0, Some(40), true));
+        // But a level changed here while muted is still news.
+        assert!(!volume_report_is_redundant(25, Some(40), true));
     }
 
     #[test]
     fn an_unknown_controller_view_is_reported() {
-        assert!(!volume_report_is_redundant(25, None));
+        assert!(!volume_report_is_redundant(25, None, false));
     }
 }

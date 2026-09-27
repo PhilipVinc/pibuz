@@ -62,6 +62,18 @@ impl DaemonShared {
         }
     }
 
+    /// The Connect session is gone (`state` says how: "off", "exhausted").
+    ///
+    /// Clears `is_active` with `session_active`: with no session we are
+    /// nobody's renderer, and `is_active` used to be written only by the sink's
+    /// ownership latch, so `/api/status` went on saying `is_active: true` after
+    /// `pibuz qconnect disable` or a reconnect that gave up.
+    pub fn latch_qconnect_session_down(&mut self, state: &str) {
+        self.qconnect.state = state.to_string();
+        self.qconnect.session_active = false;
+        self.qconnect.is_active = false;
+    }
+
     pub fn emit_qconnect_session_changed(&self) {
         if let Some(bus) = &self.bus {
             let _ = bus.send(qbz_models::CoreEvent::QconnectSessionChanged {
@@ -140,6 +152,31 @@ mod tests {
             bus: None,
         };
         assert!(shared.network_online());
+    }
+
+    #[test]
+    fn a_session_going_down_clears_the_active_renderer_flag() {
+        let mut shared = DaemonShared {
+            last_errors: LatchedErrors::default(),
+            driver_last_tick: None,
+            muted: false,
+            premute_volume: 1.0,
+            started_at: std::time::Instant::now(),
+            startup_warnings: 0,
+            qconnect: QconnectStatus::default(),
+            network_online: std::sync::atomic::AtomicBool::new(true),
+            bus: None,
+        };
+        shared.qconnect.state = "connected".to_string();
+        shared.qconnect.session_active = true;
+        shared.qconnect.is_active = true;
+        shared.latch_qconnect_session_down("off");
+        assert_eq!(shared.qconnect.state, "off");
+        assert!(!shared.qconnect.session_active);
+        assert!(
+            !shared.qconnect.is_active,
+            "/api/status still says we render"
+        );
     }
 
     #[test]

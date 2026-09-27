@@ -78,6 +78,11 @@ pub(crate) struct DaemonQconnectInner {
     pub last_pushed_queue_ids: Option<Vec<u64>>,
 }
 
+/// The configured `qconnect.volume_mode` (unset or unknown -> `Software`).
+fn volume_mode_at(settings_db: &std::path::Path) -> engine::VolumeMode {
+    engine::VolumeMode::from_kv(transport::load_volume_mode_at(settings_db).as_deref())
+}
+
 /// Map a lifecycle state to the `/api/status` `qconnect.state` label + the
 /// session-active flag, and latch it into `DaemonShared`.
 fn latch_lifecycle_into_shared(shared: &SharedState, state: QconnectLifecycleState) {
@@ -234,9 +239,7 @@ impl DaemonQconnectService {
         // T10 (OD4, §7.4): resolve the volume policy from the daemon-root KV at
         // connect, so a later `pibuz settings reload` (T11) is picked up on the
         // next connect. Unset/unknown -> Software (the OD4 default).
-        let volume_mode = engine::VolumeMode::from_kv(
-            transport::load_volume_mode_at(&self.settings_db).as_deref(),
-        );
+        let volume_mode = volume_mode_at(&self.settings_db);
         let engine = DaemonRendererEngine::new(
             Arc::clone(&self.runtime),
             volume_mode,
@@ -389,8 +392,7 @@ impl DaemonQconnectService {
         }
 
         if let Ok(mut s) = self.shared.lock() {
-            s.qconnect.state = "off".to_string();
-            s.qconnect.session_active = false;
+            s.latch_qconnect_session_down("off");
             s.emit_qconnect_session_changed();
         }
         Ok(())
@@ -701,6 +703,20 @@ pub fn start(
         s.qconnect.session_active = false;
     }
 
+    // `external` from boot, not only from the first successful connect: until
+    // then — or for good, with Connect off or unreachable — the player's
+    // default level (0.75) would reach the samples, and the jump to unity when
+    // the connect lands would be heard mid-track. `connect_locked` sets it
+    // again per connect, which is what picks up a changed setting.
+    let boot_volume_mode = volume_mode_at(&settings_db);
+    if let Err(err) = runtime
+        .core()
+        .player()
+        .set_volume_external(boot_volume_mode.is_external())
+    {
+        log::warn!("[QConnect] failed to set the external-volume flag at boot: {err}");
+    }
+
     let service = Arc::new(DaemonQconnectService {
         inner: Arc::new(Mutex::new(DaemonQconnectInner::default())),
         runtime,
@@ -810,5 +826,25 @@ pub fn start(
         publish_task,
         volume_publish_task,
         refresh_task,
+    }
+}
+
+#[cfg(test)]
+mod volume_mode_tests {
+    use super::{engine::VolumeMode, transport, volume_mode_at};
+
+    /// What boot and every connect resolve the player's external-volume flag
+    /// from: the value `pibuz settings set qconnect.volume_mode` stored.
+    #[test]
+    fn the_stored_mode_is_what_boot_and_connect_resolve() {
+        let db =
+            std::env::temp_dir().join(format!("pibuz_volume_mode_at_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&db);
+        assert_eq!(volume_mode_at(&db), VolumeMode::Software, "unset");
+        transport::save_volume_mode_at(&db, "external");
+        assert_eq!(volume_mode_at(&db), VolumeMode::External);
+        transport::save_volume_mode_at(&db, "locked");
+        assert_eq!(volume_mode_at(&db), VolumeMode::Locked);
+        let _ = std::fs::remove_file(&db);
     }
 }

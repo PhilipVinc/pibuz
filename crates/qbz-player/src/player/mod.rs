@@ -539,6 +539,58 @@ fn card_copy_of_stream(
     Some(file.clone())
 }
 
+/// Decode `audio` from `offset` into the track.
+///
+/// `AudioCommand::Play` carries an offset (a takeback, a controller resuming a
+/// cached track mid-way), and `engine.append` takes it — but `append` only
+/// LABELS the clock with it: it skips no samples. The seek-after that used to
+/// land the audio there was removed when the offset moved into the command
+/// (1c6f448ad), and nothing replaced it, so a cache hit at 2:19 played from
+/// 0:00 while the clock and the controller said 2:19.
+///
+/// The same ladder the Seek arm uses, in the same order: Symphonia's native
+/// seek (it bisects; Qobuz FLACs carry no SEEKTABLE), then rodio's own seek,
+/// then decoding forward — slow, but it is the right audio.
+fn decode_at(
+    audio: &TrackAudio,
+    offset: Duration,
+) -> Result<Box<dyn Source<Item = f32> + Send>, String> {
+    if offset.is_zero() {
+        return match audio {
+            TrackAudio::Memory(data) => decode_with_fallback(data),
+            TrackAudio::File(file) => decode_file_with_fallback(file),
+        };
+    }
+    let native = match audio {
+        TrackAudio::Memory(data) => seek_in_memory(data, offset),
+        TrackAudio::File(file) => match InMemorySource::from_cached_file(file) {
+            Ok(mut source) => match source.seek_to(offset) {
+                Ok(()) => Some(Box::new(source) as Box<dyn Source<Item = f32> + Send>),
+                Err(err) => {
+                    log::warn!("Play at {offset:?}: native seek on the cached file failed ({err})");
+                    None
+                }
+            },
+            Err(err) => {
+                log::warn!("Play at {offset:?}: Symphonia could not open the cached file ({err})");
+                None
+            }
+        },
+    };
+    if let Some(source) = native {
+        return Ok(source);
+    }
+    let decode = || match audio {
+        TrackAudio::Memory(data) => decode_with_fallback(data),
+        TrackAudio::File(file) => decode_file_with_fallback(file),
+    };
+    let mut source = decode()?;
+    if source.try_seek(offset).is_ok() {
+        return Ok(source);
+    }
+    Ok(Box::new(decode()?.skip_duration(offset)))
+}
+
 fn seek_in_memory(
     data: &TrackBytes,
     position: Duration,
@@ -777,6 +829,27 @@ fn may_fall_back_to_legacy(configured_device: Option<&str>, backend_error: &str)
         .map(str::trim)
         .is_some_and(|d| !d.is_empty() && !d.eq_ignore_ascii_case("default"));
     !(names_a_device && qbz_audio::is_device_busy_error(backend_error))
+}
+
+/// A seek that has nothing to seek IN yet — the device was released by the
+/// pause-suspend teardown, or nothing is loaded (a play that failed) — still
+/// moves the clock to where it was asked to go.
+///
+/// It used to be dropped: Resume then rebuilt at the OLD position, a seek back
+/// "succeeded" and snapped back, and over QConnect the buffering latch — armed
+/// at the target by the renderer's `seek` — never saw the player arrive, so
+/// the phone showed a spinner on a paused track until the 90 s backstop.
+fn park_seek(thread_state: &SharedState, position_secs: u64) {
+    let duration = thread_state.duration();
+    let target = if duration > 0 {
+        position_secs.min(duration)
+    } else {
+        position_secs
+    };
+    thread_state.position.store(target, Ordering::SeqCst);
+    thread_state
+        .position_at_start
+        .store(target, Ordering::SeqCst);
 }
 
 /// The track a failed play was for: `(track_id, start_position_secs,
@@ -1888,6 +1961,15 @@ impl SharedState {
     /// Record a user-readable error explanation alongside `stream_error=true`.
     /// The message is drained once via `take_stream_error_message` so the UI
     /// fires the toast exactly once per error.
+    /// Whether an error message is recorded and not yet drained — so a
+    /// generic follow-up does not overwrite the specific cause.
+    pub fn has_pending_stream_error(&self) -> bool {
+        self.stream_error_message
+            .read()
+            .map(|m| m.is_some())
+            .unwrap_or(false)
+    }
+
     pub fn record_stream_error(&self, message: impl Into<String>) {
         self.stream_error.store(true, Ordering::SeqCst);
         if let Ok(mut m) = self.stream_error_message.write() {
@@ -2983,10 +3065,8 @@ impl Player {
                                 thread_state.volume_external(),
                             );
 
-                            let decoded = match &audio {
-                                TrackAudio::Memory(data) => decode_with_fallback(data),
-                                TrackAudio::File(path) => decode_file_with_fallback(path),
-                            };
+                            let decoded =
+                                decode_at(&audio, Duration::from_secs(start_position_secs));
                             let source = match decoded {
                                 Ok(s) => s,
                                 Err(e) => {
@@ -3002,10 +3082,16 @@ impl Player {
                                 }
                             };
 
-                            let actual_duration = source
-                                .total_duration()
-                                .map(|d| d.as_secs())
-                                .unwrap_or(duration_secs);
+                            // A source positioned by decoding forward
+                            // (`skip_duration`) reports only what is LEFT, so
+                            // at an offset the caller's figure is the track's.
+                            let actual_duration = match source.total_duration() {
+                                Some(_) if start_position_secs > 0 && duration_secs > 0 => {
+                                    duration_secs
+                                }
+                                Some(d) => d.as_secs(),
+                                None => duration_secs,
+                            };
                             thread_state
                                 .duration
                                 .store(actual_duration, Ordering::SeqCst);
@@ -3087,11 +3173,15 @@ impl Player {
                             }
 
                             thread_state.is_playing.store(true, Ordering::SeqCst);
-                            thread_state.position.store(0, Ordering::SeqCst);
+                            thread_state
+                                .position
+                                .store(start_position_secs, Ordering::SeqCst);
                             thread_state
                                 .current_track_id
                                 .store(track_id, Ordering::SeqCst);
-                            thread_state.start_playback_timer(0);
+                            // From the offset, as PlayStreaming does: the clock is the
+                            // track's, and the audio now starts there too (`decode_at`).
+                            thread_state.start_playback_timer(start_position_secs);
 
                             *current_engine = Some(engine);
                             log::info!(
@@ -3876,10 +3966,10 @@ impl Player {
                                             ResumeInput::Memory(TrackBytes::from(bytes.as_slice()))
                                         }
                                         Err(e) => {
-                                            log::warn!(
-                                                "Audio thread: cannot resume - cached file {} unreadable: {e}",
+                                            fail(format!(
+                                                "cached file {} unreadable: {e}",
                                                 file.path().display()
-                                            );
+                                            ));
                                             return;
                                         }
                                     }
@@ -3961,7 +4051,15 @@ impl Player {
                                 }
 
                                 let Some(ref stream) = *stream_opt else {
-                                    fail("no audio device available".to_string());
+                                    // `init_device` has usually said WHY already
+                                    // ("Device busy: ..."); that is the message
+                                    // worth keeping, not this generic one.
+                                    if thread_state.has_pending_stream_error() {
+                                        log::error!("Resume: no audio device available");
+                                        thread_state.is_playing.store(false, Ordering::SeqCst);
+                                    } else {
+                                        fail("no audio device available".to_string());
+                                    }
                                     return;
                                 };
 
@@ -4288,6 +4386,7 @@ impl Player {
                                 && current_audio_file.is_none()
                             {
                                 log::warn!("Audio thread: cannot seek - no audio data available");
+                                park_seek(&thread_state, position_secs);
                                 return;
                             }
                             if let Some(ref stream_src) = *current_streaming_source {
@@ -4322,9 +4421,21 @@ impl Player {
                             }
 
                             let Some(ref stream) = *stream_opt else {
-                                log::error!(
-                                    "Audio thread: cannot seek - no audio device available"
-                                );
+                                if thread_state.is_playing() {
+                                    log::error!(
+                                        "Audio thread: cannot seek - no audio device available"
+                                    );
+                                } else {
+                                    // Paused long enough for the pause-suspend
+                                    // teardown to release the device. Resume
+                                    // rebuilds from the stored position, so
+                                    // storing it IS the seek.
+                                    log::info!(
+                                        "Audio thread: seek to {}s while suspended — resume will start there",
+                                        position_secs
+                                    );
+                                }
+                                park_seek(&thread_state, position_secs);
                                 return;
                             };
 
@@ -8336,6 +8447,34 @@ mod play_failure_tests {
         assert_eq!(state.take_stream_error_message().as_deref(), Some(BUSY));
     }
 
+    /// A seek while suspended (or with nothing loaded) lands the clock where
+    /// it was asked to go, so a Resume rebuilds there and the QConnect latch —
+    /// released by a paused player at or past its target — lets go.
+    #[test]
+    fn a_seek_with_nothing_to_seek_in_still_moves_the_clock() {
+        let state = SharedState::new();
+        state.duration.store(300, Ordering::SeqCst);
+        state.position.store(40, Ordering::SeqCst);
+        super::park_seek(&state, 139);
+        assert_eq!(state.current_position(), 139);
+        assert_eq!(state.current_position_ms(), 139_000);
+        // Never past the end of the track.
+        super::park_seek(&state, 999);
+        assert_eq!(state.current_position(), 300);
+    }
+
+    /// A generic follow-up must be able to tell a specific cause is already
+    /// waiting to be reported (Resume after a busy `init_device`).
+    #[test]
+    fn a_pending_error_is_visible_until_drained() {
+        let state = SharedState::new();
+        assert!(!state.has_pending_stream_error());
+        state.record_stream_error(BUSY);
+        assert!(state.has_pending_stream_error());
+        assert_eq!(state.take_stream_error_message().as_deref(), Some(BUSY));
+        assert!(!state.has_pending_stream_error());
+    }
+
     /// `volume_external` keeps the level off the mixer too, not only off the
     /// samples: `apply_engine_volume` is the one door every engine's volume
     /// goes through.
@@ -8349,5 +8488,59 @@ mod play_failure_tests {
         #[cfg(target_os = "linux")]
         assert_eq!(out.mixer_writes(), vec![0.3]);
         engine.stop();
+    }
+}
+
+#[cfg(test)]
+mod play_offset_tests {
+    use super::{decode_at, TrackAudio};
+    use crate::player::streaming_source::tests::{ramp_wav, temp_wav};
+    use qbz_cache::TrackBytes;
+    use std::time::Duration;
+
+    const RATE: u32 = 8_000;
+    const SECS: u32 = 4;
+    const PEAK: i16 = 30_000;
+
+    /// Where on a 0 -> PEAK ramp a sample sits, as a fraction of the track.
+    fn fraction_of_track(sample: f32) -> f32 {
+        sample / (PEAK as f32 / 32768.0)
+    }
+
+    fn first_sample(audio: &TrackAudio, offset: Duration) -> f32 {
+        decode_at(audio, offset)
+            .expect("decode")
+            .next()
+            .expect("a sample")
+    }
+
+    /// A cached `Play` at 2 s of a 4 s ramp must START there. It used to
+    /// start at 0:00 while the clock said 2 s: `engine.append`'s offset only
+    /// labels the clock.
+    #[test]
+    fn a_cached_play_at_an_offset_starts_at_the_offset() {
+        let wav = ramp_wav(RATE, RATE * SECS, PEAK);
+        let file = temp_wav("play-offset", &wav);
+        for audio in [
+            TrackAudio::Memory(TrackBytes::from(wav.clone())),
+            TrackAudio::File(file.clone()),
+        ] {
+            let at = fraction_of_track(first_sample(&audio, Duration::from_secs(2)));
+            // A seek lands on a packet boundary: a quarter second of slack,
+            // far tighter than the bug, which lands at 0.0.
+            assert!(
+                (at - 0.5).abs() < 0.0625,
+                "a play at 2s of a 4s track started {:.0}% in",
+                at * 100.0
+            );
+        }
+        std::fs::remove_file(file.path()).ok();
+    }
+
+    #[test]
+    fn a_play_from_the_top_still_starts_at_the_top() {
+        let wav = ramp_wav(RATE, RATE * SECS, PEAK);
+        let audio = TrackAudio::Memory(TrackBytes::from(wav));
+        assert!(fraction_of_track(first_sample(&audio, Duration::ZERO)).abs() < 0.01);
     }
 }

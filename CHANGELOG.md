@@ -36,6 +36,25 @@ tags on `main`.
     (no device, a decode or engine failure), which used to leave the previous
     track's state behind — including its audio, for a later resume to replay.
 
+- **A cached track loaded at a position now starts there.** A takeback, or a
+  controller resuming a track already in the memory or disk cache mid-way,
+  played from 0:00 while the clock and the phone showed the position.
+- **A resume that cannot get the device is reported.** Pausing long enough for
+  the device to be released, letting another player take it, then pressing
+  play left the phone on "playing" over silence; it now shows paused, with the
+  device's own error (not a generic one) in `/api/status` and the hook.
+- **A seek while paused is kept.** After a pause long enough to release the
+  device, a seek was dropped: resume came back at the old position, and the
+  phone spun on a paused track.
+- **`external` volume applies from boot**, not only once Connect has connected.
+- **A mute from the phone is not reported back as volume 0**, which dragged its
+  slider to the bottom.
+- **`audio.alsa_mixer_device` survives a busy-device retry.** A stream that
+  opened on a retry (MPD letting go of the DAC a second late) or through
+  plughw lost the configured mixer, and hardware volume used the PCM's.
+- `/api/status` no longer reports `qconnect.is_active: true` once the session
+  is gone.
+
 ### Changed
 
 - **Releases publish the source only.** No binaries are built or attached to

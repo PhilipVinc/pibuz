@@ -370,6 +370,8 @@ fn build_driver_deps(
 ) -> DriverDeps {
     let latch_shared = shared.clone();
     let tick_shared = shared;
+    let report_notify_latch = report_notify.clone();
+    let edge_notify_latch = edge_notify.clone();
     DriverDeps {
         quality: Arc::new(move || {
             quality_cell
@@ -401,6 +403,14 @@ fn build_driver_deps(
                     track_id: 0,
                     message,
                 });
+                // And tell the controller. A failure that leaves `is_playing`
+                // where it was produces no driver edge — a Resume that fails
+                // while the renderer's own echo already said PLAYING goes
+                // false -> false — and the report floor skips a renderer that
+                // is not playing, so the phone went on showing "playing" over
+                // silence (issue #2, on the resume path).
+                report_notify_latch.notify_one();
+                edge_notify_latch.notify_one();
             }
         }),
         on_tick: Arc::new(move || {
@@ -622,6 +632,53 @@ pub(crate) async fn reload_qconnect(state: &crate::api::ApiState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whether `notify` holds a permit, without waiting for one.
+    async fn was_pulsed(notify: &tokio::sync::Notify) -> bool {
+        tokio::time::timeout(std::time::Duration::from_millis(20), notify.notified())
+            .await
+            .is_ok()
+    }
+
+    fn deps_with_notifies() -> (
+        DriverDeps,
+        Arc<tokio::sync::Notify>,
+        Arc<tokio::sync::Notify>,
+    ) {
+        let report = Arc::new(tokio::sync::Notify::new());
+        let edge = Arc::new(tokio::sync::Notify::new());
+        let (bus, _) = tokio::sync::broadcast::channel(8);
+        let deps = build_driver_deps(
+            Arc::new(std::sync::Mutex::new(qbz_models::Quality::Lossless)),
+            new_shared(&PibuzConfig::default()),
+            report.clone(),
+            edge.clone(),
+            bus,
+        );
+        (deps, report, edge)
+    }
+
+    /// Issue #2 on the resume path: a play that fails without changing
+    /// `is_playing` makes no driver edge, so the stream-error latch itself must
+    /// wake the report scheduler (and the events bridge), or the controller
+    /// keeps showing "playing" over silence.
+    #[tokio::test]
+    async fn a_stream_failure_wakes_the_controller_report() {
+        let (deps, report, edge) = deps_with_notifies();
+        (deps.on_latch)("stream", "Device busy: output".to_string());
+        assert!(
+            was_pulsed(&report).await,
+            "the report scheduler was not woken"
+        );
+        assert!(was_pulsed(&edge).await, "the events bridge was not woken");
+    }
+
+    #[tokio::test]
+    async fn other_latches_leave_the_report_alone() {
+        let (deps, report, _) = deps_with_notifies();
+        (deps.on_latch)("transport", "offline".to_string());
+        assert!(!was_pulsed(&report).await);
+    }
 
     #[test]
     fn fresh_shared_state_has_no_latched_errors() {

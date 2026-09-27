@@ -767,6 +767,16 @@ impl AlsaBackend {
         &self,
         config: &BackendConfig,
     ) -> Option<Result<(super::AlsaDirectStream, super::backend::BitPerfectMode), String>> {
+        with_mixer_device(self.open_direct_stream(config), &config.alsa_mixer_device)
+    }
+
+    /// Every way of opening the stream. Returns it WITHOUT the configured
+    /// mixer: [`Self::try_create_direct_stream`] applies that to whichever
+    /// attempt succeeded.
+    fn open_direct_stream(
+        &self,
+        config: &BackendConfig,
+    ) -> Option<Result<(super::AlsaDirectStream, super::backend::BitPerfectMode), String>> {
         let device_id = config.device_id.as_ref()?;
 
         // Only use direct ALSA for hw:/plughw:/front: devices and named PCMs
@@ -856,9 +866,8 @@ impl AlsaBackend {
             );
 
             match super::AlsaDirectStream::new(&hw_device, config.sample_rate, config.channels) {
-                Ok(mut stream) => {
+                Ok(stream) => {
                     log::info!("[ALSA Backend] ✓ Direct hw stream created successfully");
-                    stream.set_mixer_device(config.alsa_mixer_device.clone());
                     return Some(Ok((stream, direct_mode)));
                 }
                 Err(e) => {
@@ -1023,6 +1032,69 @@ impl AlsaBackend {
                 )))
             }
         }
+    }
+}
+
+/// What [`with_mixer_device`] needs of a freshly opened stream.
+trait TakesMixerDevice {
+    fn set_mixer_device(&mut self, device: Option<String>);
+}
+
+impl TakesMixerDevice for super::AlsaDirectStream {
+    fn set_mixer_device(&mut self, device: Option<String>) {
+        super::AlsaDirectStream::set_mixer_device(self, device);
+    }
+}
+
+/// Hand the configured `audio.alsa_mixer_device` to an opened stream,
+/// whichever attempt opened it.
+///
+/// It used to be set on the first hw attempt only, so a stream that opened on
+/// a busy-retry — the moOde case, MPD letting go of the DAC a second late — or
+/// through plughw silently lost it, and hardware volume went to the mixer
+/// derived from the PCM name instead of the one configured.
+fn with_mixer_device<S: TakesMixerDevice, M>(
+    opened: Option<Result<(S, M), String>>,
+    mixer_device: &Option<String>,
+) -> Option<Result<(S, M), String>> {
+    opened.map(|result| {
+        result.map(|(mut stream, mode)| {
+            stream.set_mixer_device(mixer_device.clone());
+            (stream, mode)
+        })
+    })
+}
+
+#[cfg(test)]
+mod mixer_device_tests {
+    use super::{with_mixer_device, TakesMixerDevice};
+
+    #[derive(Default)]
+    struct Opened(Option<Option<String>>);
+    impl TakesMixerDevice for Opened {
+        fn set_mixer_device(&mut self, device: Option<String>) {
+            self.0 = Some(device);
+        }
+    }
+
+    #[test]
+    fn the_configured_mixer_reaches_a_stream_opened_by_any_attempt() {
+        let mixer = Some("hw:CARD=DAC".to_string());
+        let (stream, _) = with_mixer_device(Some(Ok((Opened::default(), ()))), &mixer)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stream.0, Some(mixer));
+    }
+
+    #[test]
+    fn a_failed_or_declined_open_is_passed_through() {
+        let mixer = Some("hw:CARD=DAC".to_string());
+        assert!(with_mixer_device::<Opened, ()>(None, &mixer).is_none());
+        assert!(
+            with_mixer_device::<Opened, ()>(Some(Err("busy".into())), &mixer)
+                .unwrap()
+                .is_err()
+        );
     }
 }
 

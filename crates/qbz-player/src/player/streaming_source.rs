@@ -2335,7 +2335,7 @@ impl Iterator for InMemorySource {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::thread;
     use std::time::Duration;
@@ -2343,7 +2343,7 @@ mod tests {
     /// A mono 16-bit PCM WAV whose samples ramp linearly from 0 to `peak`
     /// across the whole file, so a decoded sample's VALUE says where in the
     /// file it came from — which is what makes a seek testable.
-    fn ramp_wav(sample_rate: u32, total_frames: u32, peak: i16) -> Vec<u8> {
+    pub(crate) fn ramp_wav(sample_rate: u32, total_frames: u32, peak: i16) -> Vec<u8> {
         let data_len = total_frames * 2;
         let mut w = Vec::with_capacity(44 + data_len as usize);
         w.extend_from_slice(b"RIFF");
@@ -2368,7 +2368,7 @@ mod tests {
     /// A cache entry holding `bytes`, SEALED the way the L2 cache seals
     /// everything — which is the only shape these tests should be decoding,
     /// since it is the only shape the daemon writes.
-    fn temp_wav(name: &str, bytes: &[u8]) -> qbz_cache::CachedFile {
+    pub(crate) fn temp_wav(name: &str, bytes: &[u8]) -> qbz_cache::CachedFile {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!("qbz-{name}-{n}.wav"));
