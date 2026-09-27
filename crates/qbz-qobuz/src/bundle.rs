@@ -458,8 +458,15 @@ fn char_bounded(s: &str, lo: usize, hi: usize) -> &str {
 /// why a hint list being slightly wrong costs a wasted probe rather than a
 /// broken CMAF path.
 ///
-/// `known_secrets` are filtered out: the legacy app secrets are also 32 hex
-/// and would otherwise burn probe slots.
+/// **`known_secrets` come FIRST.** The webplayer does not keep the seed as a
+/// literal: `rng.prototype.initialization()` builds it at runtime with
+/// `initialSeed("<base64>", window.utimezone.<zone>)` — the very scheme
+/// `extract_secrets` decodes the app secrets from — and the production branch
+/// of that function yields one of them. 2.5.0 filtered the decoded secrets out
+/// as "legacy secrets that would burn probe slots", scanned for a literal that
+/// is not there, and so found nothing on the live bundle: CMAF was off for
+/// every install, and a 512 MB board fell back to whole-track downloads in
+/// RAM. At most three extra probes, once per bundle version, is the price.
 ///
 /// An empty result is a normal outcome, not an error — it means this bundle
 /// exposes no seed in a shape this sees, and CMAF is simply unavailable.
@@ -503,13 +510,24 @@ pub fn extract_cmaf_seed_candidates(bundle: &str, known_secrets: &[String]) -> V
     // (HashMap iteration is not) and a cached candidate list matches a
     // re-extracted one.
     candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    candidates.truncate(MAX_CMAF_SEED_CANDIDATES);
+
+    let decoded = known_secrets
+        .iter()
+        .filter(|s| s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+        .cloned();
+    let mut out: Vec<String> = Vec::new();
+    for value in decoded.chain(candidates.into_iter().map(|(value, _)| value)) {
+        if !out.contains(&value) {
+            out.push(value);
+        }
+    }
+    out.truncate(MAX_CMAF_SEED_CANDIDATES);
 
     log::debug!(
         "[Bundle] {} CMAF seed candidate(s) after scoring",
-        candidates.len()
+        out.len()
     );
-    candidates.into_iter().map(|(value, _)| value).collect()
+    out
 }
 
 fn extract_private_key(bundle: &str) -> Option<String> {
@@ -575,13 +593,24 @@ mod tests {
         assert_eq!(got.first(), Some(&near), "got {got:?}");
     }
 
-    /// The legacy app secrets are 32 hex too, and are already known to be
-    /// something else — they must not burn probe slots.
+    /// The seed is built at runtime by the same `initialSeed(...)` scheme the
+    /// app secrets are decoded from, so the decoded secrets are the likeliest
+    /// candidates and go first, ahead of any hinted literal, each once.
+    ///
+    /// The other way round was 2.5.0: secrets filtered out, a literal hunted
+    /// for that the live bundle does not contain, CMAF off everywhere.
     #[test]
-    fn cmaf_seed_candidates_exclude_known_secrets() {
-        let secret = "d".repeat(32);
-        let bundle = format!(r#"cmaf:{{appSecret:"{secret}"}}"#);
-        assert!(extract_cmaf_seed_candidates(&bundle, &[secret]).is_empty());
+    fn cmaf_seed_candidates_put_the_decoded_secrets_first() {
+        let secrets = vec!["d".repeat(32), "e".repeat(32)];
+        let literal = "f".repeat(32);
+        let bundle = format!(r#"cmaf:{{k:"{literal}",dup:"{}"}}"#, secrets[0]);
+        assert_eq!(
+            extract_cmaf_seed_candidates(&bundle, &secrets),
+            vec![secrets[0].clone(), secrets[1].clone(), literal]
+        );
+        // With no literal to find at all — today's live bundle — the secrets
+        // alone are the candidates, rather than nothing.
+        assert_eq!(extract_cmaf_seed_candidates("var x=1", &secrets), secrets);
     }
 
     #[test]

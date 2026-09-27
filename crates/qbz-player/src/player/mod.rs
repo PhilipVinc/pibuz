@@ -772,6 +772,24 @@ fn begin_new_track(
     thread_state.set_gapless_next_track_id(0);
 }
 
+/// Would a successor at `next_rate` be refused by the engine for a rate change?
+///
+/// `next_rate` is what the stream URL reports, which Qobuz gives in kHz (`96`,
+/// `44.1`); a value that already looks like Hz is taken as Hz. An unknown rate
+/// on either side is not a mismatch: better a wasted fetch than a lost
+/// hand-off.
+fn gapless_rate_mismatch(current_hz: u32, next_rate: f64) -> bool {
+    if current_hz == 0 || !next_rate.is_finite() || next_rate <= 0.0 {
+        return false;
+    }
+    let next_hz = if next_rate < 1000.0 {
+        (next_rate * 1000.0).round() as u32
+    } else {
+        next_rate.round() as u32
+    };
+    next_hz != current_hz
+}
+
 pub(crate) fn spill_to_disk(total: usize, budget: usize) -> bool {
     total.saturating_mul(2) > budget
 }
@@ -5874,25 +5892,48 @@ impl Player {
                     if let Some(cache) = self.audio_cache.get_playback_cache() {
                         cache.abort_write(track_id);
                     }
-                    if !self.host_can_hold_whole_track() {
-                        // No segment table means no size to decide on, so there
-                        // is no bounded way to take this path here.
-                        log::info!(
-                            "[PREFETCH] Track {track_id}: the legacy download has no size to \
-                             decide on — skipping it on this host"
-                        );
-                        self.audio_cache.unmark_fetching(track_id);
-                        return Ok(());
-                    }
+                    // The plain download is sized too — from `Content-Length` —
+                    // so it goes through the same chooser: memory, card, or not
+                    // at all. It used to land in a `Vec` whatever its size.
                     match client.get_stream_url_with_fallback(track_id, quality).await {
-                        // The legacy nginx path streams into a `Vec` without
-                        // knowing the length up front, so this one still pays
-                        // for a copy on the way into the cache. It is the
-                        // fallback, not the path a healthy prefetch takes.
-                        Ok(stream_url) => self
-                            .download_audio(&stream_url.url)
+                        Ok(stream_url) => {
+                            let choose = self.destination_chooser(track_id, "PREFETCH");
+                            match qbz_qobuz::cmaf::download_plain_sized(
+                                &stream_url.url,
+                                track_id,
+                                choose,
+                            )
                             .await
-                            .map(|data| Some(TrackBytes::from(data))),
+                            {
+                                Ok(qbz_qobuz::DownloadedTrack::Memory(data)) => Ok(Some(data)),
+                                Ok(qbz_qobuz::DownloadedTrack::File(_)) => match self
+                                    .audio_cache
+                                    .get_playback_cache()
+                                    .and_then(|c| c.commit_write(track_id))
+                                {
+                                    Some(path) => {
+                                        log::info!(
+                                            "[PREFETCH] Track {track_id} staged on disk ({})",
+                                            path.display()
+                                        );
+                                        Ok(None)
+                                    }
+                                    None => Err(format!(
+                                        "track {track_id} could not be published to disk"
+                                    )),
+                                },
+                                Ok(qbz_qobuz::DownloadedTrack::Refused) => {
+                                    self.audio_cache.unmark_fetching(track_id);
+                                    return Ok(());
+                                }
+                                Err(e) => {
+                                    if let Some(cache) = self.audio_cache.get_playback_cache() {
+                                        cache.abort_write(track_id);
+                                    }
+                                    Err(e)
+                                }
+                            }
+                        }
                         Err(e) => Err(format!("Failed to get stream URL: {e}")),
                     }
                 }
@@ -6160,37 +6201,58 @@ impl Player {
             }
         }
 
-        // Legacy fallback: a plain URL download, always in memory — CMAF failed
-        // outright, so there is no segment table and no size to decide on.
-        //
-        // No size means no way to bound it, so a host that cannot afford an
-        // arbitrary whole track does not take this path at all. It is the
-        // fallback for a CDN failure, not a route worth an OOM.
-        if !self.host_can_hold_whole_track() {
+        // Legacy fallback: a plain URL download. Sized from `Content-Length`
+        // and sent through the same chooser as the CMAF path — it used to be a
+        // whole track in a `Vec` whatever its size, which on a Pi was 550 MB,
+        // twice, with the daemon deep in swap and the playing track dropping out.
+        let stream_url = match client.get_stream_url_with_fallback(track_id, quality).await {
+            Ok(stream_url) => stream_url,
+            Err(e) => {
+                log::warn!("[GAPLESS] No stream URL for {track_id}: {e}");
+                return None;
+            }
+        };
+        // The URL names the format, so a successor gapless cannot use is known
+        // before a byte of it is fetched. The engine drops a rate change on the
+        // floor (`format mismatch ... ignoring PlayNext`) — after the download,
+        // which is how 550 MB came in for nothing.
+        if gapless_rate_mismatch(self.state.get_sample_rate(), stream_url.sampling_rate) {
             log::info!(
-                "[GAPLESS] Track {track_id}: CMAF failed and the legacy download has no size to \
-                 decide on — skipping it on this host"
+                "[GAPLESS] Track {track_id} is {} kHz and the playing track {} Hz — gapless \
+                 cannot bridge a rate change, not fetching it",
+                stream_url.sampling_rate,
+                self.state.get_sample_rate()
             );
             return None;
         }
-        match client.get_stream_url_with_fallback(track_id, quality).await {
-            Ok(stream_url) => match self.download_audio(&stream_url.url).await {
-                Ok(data) => {
-                    let bytes: TrackBytes = data.into();
-                    log::info!(
-                        "[GAPLESS] Track {track_id} downloaded for gapless ({} bytes)",
-                        bytes.len()
-                    );
-                    self.audio_cache.insert(track_id, bytes.clone());
-                    Some(TrackAudio::Memory(bytes))
+        let choose = self.destination_chooser(track_id, "GAPLESS");
+        match qbz_qobuz::cmaf::download_plain_sized(&stream_url.url, track_id, choose).await {
+            Ok(qbz_qobuz::DownloadedTrack::File(_)) => {
+                match self.audio_cache.get_playback_cache().and_then(|c| {
+                    c.commit_write(track_id)
+                        .map(|path| qbz_cache::CachedFile::new(path, c.key()))
+                }) {
+                    Some(file) => Some(TrackAudio::File(file)),
+                    None => {
+                        log::warn!("[GAPLESS] Track {track_id} could not be published to disk");
+                        None
+                    }
                 }
-                Err(e) => {
-                    log::warn!("[GAPLESS] Legacy download failed for {track_id}: {e}");
-                    None
-                }
-            },
+            }
+            Ok(qbz_qobuz::DownloadedTrack::Memory(bytes)) => {
+                log::info!(
+                    "[GAPLESS] Track {track_id} downloaded for gapless ({} bytes)",
+                    bytes.len()
+                );
+                self.audio_cache.insert(track_id, bytes.clone());
+                Some(TrackAudio::Memory(bytes))
+            }
+            Ok(qbz_qobuz::DownloadedTrack::Refused) => None,
             Err(e) => {
-                log::warn!("[GAPLESS] No stream URL for {track_id}: {e}");
+                log::warn!("[GAPLESS] Legacy download failed for {track_id}: {e}");
+                if let Some(cache) = self.audio_cache.get_playback_cache() {
+                    cache.abort_write(track_id);
+                }
                 None
             }
         }
@@ -7952,5 +8014,35 @@ mod audio_thread_busy_tests {
             state.audio_thread_busy().is_none(),
             "cleared by an early return too"
         );
+    }
+}
+
+#[cfg(test)]
+mod gapless_rate_tests {
+    use super::gapless_rate_mismatch;
+
+    /// The Pi, 2026-09-27: a 96 kHz track playing, a 192 kHz successor. The
+    /// engine refuses that hand-off, so fetching the successor — 550 MB, into
+    /// RAM, with the daemon in swap — was all cost and no gapless.
+    #[test]
+    fn a_rate_change_is_known_from_the_urls_khz() {
+        assert!(gapless_rate_mismatch(96_000, 192.0));
+        assert!(gapless_rate_mismatch(48_000, 44.1));
+        assert!(!gapless_rate_mismatch(96_000, 96.0));
+        assert!(!gapless_rate_mismatch(44_100, 44.1));
+    }
+
+    #[test]
+    fn a_rate_already_in_hz_is_read_as_hz() {
+        assert!(!gapless_rate_mismatch(96_000, 96_000.0));
+        assert!(gapless_rate_mismatch(96_000, 192_000.0));
+    }
+
+    /// Nothing known is not a mismatch: a wasted fetch beats a lost hand-off.
+    #[test]
+    fn an_unknown_rate_is_not_a_mismatch() {
+        assert!(!gapless_rate_mismatch(0, 192.0));
+        assert!(!gapless_rate_mismatch(96_000, 0.0));
+        assert!(!gapless_rate_mismatch(96_000, f64::NAN));
     }
 }

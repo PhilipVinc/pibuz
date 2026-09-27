@@ -7,6 +7,17 @@ tags on `main`.
 
 ### Fixed
 
+- Fixed a reproduction path that was broken in 2.5.0.
+
+- **Hi-Res albums no longer drop out and pop on a small board.** Without CMAF,
+  every gapless prefetch fell back to a plain download that put the whole next
+  track in memory, and then copied it. On a 905 MB Pi playing a 24/192 album,
+  that was a 550 MB track held twice: the daemon went 810 MB into swap and the
+  playing track dropped out for minutes. The plain download now reads the size
+  from `Content-Length` and goes through the same memory/card/skip decision as
+  CMAF, with the card copy sealed as always. A successor at a different
+  sample rate, which gapless cannot bridge, is not fetched at all.
+
 - **A resume after a long pause no longer wedges the renderer until a
   restart.** Pause a cast track for about two hours, press play, and the
   daemon went silent for good: it kept accepting casts from every controller

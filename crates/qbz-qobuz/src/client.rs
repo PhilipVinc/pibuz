@@ -43,6 +43,24 @@ struct CmafSession {
     expires_at: u64,
 }
 
+/// The seeds `QobuzClient::cmaf_seed` probes, in order: the bundle's extracted
+/// candidates, then any decoded app secret not already among them.
+///
+/// The secrets are there because the seed IS one of them (see
+/// `bundle::extract_cmaf_seed_candidates`), and because a bundle cache written
+/// before that was understood holds no candidates at all — every 2.5.0
+/// install's. Without them such a cache stays seedless, and CMAF off, until
+/// Qobuz happens to ship a new bundle.
+fn cmaf_seed_candidates(tokens: &BundleTokens) -> Vec<String> {
+    let mut candidates = tokens.cmaf_seeds.clone();
+    for secret in &tokens.secrets {
+        if !candidates.contains(secret) {
+            candidates.push(secret.clone());
+        }
+    }
+    candidates
+}
+
 /// Qobuz API client
 pub struct QobuzClient {
     http: Client,
@@ -305,7 +323,7 @@ impl QobuzClient {
             let tokens = tokens.as_ref().ok_or_else(|| {
                 ApiError::BundleExtractionError("Client not initialized".to_string())
             })?;
-            tokens.cmaf_seeds.clone()
+            cmaf_seed_candidates(tokens)
         };
 
         if candidates.is_empty() {
@@ -1287,5 +1305,34 @@ impl QobuzClient {
 impl Default for QobuzClient {
     fn default() -> Self {
         Self::new().expect("Failed to create client")
+    }
+}
+
+#[cfg(test)]
+mod cmaf_seed_candidate_tests {
+    use super::*;
+
+    fn tokens(seeds: &[&str], secrets: &[&str]) -> BundleTokens {
+        BundleTokens {
+            app_id: "123".into(),
+            secrets: secrets.iter().map(|s| s.to_string()).collect(),
+            private_key: None,
+            cmaf_seeds: seeds.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// A pre-fix cache — secrets, no seed candidates — still gets probes. This
+    /// is the Pi on 2026-09-27: CMAF off, whole 550 MB tracks downloaded into
+    /// RAM, swap, and audible dropouts.
+    #[test]
+    fn a_seedless_cache_still_probes_the_decoded_secrets() {
+        let got = cmaf_seed_candidates(&tokens(&[], &["s1", "s2", "s3"]));
+        assert_eq!(got, ["s1", "s2", "s3"]);
+    }
+
+    #[test]
+    fn extracted_candidates_go_first_and_nothing_is_probed_twice() {
+        let got = cmaf_seed_candidates(&tokens(&["s2", "lit"], &["s1", "s2"]));
+        assert_eq!(got, ["s2", "lit", "s1"]);
     }
 }

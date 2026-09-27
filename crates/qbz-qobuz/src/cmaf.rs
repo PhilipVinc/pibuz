@@ -488,6 +488,124 @@ pub async fn download_full_sized(
     }
 }
 
+/// [`download_full_sized`] for a plain URL — the legacy `/track/getFileUrl`
+/// path, taken whenever CMAF is unavailable — with the size from
+/// `Content-Length` in place of the segment table.
+///
+/// The plain download used to go into a `Vec` whatever its size, on the
+/// reasoning that it had "no size to decide on", and then COPY it into the
+/// cache. On a 905 MB Pi with CMAF out of action that was a 550 MB Hi-Res
+/// track, twice, for seven minutes: the daemon went 810 MB into swap and the
+/// playing track dropped out for most of that time — only for the successor to
+/// be thrown away at the end, a rate change gapless could not bridge anyway.
+/// The size was on the response all along.
+///
+/// Same `choose`, same destinations, and the same sealed writer as the CMAF
+/// path, so this adds no fourth route onto the card. A body that disagrees
+/// with its `Content-Length` is refused rather than published, and a response
+/// with no length at all is declined: an unbounded download is exactly what
+/// this exists to prevent.
+pub async fn download_plain_sized(
+    url: &str,
+    track_id: u64,
+    choose: impl FnOnce(usize) -> TrackDestination,
+) -> std::result::Result<DownloadedTrack, String> {
+    let http = build_cdn_client()?;
+    let mut response = http
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("plain download of track {track_id}: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "plain download of track {track_id}: HTTP {}",
+            response.status()
+        ));
+    }
+    let Some(total) = response.content_length().map(|len| len as usize) else {
+        log::info!(
+            "[PLAIN] Track {track_id} declined: the response gives no length, and an \
+             unbounded download is not worth the risk"
+        );
+        return Ok(DownloadedTrack::Refused);
+    };
+
+    match choose(total) {
+        TrackDestination::Refuse => {
+            log::info!(
+                "[PLAIN] Track {} declined at {:.2} MB — the caller has nowhere to put it",
+                track_id,
+                total as f64 / (1024.0 * 1024.0),
+            );
+            Ok(DownloadedTrack::Refused)
+        }
+        TrackDestination::Memory => {
+            let mut output = ArcSlab::with_capacity(total);
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|e| format!("plain download of track {track_id}: {e}"))?
+            {
+                output.append(&chunk)?;
+            }
+            Ok(DownloadedTrack::Memory(output.into_arc()?))
+        }
+        TrackDestination::File { path, key } => {
+            // Same shape as the CMAF disk path, for the same reasons: the
+            // writer off the async workers, and a two-deep channel as the
+            // throttle so the card paces the download rather than dirty pages
+            // piling up.
+            let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(2);
+            let writer_path = path.clone();
+            let writer = tokio::task::spawn_blocking(move || {
+                write_track_to_disk(&writer_path, key, Vec::new(), rx)
+            });
+            let fetch = async {
+                while let Some(chunk) = response
+                    .chunk()
+                    .await
+                    .map_err(|e| format!("plain download of track {track_id}: {e}"))?
+                {
+                    tx.send(chunk.to_vec())
+                        .await
+                        .map_err(|_| "disk writer stopped early".to_string())?;
+                }
+                Ok::<(), String>(())
+            }
+            .await;
+            drop(tx);
+            let written = match writer.await {
+                Ok(Ok(written)) => written,
+                Ok(Err(e)) => {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(e);
+                }
+                Err(e) => {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(format!("disk writer task failed: {e}"));
+                }
+            };
+            if let Err(e) = fetch {
+                let _ = std::fs::remove_file(&path);
+                return Err(e);
+            }
+            if written != total {
+                let _ = std::fs::remove_file(&path);
+                return Err(format!(
+                    "plain download of track {track_id}: wrote {written} bytes, Content-Length \
+                     said {total} -- refusing to publish a short file"
+                ));
+            }
+            log::info!(
+                "[PLAIN] Track {} written straight to disk: {:.2} MB",
+                track_id,
+                written as f64 / (1024.0 * 1024.0),
+            );
+            Ok(DownloadedTrack::File(path))
+        }
+    }
+}
+
 /// Write a track to `path` from `rx`, pacing the card.
 ///
 /// Runs on a blocking thread. Per chunk:
@@ -1595,5 +1713,163 @@ mod arc_slab_tests {
         assert!(slab.filled().is_empty());
         let bytes = ArcSlab::with_capacity(32).into_arc().unwrap_err();
         assert!(bytes.contains("assembled 0 bytes"), "{bytes}");
+    }
+}
+
+/// [`download_plain_sized`] against a loopback server: the size decides where
+/// the track goes, the card copy is sealed, and a body that is short or has no
+/// length is never published.
+#[cfg(test)]
+mod plain_sized_tests {
+    use super::{download_plain_sized, DownloadedTrack, TrackDestination};
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// How the fake server frames its one body.
+    #[derive(Clone, Copy)]
+    enum Framing {
+        /// An honest `Content-Length`.
+        Sized,
+        /// No length at all: the body runs until the connection closes.
+        Unsized,
+        /// Claims more than it sends, then hangs up.
+        Short,
+    }
+
+    async fn serve(body: Vec<u8>, framing: Framing) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/track.flac", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut conn, _)) = listener.accept().await {
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") {
+                        if conn.read(&mut byte).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        head.push(byte[0]);
+                    }
+                    let header = match framing {
+                        Framing::Sized => format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        ),
+                        Framing::Unsized => "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".into(),
+                        Framing::Short => format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len() * 2
+                        ),
+                    };
+                    let _ = conn.write_all(header.as_bytes()).await;
+                    let _ = conn.write_all(&body).await;
+                });
+            }
+        });
+        url
+    }
+
+    fn track(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    fn crypto() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+
+    /// The decision is made from the size, BEFORE the body is read — the
+    /// thing the old plain download had no way to do.
+    #[tokio::test]
+    async fn the_chooser_sees_the_content_length_and_memory_gets_the_track() {
+        crypto();
+        let body = track(300_000);
+        let url = serve(body.clone(), Framing::Sized).await;
+        let seen = Arc::new(Mutex::new(None));
+        let saw = Arc::clone(&seen);
+        let got = download_plain_sized(&url, 1, move |total| {
+            *saw.lock().unwrap() = Some(total);
+            TrackDestination::Memory
+        })
+        .await
+        .unwrap();
+        assert_eq!(*seen.lock().unwrap(), Some(300_000));
+        match got {
+            DownloadedTrack::Memory(bytes) => assert_eq!(&bytes[..], &body[..]),
+            _ => panic!("expected the track in memory"),
+        }
+    }
+
+    /// A track too big for RAM goes to the card, SEALED — this is a route into
+    /// the L2 cache, which holds no plaintext audio.
+    #[tokio::test]
+    async fn a_card_destination_writes_the_track_sealed() {
+        crypto();
+        let body = track(300_000);
+        let url = serve(body.clone(), Framing::Sized).await;
+        let dir = std::env::temp_dir().join(format!("qbz-plain-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("track.part");
+        let key = qbz_cmaf::SealKey::random();
+        let dest = path.clone();
+        let got =
+            download_plain_sized(&url, 1, move |_| TrackDestination::File { path: dest, key })
+                .await
+                .unwrap();
+        assert!(matches!(got, DownloadedTrack::File(p) if p == path));
+        let on_disk = std::fs::read(&path).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_ne!(on_disk, body, "the card copy was written in the clear");
+        let unsealed = qbz_cmaf::vault::unseal_in_place(key, on_disk).expect("unseal");
+        assert_eq!(unsealed, body);
+    }
+
+    #[tokio::test]
+    async fn a_refusal_downloads_nothing() {
+        crypto();
+        let url = serve(track(1000), Framing::Sized).await;
+        let got = download_plain_sized(&url, 1, |_| TrackDestination::Refuse)
+            .await
+            .unwrap();
+        assert!(matches!(got, DownloadedTrack::Refused));
+    }
+
+    /// No length, no decision — and an undecided download is the unbounded
+    /// one this exists to prevent. Declined, and the chooser never asked.
+    #[tokio::test]
+    async fn a_response_with_no_length_is_declined() {
+        crypto();
+        let url = serve(track(1000), Framing::Unsized).await;
+        let got = download_plain_sized(&url, 1, |_| panic!("nothing to decide on"))
+            .await
+            .unwrap();
+        assert!(matches!(got, DownloadedTrack::Refused));
+    }
+
+    /// A body shorter than it claimed is never handed over as a track: a short
+    /// one decodes as garbage on every later play.
+    #[tokio::test]
+    async fn a_short_body_is_refused_in_memory_and_on_the_card() {
+        crypto();
+        let url = serve(track(50_000), Framing::Short).await;
+        assert!(download_plain_sized(&url, 1, |_| TrackDestination::Memory)
+            .await
+            .is_err());
+
+        let dir = std::env::temp_dir().join(format!("qbz-plain-short-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("track.part");
+        let dest = path.clone();
+        let got = download_plain_sized(&url, 1, move |_| TrackDestination::File {
+            path: dest,
+            key: qbz_cmaf::SealKey::random(),
+        })
+        .await;
+        assert!(got.is_err(), "{:?}", got.as_ref().map(|_| ()));
+        assert!(
+            !path.exists(),
+            "a short file must not be left for the cache to publish"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
