@@ -193,6 +193,7 @@ pub const QC_VOLUME_MODE: &str = "Volume mode";
 pub const QC_APPLIES_NEXT: &str = "applies on the next connection";
 pub const VOL_SOFTWARE: &str = "software";
 pub const VOL_LOCKED: &str = "locked";
+pub const VOL_EXTERNAL: &str = "external";
 
 pub fn qc_preview(name: &str) -> String {
     format!("phones will see: \"{name}\"")

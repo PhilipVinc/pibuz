@@ -23,7 +23,9 @@ use std::sync::Arc;
 
 use qbz_app::shell::AppRuntime;
 use qbz_models::CoreEvent;
-use qconnect_app::{is_local_renderer_active, QueueCommandType};
+use qconnect_app::{
+    is_local_renderer_active, QueueCommandType, RendererReport, RendererReportType,
+};
 use serde_json::json;
 use tokio::sync::{broadcast, Mutex};
 use tokio::task::JoinHandle;
@@ -180,4 +182,120 @@ pub fn spawn_queue_cloud_publish(
             publish_local_queue_if_changed(&inner, &runtime).await;
         }
     })
+}
+
+/// Tell the controller about a volume change that did not come from it.
+///
+/// A controller's own `SetVolume` is reported back by the shared renderer
+/// (`QconnectApp`'s SetVolume echo); nothing reported a change made HERE — an
+/// integrator's `POST /api/playback/volume`, MPRIS — so the app's slider sat
+/// where it was while the level moved under it. In `external` mode that is
+/// the whole point of the POST (issue #3): the level lives with whoever owns
+/// the DAC, and this is how the phone learns it.
+///
+/// Echo-safe the same way the queue publish is: the cloud's current view of
+/// OUR volume (`session_renderer_states`, updated from every
+/// `CTRL_VOLUME_CHANGED` it sends) is compared first, so a level that came from
+/// the controller — or that we already reported — goes nowhere.
+pub async fn publish_local_volume_if_changed(
+    inner: &Arc<Mutex<DaemonQconnectInner>>,
+    runtime: &Arc<AppRuntime<DaemonAdapter>>,
+) {
+    let (app, sync_state, volume_mode) = {
+        let guard = inner.lock().await;
+        match guard.runtime.as_ref() {
+            Some(rt) => (
+                Arc::clone(&rt.app),
+                Arc::clone(&rt.sync_state),
+                rt.volume_mode,
+            ),
+            None => return,
+        }
+    };
+    let ours = volume_mode.reported_volume_pct(runtime.core().get_playback_state().volume);
+    {
+        let state = sync_state.lock().await;
+        if !is_local_renderer_active(&state.session) {
+            return;
+        }
+        let theirs = state
+            .session
+            .local_renderer_id
+            .and_then(|id| state.session_renderer_states.get(&id))
+            .and_then(|renderer| renderer.volume);
+        if volume_report_is_redundant(ours, theirs) {
+            return;
+        }
+    }
+    log::info!("[QConnect] Reporting volume {ours}% (changed locally)");
+    let report = RendererReport::new(
+        RendererReportType::RndrSrvrVolumeChanged,
+        Uuid::new_v4().to_string(),
+        app.queue_state_snapshot().await.version,
+        json!({ "volume": ours }),
+    );
+    if let Err(err) = app.send_renderer_report_command(report).await {
+        log::warn!("[QConnect] Failed to report a local volume change: {err}");
+    }
+}
+
+/// Whether the controller already shows `ours`. An unknown view (`None`) is
+/// NOT redundant: the controller has told us nothing, so tell it.
+fn volume_report_is_redundant(ours: i32, theirs: Option<i32>) -> bool {
+    theirs == Some(ours)
+}
+
+/// The volume-publish subscriber: coalesces `CoreEvent::VolumeChanged` bursts
+/// (a slider drag) over a short window, then runs
+/// [`publish_local_volume_if_changed`] once. Same #521 contract as
+/// [`spawn_queue_cloud_publish`]: aborted+joined in `QconnectHandle::shutdown`.
+pub fn spawn_volume_cloud_publish(
+    inner: Arc<Mutex<DaemonQconnectInner>>,
+    runtime: Arc<AppRuntime<DaemonAdapter>>,
+    mut rx: broadcast::Receiver<CoreEvent>,
+) -> JoinHandle<()> {
+    use tokio::sync::broadcast::error::RecvError;
+    // Short: this is a slider the listener is watching, not a queue edit.
+    const COALESCE: std::time::Duration = std::time::Duration::from_millis(150);
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(CoreEvent::VolumeChanged { .. }) => {}
+                Ok(_) => continue,
+                Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Closed) => return,
+            }
+            let deadline = tokio::time::Instant::now() + COALESCE;
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(deadline) => break,
+                    r = rx.recv() => if let Err(RecvError::Closed) = r { return },
+                }
+            }
+            publish_local_volume_if_changed(&inner, &runtime).await;
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::volume_report_is_redundant;
+
+    #[test]
+    fn a_level_the_controller_already_shows_is_not_reported_again() {
+        // The controller's own SetVolume lands here too (the player emits
+        // VolumeChanged for it); the cloud's echo has already told us it
+        // shows that level, so a report would be a duplicate.
+        assert!(volume_report_is_redundant(40, Some(40)));
+    }
+
+    #[test]
+    fn a_local_change_is_reported() {
+        assert!(!volume_report_is_redundant(25, Some(40)));
+    }
+
+    #[test]
+    fn an_unknown_controller_view_is_reported() {
+        assert!(!volume_report_is_redundant(25, None));
+    }
 }

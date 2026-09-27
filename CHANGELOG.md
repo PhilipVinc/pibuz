@@ -3,6 +3,45 @@
 Notable changes per release. Versions are plain semver; releases are `vX.Y.Z`
 tags on `main`.
 
+## 2.6.0 — unreleased
+
+### Added
+
+- **`qconnect.volume_mode external`: report the level, don't apply it**
+  (issue #3; go-librespot's `external_volume`). The controller's volume is
+  accepted and reported everywhere a level is read — back to the controller,
+  `/api/now-playing`, the `VolumeChanged` event on `/api/events` and the hook —
+  but the samples stay at full scale and no mixer is touched, so an integrator
+  that owns the DAC's volume applies it once, through its own curve.
+  `POST /api/playback/volume` moves the reported level, and in this mode only
+  that. moOde never sets this mode; `software` and `locked` are unchanged.
+
+### Fixed
+
+- **A volume changed on the box now reaches the controller's slider.** A
+  `POST /api/playback/volume` (or MPRIS) used to move the level while the
+  Qobuz app went on showing the old one. It is reported within ~150 ms, and
+  only when the controller does not already show it.
+- **A cast whose output device stays busy no longer shows "playing" over
+  silence** (issue #2). When another process holds the device past the retry
+  window:
+  - a device you NAMED is no longer swapped for the system default, which is
+    some other output — the track "played" there, its clock running, while the
+    DAC in front of you said nothing;
+  - the load fails the way a failed stream always did: the controller shows
+    that track PAUSED rather than playing, or spinning for 90 s, and a tap on
+    play tries the device again. The failure also reaches `/api/status`,
+    `/api/events` and the hook, which it silently did not before.
+  - The same applies to the other ways a cached-track play could fail
+    (no device, a decode or engine failure), which used to leave the previous
+    track's state behind — including its audio, for a later resume to replay.
+
+### Changed
+
+- **Releases publish the source only.** No binaries are built or attached to
+  GitHub releases any more; build from source (see the README). The binary
+  assets of 2.5.0 and 2.5.1 have been removed.
+
 ## 2.5.1 — 2026-09-27
 
 A packaging release: the same code as 2.5.0, under a version no earlier build

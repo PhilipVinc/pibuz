@@ -81,6 +81,9 @@ pub struct VirtualAudioOut {
     underruns: AtomicU64,
     /// Every frame handed over, in order, when recording is on.
     tape: Mutex<Option<Vec<f32>>>,
+    /// Every level a caller tried to put on the (absent) hardware mixer, so a
+    /// test can assert a mixer was — or was NOT — driven.
+    mixer_writes: Mutex<Vec<f32>>,
 }
 
 impl VirtualAudioOut {
@@ -105,7 +108,14 @@ impl VirtualAudioOut {
             silence_written: AtomicU64::new(0),
             underruns: AtomicU64::new(0),
             tape: Mutex::new(None),
+            mixer_writes: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Every `set_hardware_volume` call so far, in order. The device still
+    /// answers each with an error — it has no mixer — exactly as before.
+    pub fn mixer_writes(&self) -> Vec<f32> {
+        self.mixer_writes.lock().expect("mixer writes").clone()
     }
 
     /// Keep every frame handed over, so a test can assert on the audio itself —
@@ -367,7 +377,8 @@ impl AudioOut for VirtualAudioOut {
         self.discard_queued()
     }
 
-    fn set_hardware_volume(&self, _volume: f32) -> Result<(), String> {
+    fn set_hardware_volume(&self, volume: f32) -> Result<(), String> {
+        self.mixer_writes.lock().expect("mixer writes").push(volume);
         Err("the virtual device has no mixer".to_string())
     }
 }

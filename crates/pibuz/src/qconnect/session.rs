@@ -231,7 +231,11 @@ pub async fn bootstrap_remote_presence(
 fn join_volume_fraction(initial_volume: Option<u8>, mode: VolumeMode) -> Option<f32> {
     match mode {
         VolumeMode::Locked => None,
-        VolumeMode::Software => initial_volume.map(|pct| f32::from(pct.min(100)) / 100.0),
+        // `External` stores the join-time level as the one it REPORTS; it never
+        // reaches the samples, so the reason `Locked` is excluded does not apply.
+        VolumeMode::Software | VolumeMode::External => {
+            initial_volume.map(|pct| f32::from(pct.min(100)) / 100.0)
+        }
     }
 }
 
@@ -488,6 +492,18 @@ mod join_volume_tests {
     fn unset_leaves_the_player_alone_in_either_mode() {
         assert_eq!(join_volume_fraction(None, VolumeMode::Software), None);
         assert_eq!(join_volume_fraction(None, VolumeMode::Locked), None);
+        assert_eq!(join_volume_fraction(None, VolumeMode::External), None);
+    }
+
+    /// `external` stores the join-time level as the one it REPORTS — the
+    /// integrator applies it — so `Locked`'s reason for skipping it (a level
+    /// the slider could not undo, on the samples) does not arise.
+    #[test]
+    fn external_mode_takes_the_join_time_level_as_its_reported_level() {
+        assert_eq!(
+            join_volume_fraction(Some(10), VolumeMode::External),
+            Some(0.1)
+        );
     }
 
     #[test]

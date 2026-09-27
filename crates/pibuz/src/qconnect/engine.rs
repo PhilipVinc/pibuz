@@ -44,30 +44,49 @@ pub enum VolumeMode {
     /// remote `SetVolume` is acknowledged-but-ignored (logged at info) and 100
     /// is reported. For DACs feeding power amps where software gain is unwanted.
     Locked,
+    /// Reported, not applied (issue #3; go-librespot's `external_volume`). The
+    /// controller's level is accepted and reported everywhere a level is read —
+    /// the controller, `/api/now-playing`, `/api/events`, the hook — but the
+    /// samples stay at full scale and no mixer is touched: an integrator that
+    /// owns the DAC's volume applies it. `POST /api/playback/volume` moves the
+    /// reported level and so, in this mode, only what the controller shows.
+    External,
 }
 
 impl VolumeMode {
-    /// Parse the `volume_mode` KV value. Anything but the literal `"locked"`
-    /// (unset, empty, unknown) falls back to `Software` — the OD4 default.
+    /// Parse the `volume_mode` KV value. Anything but the literals `"locked"`
+    /// and `"external"` (unset, empty, unknown) falls back to `Software` — the
+    /// OD4 default.
     pub fn from_kv(value: Option<&str>) -> Self {
         match value.map(str::trim) {
             Some("locked") => VolumeMode::Locked,
+            Some("external") => VolumeMode::External,
             _ => VolumeMode::Software,
         }
     }
 
     /// Whether a controller's remote `SetVolume` should reach the player. True
-    /// only in `Software`; `Locked` acknowledges-but-ignores.
+    /// in `Software` and `External` — in `External` the player stores and
+    /// reports the level without applying it; `Locked` acknowledges-but-ignores.
     pub fn applies_remote_volume(self) -> bool {
-        matches!(self, VolumeMode::Software)
+        matches!(self, VolumeMode::Software | VolumeMode::External)
+    }
+
+    /// Whether the player's level must be kept off the samples and the mixer
+    /// (`Player::set_volume_external`).
+    pub fn is_external(self) -> bool {
+        matches!(self, VolumeMode::External)
     }
 
     /// The volume (0-100 percent) to REPORT to the controller given the player's
-    /// real 0.0-1.0 fraction. `Software` reports the real (rounded) percent;
-    /// `Locked` always reports 100 regardless of the player's actual level.
+    /// real 0.0-1.0 fraction. `Software` and `External` report the real
+    /// (rounded) percent; `Locked` always reports 100 regardless of the
+    /// player's actual level.
     pub fn reported_volume_pct(self, real_fraction: f32) -> i32 {
         match self {
-            VolumeMode::Software => (real_fraction.clamp(0.0, 1.0) * 100.0).round() as i32,
+            VolumeMode::Software | VolumeMode::External => {
+                (real_fraction.clamp(0.0, 1.0) * 100.0).round() as i32
+            }
             VolumeMode::Locked => 100,
         }
     }
@@ -957,5 +976,32 @@ mod tests {
         assert_eq!(VolumeMode::from_kv(Some("garbage")), VolumeMode::Software);
         // Whitespace around the real value is tolerated.
         assert_eq!(VolumeMode::from_kv(Some(" locked ")), VolumeMode::Locked);
+    }
+
+    /// Issue #3. `external` takes the controller's level and reports it back
+    /// like `software` does; what differs — the level never reaches the
+    /// samples or the mixer — is `is_external`, which the connect path hands
+    /// to `Player::set_volume_external`.
+    #[test]
+    fn external_mode_accepts_and_reports_the_real_level_without_applying_it() {
+        let mode = VolumeMode::from_kv(Some("external"));
+        assert_eq!(mode, VolumeMode::External);
+        assert_eq!(
+            VolumeMode::from_kv(Some(" external ")),
+            VolumeMode::External
+        );
+        assert!(
+            mode.applies_remote_volume(),
+            "the level must still be stored"
+        );
+        assert_eq!(mode.reported_volume_pct(0.4), 40);
+        assert_eq!(mode.reported_volume_pct(1.0), 100);
+        assert!(mode.is_external());
+    }
+
+    #[test]
+    fn only_external_keeps_the_level_off_the_samples() {
+        assert!(!VolumeMode::Software.is_external());
+        assert!(!VolumeMode::Locked.is_external());
     }
 }

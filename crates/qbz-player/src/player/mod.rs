@@ -759,6 +759,81 @@ pub fn release_finished_track_from(
     cache.release(track_id)
 }
 
+/// Whether a backend that failed to open the output may hand the track to the
+/// legacy CPAL path.
+///
+/// Not when the user NAMED a device and it is busy (issue #2). The legacy path
+/// cannot reach a busy device any more than the backend could, so all it can do
+/// is open a DIFFERENT one — the system default — which on a box that shares
+/// one DAC between several renderers is the headphone jack or HDMI: the track
+/// "plays", its clock runs, the controller shows it playing, and the DAC the
+/// listener is sitting in front of says nothing. Failing is the honest answer;
+/// the caller records it and the controller is told.
+///
+/// Everything else keeps the fallback it had (#591/#592): a rate the hardware
+/// cannot take natively, an unnamed default device, any non-busy failure.
+fn may_fall_back_to_legacy(configured_device: Option<&str>, backend_error: &str) -> bool {
+    let names_a_device = configured_device
+        .map(str::trim)
+        .is_some_and(|d| !d.is_empty() && !d.eq_ignore_ascii_case("default"));
+    !(names_a_device && qbz_audio::is_device_busy_error(backend_error))
+}
+
+/// The track a failed play was for: `(track_id, start_position_secs,
+/// duration_secs)`, exactly as the play command carried them.
+type FailedTrack = (u64, u64, u64);
+
+/// Give up on a play whose output could not be made to work, and SAY so.
+///
+/// Shared by every failure arm of `Play` and `PlayStreaming`. The `Play` arms
+/// used to `return` having only logged (or set a message-less `stream_error`),
+/// which left `is_playing` and the clock of whatever played before running —
+/// the controller was told "playing" over silence (issue #2) — and left the
+/// previous track's audio loaded for a later Resume to replay under the new
+/// track's name.
+///
+/// Leaves the player PAUSED ON THE TRACK IT FAILED TO PLAY, at the offset it
+/// was asked for, with nothing loaded:
+/// - the controller is told that track, paused — not the previous one (its
+///   cursor would jump back) and not "playing";
+/// - the QConnect buffering latch releases on its own: it treats a player that
+///   is on the loading track, not playing, at the offset, as a load that
+///   arrived into a pause (`BufferingLatch::in_flight_with_state`);
+/// - nothing is loaded, so a tap on play cold-loads the track again rather
+///   than resuming audio that is not there (`renderer.rs`, the PLAYING arm);
+/// - the track id CHANGES, so the driver cannot mistake the failure for the
+///   previous track ending near its end and auto-advance into the next one,
+///   which would fail the same way, and so on down the queue.
+///
+/// `record_stream_error` is what the driver latches into `/api/status`,
+/// `/api/events` and the hook.
+fn fail_play(
+    thread_state: &SharedState,
+    current_audio_data: &mut Option<TrackBytes>,
+    current_audio_file: &mut Option<qbz_cache::CachedFile>,
+    current_streaming_source: &mut Option<Arc<BufferedMediaSource>>,
+    (track_id, start_position_secs, duration_secs): FailedTrack,
+    message: impl Into<String>,
+) {
+    let message = message.into();
+    log::error!("Audio thread: could not play track {track_id}: {message}");
+    release_streaming_source(current_streaming_source);
+    *current_audio_data = None;
+    *current_audio_file = None;
+    thread_state.set_loaded_audio(false);
+    // Not playing FIRST: every clock reader extrapolates only while playing,
+    // so from here on the position below is read verbatim.
+    thread_state.is_playing.store(false, Ordering::SeqCst);
+    thread_state
+        .position
+        .store(start_position_secs, Ordering::SeqCst);
+    thread_state.duration.store(duration_secs, Ordering::SeqCst);
+    thread_state
+        .current_track_id
+        .store(track_id, Ordering::SeqCst);
+    thread_state.record_stream_error(message);
+}
+
 fn begin_new_track(
     thread_state: &SharedState,
     gapless_pending: &mut Option<GaplessPending>,
@@ -1230,7 +1305,15 @@ fn apply_engine_volume(
     #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] stream_opt: &Option<StreamType>,
     engine: &PlaybackEngine,
     volume: f32,
+    external: bool,
 ) {
+    // An external volume is reported, never applied: full-scale samples, and
+    // no mixer — CoreAudio's or ALSA's — touched. See `volume_external`.
+    if external {
+        engine.set_unity_gain();
+        return;
+    }
+
     #[cfg(target_os = "macos")]
     if stream_opt
         .as_ref()
@@ -1728,6 +1811,11 @@ pub struct SharedState {
     /// allocate a whole track on a board that cannot hold one. Set once by
     /// `Player::new`, after the cache it describes has been built.
     disk_spill_available: Arc<AtomicBool>,
+    /// The volume is EXTERNAL: `volume` above is still accepted, stored and
+    /// reported everywhere a level is read, but the audio thread plays at
+    /// unity and never drives a mixer with it — whoever owns the DAC applies
+    /// it. Set by the daemon's `qconnect.volume_mode external`.
+    volume_external: Arc<AtomicBool>,
     /// The command the audio thread is handling right now, and since when.
     /// `None` while it is waiting for one. See [`SharedState::audio_thread_busy`].
     audio_thread_busy: Arc<std::sync::Mutex<Option<(Instant, &'static str)>>>,
@@ -1764,7 +1852,13 @@ impl SharedState {
             bit_perfect_mode: Arc::new(AtomicU8::new(0)),
             play_generation: Arc::new(AtomicU64::new(0)),
             disk_spill_available: Arc::new(AtomicBool::new(false)),
+            volume_external: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// See [`SharedState::volume_external`].
+    pub fn volume_external(&self) -> bool {
+        self.volume_external.load(Ordering::SeqCst)
     }
 
     pub fn set_disk_spill_available(&self, available: bool) {
@@ -2270,6 +2364,15 @@ impl Player {
                                     state.record_stream_error(e.clone());
                                     return None;
                                 }
+                                if !may_fall_back_to_legacy(settings.output_device.as_deref(), &e) {
+                                    log::error!(
+                                        "Backend system init failed: {e}; not falling back to \
+                                         another device — the configured one is busy"
+                                    );
+                                    state.set_current_device(None);
+                                    state.record_stream_error(e.clone());
+                                    return None;
+                                }
                                 log::warn!(
                                     "Backend system init failed: {}, falling back to legacy",
                                     e
@@ -2607,6 +2710,15 @@ impl Player {
                                         // back to the legacy CPAL path immediately, same
                                         // as the streaming handler and init_device do.
                                         #[cfg(not(target_os = "macos"))]
+                                        Some(Err(e))
+                                            if !may_fall_back_to_legacy(
+                                                settings.output_device.as_deref(),
+                                                &e,
+                                            ) =>
+                                        {
+                                            Err(e)
+                                        }
+                                        #[cfg(not(target_os = "macos"))]
                                         Some(Err(e)) => {
                                             log::warn!(
                                                 "Backend system init failed for Play: {}, falling back to legacy",
@@ -2644,9 +2756,15 @@ impl Player {
                                     };
 
                                     let Some(device) = device else {
-                                        log::error!("No audio output device available");
                                         thread_state.set_current_device(None);
-                                        thread_state.set_stream_error(true);
+                                        fail_play(
+                                            &thread_state,
+                                            current_audio_data,
+                                            current_audio_file,
+                                            current_streaming_source,
+                                            (track_id, start_position_secs, duration_secs),
+                                            "No audio output device available".to_string(),
+                                        );
                                         return;
                                     };
 
@@ -2704,8 +2822,15 @@ impl Player {
                                             sample_rate,
                                             e
                                         );
-                                        thread_state.set_stream_error(true);
                                         thread_state.set_current_device(None);
+                                        fail_play(
+                                            &thread_state,
+                                            current_audio_data,
+                                            current_audio_file,
+                                            current_streaming_source,
+                                            (track_id, start_position_secs, duration_secs),
+                                            e,
+                                        );
                                         return;
                                     }
                                 }
@@ -2728,7 +2853,14 @@ impl Player {
                             *current_track_channels = Some(channels);
 
                             let Some(ref stream) = *stream_opt else {
-                                log::error!("Audio thread: no audio device available");
+                                fail_play(
+                                    &thread_state,
+                                    current_audio_data,
+                                    current_audio_file,
+                                    current_streaming_source,
+                                    (track_id, start_position_secs, duration_secs),
+                                    "No audio output device available".to_string(),
+                                );
                                 return;
                             };
 
@@ -2804,12 +2936,19 @@ impl Player {
                                                     thread_state.set_stream_error(false);
                                                 } else {
                                                     log::error!("Auto-reinit failed. Audio device unavailable.");
-                                                    thread_state
-                                                        .is_playing
-                                                        .store(false, Ordering::SeqCst);
                                                     thread_state.set_current_device(None);
                                                 }
                                             }
+                                            // This track did not start either way:
+                                            // a reinit only readies the NEXT play.
+                                            fail_play(
+                                                &thread_state,
+                                                current_audio_data,
+                                                current_audio_file,
+                                                current_streaming_source,
+                                                (track_id, start_position_secs, duration_secs),
+                                                format!("Failed to create engine: {e}"),
+                                            );
                                             return;
                                         }
                                     }
@@ -2837,7 +2976,12 @@ impl Player {
                             };
 
                             let volume = f32::from_bits(thread_state.volume.load(Ordering::SeqCst));
-                            apply_engine_volume(stream_opt, &engine, volume);
+                            apply_engine_volume(
+                                stream_opt,
+                                &engine,
+                                volume,
+                                thread_state.volume_external(),
+                            );
 
                             let decoded = match &audio {
                                 TrackAudio::Memory(data) => decode_with_fallback(data),
@@ -2846,7 +2990,14 @@ impl Player {
                             let source = match decoded {
                                 Ok(s) => s,
                                 Err(e) => {
-                                    log::error!("Failed to decode audio: {}", e);
+                                    fail_play(
+                                        &thread_state,
+                                        current_audio_data,
+                                        current_audio_file,
+                                        current_streaming_source,
+                                        (track_id, start_position_secs, duration_secs),
+                                        format!("Failed to decode audio: {e}"),
+                                    );
                                     return;
                                 }
                             };
@@ -2924,7 +3075,14 @@ impl Player {
                             // The offset the caller asked for, not 0. See
                             // `AudioCommand::Play::start_position_secs`.
                             if let Err(e) = engine.append(source, start_position_secs) {
-                                log::error!("Failed to append source to engine: {}", e);
+                                fail_play(
+                                    &thread_state,
+                                    current_audio_data,
+                                    current_audio_file,
+                                    current_streaming_source,
+                                    (track_id, start_position_secs, duration_secs),
+                                    format!("Failed to append source to engine: {e}"),
+                                );
                                 return;
                             }
 
@@ -3112,6 +3270,15 @@ impl Player {
                                         // back to the legacy CPAL path immediately, same
                                         // as the Play/Resume paths do via init_device.
                                         #[cfg(not(target_os = "macos"))]
+                                        Some(Err(e))
+                                            if !may_fall_back_to_legacy(
+                                                settings.output_device.as_deref(),
+                                                &e,
+                                            ) =>
+                                        {
+                                            Err(e)
+                                        }
+                                        #[cfg(not(target_os = "macos"))]
                                         Some(Err(e)) => {
                                             log::warn!(
                                                 "Backend system init failed for streaming: {}, falling back to legacy",
@@ -3134,12 +3301,12 @@ impl Player {
                                         // streaming source was already stored at
                                         // command-accept, and a Resume that finds it
                                         // would replay a track that never started.
-                                        release_streaming_source(current_streaming_source);
-                                        *current_audio_data = None;
-                                        *current_audio_file = None;
-                                        thread_state.set_loaded_audio(false);
-                                        thread_state.is_playing.store(false, Ordering::SeqCst);
-                                        thread_state.record_stream_error(
+                                        fail_play(
+                                            &thread_state,
+                                            current_audio_data,
+                                            current_audio_file,
+                                            current_streaming_source,
+                                            (track_id, start_position_secs, duration_secs),
                                             "No audio output device available for streaming",
                                         );
                                         return;
@@ -3177,12 +3344,14 @@ impl Player {
                                         // later Resume replay the completed download
                                         // with duration still 0, pinning the bar at
                                         // 0:00 forever (#508/#592).
-                                        release_streaming_source(current_streaming_source);
-                                        *current_audio_data = None;
-                                        *current_audio_file = None;
-                                        thread_state.set_loaded_audio(false);
-                                        thread_state.is_playing.store(false, Ordering::SeqCst);
-                                        thread_state.record_stream_error(e);
+                                        fail_play(
+                                            &thread_state,
+                                            current_audio_data,
+                                            current_audio_file,
+                                            current_streaming_source,
+                                            (track_id, start_position_secs, duration_secs),
+                                            e,
+                                        );
                                         return;
                                     }
                                 }
@@ -3221,12 +3390,12 @@ impl Player {
                                     }
                                     Err(e) => {
                                         log::error!("Failed to create engine for streaming: {}", e);
-                                        release_streaming_source(current_streaming_source);
-                                        *current_audio_data = None;
-                                        *current_audio_file = None;
-                                        thread_state.set_loaded_audio(false);
-                                        thread_state.is_playing.store(false, Ordering::SeqCst);
-                                        thread_state.record_stream_error(
+                                        fail_play(
+                                            &thread_state,
+                                            current_audio_data,
+                                            current_audio_file,
+                                            current_streaming_source,
+                                            (track_id, start_position_secs, duration_secs),
                                             "Failed to create the playback engine for streaming",
                                         );
                                         return;
@@ -3251,7 +3420,12 @@ impl Player {
                             };
 
                             let volume = f32::from_bits(thread_state.volume.load(Ordering::SeqCst));
-                            apply_engine_volume(stream_opt, &engine, volume);
+                            apply_engine_volume(
+                                stream_opt,
+                                &engine,
+                                volume,
+                                thread_state.volume_external(),
+                            );
 
                             // Wait for minimum buffer before starting playback.
                             //
@@ -3355,12 +3529,14 @@ impl Player {
                                             .to_string()
                                     }
                                 };
-                                release_streaming_source(current_streaming_source);
-                                *current_audio_data = None;
-                                *current_audio_file = None;
-                                thread_state.set_loaded_audio(false);
-                                thread_state.is_playing.store(false, Ordering::SeqCst);
-                                thread_state.record_stream_error(err_msg);
+                                fail_play(
+                                    &thread_state,
+                                    current_audio_data,
+                                    current_audio_file,
+                                    current_streaming_source,
+                                    (track_id, start_position_secs, duration_secs),
+                                    err_msg,
+                                );
                                 return;
                             }
                             if resume_buffer_target > 0
@@ -3389,12 +3565,12 @@ impl Player {
                                             "Failed to create incremental streaming source: {}",
                                             e
                                         );
-                                        release_streaming_source(current_streaming_source);
-                                        *current_audio_data = None;
-                                        *current_audio_file = None;
-                                        thread_state.set_loaded_audio(false);
-                                        thread_state.is_playing.store(false, Ordering::SeqCst);
-                                        thread_state.record_stream_error(
+                                        fail_play(
+                                            &thread_state,
+                                            current_audio_data,
+                                            current_audio_file,
+                                            current_streaming_source,
+                                            (track_id, start_position_secs, duration_secs),
                                             "Failed to start the streaming decoder",
                                         );
                                         return;
@@ -3483,14 +3659,16 @@ impl Player {
                                 }
                                 if let Some(err) = source.download_error() {
                                     log::error!("Resume: feeder failed after the seek: {}", err);
-                                    release_streaming_source(current_streaming_source);
-                                    *current_audio_data = None;
-                                    *current_audio_file = None;
-                                    thread_state.set_loaded_audio(false);
-                                    thread_state.is_playing.store(false, Ordering::SeqCst);
-                                    thread_state.record_stream_error(format!(
-                                        "Stream feeder failed after the resume seek: {err}"
-                                    ));
+                                    fail_play(
+                                        &thread_state,
+                                        current_audio_data,
+                                        current_audio_file,
+                                        current_streaming_source,
+                                        (track_id, start_position_secs, duration_secs),
+                                        format!(
+                                            "Stream feeder failed after the resume seek: {err}"
+                                        ),
+                                    );
                                     return;
                                 }
                                 log::info!(
@@ -3817,7 +3995,12 @@ impl Player {
 
                                 let volume =
                                     f32::from_bits(thread_state.volume.load(Ordering::SeqCst));
-                                apply_engine_volume(stream_opt, &engine, volume);
+                                apply_engine_volume(
+                                    stream_opt,
+                                    &engine,
+                                    volume,
+                                    thread_state.volume_external(),
+                                );
 
                                 let resume_pos = thread_state.position.load(Ordering::SeqCst);
                                 let skipped_source: Box<dyn Source<Item = f32> + Send> =
@@ -4053,7 +4236,12 @@ impl Player {
                                 .volume
                                 .store(volume.to_bits(), Ordering::SeqCst);
                             if let Some(ref engine) = *current_engine {
-                                apply_engine_volume(stream_opt, engine, volume);
+                                apply_engine_volume(
+                                    stream_opt,
+                                    engine,
+                                    volume,
+                                    thread_state.volume_external(),
+                                );
                             }
                             // debug: a slider drag delivers dozens of these per
                             // second — at info they dominated a field log (#555,
@@ -4191,7 +4379,10 @@ impl Player {
                             let seek_abort = |thread_state: &SharedState, why: &str| {
                                 log::error!("Audio thread: seek aborted: {why}");
                                 thread_state.is_playing.store(false, Ordering::SeqCst);
-                                thread_state.set_stream_error(true);
+                                // With the message, not just the flag: the flag
+                                // alone reaches nobody (the driver drains the
+                                // message), so an aborted seek went unreported.
+                                thread_state.record_stream_error(format!("Seek aborted: {why}"));
                             };
 
                             let mut engine = match stream {
@@ -4226,7 +4417,12 @@ impl Player {
                             };
 
                             let volume = f32::from_bits(thread_state.volume.load(Ordering::SeqCst));
-                            apply_engine_volume(stream_opt, &engine, volume);
+                            apply_engine_volume(
+                                stream_opt,
+                                &engine,
+                                volume,
+                                thread_state.volume_external(),
+                            );
 
                             // Build the decoded source for the seek. Both
                             // streaming and cached paths use Symphonia's native
@@ -7070,8 +7266,26 @@ impl Player {
             return Ok(());
         }
 
+        // Record the level now rather than when the audio thread gets to the
+        // command: that thread can be seconds deep in something else (a busy
+        // device's retry ladder, a buffer wait), and until it answers every
+        // reader — the API, the events bridge, the controller report — would
+        // go on reporting the OLD level. The thread stores the same value again.
+        self.state.volume.store(clamped.to_bits(), Ordering::SeqCst);
         self.tx
             .send(AudioCommand::SetVolume(clamped))
+            .map_err(|e| format!("Failed to send volume command: {}", e))
+    }
+
+    /// Make the volume EXTERNAL (reported, not applied) or take it back.
+    ///
+    /// Re-applies the current level either way, so the switch is heard at
+    /// once: to unity when going external, back to the stored level when not.
+    /// `set_volume` cannot do that — it skips a level it already holds.
+    pub fn set_volume_external(&self, external: bool) -> Result<(), String> {
+        self.state.volume_external.store(external, Ordering::SeqCst);
+        self.tx
+            .send(AudioCommand::SetVolume(self.state.volume()))
             .map_err(|e| format!("Failed to send volume command: {}", e))
     }
 
@@ -8044,5 +8258,96 @@ mod gapless_rate_tests {
         assert!(!gapless_rate_mismatch(0, 192.0));
         assert!(!gapless_rate_mismatch(96_000, 0.0));
         assert!(!gapless_rate_mismatch(96_000, f64::NAN));
+    }
+}
+
+#[cfg(test)]
+mod play_failure_tests {
+    use super::{apply_engine_volume, fail_play, may_fall_back_to_legacy, SharedState};
+    use crate::player::playback_engine::PlaybackEngine;
+    use qbz_cache::TrackBytes;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    const BUSY: &str = "ALSA Direct failed: Device busy: Failed to open ALSA device 'output': \
+                        'Device or resource busy (16)'. Device may be in use or inaccessible.";
+
+    /// Issue #2: a busy device the user NAMED is not swapped for the system
+    /// default, which is some other output — the track would "play" there.
+    #[test]
+    fn a_busy_named_device_does_not_fall_back_to_another_output() {
+        assert!(!may_fall_back_to_legacy(Some("output"), BUSY));
+        assert!(!may_fall_back_to_legacy(Some("hw:CARD=DAC,DEV=0"), BUSY));
+    }
+
+    /// Everything the fallback was there for keeps it (#591/#592).
+    #[test]
+    fn every_other_failure_keeps_the_fallback() {
+        // Nothing named: the default IS what was asked for.
+        assert!(may_fall_back_to_legacy(None, BUSY));
+        assert!(may_fall_back_to_legacy(Some(""), BUSY));
+        assert!(may_fall_back_to_legacy(Some("default"), BUSY));
+        // Named, but not busy.
+        assert!(may_fall_back_to_legacy(
+            Some("output"),
+            "ALSA Direct failed: Permission denied: open. Device may be in use or inaccessible."
+        ));
+    }
+
+    /// A failed play leaves the player paused on the track it failed to play,
+    /// at the offset asked for, with nothing loaded and the reason recorded.
+    /// Every clause is load-bearing — see `fail_play`.
+    #[test]
+    fn a_failed_play_is_paused_on_the_failed_track_with_nothing_loaded() {
+        const PREVIOUS: u64 = 111;
+        const FAILED: u64 = 222;
+        let state = SharedState::new();
+        // What the previous track left behind: playing, a running clock.
+        state.current_track_id.store(PREVIOUS, Ordering::SeqCst);
+        state.is_playing.store(true, Ordering::SeqCst);
+        state.set_loaded_audio(true);
+        state.start_playback_timer(200);
+        let mut data = Some(TrackBytes::from(vec![0u8; 4]));
+        let mut file = None;
+        let mut streaming = None;
+
+        fail_play(
+            &state,
+            &mut data,
+            &mut file,
+            &mut streaming,
+            (FAILED, 139, 300),
+            BUSY,
+        );
+
+        assert!(!state.is_playing(), "a failed play must not report playing");
+        assert_eq!(state.current_track_id(), FAILED);
+        assert_eq!(state.current_position(), 139);
+        assert_eq!(state.current_position_ms(), 139_000);
+        assert_eq!(state.duration(), 300);
+        assert!(
+            !state.has_loaded_audio(),
+            "a later Resume would replay stale audio"
+        );
+        assert!(
+            data.is_none(),
+            "the previous track's bytes are still loaded"
+        );
+        assert_eq!(state.take_stream_error_message().as_deref(), Some(BUSY));
+    }
+
+    /// `volume_external` keeps the level off the mixer too, not only off the
+    /// samples: `apply_engine_volume` is the one door every engine's volume
+    /// goes through.
+    #[test]
+    fn an_external_volume_is_never_applied_to_the_engine() {
+        let out = Arc::new(qbz_audio::VirtualAudioOut::new(44_100, 2, 200, 100.0));
+        let engine = PlaybackEngine::new_alsa_direct(out.clone(), true);
+        apply_engine_volume(&None, &engine, 0.3, true);
+        assert!(out.mixer_writes().is_empty());
+        apply_engine_volume(&None, &engine, 0.3, false);
+        #[cfg(target_os = "linux")]
+        assert_eq!(out.mixer_writes(), vec![0.3]);
+        engine.stop();
     }
 }

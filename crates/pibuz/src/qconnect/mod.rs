@@ -58,6 +58,8 @@ pub(crate) struct DaemonQconnectRuntime {
     pub config: WsTransportConfig,
     pub event_loop: JoinHandle<()>,
     pub sync_state: Arc<Mutex<QconnectRemoteSyncState>>,
+    /// This session's volume policy, for the volume publish (publish.rs).
+    pub volume_mode: engine::VolumeMode,
 }
 
 /// Connect-flow state, mirrored on the desktop `SlintQconnectInner`. `pub(crate)`
@@ -281,6 +283,18 @@ impl DaemonQconnectService {
                 log::warn!("[QConnect] failed to pin volume to 100% at connect: {err}");
             }
         }
+        // `External` keeps the level off the samples and the mixer. Set on
+        // EVERY connect, not only when external, so switching back to another
+        // mode (a settings change picked up here) hands the level back to the
+        // player instead of leaving it at unity.
+        if let Err(err) = self
+            .runtime
+            .core()
+            .player()
+            .set_volume_external(volume_mode.is_external())
+        {
+            log::warn!("[QConnect] failed to set the external-volume flag at connect: {err}");
+        }
 
         // Subscribe to transport events SYNCHRONOUSLY here — after connect()
         // returns and BEFORE the spawn / any further await — so the receiver is
@@ -320,6 +334,7 @@ impl DaemonQconnectService {
                 config,
                 event_loop,
                 sync_state,
+                volume_mode,
             });
         }
 
@@ -532,6 +547,8 @@ pub struct QconnectHandle {
     /// The queue-publish subscriber (publish.rs). Same #521 ordering contract as
     /// `report_task` — it clones `Arc<AppRuntime>` + the qconnect inner.
     publish_task: Option<JoinHandle<()>>,
+    /// The volume-publish subscriber (publish.rs). Same #521 contract.
+    volume_publish_task: Option<JoinHandle<()>>,
     /// The pairing token-refresh heartbeat (pairing.rs). Same #521 contract.
     refresh_task: Option<JoinHandle<()>>,
 }
@@ -634,6 +651,11 @@ impl QconnectHandle {
         if let Some(publish_task) = self.publish_task.take() {
             publish_task.abort();
             let _ = publish_task.await;
+        }
+        // And the volume-publish subscriber.
+        if let Some(volume_publish_task) = self.volume_publish_task.take() {
+            volume_publish_task.abort();
+            let _ = volume_publish_task.await;
         }
         // And the pairing token-refresh heartbeat.
         if let Some(refresh_task) = self.refresh_task.take() {
@@ -767,6 +789,13 @@ pub fn start(
     // push the local queue to the cloud when it changed. Runs for the daemon
     // lifetime; a no-op until a connect installs a runtime (and gated to
     // active-local-renderer sessions inside the publish body).
+    // Volume-publish subscriber (publish.rs): a volume changed HERE (the API,
+    // MPRIS) reaches the controller's slider. Same lifetime and gates.
+    let volume_publish_task = Some(publish::spawn_volume_cloud_publish(
+        Arc::clone(&service.inner),
+        Arc::clone(&service.runtime),
+        core_events.resubscribe(),
+    ));
     let publish_task = Some(publish::spawn_queue_cloud_publish(
         Arc::clone(&service.inner),
         Arc::clone(&service.runtime),
@@ -779,6 +808,7 @@ pub fn start(
         pairing,
         report_task,
         publish_task,
+        volume_publish_task,
         refresh_task,
     }
 }

@@ -141,12 +141,15 @@ impl QConnectState {
                         )));
                     }
                     QField::VolumeMode => {
-                        let opts = vec![s::VOL_SOFTWARE.to_string(), s::VOL_LOCKED.to_string()];
-                        let sel = if self.staged.volume_mode == "locked" {
-                            1
-                        } else {
-                            0
-                        };
+                        let opts = vec![
+                            s::VOL_SOFTWARE.to_string(),
+                            s::VOL_LOCKED.to_string(),
+                            s::VOL_EXTERNAL.to_string(),
+                        ];
+                        let sel = opts
+                            .iter()
+                            .position(|o| *o == self.staged.volume_mode)
+                            .unwrap_or(0);
                         self.editor = Some(Editor::Volume(SelectPopup::new(
                             s::QC_VOLUME_MODE,
                             opts,
@@ -178,8 +181,12 @@ impl QConnectState {
             },
             Editor::Volume(mut p) => match p.handle_key(key) {
                 SelectOutcome::Chosen(i) => {
-                    self.staged.volume_mode =
-                        if i == 1 { "locked" } else { "software" }.to_string();
+                    self.staged.volume_mode = match i {
+                        1 => s::VOL_LOCKED,
+                        2 => s::VOL_EXTERNAL,
+                        _ => s::VOL_SOFTWARE,
+                    }
+                    .to_string();
                     ScreenAction::Consumed
                 }
                 SelectOutcome::Cancelled => ScreenAction::Consumed,

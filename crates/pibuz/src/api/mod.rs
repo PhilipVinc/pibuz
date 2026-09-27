@@ -146,6 +146,11 @@ pub struct ApiState {
     /// API starts serving at step 11) publishes it — empty only in the brief
     /// window between the two, which the reload handler no-ops through.
     pub qconnect_control: Arc<std::sync::OnceLock<crate::qconnect::QconnectControl>>,
+    /// Wakes the events bridge (`events_bridge::spawn`), which otherwise sees a
+    /// volume change only on a driver edge or its 2 s poll. Pulsed after a
+    /// volume or mute, so `/api/events`, the hook and the controller (the
+    /// volume publish, `qconnect/publish.rs`) hear it at once.
+    pub events_edge: Arc<tokio::sync::Notify>,
 }
 
 /// TTL-cached output-device names for the `device_present` check.

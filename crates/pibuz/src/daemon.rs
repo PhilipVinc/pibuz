@@ -145,6 +145,8 @@ pub async fn run(roots: ProfileRoots, cfg: PibuzConfig, warns: Vec<String>) -> R
     //       PositionUpdated / VolumeChanged. Holds only a Weak<AppRuntime>
     //       upgraded per wake, but is still aborted+joined ahead of
     //       `drop(booted)` so a mid-wake strong Arc can't outlive the ordering.
+    // The API pulses the same edge after a volume change (`ApiState::events_edge`).
+    let events_edge = edge_notify.clone();
     let events_bridge =
         crate::events_bridge::spawn(&booted.runtime, booted.bus.clone(), edge_notify);
 
@@ -207,6 +209,7 @@ pub async fn run(roots: ProfileRoots, cfg: PibuzConfig, warns: Vec<String>) -> R
             audio_snapshot: std::sync::Mutex::new(initial_audio_settings),
             quality: quality_cell.clone(),
             qconnect_control: qconnect_control.clone(),
+            events_edge: events_edge.clone(),
         },
     );
     log::info!("control API listening on {bind_addr}");

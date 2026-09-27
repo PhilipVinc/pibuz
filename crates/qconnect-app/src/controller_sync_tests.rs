@@ -1178,3 +1178,65 @@ async fn a_multi_track_release_names_its_placeholder_head_the_same_way() {
     );
     harness.assert_invariants();
 }
+
+/// Issue #2: a cast arrives while another player holds the DAC, and the load
+/// gives up. The phone must end up on THAT track, paused — not "playing" over
+/// silence, not back on the previous track — and a tap on play must try the
+/// device again rather than resume audio that was never loaded.
+#[tokio::test]
+async fn a_load_that_cannot_open_the_device_is_paused_and_play_retries_it() {
+    let harness = ControllerHarness::new().await;
+    harness.become_active_renderer().await;
+    harness.controller().push_queue_and_play(&TRACKS, 0).await;
+    harness.advance_playback(20_000);
+    harness.report_tick().await;
+
+    harness.let_the_load_windows_expire();
+    harness.make_the_audio_thread_lag();
+    harness
+        .controller()
+        .tap_next_track(TRACKS[1], Some(TRACKS[2]))
+        .await;
+    harness.the_pending_load_fails();
+    harness.report_tick().await;
+
+    let view = harness.view();
+    assert_eq!(
+        view.transport,
+        Transport::Paused,
+        "timeline:\n{}",
+        harness.rendered_timeline()
+    );
+    // The screen names a queue ITEM; find the one the failed track sits in.
+    let failed_item = harness
+        .queue_snapshot()
+        .await
+        .queue_items
+        .iter()
+        .find(|item| item.track_id == TRACKS[1])
+        .map(|item| item.queue_item_id);
+    assert!(
+        failed_item.is_some(),
+        "the failed track is not in the cloud queue"
+    );
+    assert_eq!(
+        view.track_id, failed_item,
+        "the screen left the failed track"
+    );
+
+    let before = harness.engine_calls().len();
+    harness.let_the_load_windows_expire();
+    harness.controller().tap_play().await;
+    let after: Vec<_> = harness.engine_calls().into_iter().skip(before).collect();
+    assert!(
+        after.iter().any(|call| matches!(
+            call,
+            EngineCall::StartStream { track_id, .. } if *track_id == TRACKS[1]
+        )),
+        "play after a failed load must open the stream again; it did {after:?}\ntimeline:\n{}",
+        harness.rendered_timeline()
+    );
+    harness.audio_thread_catches_up();
+    assert!(harness.engine().snapshot().is_playing);
+    harness.assert_invariants();
+}

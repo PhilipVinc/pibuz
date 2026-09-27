@@ -171,6 +171,15 @@ impl std::fmt::Display for AlsaDirectError {
     }
 }
 
+/// Whether an output-open failure MESSAGE says the device is held by someone
+/// else. The backends hand the player a `String`, not an `AlsaDirectError`, so
+/// this is read off the text: `AlsaDirectError::DeviceBusy`'s `Display` (the hw
+/// path's give-up message) or the raw ALSA errno text (the plughw path's).
+pub fn is_device_busy_error(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    lower.contains("device busy") || lower.contains("device or resource busy")
+}
+
 impl AlsaDirectError {
     /// Check if this error allows fallback to plughw
     pub fn allows_plughw_fallback(&self) -> bool {
@@ -961,5 +970,38 @@ impl CpalDefaultBackend {
                 e
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod device_busy_tests {
+    use super::{is_device_busy_error, AlsaDirectError};
+
+    #[test]
+    fn the_hw_paths_give_up_message_reads_as_busy() {
+        // Exactly what alsa_backend.rs returns once the retry ladder runs out.
+        let error = AlsaDirectError::from_alsa_error(
+            "Failed to open ALSA device 'output': ALSA function 'snd_pcm_open' failed \
+             with error 'Device or resource busy (16)'",
+        );
+        assert!(matches!(error, AlsaDirectError::DeviceBusy(_)));
+        let message = format!("ALSA Direct failed: {error}. Device may be in use or inaccessible.");
+        assert!(is_device_busy_error(&message));
+    }
+
+    #[test]
+    fn the_plughw_paths_give_up_message_reads_as_busy() {
+        assert!(is_device_busy_error(
+            "Bit-perfect playback could not be established. hw failed, plughw failed: \
+             ALSA function 'snd_pcm_open' failed with error 'Device or resource busy (16)'"
+        ));
+    }
+
+    #[test]
+    fn other_open_failures_do_not() {
+        assert!(!is_device_busy_error(
+            "ALSA Direct failed: Permission denied: snd_pcm_open. Device may be in use or inaccessible."
+        ));
+        assert!(!is_device_busy_error("No audio output device available"));
     }
 }

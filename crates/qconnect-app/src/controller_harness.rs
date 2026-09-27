@@ -274,6 +274,23 @@ impl FakeEngine {
         }
     }
 
+    /// The pending stream never becomes audible: the device could not be
+    /// opened (issue #2 — another player holds it).
+    ///
+    /// Models `qbz_player::player::fail_play`, which is what the real audio
+    /// thread does on every failure arm: it lands on the track it was asked
+    /// for, at the offset asked for, NOT playing and with NOTHING loaded.
+    pub fn fail_the_pending_load(&self) {
+        let mut player = self.player.lock().expect("fake player");
+        if let Some((track_id, position_ms, duration_ms)) = player.pending_track.take() {
+            player.track_id = track_id;
+            player.position_ms = position_ms;
+            player.duration_ms = duration_ms;
+            player.loaded_audio = false;
+            player.playing = false;
+        }
+    }
+
     /// What the player holds: how many tracks, and which one the cursor names.
     pub fn queue(&self) -> (Vec<u64>, Option<u64>) {
         let player = self.player.lock().expect("fake player");
@@ -1348,6 +1365,11 @@ impl ControllerHarness {
     /// The first samples of the pending stream arrive.
     pub fn audio_thread_catches_up(&self) {
         self.inner.engine.catch_up();
+    }
+
+    /// The pending stream fails to open. See [`FakeEngine::fail_the_pending_load`].
+    pub fn the_pending_load_fails(&self) {
+        self.inner.engine.fail_the_pending_load();
     }
 
     /// The queue the PLAYER holds, and the track its cursor names.

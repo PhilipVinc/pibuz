@@ -89,8 +89,8 @@ pub use alsa_direct::AlsaDirectStream;
 pub use analyzer_tap::{AnalyzerMessage, AnalyzerTap};
 pub use audio_out::AudioOut;
 pub use backend::{
-    AlsaDirectError, AlsaPlugin, AudioBackend, AudioBackendType, AudioDevice, BackendConfig,
-    BackendManager, BackendResult, BitPerfectMode,
+    is_device_busy_error, AlsaDirectError, AlsaPlugin, AudioBackend, AudioBackendType, AudioDevice,
+    BackendConfig, BackendManager, BackendResult, BitPerfectMode,
 };
 pub use coreaudio_direct::CoreAudioExclusiveGuard;
 pub use dac_capabilities::{query_dac_capabilities, DacCapabilities};

@@ -217,6 +217,7 @@ pub fn volume(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
     if let Err(e) = state.runtime.core().set_volume(target) {
         return runtime_error(&e.to_string());
     }
+    state.events_edge.notify_one();
     json(
         200,
         serde_json::json!({"volume": canon_volume(target), "muted": muted_after}),
@@ -339,6 +340,7 @@ fn apply_mute(state: &ApiState, live: f32, arg: &str) -> Response<Cursor<Vec<u8>
     if let Err(e) = set_result {
         return runtime_error(&e.to_string());
     }
+    state.events_edge.notify_one();
     json(
         200,
         serde_json::json!({"volume": canon_volume(nominal), "muted": muted_now}),

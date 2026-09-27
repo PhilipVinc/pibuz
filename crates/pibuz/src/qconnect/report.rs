@@ -756,6 +756,36 @@ mod report_decision_tests {
         assert_eq!(d.track_id, 77, "the player is still on the outgoing track");
     }
 
+    /// Issue #2: the device is busy and the load gives up. The player's
+    /// `fail_play` leaves it on the track it failed to play, not playing, at
+    /// the offset it was asked for — and from that alone the latch must let go
+    /// and the controller must see THAT track PAUSED: not "playing" over
+    /// silence, not a spinner until the 90 s backstop, and not the previous
+    /// track (its cursor would jump back).
+    #[test]
+    fn a_load_the_player_gave_up_on_reports_that_track_paused() {
+        const LEAVING: u64 = 111;
+        const FAILED: u64 = 222;
+        for start_secs in [0, 139] {
+            let latch = BufferingLatch::default();
+            latch.begin(FAILED, start_secs, 300);
+            // While the device retries, the player still names what it left.
+            let d = tick(&latch, on(LEAVING, 40, true), false);
+            assert_eq!(d.buffer_state, BUFFER_STATE_BUFFERING);
+
+            // `fail_play`'s end state.
+            let d = tick(&latch, on(FAILED, start_secs, false), false);
+            assert_eq!(d.playing_state, PLAYING_STATE_PAUSED, "from {start_secs}s");
+            assert_eq!(d.buffer_state, BUFFER_STATE_OK, "from {start_secs}s");
+            assert_eq!(d.track_id, FAILED, "from {start_secs}s");
+            assert_eq!(d.position_secs, start_secs);
+            assert!(
+                latch.in_flight(FAILED, start_secs * 1000).is_none(),
+                "the latch is still holding a load that has ended"
+            );
+        }
+    }
+
     /// Nothing loaded is STOPPED, not PAUSED: PAUSED invites the controller to
     /// offer a resume for audio that was never there.
     #[test]

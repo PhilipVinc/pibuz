@@ -560,6 +560,24 @@ impl PlaybackEngine {
         }
     }
 
+    /// Pass samples through at unity gain, and leave any hardware mixer alone.
+    ///
+    /// For an EXTERNAL volume (`SharedState::volume_external`): the level is
+    /// someone else's to apply, so this must not do what `set_volume(1.0)`
+    /// does on a hardware-volume engine — drive the DAC's mixer to full scale
+    /// under the integrator who owns it.
+    pub fn set_unity_gain(&self) {
+        match self {
+            Self::Rodio { sink } => sink.set_volume(1.0),
+            Self::AlsaDirect {
+                volume: software_volume,
+                ..
+            } => software_volume.store(1.0f32.to_bits(), Ordering::Relaxed),
+            #[cfg(target_os = "linux")]
+            Self::Jack { .. } => {}
+        }
+    }
+
     /// Check if playback queue is empty (all sources consumed, not playing)
     pub fn empty(&self) -> bool {
         match self {
@@ -1923,5 +1941,73 @@ mod engine_behaviour_tests {
                 "stop {name} took {took:?} — the join is not bounded"
             );
         }
+    }
+
+    /// Everything the device was handed that is not silence (the prime and
+    /// the stop pad are zeros).
+    fn audio_in(tape: &[f32]) -> Vec<f32> {
+        tape.iter().copied().filter(|s| *s != 0.0).collect()
+    }
+
+    /// Play a short tone through a software-volume engine and return what the
+    /// device received, after `configure` has set the engine's gain.
+    fn tape_through(configure: impl FnOnce(&PlaybackEngine)) -> Vec<f32> {
+        let out = device();
+        out.record();
+        let mut engine = PlaybackEngine::new_alsa_direct(out.clone(), false);
+        configure(&engine);
+        engine.append(tone(0.3, 0.25), 0).expect("append");
+        assert!(wait_for("the tone to finish", || engine.empty()));
+        engine.stop();
+        audio_in(&out.recorded())
+    }
+
+    /// Issue #3, `qconnect.volume_mode external`: the controller's level is
+    /// the integrator's to apply, so the samples reach the DAC untouched even
+    /// though a level below 100 % is held and reported.
+    #[test]
+    fn an_external_volume_leaves_the_samples_bit_perfect() {
+        let audio = tape_through(|engine| {
+            engine.set_volume(0.3);
+            engine.set_unity_gain();
+        });
+        assert!(!audio.is_empty(), "nothing was handed to the device");
+        assert!(
+            audio.iter().all(|s| *s == 0.25),
+            "an external volume attenuated the samples"
+        );
+    }
+
+    /// The control for the case above: without it, a writer that ignored the
+    /// gain altogether would pass it too.
+    #[test]
+    fn a_software_volume_below_unity_does_attenuate() {
+        let audio = tape_through(|engine| engine.set_volume(0.3));
+        assert!(!audio.is_empty(), "nothing was handed to the device");
+        assert!(
+            audio.iter().all(|s| s.abs() < 0.25),
+            "a 30 % software volume reached the device at full scale"
+        );
+    }
+
+    /// An external volume must not drive the DAC's mixer either — not even to
+    /// full scale, which is what `set_volume(1.0)` does on a hardware-volume
+    /// engine, and which would override the integrator who owns that mixer.
+    #[test]
+    fn unity_gain_leaves_a_hardware_mixer_alone() {
+        let out = device();
+        let engine = PlaybackEngine::new_alsa_direct(out.clone(), true);
+        engine.set_unity_gain();
+        assert!(
+            out.mixer_writes().is_empty(),
+            "unity gain wrote {:?} to the hardware mixer",
+            out.mixer_writes()
+        );
+        // The hardware-volume engine does reach the mixer for a real level —
+        // on Linux, where that path is compiled — so the empty list above is
+        // not the device simply never being asked.
+        engine.set_volume(0.3);
+        #[cfg(target_os = "linux")]
+        assert_eq!(out.mixer_writes(), vec![0.3]);
     }
 }

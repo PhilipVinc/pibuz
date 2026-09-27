@@ -494,9 +494,9 @@ fn render_autoplay(mode: AutoplayMode) -> String {
 
 fn parse_volume_mode(v: &str) -> Result<String, String> {
     match v.to_ascii_lowercase().as_str() {
-        "software" | "locked" => Ok(v.to_ascii_lowercase()),
+        "software" | "locked" | "external" => Ok(v.to_ascii_lowercase()),
         other => Err(format!(
-            "invalid volume mode '{other}' — expected one of: software, locked"
+            "invalid volume mode '{other}' — expected one of: software, locked, external"
         )),
     }
 }
@@ -1577,6 +1577,15 @@ mod tests {
         for (k, _) in KEY_TABLE {
             assert!(seen.insert(*k), "duplicate canonical key: {k}");
         }
+    }
+
+    #[test]
+    fn volume_mode_accepts_the_three_modes_and_nothing_else() {
+        for mode in ["software", "locked", "external"] {
+            assert_eq!(parse_volume_mode(mode).as_deref(), Ok(mode));
+        }
+        assert_eq!(parse_volume_mode("External").as_deref(), Ok("external"));
+        assert!(parse_volume_mode("hardware").is_err());
     }
 
     #[test]
