@@ -30,6 +30,11 @@ use crate::events::CoreEvent;
 ///     }
 /// }
 /// ```
+// `double_must_use` (clippy 1.99) fires on what `#[async_trait]` generates, not
+// on anything written here: it marks each method `#[must_use]` and returns a
+// boxed future, which is must_use already. `unknown_lints` because toolchains
+// before 1.99 do not know the name.
+#[allow(unknown_lints, clippy::double_must_use)]
 #[async_trait]
 pub trait FrontendAdapter: Send + Sync {
     /// Called when the core emits an event.

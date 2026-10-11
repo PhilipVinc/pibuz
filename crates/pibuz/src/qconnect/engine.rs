@@ -475,7 +475,8 @@ impl QconnectRendererEngine for DaemonRendererEngine {
         // on moOde, and that must still happen before either path.
         {
             let player = self.core().player();
-            if player.play_cached_if_present(track_id, quality, start_position_secs) {
+            if player.play_cached_if_present(track_id, quality, start_position_secs, duration_secs)
+            {
                 self.abort_current_feeder();
 
                 // Arm the latch here TOO, not just on the streaming path.

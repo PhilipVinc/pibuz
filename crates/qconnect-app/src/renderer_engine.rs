@@ -22,6 +22,9 @@ use qbz_player::PlaybackState;
 /// `QbzCore` / `Player` in one line; the async/sync split follows `QbzCore`
 /// (queue/catalog are async; raw transport is sync). Keep this MINIMAL — exactly
 /// these methods.
+// clippy 1.99 `double_must_use` fires on `#[async_trait]`'s output, not on
+// this code; see `qbz_models::FrontendAdapter`.
+#[allow(unknown_lints, clippy::double_must_use)]
 #[async_trait]
 pub trait QconnectRendererEngine: Send + Sync {
     // ---- transport (sync on the engine) ----

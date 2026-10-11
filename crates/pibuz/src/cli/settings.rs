@@ -867,7 +867,8 @@ pub(crate) fn write_one(
         "qconnect.device_name" => qconnect_kv::persist_device_name_at(
             &qconnect_db(roots),
             parse_output_device(raw).as_deref(),
-        ),
+        )
+        .map_err(SetError::Io)?,
         "qconnect.startup_mode" => {
             let mode = match raw.to_ascii_lowercase().as_str() {
                 "on" => qconnect_app::QconnectStartupMode::On,
@@ -878,19 +879,19 @@ pub(crate) fn write_one(
                     )))
                 }
             };
-            qconnect_kv::save_startup_mode_at(&qconnect_db(roots), mode)
+            qconnect_kv::save_startup_mode_at(&qconnect_db(roots), mode).map_err(SetError::Io)?
         }
         "qconnect.volume_mode" => {
             let v = parse_volume_mode(raw).map_err(SetError::Usage)?;
-            qconnect_kv::save_volume_mode_at(&qconnect_db(roots), &v)
+            qconnect_kv::save_volume_mode_at(&qconnect_db(roots), &v).map_err(SetError::Io)?
         }
         "qconnect.initial_volume" => {
             let v = parse_initial_volume(raw).map_err(SetError::Usage)?;
-            qconnect_kv::save_initial_volume_at(&qconnect_db(roots), v)
+            qconnect_kv::save_initial_volume_at(&qconnect_db(roots), v).map_err(SetError::Io)?
         }
         "qconnect.pairing" => {
             let v = parse_bool(raw).map_err(SetError::Usage)?;
-            qconnect_kv::save_pairing_enabled_at(&qconnect_db(roots), v)
+            qconnect_kv::save_pairing_enabled_at(&qconnect_db(roots), v).map_err(SetError::Io)?
         }
         "qconnect.pairing_port" => {
             let port = raw
@@ -901,7 +902,7 @@ pub(crate) fn write_one(
                 .ok_or_else(|| {
                     SetError::Usage(format!("invalid port '{raw}' — expected 1-65535"))
                 })?;
-            qconnect_kv::save_pairing_port_at(&qconnect_db(roots), port)
+            qconnect_kv::save_pairing_port_at(&qconnect_db(roots), port).map_err(SetError::Io)?
         }
         "hooks.script" => {
             let v = parse_hook_script(raw).map_err(SetError::Usage)?;
@@ -1013,7 +1014,10 @@ pub fn set(roots: &ProfileRoots, key: &str, value: &str) -> i32 {
 /// Human line verbatim per 02 §2.2 (device name interpolated).
 pub fn qconnect_enable(roots: &ProfileRoots) -> i32 {
     let db = qconnect_db(roots);
-    qconnect_kv::save_startup_mode_at(&db, qconnect_app::QconnectStartupMode::On);
+    if let Err(e) = qconnect_kv::save_startup_mode_at(&db, qconnect_app::QconnectStartupMode::On) {
+        eprintln!("error: {e}");
+        return 1;
+    }
     nudge(roots);
     let name = qconnect_kv::resolve_qconnect_friendly_name(
         qconnect_kv::load_device_name_at(&db).as_deref(),
@@ -1026,7 +1030,10 @@ pub fn qconnect_enable(roots: &ProfileRoots) -> i32 {
 /// (disconnects the live session, per `daemon::reload_qconnect`).
 pub fn qconnect_disable(roots: &ProfileRoots) -> i32 {
     let db = qconnect_db(roots);
-    qconnect_kv::save_startup_mode_at(&db, qconnect_app::QconnectStartupMode::Off);
+    if let Err(e) = qconnect_kv::save_startup_mode_at(&db, qconnect_app::QconnectStartupMode::Off) {
+        eprintln!("error: {e}");
+        return 1;
+    }
     nudge(roots);
     println!("qconnect disabled");
     0
@@ -1038,7 +1045,10 @@ pub fn qconnect_disable(roots: &ProfileRoots) -> i32 {
 /// (`daemon::reload_qconnect` / `QconnectControl::refresh_device_name`).
 pub fn qconnect_name(roots: &ProfileRoots, name: &str) -> i32 {
     let db = qconnect_db(roots);
-    qconnect_kv::persist_device_name_at(&db, parse_output_device(name).as_deref());
+    if let Err(e) = qconnect_kv::persist_device_name_at(&db, parse_output_device(name).as_deref()) {
+        eprintln!("error: {e}");
+        return 1;
+    }
     nudge(roots);
     let effective =
         qconnect_kv::resolve_qconnect_friendly_name(parse_output_device(name).as_deref());
@@ -1568,6 +1578,28 @@ mod tests {
         std::fs::write(&roots.data, b"not a directory").unwrap();
         let err = write_one(&roots, "audio.exclusive_mode", "true").unwrap_err();
         assert!(matches!(err, SetError::Io(_)), "{err:?}");
+        cleanup(&roots);
+    }
+
+    /// The same for the `qconnect.*` keys, whose store used to swallow a
+    /// failed open or write and report success — exit 0 for a setting that
+    /// was never saved.
+    #[test]
+    fn a_qconnect_store_that_cannot_open_is_an_io_error() {
+        let roots = scratch_roots("qconnect-open-blocked");
+        std::fs::create_dir_all(roots.data.parent().unwrap()).unwrap();
+        std::fs::write(&roots.data, b"not a directory").unwrap();
+        for (key, value) in [
+            ("qconnect.device_name", "Moode Qobuz"),
+            ("qconnect.startup_mode", "on"),
+            ("qconnect.volume_mode", "locked"),
+            ("qconnect.initial_volume", "10"),
+            ("qconnect.pairing", "on"),
+            ("qconnect.pairing_port", "8183"),
+        ] {
+            let err = write_one(&roots, key, value).unwrap_err();
+            assert!(matches!(err, SetError::Io(_)), "{key}: {err:?}");
+        }
         cleanup(&roots);
     }
 

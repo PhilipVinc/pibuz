@@ -5705,6 +5705,7 @@ impl Player {
         track_id: u64,
         quality: Quality,
         start_position_secs: u64,
+        duration_secs: u64,
         gen: u64,
     ) -> Option<Result<(), String>> {
         // Cache hit: replay instantly from L1/L2 unless the cached copy is
@@ -5734,7 +5735,12 @@ impl Player {
                 // it landed, which the QConnect latch reads as "not arrived" —
                 // and it decoded from the top of the track to throw the result
                 // away.
-                return Some(self.apply_play_data(cached.data, track_id, start_position_secs));
+                return Some(self.apply_play_data(
+                    cached.data,
+                    track_id,
+                    start_position_secs,
+                    duration_secs,
+                ));
             }
         }
 
@@ -5769,7 +5775,7 @@ impl Player {
                     log::info!("Player: L2-hit play for track {track_id} superseded (gen {gen})");
                     return Some(Ok(()));
                 }
-                match self.apply_play_file(&file, track_id, start_position_secs) {
+                match self.apply_play_file(&file, track_id, start_position_secs, duration_secs) {
                     Ok(()) => {
                         log::info!(
                             "[CACHE HIT] Track {} — playing from the disk cache ({}), from {}s",
@@ -5822,14 +5828,20 @@ impl Player {
     ///
     /// The entry point for callers that own their own fetch path — the
     /// QConnect renderer — and want the cache consulted first.
+    ///
+    /// `duration_secs` is the catalog length, `0` when the caller has none. A
+    /// failed play reports it, so the controller still shows how long the
+    /// track is; a play at an offset reports it in place of the decoder's
+    /// figure, which there may count only what is left.
     pub fn play_cached_if_present(
         &self,
         track_id: u64,
         quality: Quality,
         start_position_secs: u64,
+        duration_secs: u64,
     ) -> bool {
         let gen = self.begin_play();
-        match self.try_play_cached(track_id, quality, start_position_secs, gen) {
+        match self.try_play_cached(track_id, quality, start_position_secs, duration_secs, gen) {
             Some(Ok(())) => true,
             Some(Err(e)) => {
                 log::warn!("[CACHE] Track {track_id} failed to start from cache: {e}");
@@ -5866,7 +5878,7 @@ impl Player {
 
         // Cache hit: L1 then L2, unless the cached copy is below the quality
         // now requested.
-        if let Some(done) = self.try_play_cached(track_id, quality, start_position_secs, gen) {
+        if let Some(done) = self.try_play_cached(track_id, quality, start_position_secs, 0, gen) {
             return done;
         }
 
@@ -6090,7 +6102,7 @@ impl Player {
 
         // Send to audio thread (do not re-bump generation), starting AT the
         // requested offset rather than from zero and seeking after.
-        self.apply_play_data(audio_data, track_id, start_position_secs)
+        self.apply_play_data(audio_data, track_id, start_position_secs, 0)
     }
 
     /// Download a track fully into the L1/L2 cache **without** starting
@@ -6869,7 +6881,7 @@ impl Player {
     /// cache are passed through without a copy.
     pub fn play_data(&self, data: impl Into<TrackBytes>, track_id: u64) -> Result<(), String> {
         let _gen = self.begin_play();
-        self.apply_play_data(data, track_id, 0)
+        self.apply_play_data(data, track_id, 0, 0)
     }
 
     /// Send `Play` without bumping generation (used by `play_track` after
@@ -6886,6 +6898,7 @@ impl Player {
         file: &qbz_cache::CachedFile,
         track_id: u64,
         start_position_secs: u64,
+        duration_secs: u64,
     ) -> Result<(), String> {
         let probe = decode_file_with_fallback(file)?;
         let sample_rate: u32 = probe.sample_rate().into();
@@ -6913,7 +6926,7 @@ impl Player {
                 audio: TrackAudio::File(file.clone()),
                 track_id,
                 start_position_secs,
-                duration_secs: 0, // Will be determined by decoder
+                duration_secs,
                 sample_rate,
                 channels,
             })
@@ -6928,6 +6941,7 @@ impl Player {
         data: impl Into<TrackBytes>,
         track_id: u64,
         start_position_secs: u64,
+        duration_secs: u64,
     ) -> Result<(), String> {
         let data: TrackBytes = data.into();
         log::info!(
@@ -6959,7 +6973,7 @@ impl Player {
                 audio: TrackAudio::Memory(data),
                 track_id,
                 start_position_secs,
-                duration_secs: 0, // Will be determined by decoder
+                duration_secs,
                 sample_rate,
                 channels,
             })
@@ -8542,5 +8556,70 @@ mod play_offset_tests {
         let wav = ramp_wav(RATE, RATE * SECS, PEAK);
         let audio = TrackAudio::Memory(TrackBytes::from(wav));
         assert!(fraction_of_track(first_sample(&audio, Duration::ZERO)).abs() < 0.01);
+    }
+}
+
+#[cfg(test)]
+mod cached_play_duration_tests {
+    use super::{AudioCommand, AudioDiagnostic, AudioSettings, Player, SharedState};
+    use crate::player::streaming_source::tests::{ramp_wav, temp_wav};
+    use qbz_models::Quality;
+    use std::sync::mpsc::{self, Receiver};
+    use std::sync::{Arc, Mutex};
+
+    const TRACK: u64 = 74_936_706;
+    const CATALOG_SECS: u64 = 300;
+
+    /// A `Player` whose audio thread is this test: every command it sends
+    /// lands in the receiver instead of being played.
+    fn player_without_an_audio_thread() -> (Player, Receiver<AudioCommand>) {
+        let (tx, rx) = mpsc::channel();
+        let player = Player {
+            tx,
+            state: SharedState::new(),
+            audio_settings: Arc::new(Mutex::new(AudioSettings::default())),
+            diagnostic: AudioDiagnostic::new(),
+            audio_cache: Arc::new(qbz_cache::AudioCache::new(16 * 1024 * 1024)),
+        };
+        (player, rx)
+    }
+
+    fn sent_duration(rx: &Receiver<AudioCommand>) -> u64 {
+        match rx.try_recv().expect("a command was sent") {
+            AudioCommand::Play {
+                track_id,
+                duration_secs,
+                ..
+            } => {
+                assert_eq!(track_id, TRACK);
+                duration_secs
+            }
+            other => panic!("expected Play, got {}", other.label()),
+        }
+    }
+
+    /// Every cached `Play` used to say `duration_secs: 0`. When the audio
+    /// thread then failed it (a busy device), `fail_play` stored that 0, and
+    /// the phone showed the right track, paused, with no length.
+    #[test]
+    fn a_connect_cache_hit_carries_the_catalog_duration() {
+        let (player, rx) = player_without_an_audio_thread();
+        player
+            .audio_cache
+            .insert(TRACK, ramp_wav(8_000, 8_000 * 4, 30_000));
+        assert!(player.play_cached_if_present(TRACK, Quality::Mp3, 2, CATALOG_SECS));
+        assert_eq!(sent_duration(&rx), CATALOG_SECS);
+    }
+
+    /// The disk-cache half sends its own `Play`.
+    #[test]
+    fn a_play_from_the_card_carries_the_catalog_duration() {
+        let (player, rx) = player_without_an_audio_thread();
+        let file = temp_wav("cached-play-duration", &ramp_wav(8_000, 8_000 * 4, 30_000));
+        player
+            .apply_play_file(&file, TRACK, 2, CATALOG_SECS)
+            .expect("a readable file");
+        assert_eq!(sent_duration(&rx), CATALOG_SECS);
+        std::fs::remove_file(file.path()).ok();
     }
 }

@@ -405,24 +405,60 @@ pub fn resolve_local_identity() -> qconnect_app::LocalIdentity {
 // qconnect_transport.rs:281-411). The desktop variants read the GLOBAL settings
 // DB; the daemon threads the DB path so T11 (`pibuz qconnect enable|disable`,
 // settings show/set) and T13 (TUI QConnect screen) drive the SAME daemon-root DB
-// the connect path reads. Every helper is fail-open (returns the default / no-op
-// on any error).
+// the connect path reads. Every LOAD is fail-open (returns the default on any
+// error); every SAVE returns the error, so `pibuz settings set qconnect.*` can
+// exit 1 instead of reporting a write that never happened.
 // ---------------------------------------------------------------------------
+
+/// How long a connection waits on another one's lock before giving up. The
+/// daemon and a `settings set` from moOde open this file concurrently, and
+/// without a timeout SQLite fails the loser immediately with SQLITE_BUSY —
+/// which used to drop the write silently. Every holder keeps the lock for
+/// one statement, so this is never actually waited out.
+const QCONNECT_SETTINGS_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Open the daemon-root QConnect settings DB (key/value table), creating it when
 /// missing. Mirrors the Tauri `startup.rs::open_settings_conn`.
-fn open_qconnect_settings_conn_at(path: &Path) -> Option<rusqlite::Connection> {
-    let conn = rusqlite::Connection::open(path).ok()?;
+fn try_open_qconnect_settings_conn_at(path: &Path) -> Result<rusqlite::Connection, String> {
+    let fail = |err: rusqlite::Error| format!("qconnect settings {}: {err}", path.display());
+    // SQLite creates the file but not its directory. On a fresh profile the
+    // data root does not exist until the daemon or another store makes it, and
+    // a `settings set qconnect.*` that came first was dropped without a word.
+    // The other stores create theirs.
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|err| format!("qconnect settings {}: {err}", dir.display()))?;
+    }
+    let conn = rusqlite::Connection::open(path).map_err(fail)?;
+    // Before the PRAGMA: switching to WAL takes a lock too.
+    conn.busy_timeout(QCONNECT_SETTINGS_BUSY_TIMEOUT)
+        .map_err(fail)?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
-        .ok()?;
+        .map_err(fail)?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         )",
     )
-    .ok()?;
-    Some(conn)
+    .map_err(fail)?;
+    Ok(conn)
+}
+
+/// The fail-open form the loaders use.
+fn open_qconnect_settings_conn_at(path: &Path) -> Option<rusqlite::Connection> {
+    try_open_qconnect_settings_conn_at(path).ok()
+}
+
+/// Store one `key = value` row.
+fn put_qconnect_setting_at(path: &Path, key: &str, value: &str) -> Result<(), String> {
+    try_open_qconnect_settings_conn_at(path)?
+        .execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+            rusqlite::params![key, value],
+        )
+        .map(drop)
+        .map_err(|err| format!("qconnect settings {}: write {key}: {err}", path.display()))
 }
 
 /// Load the persisted custom device name (fail-open: None on any error).
@@ -438,20 +474,18 @@ pub fn load_device_name_at(path: &Path) -> Option<String> {
 }
 
 /// Persist the custom device name (None clears it).
-pub fn persist_device_name_at(path: &Path, name: Option<&str>) {
-    let Some(conn) = open_qconnect_settings_conn_at(path) else {
-        return;
-    };
+pub fn persist_device_name_at(path: &Path, name: Option<&str>) -> Result<(), String> {
     match name {
-        Some(n) => {
-            let _ = conn.execute(
-                "INSERT OR REPLACE INTO settings (key, value) VALUES ('device_name', ?1)",
-                rusqlite::params![n],
-            );
-        }
-        None => {
-            let _ = conn.execute("DELETE FROM settings WHERE key = 'device_name'", []);
-        }
+        Some(n) => put_qconnect_setting_at(path, "device_name", n),
+        None => try_open_qconnect_settings_conn_at(path)?
+            .execute("DELETE FROM settings WHERE key = 'device_name'", [])
+            .map(drop)
+            .map_err(|err| {
+                format!(
+                    "qconnect settings {}: clear device_name: {err}",
+                    path.display()
+                )
+            }),
     }
 }
 
@@ -473,14 +507,11 @@ pub fn load_startup_mode_at(path: &Path) -> qconnect_app::QconnectStartupMode {
 }
 
 /// Persist the QConnect startup mode.
-pub fn save_startup_mode_at(path: &Path, mode: qconnect_app::QconnectStartupMode) {
-    let Some(conn) = open_qconnect_settings_conn_at(path) else {
-        return;
-    };
-    let _ = conn.execute(
-        "INSERT OR REPLACE INTO settings (key, value) VALUES ('startup_mode', ?1)",
-        rusqlite::params![mode.as_str()],
-    );
+pub fn save_startup_mode_at(
+    path: &Path,
+    mode: qconnect_app::QconnectStartupMode,
+) -> Result<(), String> {
+    put_qconnect_setting_at(path, "startup_mode", mode.as_str())
 }
 
 /// Load the last-known QConnect on/off state, if recorded (`last_known_state` =
@@ -510,15 +541,8 @@ pub fn load_last_known_state_at(path: &Path) -> Option<bool> {
 
 /// Persist the last-known on/off state. See [`load_last_known_state_at`].
 #[allow(dead_code)] // unwired half of RememberLast — see load_last_known_state_at
-pub fn save_last_known_state_at(path: &Path, state: bool) {
-    let Some(conn) = open_qconnect_settings_conn_at(path) else {
-        return;
-    };
-    let value = if state { "on" } else { "off" };
-    let _ = conn.execute(
-        "INSERT OR REPLACE INTO settings (key, value) VALUES ('last_known_state', ?1)",
-        rusqlite::params![value],
-    );
+pub fn save_last_known_state_at(path: &Path, state: bool) -> Result<(), String> {
+    put_qconnect_setting_at(path, "last_known_state", if state { "on" } else { "off" })
 }
 
 /// Load the daemon volume mode (`volume_mode` = "software" | "locked"; 01 §7.4).
@@ -535,14 +559,8 @@ pub fn load_volume_mode_at(path: &Path) -> Option<String> {
 }
 
 /// Persist the daemon volume mode ("software" | "locked").
-pub fn save_volume_mode_at(path: &Path, mode: &str) {
-    let Some(conn) = open_qconnect_settings_conn_at(path) else {
-        return;
-    };
-    let _ = conn.execute(
-        "INSERT OR REPLACE INTO settings (key, value) VALUES ('volume_mode', ?1)",
-        rusqlite::params![mode],
-    );
+pub fn save_volume_mode_at(path: &Path, mode: &str) -> Result<(), String> {
+    put_qconnect_setting_at(path, "volume_mode", mode)
 }
 
 /// Load the pairing-surface switch (`pairing` = "on" | "off"; pairing.rs). NEW
@@ -563,15 +581,8 @@ pub fn load_pairing_enabled_at(path: &Path) -> bool {
 }
 
 /// Persist the pairing-surface switch.
-pub fn save_pairing_enabled_at(path: &Path, enabled: bool) {
-    let Some(conn) = open_qconnect_settings_conn_at(path) else {
-        return;
-    };
-    let value = if enabled { "on" } else { "off" };
-    let _ = conn.execute(
-        "INSERT OR REPLACE INTO settings (key, value) VALUES ('pairing', ?1)",
-        rusqlite::params![value],
-    );
+pub fn save_pairing_enabled_at(path: &Path, enabled: bool) -> Result<(), String> {
+    put_qconnect_setting_at(path, "pairing", if enabled { "on" } else { "off" })
 }
 
 /// Default port for the pairing listener — one above the control plane's 8182.
@@ -594,14 +605,8 @@ pub fn load_pairing_port_at(path: &Path) -> u16 {
 }
 
 /// Persist the pairing listener port.
-pub fn save_pairing_port_at(path: &Path, port: u16) {
-    let Some(conn) = open_qconnect_settings_conn_at(path) else {
-        return;
-    };
-    let _ = conn.execute(
-        "INSERT OR REPLACE INTO settings (key, value) VALUES ('pairing_port', ?1)",
-        rusqlite::params![port.to_string()],
-    );
+pub fn save_pairing_port_at(path: &Path, port: u16) -> Result<(), String> {
+    put_qconnect_setting_at(path, "pairing_port", &port.to_string())
 }
 
 /// The volume to set on ourselves when a Connect session picks this device,
@@ -627,14 +632,8 @@ pub fn load_initial_volume_at(path: &Path) -> Option<u8> {
 }
 
 /// Persist the join-time volume percentage; `0` disables it.
-pub fn save_initial_volume_at(path: &Path, percent: u8) {
-    let Some(conn) = open_qconnect_settings_conn_at(path) else {
-        return;
-    };
-    let _ = conn.execute(
-        "INSERT OR REPLACE INTO settings (key, value) VALUES ('initial_volume', ?1)",
-        rusqlite::params![percent.to_string()],
-    );
+pub fn save_initial_volume_at(path: &Path, percent: u8) -> Result<(), String> {
+    put_qconnect_setting_at(path, "initial_volume", &percent.to_string())
 }
 
 /// Build the WS transport config: env overrides first, then auto-discovery via
@@ -927,10 +926,10 @@ mod tests {
         assert_eq!(load_pairing_port_at(&tmp), DEFAULT_PAIRING_PORT);
 
         // Persist + read back.
-        save_startup_mode_at(&tmp, qconnect_app::QconnectStartupMode::On);
-        persist_device_name_at(&tmp, Some("Living Room"));
-        save_volume_mode_at(&tmp, "locked");
-        save_last_known_state_at(&tmp, true);
+        save_startup_mode_at(&tmp, qconnect_app::QconnectStartupMode::On).unwrap();
+        persist_device_name_at(&tmp, Some("Living Room")).unwrap();
+        save_volume_mode_at(&tmp, "locked").unwrap();
+        save_last_known_state_at(&tmp, true).unwrap();
 
         assert_eq!(
             load_startup_mode_at(&tmp),
@@ -941,19 +940,97 @@ mod tests {
         assert_eq!(load_last_known_state_at(&tmp), Some(true));
 
         // Clearing the device name removes it.
-        persist_device_name_at(&tmp, None);
+        persist_device_name_at(&tmp, None).unwrap();
         assert_eq!(load_device_name_at(&tmp), None);
 
         // Pairing switch + port round-trip; port 0 / garbage fall back.
-        save_pairing_enabled_at(&tmp, false);
+        save_pairing_enabled_at(&tmp, false).unwrap();
         assert!(!load_pairing_enabled_at(&tmp));
-        save_pairing_enabled_at(&tmp, true);
+        save_pairing_enabled_at(&tmp, true).unwrap();
         assert!(load_pairing_enabled_at(&tmp));
-        save_pairing_port_at(&tmp, 9000);
+        save_pairing_port_at(&tmp, 9000).unwrap();
         assert_eq!(load_pairing_port_at(&tmp), 9000);
-        save_pairing_port_at(&tmp, 0);
+        save_pairing_port_at(&tmp, 0).unwrap();
         assert_eq!(load_pairing_port_at(&tmp), DEFAULT_PAIRING_PORT);
 
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Every save used to swallow its error, so `pibuz settings set
+    /// qconnect.volume_mode locked` exited 0 against a database it could not
+    /// open. A plain file where the directory should be fails the open even
+    /// as root, which a read-only file would not.
+    #[test]
+    fn every_save_reports_a_database_it_cannot_open() {
+        let blocker =
+            std::env::temp_dir().join(format!("pibuz_qconnect_kv_blocked_{}", std::process::id()));
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let db = blocker.join("qconnect_settings.db");
+
+        let results = [
+            (
+                "startup_mode",
+                save_startup_mode_at(&db, qconnect_app::QconnectStartupMode::On),
+            ),
+            (
+                "device_name",
+                persist_device_name_at(&db, Some("Living Room")),
+            ),
+            ("device_name cleared", persist_device_name_at(&db, None)),
+            ("volume_mode", save_volume_mode_at(&db, "locked")),
+            ("last_known_state", save_last_known_state_at(&db, true)),
+            ("pairing", save_pairing_enabled_at(&db, false)),
+            ("pairing_port", save_pairing_port_at(&db, 9000)),
+            ("initial_volume", save_initial_volume_at(&db, 30)),
+        ];
+        for (key, result) in results {
+            let err = result.expect_err(key);
+            assert!(err.contains("qconnect settings"), "{key}: {err}");
+        }
+        let _ = std::fs::remove_file(&blocker);
+    }
+
+    /// A fresh profile has no data root until something creates it. A
+    /// `qconnect.*` write that came first used to fail on the missing
+    /// directory, silently.
+    #[test]
+    fn a_save_on_a_fresh_profile_creates_the_data_root() {
+        let root =
+            std::env::temp_dir().join(format!("pibuz_qconnect_kv_fresh_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let db = root.join("data").join("qconnect_settings.db");
+
+        save_volume_mode_at(&db, "locked").expect("creates the directory, then writes");
+        assert_eq!(load_volume_mode_at(&db).as_deref(), Some("locked"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The daemon and a `settings set` from moOde open this file at the same
+    /// time. Without a busy timeout the loser of a lock race failed at once,
+    /// and the write was dropped without a word.
+    #[test]
+    fn a_save_waits_out_a_brief_lock_instead_of_dropping_the_write() {
+        let db = std::env::temp_dir().join(format!(
+            "pibuz_qconnect_kv_locked_{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&db);
+        save_volume_mode_at(&db, "software").unwrap();
+
+        let holder = try_open_qconnect_settings_conn_at(&db).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            holder.execute_batch("COMMIT").unwrap();
+        });
+
+        save_volume_mode_at(&db, "locked").expect("waits for the lock, then writes");
+        release.join().unwrap();
+        assert_eq!(load_volume_mode_at(&db).as_deref(), Some("locked"));
+
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
+        }
     }
 }

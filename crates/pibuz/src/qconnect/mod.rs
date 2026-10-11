@@ -841,9 +841,9 @@ mod volume_mode_tests {
             std::env::temp_dir().join(format!("pibuz_volume_mode_at_{}.db", std::process::id()));
         let _ = std::fs::remove_file(&db);
         assert_eq!(volume_mode_at(&db), VolumeMode::Software, "unset");
-        transport::save_volume_mode_at(&db, "external");
+        transport::save_volume_mode_at(&db, "external").unwrap();
         assert_eq!(volume_mode_at(&db), VolumeMode::External);
-        transport::save_volume_mode_at(&db, "locked");
+        transport::save_volume_mode_at(&db, "locked").unwrap();
         assert_eq!(volume_mode_at(&db), VolumeMode::Locked);
         let _ = std::fs::remove_file(&db);
     }
