@@ -72,75 +72,21 @@ pub fn should_arm_renderer_watchdog(playing_state: Option<i32>, is_active_peer: 
     is_active_peer && playing_state == Some(PLAYING_STATE_PLAYING)
 }
 
-/// The server's view of who currently owns the active-renderer slot in a
-/// SESSION_STATE frame, classified relative to us (P1-3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ServerActiveState {
-    /// No renderer is active in the session.
-    None,
-    /// We are the active renderer.
-    Me,
-    /// Another renderer is active and reports PLAYING.
-    OtherPlaying,
-    /// Another renderer is active and reports a non-playing state.
-    OtherPaused,
-}
-
-/// Outcome of takeover arbitration on a SESSION_STATE frame (P1-3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ConnectionDecision {
-    /// We should consider ourselves the active renderer.
-    pub should_be_active: bool,
-    /// We should emit CtrlSrvrSetActiveRenderer to claim the slot.
-    pub should_set_active_renderer: bool,
-    /// We should push our queue + state to the session.
-    pub should_set_queue: bool,
-    /// We should ask the renderer for its current state.
-    pub should_ask_queue: bool,
-}
-
-/// Pure takeover arbitration ported from the web controller's
-/// `computeConnectionState`. This is a REDUCED matrix: it captures the
-/// shape and named outputs faithfully from the appendix prose, but the
-/// exact web truth-table cell values were not dumped verbatim. The
-/// `OtherPaused` vs `OtherPlaying` divergence and repeat-mode
-/// reconciliation are pending a decompiled-bundle cross-check; repeat-mode
-/// reconciliation is intentionally OUT of P1-3 scope (it overlaps the
-/// existing `session_loop_mode` handling in `event_sink.rs`).
-pub fn compute_connection_state(
-    was_active: bool,
-    was_playing: bool,
-    server: ServerActiveState,
-    queue_equal: bool,
-    auto_take_when_idle: bool,
-) -> ConnectionDecision {
-    use ServerActiveState::*;
-    match server {
-        None => ConnectionDecision {
-            // Auto-take the render when the cloud reports NO active renderer and
-            // `auto_take_when_idle` is set (the caller gates this to a FRESH
-            // connect — see run_session_loop), so the user does not need an extra
-            // "Play here" click when QBZ is the only candidate. This NEVER steals
-            // from an active peer: an active peer is server==Other*/Me, not None,
-            // and those branches keep should_set_active_renderer=false.
-            should_be_active: was_active || auto_take_when_idle,
-            should_set_active_renderer: was_active || auto_take_when_idle,
-            should_set_queue: was_active,
-            should_ask_queue: false,
-        },
-        Me => ConnectionDecision {
-            should_be_active: true,
-            should_set_active_renderer: false,
-            should_set_queue: !queue_equal && (was_active || was_playing),
-            should_ask_queue: queue_equal,
-        },
-        OtherPlaying | OtherPaused => ConnectionDecision {
-            should_be_active: false,
-            should_set_active_renderer: false,
-            should_set_queue: false,
-            should_ask_queue: true,
-        },
-    }
+/// Whether to send `CtrlSrvrSetActiveRenderer` for ourselves on a SESSION_STATE:
+/// only to take back the slot we held before a connection drop, when the cloud
+/// now says nobody holds it. The official client does the same.
+///
+/// That is the WHOLE takeover policy, on purpose. The web player's
+/// `computeConnectionState` also claims an idle session on start, and takes over
+/// from a paused peer while it is itself playing locally — both for a device
+/// that plays on its own. This one never does: a phone casting to it, or handing
+/// it the session over the LAN, decides when it is the output. (An idle-session
+/// auto-claim inherited from the desktop app made every daemon start, and so
+/// every moOde renderer toggle, grab an idle session uninvited.) Nor does it ever
+/// push its own queue on connect: the cloud's queue is the truth, and the local
+/// one is only a copy of an earlier session's.
+pub fn should_reclaim_render(was_active: bool, server_idle: bool) -> bool {
+    was_active && server_idle
 }
 
 /// Pure selector for the JoinSession `reason`: a post-drop rejoin carries
@@ -566,36 +512,15 @@ mod tests {
     }
 
     #[test]
-    fn compute_connection_state_matrix() {
-        use ServerActiveState::*;
-        let d = compute_connection_state(true, true, None, false, false);
-        assert!(
-            d.should_be_active
-                && d.should_set_active_renderer
-                && d.should_set_queue
-                && !d.should_ask_queue
-        );
-        let d = compute_connection_state(true, false, Me, false, false);
-        assert!(d.should_be_active && !d.should_set_active_renderer && d.should_set_queue);
-        let d = compute_connection_state(false, false, Me, true, false);
-        assert!(d.should_ask_queue && !d.should_set_queue && !d.should_set_active_renderer);
-        let d = compute_connection_state(false, false, OtherPlaying, false, false);
-        assert!(!d.should_be_active && !d.should_set_active_renderer && d.should_ask_queue);
-        let d = compute_connection_state(false, false, None, false, false);
-        assert!(
-            !d.should_be_active
-                && !d.should_set_active_renderer
-                && !d.should_set_queue
-                && !d.should_ask_queue
-        );
-        // Fresh connect, cloud reports nobody active, auto_take_when_idle set ->
-        // QBZ claims the render (no extra "Play here" click).
-        let d = compute_connection_state(false, false, None, false, true);
-        assert!(d.should_be_active && d.should_set_active_renderer);
-        // An active peer is server==OtherPlaying/Other Paused, never None, so
-        // auto_take_when_idle can never steal it (guard at the call site too).
-        let d = compute_connection_state(false, false, OtherPlaying, false, true);
-        assert!(!d.should_set_active_renderer);
+    fn only_a_slot_held_before_the_drop_is_reclaimed() {
+        // A reconnect after holding the slot, which nobody took meanwhile.
+        assert!(should_reclaim_render(true, true));
+        // Someone else took it while we were away: theirs now.
+        assert!(!should_reclaim_render(true, false));
+        // A fresh connect to an idle session: not ours to take. This was the
+        // auto-claim, and the case the rule exists to refuse.
+        assert!(!should_reclaim_render(false, true));
+        assert!(!should_reclaim_render(false, false));
     }
 
     #[test]

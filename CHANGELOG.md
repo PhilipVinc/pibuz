@@ -19,6 +19,14 @@ tags on `main`.
   so the Qobuz controller disables its volume slider instead of offering one
   that snaps back. `software` and `external` still advertise ALLOWED. Like the
   mode itself, a change applies on the next connect.
+- **Starting the daemon no longer makes it the session's output.** On a
+  fresh connect to a session with nothing playing anywhere, the daemon used to
+  claim the active-renderer slot on its own — an auto-claim inherited from the
+  desktop app, where opening the app is a choice to play there. On a headless
+  box it meant every start, and so every moOde renderer toggle, quietly took
+  over an idle session. Now a phone decides, by casting to it or handing it
+  the session over the LAN. A connection that drops and comes back still
+  reclaims the slot it held, as the official client does.
 
 ### Fixed
 

@@ -36,13 +36,12 @@ pub use qconnect_core::{
 pub use qconnect_protocol::{QueueCommandType, RendererReport, RendererReportType};
 pub use renderer_engine::QconnectRendererEngine;
 pub use session::{
-    build_effective_renderer_snapshot, build_session_renderer_snapshot, compute_connection_state,
-    deferred_join_reason, find_unique_renderer_id, is_local_renderer_active,
-    is_peer_renderer_active, normalize_active_renderer_id, quality_from_max_audio_quality,
-    queue_item_snapshot_for_cursor, refresh_local_renderer_id, should_arm_renderer_watchdog,
-    should_reask_queue_state, ConnectionDecision, LocalIdentity, QconnectFileAudioQualitySnapshot,
-    QconnectLifecycleState, QconnectRendererInfo, QconnectSessionRendererState,
-    QconnectSessionState, RendererStatus, ServerActiveState,
+    build_effective_renderer_snapshot, build_session_renderer_snapshot, deferred_join_reason,
+    find_unique_renderer_id, is_local_renderer_active, is_peer_renderer_active,
+    normalize_active_renderer_id, quality_from_max_audio_quality, queue_item_snapshot_for_cursor,
+    refresh_local_renderer_id, should_arm_renderer_watchdog, should_reask_queue_state,
+    should_reclaim_render, LocalIdentity, QconnectFileAudioQualitySnapshot, QconnectLifecycleState,
+    QconnectRendererInfo, QconnectSessionRendererState, QconnectSessionState, RendererStatus,
     JOIN_SESSION_REASON_CONTROLLER_REQUEST, JOIN_SESSION_REASON_RECONNECTION,
     QCONNECT_RENDERER_LOST_TIMEOUT_MS,
 };
