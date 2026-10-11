@@ -22,7 +22,8 @@
 use std::sync::Arc;
 
 use qbz_app::shell::AppRuntime;
-use qbz_models::CoreEvent;
+use qbz_models::{CoreEvent, RepeatMode};
+use qconnect_app::renderer::{loop_mode_from_repeat_mode, qconnect_repeat_mode_from_loop_mode};
 use qconnect_app::{
     is_local_renderer_active, QueueCommandType, RendererReport, RendererReportType,
 };
@@ -141,6 +142,56 @@ pub async fn publish_local_queue_if_changed(
     }
 }
 
+/// Tell the session about a repeat mode changed HERE — a manual skip turning
+/// repeat-one off, or `POST /api/playback/repeat` — with `CtrlSrvrSetLoopMode`,
+/// as the web player does. Nothing did before, so the phones went on showing
+/// the old mode while the box played another.
+///
+/// Echo-safe like the others: the session's own loop mode is compared first,
+/// and a mode that came FROM the session is already equal to it. Never pushed
+/// while the session's mode is still unknown, so connecting does not overwrite
+/// the session with whatever this box last played in.
+pub async fn publish_local_loop_mode_if_changed(
+    inner: &Arc<Mutex<DaemonQconnectInner>>,
+    runtime: &Arc<AppRuntime<DaemonAdapter>>,
+) {
+    let (app, sync_state) = {
+        let guard = inner.lock().await;
+        match guard.runtime.as_ref() {
+            Some(rt) => (Arc::clone(&rt.app), Arc::clone(&rt.sync_state)),
+            None => return,
+        }
+    };
+    let session_mode = {
+        let state = sync_state.lock().await;
+        if !is_local_renderer_active(&state.session) {
+            return;
+        }
+        state.session_loop_mode
+    };
+    let local = runtime.core().get_queue_state().await.repeat;
+    let Some(loop_mode) = loop_mode_to_publish(local, session_mode) else {
+        return;
+    };
+    let command = app
+        .build_queue_command(
+            QueueCommandType::CtrlSrvrSetLoopMode,
+            json!({ "loop_mode": loop_mode }),
+        )
+        .await;
+    match app.send_queue_command(command).await {
+        Ok(_) => log::info!("[QConnect] Told the session the loop mode is now {loop_mode}"),
+        Err(err) => log::warn!("[QConnect] Failed to publish the loop mode: {err}"),
+    }
+}
+
+/// The wire loop mode to send for a local repeat mode, or `None` when the
+/// session already has it or its mode is not known yet.
+fn loop_mode_to_publish(local: RepeatMode, session: Option<i32>) -> Option<i32> {
+    let session = session.and_then(qconnect_repeat_mode_from_loop_mode)?;
+    (session != local).then(|| loop_mode_from_repeat_mode(local))
+}
+
 /// The queue-publish subscriber: debounces `CoreEvent::QueueUpdated` bursts by
 /// 2 s, then runs
 /// [`publish_local_queue_if_changed`]. Non-queue events are drained WITHOUT
@@ -157,9 +208,15 @@ pub fn spawn_queue_cloud_publish(
     const DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(2);
     tokio::spawn(async move {
         loop {
-            // Block until the FIRST queue mutation of a burst.
+            // Block until the FIRST queue mutation of a burst. A repeat-mode
+            // change goes out at once: it is one event, not a burst, and the
+            // phones should not show the old mode for two seconds.
             match rx.recv().await {
                 Ok(CoreEvent::QueueUpdated { .. }) => {}
+                Ok(CoreEvent::RepeatModeChanged { .. }) => {
+                    publish_local_loop_mode_if_changed(&inner, &runtime).await;
+                    continue;
+                }
                 Ok(_) => continue,
                 Err(RecvError::Lagged(_)) => continue,
                 Err(RecvError::Closed) => return,
@@ -172,6 +229,9 @@ pub fn spawn_queue_cloud_publish(
                     r = rx.recv() => match r {
                         Ok(CoreEvent::QueueUpdated { .. }) => {
                             deadline = tokio::time::Instant::now() + DEBOUNCE;
+                        }
+                        Ok(CoreEvent::RepeatModeChanged { .. }) => {
+                            publish_local_loop_mode_if_changed(&inner, &runtime).await;
                         }
                         Ok(_) => {}
                         Err(RecvError::Lagged(_)) => {}
@@ -286,6 +346,21 @@ pub fn spawn_volume_cloud_publish(
 #[cfg(test)]
 mod tests {
     use super::volume_report_is_redundant;
+
+    #[test]
+    fn a_loop_mode_goes_out_only_when_the_session_shows_another() {
+        use super::loop_mode_to_publish as publish;
+        use qbz_models::RepeatMode;
+        // A manual skip turned repeat-one off while the session still says one.
+        assert_eq!(publish(RepeatMode::Off, Some(2)), Some(1));
+        assert_eq!(publish(RepeatMode::All, Some(1)), Some(3));
+        // The session's own change, applied here: already equal, so no echo.
+        assert_eq!(publish(RepeatMode::One, Some(2)), None);
+        // 0 is "unknown" on the wire and reads as off, like everywhere else.
+        assert_eq!(publish(RepeatMode::Off, Some(0)), None);
+        // Before the session has said anything: never push ours over it.
+        assert_eq!(publish(RepeatMode::One, None), None);
+    }
 
     #[test]
     fn a_level_the_controller_already_shows_is_not_reported_again() {

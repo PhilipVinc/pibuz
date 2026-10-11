@@ -218,7 +218,7 @@ fn spawn_advance(rt: &Runtime, roots: &ProfileRoots, handle: &Handle, forward: b
         &qbz_app::settings::daemon_prefs::load_at(&roots.data).streaming_quality,
     );
     handle.spawn(async move {
-        let _ = qbz_app::playback_driver::advance_and_play(rt.as_ref(), quality, forward).await;
+        let _ = qbz_app::playback_driver::skip_and_play(rt.as_ref(), quality, forward).await;
     });
 }
 

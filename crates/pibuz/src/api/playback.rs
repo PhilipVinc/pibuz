@@ -348,8 +348,9 @@ fn apply_mute(state: &ApiState, live: f32, arg: &str) -> Response<Cursor<Vec<u8>
 }
 
 /// `next`/`previous` (02 §3.3.9-10): SPAWN
-/// `qbz_app::playback_driver::advance_and_play` — the FULL ritual (skip-walk →
-/// play → prefetch → persist), never a bare cursor move (02 §2.2 trap).
+/// `qbz_app::playback_driver::skip_and_play` — repeat-one off (a manual skip
+/// must move), then the FULL ritual (skip-walk → play → prefetch → persist),
+/// never a bare cursor move (02 §2.2 trap).
 ///
 /// Spawn-and-ack: the API serve loop is single-threaded, and the ritual's
 /// load leg (resolve+fetch) can block for many seconds on a slow link — an
@@ -364,7 +365,7 @@ fn advance(state: &ApiState, forward: bool) -> Response<Cursor<Vec<u8>>> {
     let shared = Arc::clone(&state.shared);
     state.rt.spawn(async move {
         if let Err(err) =
-            qbz_app::playback_driver::advance_and_play(runtime.as_ref(), quality, forward).await
+            qbz_app::playback_driver::skip_and_play(runtime.as_ref(), quality, forward).await
         {
             log::error!("[api] advance(forward={forward}) failed: {err}");
             if let Ok(mut s) = shared.lock() {

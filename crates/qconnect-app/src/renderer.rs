@@ -54,6 +54,16 @@ pub fn qconnect_repeat_mode_from_loop_mode(loop_mode: i32) -> Option<RepeatMode>
     }
 }
 
+/// The inverse: the wire loop mode for a local repeat mode, for telling the
+/// session about a change made on the renderer itself.
+pub fn loop_mode_from_repeat_mode(mode: RepeatMode) -> i32 {
+    match mode {
+        RepeatMode::Off => 1,
+        RepeatMode::One => 2,
+        RepeatMode::All => 3,
+    }
+}
+
 pub fn normalize_volume_to_fraction(volume: i32) -> f32 {
     volume.clamp(0, 100) as f32 / 100.0
 }
@@ -1161,6 +1171,17 @@ mod tests {
     use crate::{
         QConnectQueueState, QConnectRendererState, QconnectRemoteSyncState, RendererCommand,
     };
+
+    #[test]
+    fn loop_mode_round_trips_through_the_wire_values() {
+        for mode in [RepeatMode::Off, RepeatMode::One, RepeatMode::All] {
+            assert_eq!(
+                qconnect_repeat_mode_from_loop_mode(loop_mode_from_repeat_mode(mode)),
+                Some(mode)
+            );
+        }
+        assert_eq!(loop_mode_from_repeat_mode(RepeatMode::Off), 1);
+    }
 
     #[derive(Default)]
     struct MockCalls {

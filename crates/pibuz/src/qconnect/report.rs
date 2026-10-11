@@ -425,20 +425,24 @@ pub async fn run_report_scheduler(
         let decision = decide_report(
             PlayerSnapshot {
                 track_id: ev.track_id,
-                position_secs: ev.position,
+                // The MILLISECOND clock, not `ev.position`'s whole seconds: the
+                // controller extrapolates from the position we send, so a
+                // truncated one put its scrubber up to a second behind the audio
+                // after every report — the web player sends milliseconds.
+                position_ms: player.state.current_position_ms(),
                 duration_secs: ev.duration,
                 is_playing: ev.is_playing,
             },
             in_flight,
             awaiting_next,
         );
-        // `report_playback_state` wants MILLISECONDS; the player reports seconds.
+        // `report_playback_state` wants MILLISECONDS; the duration is seconds.
         report_playback_state(
             &app,
             &sync_state,
             &runtime,
             decision.playing_state,
-            (decision.position_secs as i64) * 1000,
+            decision.position_ms as i64,
             (decision.duration_secs as i64) * 1000,
             decision.track_id,
             decision.buffer_state,
@@ -490,7 +494,7 @@ pub(crate) struct ReportDecision {
     pub playing_state: i32,
     pub buffer_state: i32,
     pub track_id: u64,
-    pub position_secs: u64,
+    pub position_ms: u64,
     pub duration_secs: u64,
 }
 
@@ -499,7 +503,7 @@ pub(crate) struct ReportDecision {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PlayerSnapshot {
     pub track_id: u64,
-    pub position_secs: u64,
+    pub position_ms: u64,
     pub duration_secs: u64,
     pub is_playing: bool,
 }
@@ -550,15 +554,17 @@ pub(crate) fn decide_report(
     // The offset the stream opened at is the honest position: on a resume at
     // 2:19 the controller should draw the scrubber there while it fills, not at
     // zero.
-    let (track_id, position_secs, duration_secs) = match in_flight {
-        Some((track_id, start_secs, duration_secs)) => (track_id, start_secs, duration_secs),
-        None => (player.track_id, player.position_secs, player.duration_secs),
+    let (track_id, position_ms, duration_secs) = match in_flight {
+        Some((track_id, start_secs, duration_secs)) => {
+            (track_id, start_secs.saturating_mul(1000), duration_secs)
+        }
+        None => (player.track_id, player.position_ms, player.duration_secs),
     };
     ReportDecision {
         playing_state,
         buffer_state,
         track_id,
-        position_secs,
+        position_ms,
         duration_secs,
     }
 }
@@ -588,21 +594,33 @@ mod report_decision_tests {
 
     /// One tick of the real pipeline: ask the latch, then decide the report.
     fn tick(latch: &BufferingLatch, player: PlayerSnapshot, awaiting_next: bool) -> ReportDecision {
-        let in_flight = latch.in_flight_with_state(
-            player.track_id,
-            player.position_secs.saturating_mul(1000),
-            player.is_playing,
-        );
+        let in_flight =
+            latch.in_flight_with_state(player.track_id, player.position_ms, player.is_playing);
         decide_report(player, in_flight, awaiting_next)
     }
 
     fn on(track_id: u64, position_secs: u64, is_playing: bool) -> PlayerSnapshot {
         PlayerSnapshot {
             track_id,
-            position_secs,
+            position_ms: position_secs * 1000,
             duration_secs: 341,
             is_playing,
         }
+    }
+
+    /// The controller extrapolates from the position we report, so it must be
+    /// the millisecond clock as read, not whole seconds: 12.345 s truncated to
+    /// 12 s left its scrubber 345 ms behind the audio until the next report.
+    #[test]
+    fn a_playing_position_is_reported_to_the_millisecond() {
+        let latch = BufferingLatch::default();
+        let player = PlayerSnapshot {
+            track_id: 7,
+            position_ms: 12_345,
+            duration_secs: 341,
+            is_playing: true,
+        };
+        assert_eq!(tick(&latch, player, false).position_ms, 12_345);
     }
 
     /// THE FLICKER, the other way round. While a load is in flight the report
@@ -770,7 +788,7 @@ mod report_decision_tests {
             d.playing_state, PLAYING_STATE_PAUSED,
             "and the controller must be told PAUSED, so its play button is a play button"
         );
-        assert_eq!(d.position_secs, 7, "with the position it is actually at");
+        assert_eq!(d.position_ms, 7_000, "with the position it is actually at");
     }
 
     /// FROM HARDWARE (the seek spinner). The latch cannot fix a clock reported
@@ -827,7 +845,7 @@ mod report_decision_tests {
             assert_eq!(d.playing_state, PLAYING_STATE_PAUSED, "from {start_secs}s");
             assert_eq!(d.buffer_state, BUFFER_STATE_OK, "from {start_secs}s");
             assert_eq!(d.track_id, FAILED, "from {start_secs}s");
-            assert_eq!(d.position_secs, start_secs);
+            assert_eq!(d.position_ms, start_secs * 1000);
             assert!(
                 latch.in_flight(FAILED, start_secs * 1000).is_none(),
                 "the latch is still holding a load that has ended"

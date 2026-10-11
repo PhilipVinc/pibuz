@@ -565,6 +565,14 @@ where
             (state.renderer.clone(), state.queue.version)
         };
 
+        // The session's loop mode is this one now. Record it BEFORE the sink
+        // applies it to the engine: the host publishes local repeat changes by
+        // comparing against `session_loop_mode`, and a stale value there would
+        // send the session's own change straight back to it.
+        if let RendererCommand::SetLoopMode { loop_mode } = renderer_command {
+            self.sync.lock().await.session_loop_mode = Some(loop_mode);
+        }
+
         // Always update renderer state (for tracking next_track etc.)
         self.sink
             .on_event(QconnectAppEvent::RendererUpdated(snapshot.clone()))
@@ -2879,6 +2887,23 @@ mod tests {
                 if message_type == "MESSAGE_TYPE_SRVR_CTRL_LOOP_MODE_SET"
             )
         }));
+    }
+
+    /// The renderer-level loop command can arrive before the session-level
+    /// LOOP_MODE_SET. The session's mode must already read the new value by
+    /// the time the host sees the engine change, or the host's local-repeat
+    /// publish sends the session its own change back.
+    #[tokio::test]
+    async fn a_renderer_loop_command_is_the_sessions_loop_mode_at_once() {
+        let (app, _sink, _transport, _events_rx) = build_connected_app().await;
+        app.apply_renderer_server_command(RendererServerCommand {
+            command_type: RendererCommandType::SrvrRndrSetLoopMode,
+            payload: json!({ "loop_mode": 2 }),
+        })
+        .await
+        .expect("apply set-loop-mode command");
+        let handle = app.sync_handle();
+        assert_eq!(handle.lock().await.session_loop_mode, Some(2));
     }
 
     #[tokio::test]

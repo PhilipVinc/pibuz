@@ -582,6 +582,30 @@ async fn advance_and_play_logged<A: FrontendAdapter + Send + Sync + 'static>(
     }
 }
 
+/// A skip the LISTENER asked for — next/previous from the control API (the CLI,
+/// moOde) or MPRIS — as opposed to a track running out. In repeat-one the
+/// queue's `next()` hands back the current track, which is right when a track
+/// ends and wrong for a skip: pressing next just restarted the song. The web
+/// player turns repeat off on a manual skip and then moves; so does this, and
+/// the Connect publisher tells the session the mode changed.
+pub async fn skip_and_play<A: FrontendAdapter + Send + Sync + 'static>(
+    runtime: &AppRuntime<A>,
+    quality: Quality,
+    forward: bool,
+) -> Result<Option<QueueTrack>, String> {
+    let core = runtime.core();
+    if let Some(mode) = repeat_after_manual_skip(core.get_queue_state().await.repeat) {
+        core.set_repeat_mode(mode).await;
+    }
+    advance_and_play(runtime, quality, forward).await
+}
+
+/// The repeat mode a manual skip leaves behind, `None` to leave it alone: only
+/// repeat-one gets in the way of a skip, so only repeat-one is turned off.
+fn repeat_after_manual_skip(mode: RepeatMode) -> Option<RepeatMode> {
+    (mode == RepeatMode::One).then_some(RepeatMode::Off)
+}
+
 /// The FULL advance ritual, reused verbatim by the CLI next/prev routes (T7):
 /// bounded skip-walk to the next (or previous) playable track → play it → warm
 /// the successors for gapless → persist the session. Never a bare cursor move
@@ -692,6 +716,18 @@ fn repeat_to_str(mode: RepeatMode) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+
+    /// Pressing next in repeat-one restarted the song: the queue hands back the
+    /// current track. A manual skip turns repeat-one off; the other modes do
+    /// not stand in its way and are left alone.
+    #[test]
+    fn a_manual_skip_turns_off_repeat_one_only() {
+        use super::repeat_after_manual_skip as after;
+        use qbz_models::RepeatMode;
+        assert_eq!(after(RepeatMode::One), Some(RepeatMode::Off));
+        assert_eq!(after(RepeatMode::All), None);
+        assert_eq!(after(RepeatMode::Off), None);
+    }
 
     /// THE SKIP BUG, from the Pi's own log.
     ///

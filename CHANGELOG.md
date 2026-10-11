@@ -37,6 +37,18 @@ tags on `main`.
   found", an API or auth failure is a "service error", and anything local (a
   busy device, a decode failure) is "other". A network failure is not reported,
   as the official renderer does not report one either.
+- **Next in repeat-one now skips.** A skip from the box itself — moOde,
+  `pibuz next`/`prev`, MPRIS — in repeat-one restarted the current song
+  instead of moving on. A manual skip now turns repeat-one off and then moves,
+  as the official player does; a track that simply ends still repeats.
+- **A repeat mode changed on the box reaches the controller.** Repeat changes
+  made locally (the skip above, `pibuz repeat …`) were never sent to the
+  session, so the phones kept showing the old mode. They are now sent as soon
+  as they happen, only while the box is the active renderer, and never before
+  the session has said what its own mode is.
+- **The controller's position is accurate to the millisecond.** Positions were
+  reported in whole seconds, so the controller's scrubber, which counts on
+  from the last report, could sit up to a second behind the music.
 - **176.4 kHz tracks are reported at the top Hi-Res tier.**
   The file quality reported to the controller now uses the web player's tiers:
   anything above 96 kHz is the top Hi-Res tier (176.4 kHz was reported one
