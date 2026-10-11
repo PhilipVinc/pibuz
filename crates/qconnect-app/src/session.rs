@@ -277,8 +277,8 @@ pub struct QconnectRendererInfo {
     pub brand: Option<String>,
     pub model: Option<String>,
     pub device_type: Option<i32>,
-    /// capabilities.volume_remote_control. 1 == ALLOWED. None == not advertised
-    /// (treated as allowed to avoid regressing renderers that omit it).
+    /// capabilities.volume_remote_control: 1 == NOT_ALLOWED, 2 == ALLOWED (the
+    /// web player's enum). None == not advertised.
     #[serde(default)]
     pub volume_remote_control: Option<i32>,
 }
@@ -306,12 +306,6 @@ pub struct QconnectFileAudioQualitySnapshot {
     pub bit_depth: i32,
     pub nb_channels: i32,
     pub audio_quality: i32,
-}
-
-/// Whether the active renderer permits remote volume control. Absent capability
-/// (None) defaults to allowed; only an explicit non-ALLOWED value disables.
-pub fn renderer_allows_remote_volume(info: &QconnectRendererInfo) -> bool {
-    matches!(info.volume_remote_control, None | Some(1))
 }
 
 /// Resolve the local renderer id within the session by matching the injected

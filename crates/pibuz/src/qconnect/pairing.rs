@@ -43,7 +43,10 @@ use qconnect_transport_ws::WsTransportConfig;
 use serde_json::{json, Value};
 use tiny_http::{Method, Request, Response, Server};
 
-use super::transport::{default_qconnect_device_info, resolve_qconnect_device_uuid};
+use super::transport::{
+    default_qconnect_device_info, device_type_name, resolve_qconnect_device_type,
+    resolve_qconnect_device_uuid,
+};
 use super::DaemonQconnectService;
 // The response formatter is shared with the control plane deliberately: it is
 // a pure serializer, so reusing it does not couple the two listeners.
@@ -281,7 +284,7 @@ fn register_mdns(port: u16, friendly_name: &str) -> Result<(ServiceDaemon, Strin
     let device_uuid = resolve_qconnect_device_uuid();
     let properties = [
         ("path", "/streamcore"),
-        ("type", "SPEAKER"),
+        ("type", pairing_device_type()),
         ("sdk_version", SDK_VERSION),
         ("Name", friendly_name),
         ("device_uuid", device_uuid.as_str()),
@@ -585,6 +588,12 @@ fn handle(
     }
 }
 
+/// The LAN surface names the same DeviceType the WS join announces, so the
+/// picker and the cloud's device list agree on what this box is.
+fn pairing_device_type() -> &'static str {
+    device_type_name(resolve_qconnect_device_type()).unwrap_or("STREAMER")
+}
+
 /// `get-display-info` — picker metadata, sourced from the same canonical device
 /// identity the WS join advertises. The display quality vocabulary is
 /// MP3 | LOSSLESS | HIRES_L1 (24/96) | HIRES_L3 (24/192); our wire capability
@@ -592,7 +601,7 @@ fn handle(
 fn display_info() -> Value {
     let info = default_qconnect_device_info();
     json!({
-        "type": "SPEAKER",
+        "type": pairing_device_type(),
         "friendly_name": info.friendly_name.unwrap_or_default(),
         "model_display_name": info.model.unwrap_or_default(),
         "brand_display_name": info.brand.unwrap_or_default(),

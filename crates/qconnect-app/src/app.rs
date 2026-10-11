@@ -10,9 +10,9 @@ use qconnect_core::{
 };
 use qconnect_protocol::{
     build_qconnect_outbound_envelope, build_qconnect_renderer_outbound_envelope,
-    decode_playback_error, parse_inbound_event, InboundEnvelope, QueueCommand, QueueCommandType,
-    QueueEventType, QueueServerEvent, RendererCommandType, RendererReport, RendererReportType,
-    RendererServerCommand,
+    decode_playback_error, decode_server_errors, parse_inbound_event, InboundEnvelope,
+    QueueCommand, QueueCommandType, QueueEventType, QueueServerEvent, RendererCommandType,
+    RendererReport, RendererReportType, RendererServerCommand,
 };
 use qconnect_transport_ws::{TransportEvent, WsTransport, WsTransportConfig};
 use serde_json::Value;
@@ -355,6 +355,15 @@ where
                             queue_item_id: error.queue_item_id,
                             error_type: error.error_type,
                             queue_version: error.queue_version,
+                        })
+                        .await;
+                }
+                // Session-level errors ride the same way, at tag 2.
+                for error in decode_server_errors(&payload) {
+                    self.sink
+                        .on_event(QconnectAppEvent::ServerError {
+                            code: error.code,
+                            message: error.message,
                         })
                         .await;
                 }

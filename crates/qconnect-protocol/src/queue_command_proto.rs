@@ -902,6 +902,10 @@ pub struct PlaybackErrorMessage {
 pub struct QConnectMessage {
     #[prost(int32, optional, tag = "1")]
     pub message_type: Option<i32>,
+    /// A session-level error from the server (`message_type = ERROR(1)`), the
+    /// envelope's own field rather than a queue error's nested one.
+    #[prost(message, optional, tag = "2")]
+    pub error: Option<ErrorMessage>,
     // Tag 3 of the official `Message` envelope record (message_type #1; error #2;
     // playback_error #3; oneof payloads 21-105). Resolved from the actual transport
     // bytes: the decoder receives the batch `QConnectMessages` and `playback_error`

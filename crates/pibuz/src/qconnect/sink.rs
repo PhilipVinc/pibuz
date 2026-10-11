@@ -502,6 +502,9 @@ impl QconnectEventSink for DaemonEventSink {
                     "[QConnect] Playback error on queue_item {queue_item_id}: {error_type:?}"
                 );
             }
+            QconnectAppEvent::ServerError { code, message } => {
+                log::warn!("[QConnect] Server error {code}: {message}");
+            }
             QconnectAppEvent::ResyncComplete => {
                 log::info!("[QConnect] Post-reconnect resync complete");
             }

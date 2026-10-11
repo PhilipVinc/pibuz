@@ -15,8 +15,11 @@ pub use command::{QueueCommand, QueueCommandType};
 pub use decoder::decode_playback_error;
 pub use decoder::decode_queue_server_events;
 pub use decoder::decode_renderer_server_commands;
+pub use decoder::decode_server_errors;
 pub use error::ProtocolError;
-pub use event::{ErrorType, PlaybackErrorEvent, QueueEventType, QueueServerEvent};
+pub use event::{
+    ErrorType, PlaybackErrorEvent, QueueEventType, QueueServerEvent, ServerErrorEvent,
+};
 // Proto message types needed by downstream crates to construct/encode frames
 // (e.g. PlaybackErrorMessage for tests and any future re-encoding path).
 pub use mapper::{

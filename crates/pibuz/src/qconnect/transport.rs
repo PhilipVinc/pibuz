@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::adapter::DaemonAdapter;
+use crate::qconnect::engine::VolumeMode;
 
 // What the Qobuz apps show next to this endpoint in their device list. Display
 // strings only — the Connect identity is the persisted device_uuid — but they
@@ -29,7 +30,25 @@ use crate::adapter::DaemonAdapter;
 // overridable through its QBZ_QCONNECT_DEVICE_* env var.
 const DEFAULT_QCONNECT_DEVICE_BRAND: &str = "Pibuz";
 const DEFAULT_QCONNECT_DEVICE_MODEL: &str = "Pibuz";
-const DEFAULT_QCONNECT_DEVICE_TYPE: i32 = 5; // computer
+// DeviceType as the web player's protobuf enum numbers it. It picks the icon
+// the apps draw next to the name; the daemon is a network streamer, not the
+// "computer" the desktop app it forked from announced.
+const DEFAULT_QCONNECT_DEVICE_TYPE: i32 = DEVICE_TYPE_STREAMER;
+const DEVICE_TYPE_STREAMER: i32 = 2;
+/// Wire value -> the name the LAN pairing surface (mDNS TXT `type`,
+/// `get-display-info`) uses for it. Index = wire value; the enum stops at 9.
+const DEVICE_TYPE_NAMES: [&str; 10] = [
+    "UNKNOWN",
+    "SPEAKER",
+    "STREAMER",
+    "TV",
+    "SOUNDBAR",
+    "COMPUTER",
+    "MOBILE",
+    "CAST",
+    "HEADPHONES",
+    "TABLET",
+];
 const DEFAULT_QCONNECT_SOFTWARE_PREFIX: &str = "pibuz";
 const QCONNECT_QWS_TOKEN_KIND: &str = "jwt_qws";
 const QCONNECT_QWS_CREATE_TOKEN_PATH: &str = "/qws/createToken";
@@ -111,11 +130,26 @@ pub fn resolve_qconnect_device_model() -> String {
         .unwrap_or_else(|| DEFAULT_QCONNECT_DEVICE_MODEL.to_string())
 }
 
+/// `QBZ_QCONNECT_DEVICE_TYPE` overrides the default with a wire value; one the
+/// enum does not define falls back to the default rather than announcing a
+/// type no app knows how to draw.
 pub fn resolve_qconnect_device_type() -> i32 {
-    std::env::var("QBZ_QCONNECT_DEVICE_TYPE")
-        .ok()
+    device_type_from_env(std::env::var("QBZ_QCONNECT_DEVICE_TYPE").ok().as_deref())
+}
+
+fn device_type_from_env(value: Option<&str>) -> i32 {
+    value
         .and_then(|value| value.trim().parse::<i32>().ok())
+        .filter(|kind| device_type_name(*kind).is_some())
         .unwrap_or(DEFAULT_QCONNECT_DEVICE_TYPE)
+}
+
+/// The pairing-surface name of a DeviceType wire value, `None` outside the enum.
+pub fn device_type_name(kind: i32) -> Option<&'static str> {
+    usize::try_from(kind)
+        .ok()
+        .and_then(|index| DEVICE_TYPE_NAMES.get(index))
+        .copied()
 }
 
 pub fn resolve_system_hostname() -> String {
@@ -166,13 +200,25 @@ pub fn resolve_qconnect_friendly_name(custom_name: Option<&str>) -> String {
 
 // AudioQuality wire levels: 1=mp3, 2=cd, 3=hires_l1(96k), 4=hires_l2(192k) --
 // the same four tiers `playback.quality` names. Capabilities advertise the
-// device's min/max decode support; VOLUME_REMOTE_CONTROL_ALLOWED(2) means a
-// controller may set our volume.
+// device's min/max decode support; VolumeRemoteControl is NOT_ALLOWED(1) or
+// ALLOWED(2), the web player's enum values.
 pub const AUDIO_QUALITY_MP3: i32 = 1;
 pub const AUDIO_QUALITY_CD: i32 = 2;
 pub const AUDIO_QUALITY_HIRES_LEVEL1: i32 = 3;
 pub const AUDIO_QUALITY_HIRES_LEVEL2: i32 = 4;
+const VOLUME_REMOTE_CONTROL_NOT_ALLOWED: i32 = 1;
 const VOLUME_REMOTE_CONTROL_ALLOWED: i32 = 2;
+
+/// What to advertise for a volume mode. `Locked` ignores every SetVolume, so it
+/// says so up front instead of offering the controller a slider that snaps
+/// back; `External` applies nothing either, but it does take the level — an
+/// integrator downstream acts on it — so a controller may set it.
+fn volume_remote_control(mode: VolumeMode) -> i32 {
+    match mode {
+        VolumeMode::Locked => VOLUME_REMOTE_CONTROL_NOT_ALLOWED,
+        VolumeMode::Software | VolumeMode::External => VOLUME_REMOTE_CONTROL_ALLOWED,
+    }
+}
 /// Renderer buffer-state wire value for OK/ready (mirrors the Tauri adapter).
 pub const BUFFER_STATE_OK: i32 = 2;
 /// Renderer buffer-state wire value for "filling the buffer, not yet audible"
@@ -305,6 +351,18 @@ fn load_persisted_device_name() -> Option<String> {
     qconnect_settings_db_path().and_then(|path| load_device_name_at(&path))
 }
 
+/// Read from the KV like the name, rather than threaded from `connect()`, so
+/// every path that builds a device info agrees with the others. `connect()`
+/// reads the same key once per connect, and a change applies on the next one,
+/// so the capability and the mode the engine enforces move together.
+fn load_persisted_volume_mode() -> VolumeMode {
+    VolumeMode::from_kv(
+        qconnect_settings_db_path()
+            .and_then(|path| load_volume_mode_at(&path))
+            .as_deref(),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // The local quality cap on the cast path (upstream#693).
 //
@@ -379,7 +437,7 @@ pub fn default_qconnect_device_info_with_name(
         capabilities: Some(QconnectDeviceCapabilitiesPayload {
             min_audio_quality: Some(AUDIO_QUALITY_MP3),
             max_audio_quality: Some(local_max_audio_quality_level()),
-            volume_remote_control: Some(VOLUME_REMOTE_CONTROL_ALLOWED),
+            volume_remote_control: Some(volume_remote_control(load_persisted_volume_mode())),
         }),
         software_version: Some(resolve_qconnect_software_version()),
     }
@@ -829,6 +887,34 @@ pub fn decode_hex_channel(raw: &str) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_type_defaults_to_streamer_and_rejects_values_outside_the_enum() {
+        assert_eq!(device_type_from_env(None), DEVICE_TYPE_STREAMER);
+        assert_eq!(device_type_from_env(Some(" 1 ")), 1);
+        assert_eq!(device_type_from_env(Some("9")), 9);
+        assert_eq!(device_type_from_env(Some("10")), DEVICE_TYPE_STREAMER);
+        assert_eq!(device_type_from_env(Some("-1")), DEVICE_TYPE_STREAMER);
+        assert_eq!(device_type_from_env(Some("tv")), DEVICE_TYPE_STREAMER);
+        assert_eq!(device_type_name(2), Some("STREAMER"));
+        assert_eq!(device_type_name(10), None);
+    }
+
+    #[test]
+    fn only_locked_volume_refuses_remote_control() {
+        assert_eq!(
+            volume_remote_control(VolumeMode::Locked),
+            VOLUME_REMOTE_CONTROL_NOT_ALLOWED
+        );
+        assert_eq!(
+            volume_remote_control(VolumeMode::Software),
+            VOLUME_REMOTE_CONTROL_ALLOWED
+        );
+        assert_eq!(
+            volume_remote_control(VolumeMode::External),
+            VOLUME_REMOTE_CONTROL_ALLOWED
+        );
+    }
 
     #[test]
     fn decode_hex_channel_pads_odd_length() {

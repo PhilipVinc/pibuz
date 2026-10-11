@@ -135,6 +135,14 @@ impl ErrorType {
     }
 }
 
+/// A session-level error the server sent in the envelope's own `error` field.
+/// `code` is a string on the wire, like the queue errors' codes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerErrorEvent {
+    pub code: String,
+    pub message: String,
+}
+
 /// Renderer per-track failure surfaced from `PlaybackErrorMessage`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlaybackErrorEvent {

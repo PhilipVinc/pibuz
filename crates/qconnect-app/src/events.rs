@@ -41,6 +41,11 @@ pub enum QconnectAppEvent {
         error_type: qconnect_protocol::ErrorType,
         queue_version: Option<qconnect_core::QueueVersion>,
     },
+    /// Session-level error from the server (envelope `error`, message type 1).
+    ServerError {
+        code: String,
+        message: String,
+    },
     /// Session management event from server (types 81-87, 97-101).
     /// These don't affect the queue reducer but provide session topology info.
     SessionManagementEvent {

@@ -3,6 +3,30 @@
 Notable changes per release. Versions are plain semver; releases are `vX.Y.Z`
 tags on `main`.
 
+## 2.7.0 — unreleased
+
+### Changed
+
+- **The Qobuz apps show this box as a streamer, not a laptop.** The device
+  type announced to Connect is now `STREAMER` (2); it was `COMPUTER` (5), a
+  leftover of the desktop app this daemon forked from. It only picks the icon
+  next to the name. `QBZ_QCONNECT_DEVICE_TYPE` still overrides it, and a value
+  outside the protocol's 0-9 now falls back to the default instead of being
+  announced as-is. The LAN pairing surface (mDNS TXT and `get-display-info`),
+  which said `SPEAKER` regardless, now names the same type.
+- **`qconnect.volume_mode locked` tells the controller its volume is fixed.**
+  The device now advertises remote volume control as NOT_ALLOWED in that mode,
+  so the Qobuz controller disables its volume slider instead of offering one
+  that snaps back. `software` and `external` still advertise ALLOWED. Like the
+  mode itself, a change applies on the next connect.
+
+### Fixed
+
+- **Session-level errors from the Qobuz cloud are logged.** The Connect
+  envelope's own `error` field was never decoded, so any error the server
+  sent there vanished without a trace. It is now logged as
+  `[QConnect] Server error <code>: <message>`.
+
 ## 2.6.0 — 2026-10-11
 
 ### Added

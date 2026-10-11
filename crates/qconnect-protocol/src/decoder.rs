@@ -55,6 +55,25 @@ pub fn decode_playback_error(payload: &[u8]) -> Option<crate::event::PlaybackErr
     })
 }
 
+/// Decode every session-level server error (envelope tag 2,
+/// `message_type = ERROR(1)`) in a batch. Like `playback_error` it sits on the
+/// envelope rather than in a typed payload, so the queue and renderer decoders
+/// never see it, and before this nothing did: the error just vanished.
+pub fn decode_server_errors(payload: &[u8]) -> Vec<crate::event::ServerErrorEvent> {
+    let Ok(batch) = QConnectMessages::decode(payload) else {
+        return Vec::new();
+    };
+    batch
+        .messages
+        .into_iter()
+        .filter_map(|message| message.error)
+        .map(|error| crate::event::ServerErrorEvent {
+            code: error.code.unwrap_or_default(),
+            message: error.message.unwrap_or_default(),
+        })
+        .collect()
+}
+
 fn decode_queue_server_event(
     message: QConnectMessage,
 ) -> Result<Option<QueueServerEvent>, ProtocolError> {
@@ -1112,7 +1131,31 @@ mod tests {
 
     use super::{
         decode_playback_error, decode_queue_server_events, decode_renderer_server_commands,
+        decode_server_errors,
     };
+
+    /// Bytes laid out by hand from the web player's schema (`Message.error` is
+    /// field 2, `Error{code = 1, message = 2}`), not round-tripped through our
+    /// own structs, so a wrong tag here fails instead of agreeing with itself.
+    #[test]
+    fn decodes_a_session_error_from_the_envelope() {
+        let error = [&[0x0a, 0x04][..], b"E_NO", &[0x12, 0x03][..], b"bad"].concat();
+        let message = [
+            &[0x08, 0x01][..], // message_type = ERROR(1)
+            &[0x12, error.len() as u8][..],
+            &error,
+        ]
+        .concat();
+        let batch = [&[0x1a, message.len() as u8][..], &message].concat();
+
+        let errors = decode_server_errors(&batch);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].code, "E_NO");
+        assert_eq!(errors[0].message, "bad");
+        // An ordinary batch carries none, and garbage is not an error report.
+        assert!(decode_server_errors(&QConnectMessages::default().encode_to_vec()).is_empty());
+        assert!(decode_server_errors(&[0xff]).is_empty());
+    }
 
     #[test]
     fn decodes_playback_error_track_not_streamable() {
