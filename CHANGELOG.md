@@ -3,7 +3,7 @@
 Notable changes per release. Versions are plain semver; releases are `vX.Y.Z`
 tags on `main`.
 
-## 2.6.0 — unreleased
+## 2.6.0 — 2026-10-11
 
 ### Added
 
@@ -54,6 +54,15 @@ tags on `main`.
   plughw lost the configured mixer, and hardware volume used the PCM's.
 - `/api/status` no longer reports `qconnect.is_active: true` once the session
   is gone.
+- **A cached track that fails to load keeps its length on the phone.** A load
+  from the memory or disk cache that failed (a busy device) showed the right
+  track, paused, with no duration; a cached track loaded at a position now
+  reports its full length rather than what was left of it.
+- **`qconnect.*` settings writes report failure.** `pibuz settings set
+  qconnect.*` and `pibuz qconnect enable|disable|name` exited 0 for a write
+  that never happened; they now exit 1. A write that raced the daemon for the
+  settings file waits for it instead of being dropped, and a write on a fresh
+  profile, before the data directory exists, creates it instead of being lost.
 
 ### Changed
 
