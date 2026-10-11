@@ -234,6 +234,7 @@ pub async fn ensure_remote_track_loaded(
     engine
         .start_track_stream(track_id, quality, duration_secs, start_position_secs)
         .await
+        .inspect_err(|err| engine.on_load_failed(track_id, err))
         .map(|()| true)
 }
 
@@ -289,6 +290,7 @@ pub async fn force_remote_track_stream(
     engine
         .start_track_stream(track_id, quality, duration_secs, start_position_secs)
         .await
+        .inspect_err(|err| engine.on_load_failed(track_id, err))
         .map(|()| true)
 }
 

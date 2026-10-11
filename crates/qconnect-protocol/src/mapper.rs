@@ -12,16 +12,16 @@ use crate::{
     queue_command_proto::{
         AskForQueueStateMessage, AskForRendererStateMessage, AutoplayLoadTracksMessage,
         AutoplayRemoveTracksMessage, ClearQueueMessage, DeviceCapabilitiesMessage,
-        DeviceInfoMessage, JoinSessionMessage, MuteVolumeMessage, PlaybackPositionMessage,
-        QConnectMessage, QConnectMessageType, QConnectMessages, QueueAddTracksMessage,
-        QueueInsertTracksMessage, QueueLoadTracksMessage, QueueRemoveTracksMessage,
-        QueueReorderTracksMessage, QueueVersionRef, RendererDeviceAudioQualityChangedMessage,
-        RendererFileAudioQualityChangedMessage, RendererMaxAudioQualityChangedMessage,
-        RendererStateMessage, RendererStateUpdatedMessage, RendererVolumeChangedMessage,
-        RendererVolumeMutedMessage, SetActiveRendererMessage, SetAutoplayModeMessage,
-        SetLoopModeMessage, SetMaxAudioQualityMessage, SetPlayerStateMessage,
-        SetPlayerStateQueueItemMessage, SetQueueStateMessage, SetQueueTrackWithContext,
-        SetShuffleModeMessage, SetVolumeMessage,
+        DeviceInfoMessage, JoinSessionMessage, MuteVolumeMessage, PlaybackErrorMessage,
+        PlaybackPositionMessage, QConnectMessage, QConnectMessageType, QConnectMessages,
+        QueueAddTracksMessage, QueueInsertTracksMessage, QueueLoadTracksMessage,
+        QueueRemoveTracksMessage, QueueReorderTracksMessage, QueueVersionRef,
+        RendererDeviceAudioQualityChangedMessage, RendererFileAudioQualityChangedMessage,
+        RendererMaxAudioQualityChangedMessage, RendererStateMessage, RendererStateUpdatedMessage,
+        RendererVolumeChangedMessage, RendererVolumeMutedMessage, SetActiveRendererMessage,
+        SetAutoplayModeMessage, SetLoopModeMessage, SetMaxAudioQualityMessage,
+        SetPlayerStateMessage, SetPlayerStateQueueItemMessage, SetQueueStateMessage,
+        SetQueueTrackWithContext, SetShuffleModeMessage, SetVolumeMessage,
     },
     OutboundEnvelope, ProtocolError, QueueCommand, QueueCommandType, RendererReport,
     RendererReportType,
@@ -507,6 +507,17 @@ fn map_renderer_report(report: &RendererReport) -> Result<QConnectMessage, Proto
             rndr_srvr_max_audio_quality_changed: Some(RendererMaxAudioQualityChangedMessage {
                 max_audio_quality: optional_i32(&report.payload, "max_audio_quality")?,
                 network_type: optional_i32(&report.payload, "network_type")?,
+            }),
+            ..Default::default()
+        }),
+        // Not a typed payload: it rides at tag 3 of the envelope, like the
+        // inbound one `decode_playback_error` reads.
+        RendererReportType::PlaybackError => Ok(QConnectMessage {
+            message_type: Some(QConnectMessageType::MessageTypePlaybackError as i32),
+            playback_error: Some(PlaybackErrorMessage {
+                queue_version: Some(to_proto_queue_version(report.queue_version_ref)?),
+                queue_item_id: optional_i32(&report.payload, "queue_item_id")?,
+                error_type: optional_i32(&report.payload, "error_type")?,
             }),
             ..Default::default()
         }),
@@ -1307,5 +1318,35 @@ mod tests {
             "MESSAGE_TYPE_RNDR_SRVR_VOLUME_CHANGED"
         );
         assert!(envelope.payload_bytes.is_some());
+    }
+
+    /// Laid out by hand from the web player's schema — `Message.playback_error`
+    /// is field 3 beside `message_type = PLAYBACK_ERROR(2)`, and
+    /// `PlaybackError{queue_version = 1, queue_item_id = 2, error_type = 3}` —
+    /// and read back by the same decoder an inbound one goes through.
+    #[test]
+    fn encodes_playback_error_on_the_envelope() {
+        let report = RendererReport::new(
+            RendererReportType::PlaybackError,
+            "4c1d2f40-6a43-4f0c-9b9a-1f7c2e3d5a60",
+            QueueVersion::new(3, 1),
+            json!({ "queue_item_id": 55, "error_type": 2 }),
+        );
+        let payload = encode_renderer_report_batch(&report).expect("playback error batch");
+        let decoded = QConnectMessages::decode(payload.as_slice()).expect("decode batch");
+        assert_eq!(
+            decoded.messages[0].encode_to_vec(),
+            [
+                0x08, 0x02, // message_type = PLAYBACK_ERROR
+                0x1a, 0x0a, // field 3, 10 bytes
+                0x0a, 0x04, 0x08, 0x03, 0x10, 0x01, // queue_version 3.1
+                0x10, 0x37, // queue_item_id = 55
+                0x18, 0x02, // error_type = TRACK_NOT_STREAMABLE
+            ]
+        );
+
+        let read_back = crate::decode_playback_error(&payload).expect("decodes");
+        assert_eq!(read_back.queue_item_id, 55);
+        assert_eq!(read_back.error_type, crate::ErrorType::TrackNotStreamable);
     }
 }

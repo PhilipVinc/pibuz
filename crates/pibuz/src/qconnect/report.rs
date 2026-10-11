@@ -58,7 +58,48 @@ const AUDIO_QUALITY_MP3: i32 = 1;
 const AUDIO_QUALITY_CD: i32 = 2;
 const AUDIO_QUALITY_HIRES_L1: i32 = 3;
 const AUDIO_QUALITY_HIRES_L2: i32 = 4;
-const AUDIO_QUALITY_HIRES_L3: i32 = 5;
+
+/// Tell the cloud the load of `track_id` failed (`PlaybackError`, message type
+/// 2), as the official renderer does. Same gate as the state report: only while
+/// we are the active renderer, and only for a track the cloud's queue holds —
+/// the error names a queue item, and without one there is nothing to name.
+async fn report_playback_error(
+    app: &Arc<DaemonQconnectApp>,
+    sync_state: &Arc<Mutex<QconnectRemoteSyncState>>,
+    track_id: u64,
+    error_type: i32,
+) {
+    {
+        let state = sync_state.lock().await;
+        if !is_local_renderer_active(&state.session) {
+            return;
+        }
+    }
+    // The pure resolver, not `resolve_queue_item_ids_by_track_id`: that one
+    // also moves the reported cursor, which a failure report has no business
+    // doing — the state report that follows decides what the cursor says.
+    let queue = app.queue_state_snapshot().await;
+    let (queue_item_id, _, _) =
+        qconnect_app::queue_resolution::resolve_queue_item_ids_from_queue_state(&queue, track_id);
+    let Some(queue_item_id) = queue_item_id else {
+        log::info!("[QConnect] Track {track_id} failed but is not in the queue; not reported");
+        return;
+    };
+    let queue_version = queue.version;
+    let report = RendererReport::new(
+        RendererReportType::PlaybackError,
+        Uuid::new_v4().to_string(),
+        queue_version,
+        json!({ "queue_item_id": queue_item_id, "error_type": error_type }),
+    );
+    match app.send_renderer_report_command(report).await {
+        Ok(_) => log::info!(
+            "[QConnect] Reported playback error {error_type} on queue item {queue_item_id} \
+             (track {track_id})"
+        ),
+        Err(err) => log::warn!("[QConnect] Failed to report the playback error: {err}"),
+    }
+}
 
 /// Report this device's playback state to the cloud while the daemon is the
 /// ACTIVE LOCAL renderer. Self-gates on `is_local_renderer_active` (no-op when a
@@ -172,13 +213,14 @@ pub async fn report_playback_state(
 }
 
 /// Classify a (sample_rate, bit_depth) output into the QConnect AudioQuality
-/// level. Pure mirror of the Tauri `classify_qconnect_audio_quality`.
+/// level, the way the web player does. It classifies by Qobuz format id
+/// (5 MP3, 6 CD, 7 Hi-Res up to 96 kHz, 27 Hi-Res above), so anything above
+/// 96 kHz is HIRES_L2 — 176.4 kHz included — and HIRES_L3 is never reported:
+/// the apps offer exactly four tiers.
 fn classify_audio_quality(sample_rate: u32, bit_depth: u32) -> i32 {
     if sample_rate == 0 || bit_depth == 0 {
         AUDIO_QUALITY_UNKNOWN
-    } else if sample_rate >= 384_000 {
-        AUDIO_QUALITY_HIRES_L3
-    } else if sample_rate >= 192_000 {
+    } else if sample_rate > 96_000 {
         AUDIO_QUALITY_HIRES_L2
     } else if bit_depth > 16 || sample_rate > 48_000 {
         AUDIO_QUALITY_HIRES_L1
@@ -372,6 +414,13 @@ pub async fn run_report_scheduler(
                 None => continue,
             }
         };
+
+        // A load that failed since the last tick: name it to the cloud BEFORE
+        // the state report that retracts the spinner, so the controller learns
+        // which track failed and why rather than only seeing it stop.
+        if let Some((failed_track, error_type)) = buffering.take_failure() {
+            report_playback_error(&app, &sync_state, failed_track, error_type).await;
+        }
 
         let decision = decide_report(
             PlayerSnapshot {
@@ -802,13 +851,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn classify_audio_quality_matches_the_desktop_thresholds() {
+    fn classify_audio_quality_matches_the_web_player_tiers() {
         assert_eq!(classify_audio_quality(0, 0), AUDIO_QUALITY_UNKNOWN);
         assert_eq!(classify_audio_quality(44_100, 16), AUDIO_QUALITY_CD);
         assert_eq!(classify_audio_quality(48_000, 16), AUDIO_QUALITY_CD);
+        assert_eq!(classify_audio_quality(44_100, 24), AUDIO_QUALITY_HIRES_L1);
         assert_eq!(classify_audio_quality(96_000, 24), AUDIO_QUALITY_HIRES_L1);
+        assert_eq!(classify_audio_quality(176_400, 24), AUDIO_QUALITY_HIRES_L2);
         assert_eq!(classify_audio_quality(192_000, 24), AUDIO_QUALITY_HIRES_L2);
-        assert_eq!(classify_audio_quality(384_000, 24), AUDIO_QUALITY_HIRES_L3);
+        assert_eq!(classify_audio_quality(384_000, 24), AUDIO_QUALITY_HIRES_L2);
         assert_eq!(classify_audio_quality(22_050, 16), AUDIO_QUALITY_MP3);
     }
 

@@ -1240,3 +1240,40 @@ async fn a_load_that_cannot_open_the_device_is_paused_and_play_retries_it() {
     assert!(harness.engine().snapshot().is_playing);
     harness.assert_invariants();
 }
+
+/// A load that fails before it opens — the stream URL would not resolve, say,
+/// because the track lost its rights — must be handed to the host by name, so
+/// the daemon can send the session a `PlaybackError` for THAT track the way
+/// the official renderer does. Only the failed track: the one before it
+/// loaded fine and must not be reported.
+#[tokio::test]
+async fn a_load_that_fails_to_resolve_is_handed_to_the_host_by_track() {
+    let harness = ControllerHarness::new().await;
+    harness.become_active_renderer().await;
+    harness.controller().push_queue_and_play(&TRACKS, 0).await;
+    harness.advance_playback(20_000);
+    harness.report_tick().await;
+
+    harness.let_the_load_windows_expire();
+    harness.the_next_stream_fails("resolve stream url: Track is not streamable");
+    harness
+        .controller()
+        .tap_next_track(TRACKS[1], Some(TRACKS[2]))
+        .await;
+
+    let failed: Vec<u64> = harness
+        .engine_calls()
+        .into_iter()
+        .filter_map(|call| match call {
+            EngineCall::LoadFailed { track_id } => Some(track_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        failed,
+        vec![TRACKS[1]],
+        "timeline:\n{}",
+        harness.rendered_timeline()
+    );
+    harness.assert_invariants();
+}

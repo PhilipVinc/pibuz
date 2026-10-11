@@ -98,6 +98,12 @@ pub trait QconnectRendererEngine: Send + Sync {
         start_position_secs: u64,
     ) -> Result<(), String>;
 
+    /// A `start_track_stream` for `track_id` failed with `error`. Called by the
+    /// orchestration on every failed load, so the host can tell the session
+    /// with a `PlaybackError` — what the official renderer does, and the only
+    /// way the controller learns WHICH track failed and why. Default: nothing.
+    fn on_load_failed(&self, _track_id: u64, _error: &str) {}
+
     /// This renderer's OWN quality ceiling, or `None` when it is uncapped.
     ///
     /// The controller's `max_audio_quality` is a request; this is the local

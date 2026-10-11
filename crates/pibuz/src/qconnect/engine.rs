@@ -122,8 +122,15 @@ pub struct DaemonRendererEngine {
 /// the moment its feeder opens until the player actually starts producing
 /// audio — on a deep resume that is several seconds of downloading plus a
 /// sample pre-skip, during which the controller deserves a loading state.
+///
+/// It also carries the one load that FAILED since the scheduler last looked,
+/// as `(track_id, ErrorType)`, so the scheduler — which owns the session and
+/// resolves queue item ids — can tell the cloud with a `PlaybackError`.
 #[derive(Default)]
-pub struct BufferingLatch(std::sync::Mutex<Option<Buffering>>);
+pub struct BufferingLatch {
+    current: std::sync::Mutex<Option<Buffering>>,
+    failed: std::sync::Mutex<Option<(u64, i32)>>,
+}
 
 struct Buffering {
     track_id: u64,
@@ -143,7 +150,7 @@ impl BufferingLatch {
     /// Mark `track_id` as buffering from `start_position_secs` (replacing any
     /// previous track).
     pub fn begin(&self, track_id: u64, start_position_secs: u64, duration_secs: u64) {
-        if let Ok(mut guard) = self.0.lock() {
+        if let Ok(mut guard) = self.current.lock() {
             *guard = Some(Buffering {
                 track_id,
                 start_position_secs,
@@ -153,10 +160,25 @@ impl BufferingLatch {
         }
     }
 
+    /// Record that the load of `track_id` failed with `error_type`, replacing
+    /// any failure not yet reported: only the latest one names the track the
+    /// controller is looking at.
+    pub fn fail(&self, track_id: u64, error_type: i32) {
+        if let Ok(mut guard) = self.failed.lock() {
+            *guard = Some((track_id, error_type));
+        }
+    }
+
+    /// The failure recorded since the last call, if any, as
+    /// `(track_id, error_type)`.
+    pub fn take_failure(&self) -> Option<(u64, i32)> {
+        self.failed.lock().ok().and_then(|mut guard| guard.take())
+    }
+
     /// Clear the latch for `track_id`. Ignores a stale clear for a track that
     /// has already been superseded.
     pub fn finish(&self, track_id: u64) {
-        if let Ok(mut guard) = self.0.lock() {
+        if let Ok(mut guard) = self.current.lock() {
             if guard.as_ref().map(|b| b.track_id) == Some(track_id) {
                 *guard = None;
             }
@@ -198,7 +220,7 @@ impl BufferingLatch {
         position_ms: u64,
         is_playing: bool,
     ) -> Option<(u64, u64, u64)> {
-        let Ok(mut guard) = self.0.lock() else {
+        let Ok(mut guard) = self.current.lock() else {
             return None;
         };
         let b = guard.as_ref()?;
@@ -249,6 +271,48 @@ impl BufferingLatch {
             );
         }
         Some((b.track_id, b.start_position_secs, b.duration_secs))
+    }
+}
+
+// ErrorType, the web player's enum values.
+const ERROR_TYPE_TRACK_NOT_FOUND: i32 = 1;
+const ERROR_TYPE_TRACK_NOT_STREAMABLE: i32 = 2;
+const ERROR_TYPE_SERVICE_ERROR: i32 = 4;
+const ERROR_TYPE_OTHER_ERRORS: i32 = 100;
+
+/// The `PlaybackError` type for a failed load, or `None` when it should not be
+/// reported. Mirrors the web player: no rights -> NOT_STREAMABLE, no file ->
+/// NOT_FOUND, an API/session failure -> SERVICE_ERROR, anything else (a busy
+/// device, a decode failure) -> OTHER_ERRORS, and a NETWORK failure is not
+/// reported at all — it is this box's connection, not the track's fault.
+///
+/// It reads the error TEXT because that is all the engine seam carries: the
+/// typed `ApiError` is flattened to a string inside `QbzCore`. The phrases are
+/// `ApiError`'s own `Display`, and the tests build them from the variants, so
+/// rewording one fails a test instead of silently reclassifying.
+pub fn playback_error_type(error: &str) -> Option<i32> {
+    const NOT_STREAMABLE: [&str; 3] = [
+        "Track is not streamable",
+        "No valid quality available",
+        "User is not eligible",
+    ];
+    const SERVICE: [&str; 5] = [
+        "Authentication failed",
+        "Access forbidden by Qobuz",
+        "backing off after repeated 403s",
+        "Server error (HTTP",
+        "API error:",
+    ];
+    if error.contains("Network error:") {
+        None
+    } else if NOT_STREAMABLE.iter().any(|p| error.contains(p)) {
+        Some(ERROR_TYPE_TRACK_NOT_STREAMABLE)
+    } else if error.contains("is no longer available on Qobuz") {
+        Some(ERROR_TYPE_TRACK_NOT_FOUND)
+    } else if SERVICE.iter().any(|p| error.contains(p)) {
+        Some(ERROR_TYPE_SERVICE_ERROR)
+    } else {
+        Some(ERROR_TYPE_OTHER_ERRORS)
     }
 }
 
@@ -433,6 +497,19 @@ impl QconnectRendererEngine for DaemonRendererEngine {
             .get_tracks_batch(track_ids)
             .await
             .map_err(|err| err.to_string())
+    }
+
+    fn on_load_failed(&self, track_id: u64, error: &str) {
+        match playback_error_type(error) {
+            Some(error_type) => {
+                self.buffering.fail(track_id, error_type);
+                self.report_notify.notify_one();
+            }
+            None => log::info!(
+                "[QConnect] Not reporting the failed load of track {track_id} as a playback \
+                 error: it was the network, not the track"
+            ),
+        }
     }
 
     // ---- protected audio seam (the only protected touch) ----
@@ -718,6 +795,49 @@ async fn download_remote_audio(url: &str) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
 
+    /// Fed the REAL `ApiError` messages, wrapped the way `start_track_stream`
+    /// wraps them, so a reworded variant fails here rather than quietly
+    /// becoming OTHER_ERRORS on the wire.
+    #[test]
+    fn failed_loads_classify_like_the_web_player() {
+        use super::playback_error_type as kind;
+        use qbz_qobuz::ApiError;
+        let wrapped = |err: ApiError| format!("resolve stream url for remote track 7: {err}");
+
+        assert_eq!(kind(&wrapped(ApiError::NonStreamable)), Some(2));
+        assert_eq!(kind(&wrapped(ApiError::NoQualityAvailable)), Some(2));
+        assert_eq!(kind(&wrapped(ApiError::IneligibleUser)), Some(2));
+        assert_eq!(kind(&wrapped(ApiError::TrackUnavailable(7))), Some(1));
+        assert_eq!(kind(&wrapped(ApiError::Forbidden(String::new()))), Some(4));
+        assert_eq!(kind(&wrapped(ApiError::ForbiddenCircuitOpen(30))), Some(4));
+        assert_eq!(kind(&wrapped(ApiError::ServerError(503))), Some(4));
+        assert_eq!(
+            kind(&wrapped(ApiError::AuthenticationError("expired".into()))),
+            Some(4)
+        );
+        assert_eq!(
+            kind(&wrapped(ApiError::ApiResponse("nope".into()))),
+            Some(4)
+        );
+        // Not the track's fault, and the official renderer does not report it.
+        assert_eq!(
+            kind("resolve stream url for remote track 7: Network error: connection reset"),
+            None
+        );
+        // A local failure: the device, the decoder.
+        assert_eq!(kind("audio device busy: hw:0,0"), Some(100));
+    }
+
+    #[test]
+    fn a_failed_load_is_handed_over_once_and_the_latest_wins() {
+        let latch = super::BufferingLatch::default();
+        assert_eq!(latch.take_failure(), None);
+        latch.fail(1, 2);
+        latch.fail(3, 100);
+        assert_eq!(latch.take_failure(), Some((3, 100)));
+        assert_eq!(latch.take_failure(), None);
+    }
+
     /// THE ARTWORK FLICKER. While a track change is in progress the audio
     /// thread still reports the track being LEFT, and the latch is what stops
     /// that reaching the controller as the current state.
@@ -937,7 +1057,7 @@ mod tests {
         latch.begin(9, 0, 200);
         // Backdate past the safety window: a load that never becomes audible
         // must not report BUFFERING forever.
-        if let Ok(mut guard) = latch.0.lock() {
+        if let Ok(mut guard) = latch.current.lock() {
             if let Some(b) = guard.as_mut() {
                 b.since =
                     std::time::Instant::now() - (BUFFERING_MAX + std::time::Duration::from_secs(1));

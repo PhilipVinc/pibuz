@@ -122,6 +122,10 @@ pub enum EngineCall {
     SetShuffleWithLocalOrder {
         enabled: bool,
     },
+    /// The orchestration told the host a load failed (`on_load_failed`).
+    LoadFailed {
+        track_id: u64,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -147,6 +151,10 @@ struct FakePlayer {
     pending_track: Option<(u64, u64, u64)>,
     /// Whether `start_track_stream` lands instantly or has to be caught up.
     audio_thread_lags: bool,
+    /// The next `start_track_stream` returns this error instead of opening:
+    /// a failure the engine sees SYNCHRONOUSLY (the stream URL would not
+    /// resolve), as opposed to `fail_the_pending_load`'s audio-thread one.
+    next_stream_fails: Option<String>,
 }
 
 /// A player that models just enough to answer the orchestration's questions.
@@ -291,6 +299,11 @@ impl FakeEngine {
         }
     }
 
+    /// The next `start_track_stream` fails with `error` before opening anything.
+    pub fn fail_the_next_stream(&self, error: &str) {
+        self.player.lock().expect("fake player").next_stream_fails = Some(error.to_string());
+    }
+
     /// What the player holds: how many tracks, and which one the cursor names.
     pub fn queue(&self) -> (Vec<u64>, Option<u64>) {
         let player = self.player.lock().expect("fake player");
@@ -317,6 +330,10 @@ impl Default for FakeEngine {
 
 #[async_trait]
 impl QconnectRendererEngine for FakeEngine {
+    fn on_load_failed(&self, track_id: u64, _error: &str) {
+        self.record(EngineCall::LoadFailed { track_id });
+    }
+
     fn resume(&self) -> Result<(), String> {
         self.record(EngineCall::Resume);
         self.player.lock().expect("fake player").playing = true;
@@ -434,6 +451,9 @@ impl QconnectRendererEngine for FakeEngine {
             quality,
         });
         let mut player = self.player.lock().expect("fake player");
+        if let Some(error) = player.next_stream_fails.take() {
+            return Err(error);
+        }
         let duration_ms = if duration_secs > 0 {
             duration_secs * 1000
         } else {
@@ -1370,6 +1390,11 @@ impl ControllerHarness {
     /// The pending stream fails to open. See [`FakeEngine::fail_the_pending_load`].
     pub fn the_pending_load_fails(&self) {
         self.inner.engine.fail_the_pending_load();
+    }
+
+    /// The next stream fails before it opens. See [`FakeEngine::fail_the_next_stream`].
+    pub fn the_next_stream_fails(&self, error: &str) {
+        self.inner.engine.fail_the_next_stream(error);
     }
 
     /// The queue the PLAYER holds, and the track its cursor names.

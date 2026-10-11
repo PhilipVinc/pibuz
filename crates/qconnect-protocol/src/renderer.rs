@@ -50,6 +50,7 @@ pub enum RendererReportType {
     RndrSrvrFileAudioQualityChanged,
     RndrSrvrDeviceAudioQualityChanged,
     RndrSrvrMaxAudioQualityChanged,
+    PlaybackError,
 }
 
 impl RendererReportType {
@@ -69,6 +70,7 @@ impl RendererReportType {
             Self::RndrSrvrMaxAudioQualityChanged => {
                 "MESSAGE_TYPE_RNDR_SRVR_MAX_AUDIO_QUALITY_CHANGED"
             }
+            Self::PlaybackError => "MESSAGE_TYPE_PLAYBACK_ERROR",
         }
     }
 }

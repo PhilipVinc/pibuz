@@ -22,6 +22,18 @@ tags on `main`.
 
 ### Fixed
 
+- **A track that fails to load is reported to the session as a playback
+  error**, the way the official renderer does, instead of the controller only
+  seeing it stop. The type follows the web player's mapping: no rights or no
+  subscription is "not streamable", a track gone from the catalogue is "not
+  found", an API or auth failure is a "service error", and anything local (a
+  busy device, a decode failure) is "other". A network failure is not reported,
+  as the official renderer does not report one either.
+- **176.4 kHz tracks are reported at the top Hi-Res tier.**
+  The file quality reported to the controller now uses the web player's tiers:
+  anything above 96 kHz is the top Hi-Res tier (176.4 kHz was reported one
+  tier down), and the fifth tier, which the apps never offer, is no longer
+  reported for 352.8/384 kHz.
 - **Session-level errors from the Qobuz cloud are logged.** The Connect
   envelope's own `error` field was never decoded, so any error the server
   sent there vanished without a trace. It is now logged as

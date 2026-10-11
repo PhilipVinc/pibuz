@@ -4,6 +4,7 @@
 // please the lint would break the generated mapping.
 #[allow(clippy::enum_variant_names)]
 pub enum QConnectMessageType {
+    MessageTypePlaybackError = 2,
     MessageTypeRndrSrvrJoinSession = 21,
     MessageTypeRndrSrvrDeviceInfoUpdated = 22,
     MessageTypeRndrSrvrStateUpdated = 23,
