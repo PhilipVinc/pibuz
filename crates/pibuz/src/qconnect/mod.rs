@@ -54,7 +54,6 @@ pub(crate) struct DaemonQconnectRuntime {
     pub app: Arc<DaemonQconnectApp>,
     /// Re-latched by `bootstrap_after_reconnect` on a credential re-resolve;
     /// consumed by the full-reconnect path (T10) + status/endpoint reporting.
-    #[allow(dead_code)]
     pub config: WsTransportConfig,
     pub event_loop: JoinHandle<()>,
     pub sync_state: Arc<Mutex<QconnectRemoteSyncState>>,
@@ -69,7 +68,6 @@ pub(crate) struct DaemonQconnectRuntime {
 pub(crate) struct DaemonQconnectInner {
     pub runtime: Option<DaemonQconnectRuntime>,
     /// Latched connect/loop error; surfaced by `pibuz status` QConnect block (T11).
-    #[allow(dead_code)]
     pub last_error: Option<String>,
     pub lifecycle_state: QconnectLifecycleState,
     /// Last local queue ids this session pushed to the cloud (the publish.rs
@@ -148,7 +146,6 @@ pub struct DaemonQconnectService {
     inner: Arc<Mutex<DaemonQconnectInner>>,
     runtime: Runtime,
     shared: SharedState,
-    #[allow(dead_code)] // T11 (settings reload) re-reads the KV through this path.
     settings_db: PathBuf,
     custom_device_name: Arc<tokio::sync::RwLock<Option<String>>>,
     /// Tokens handed over by a Qobuz app via the local pairing surface
@@ -603,18 +600,6 @@ impl QconnectControl {
 }
 
 impl QconnectHandle {
-    /// Connect on demand (T11 `pibuz qconnect enable`).
-    #[allow(dead_code)]
-    pub async fn connect(&self) -> Result<(), String> {
-        self.service.connect().await
-    }
-
-    /// Disconnect on demand (T11 `pibuz qconnect disable`).
-    #[allow(dead_code)]
-    pub async fn disconnect(&self) -> Result<(), String> {
-        self.service.disconnect().await
-    }
-
     /// A cheap, `Clone`-able handle onto the running service — what
     /// `daemon.rs`'s `POST /api/settings/reload` route holds (via an
     /// `Arc<OnceLock<QconnectControl>>` populated right after `start()`

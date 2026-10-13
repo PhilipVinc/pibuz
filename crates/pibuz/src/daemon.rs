@@ -22,7 +22,6 @@ use crate::state::{DaemonShared, LatchedErrors, QconnectStatus};
 /// tasks: T4 spawns the playback driver on `runtime` + `shared`, T6 serves
 /// `bus` over HTTP/SSE, T9/T10 wire QConnect. Held alive by [`run`] through the
 /// signal park so the core stays up.
-#[allow(dead_code)] // fields are the seam later tasks (T6/T9/T10) read.
 pub struct BootedRuntime {
     pub runtime: Arc<AppRuntime<DaemonAdapter>>,
     pub shared: Arc<Mutex<DaemonShared>>,
