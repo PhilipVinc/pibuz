@@ -7,7 +7,6 @@ repository.workspace = true
 
 [dependencies]
 qbz-models = { path = "../qbz-models" }
-qbz-cache = { path = "../qbz-cache" }
 qbz-audio = { path = "../qbz-audio" }
 qbz-player = { path = "../qbz-player" }
 qbz-core = { path = "../qbz-core" }
@@ -27,3 +26,7 @@ rustls = { version = "0.23", features = ["aws_lc_rs"] }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# The residency tests drive a real AudioCache.
+qbz-cache = { path = "../qbz-cache" }
