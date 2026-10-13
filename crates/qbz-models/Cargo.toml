@@ -18,7 +18,6 @@ async-trait = { workspace = true }
 log = { workspace = true }
 
 # Error handling
-thiserror = { workspace = true }
 
 # Time
 chrono = { workspace = true }
