@@ -83,14 +83,6 @@ pub trait QconnectEventSink: Send + Sync {
     async fn on_event(&self, event: QconnectAppEvent);
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct NoOpEventSink;
-
-#[async_trait]
-impl QconnectEventSink for NoOpEventSink {
-    async fn on_event(&self, _event: QconnectAppEvent) {}
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;

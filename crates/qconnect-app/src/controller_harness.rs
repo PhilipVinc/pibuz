@@ -65,9 +65,10 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
 use crate::renderer_engine::QconnectRendererEngine;
+use crate::session::QconnectRendererInfo;
 use crate::{
     cache_renderer_snapshot, QConnectRendererState, QconnectApp, QconnectAppEvent,
-    QconnectEventSink, QconnectRemoteSyncState, QconnectRendererInfo,
+    QconnectEventSink, QconnectRemoteSyncState,
 };
 
 // ===================================================================== engine

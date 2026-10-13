@@ -67,20 +67,6 @@ pub fn ordered_queue_cursors(queue: &QConnectQueueState) -> Vec<QconnectOrderedQ
     cursors
 }
 
-pub fn queue_item_track_id_for_cursor(
-    queue: &QConnectQueueState,
-    cursor: QconnectOrderedQueueCursor,
-) -> Option<u64> {
-    match cursor {
-        QconnectOrderedQueueCursor::Queue(index) => {
-            queue.queue_items.get(index).map(|item| item.track_id)
-        }
-        QconnectOrderedQueueCursor::Autoplay(index) => {
-            queue.autoplay_items.get(index).map(|item| item.track_id)
-        }
-    }
-}
-
 pub fn normalized_queue_item_id_for_cursor(
     queue: &QConnectQueueState,
     cursor: QconnectOrderedQueueCursor,

@@ -430,66 +430,6 @@ pub fn build_session_renderer_snapshot(
     }
 }
 
-/// Merge a base renderer snapshot (the local player's view) with the cloud's
-/// cached per-renderer state and the session loop mode, producing the
-/// "effective" renderer state the controller should reason about. Pure: no
-/// frontend/Tauri dependency. Hoisted from the Tauri adapter (ADR-006) so the
-/// Tauri and Slint controller paths share one definition.
-pub fn build_effective_renderer_snapshot(
-    queue: &QConnectQueueState,
-    base_renderer_state: &QConnectRendererState,
-    session_renderer_state: Option<&QconnectSessionRendererState>,
-    session_loop_mode: Option<i32>,
-) -> QConnectRendererState {
-    let mut renderer_snapshot = base_renderer_state.clone();
-
-    if let Some(session_renderer_state) = session_renderer_state {
-        if let Some(active) = session_renderer_state.active {
-            renderer_snapshot.active = Some(active);
-        }
-        if let Some(playing_state) = session_renderer_state.playing_state {
-            renderer_snapshot.playing_state = Some(playing_state);
-        }
-        if let Some(current_position_ms) = session_renderer_state.current_position_ms {
-            renderer_snapshot.current_position_ms = Some(current_position_ms);
-        }
-        if let Some(volume) = session_renderer_state.volume {
-            renderer_snapshot.volume = Some(volume);
-        }
-        if let Some(muted) = session_renderer_state.muted {
-            renderer_snapshot.muted = Some(muted);
-        }
-        if let Some(max_audio_quality) = session_renderer_state.max_audio_quality {
-            renderer_snapshot.max_audio_quality = Some(max_audio_quality);
-        }
-        if let Some(loop_mode) = session_renderer_state.loop_mode.or(session_loop_mode) {
-            renderer_snapshot.loop_mode = Some(loop_mode);
-        }
-        if let Some(shuffle_mode) = session_renderer_state.shuffle_mode {
-            renderer_snapshot.shuffle_mode = Some(shuffle_mode);
-        }
-        if session_renderer_state.updated_at_ms > 0 {
-            renderer_snapshot.updated_at_ms = session_renderer_state.updated_at_ms;
-        }
-
-        if session_renderer_state.current_queue_item_id.is_some() {
-            let session_snapshot = build_session_renderer_snapshot(
-                queue,
-                Some(session_renderer_state),
-                session_loop_mode,
-            );
-            if session_snapshot.current_track.is_some() {
-                renderer_snapshot.current_track = session_snapshot.current_track;
-                renderer_snapshot.next_track = session_snapshot.next_track;
-            }
-        }
-    } else if let Some(loop_mode) = session_loop_mode {
-        renderer_snapshot.loop_mode = Some(loop_mode);
-    }
-
-    renderer_snapshot
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
