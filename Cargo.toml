@@ -86,3 +86,24 @@ strsim = "0.11"
 # workflows' env (CARGO_PROFILE_RELEASE_*) — they are CI-memory tuning, not
 # a property of the package.
 strip = "symbols"
+
+# Release builds happen ON the Pi (four slow cores, no incremental), so every
+# CPU-second here is several on the board. These dependencies do real work but
+# none of it is hot — nothing on the audio, decode or download path — so they
+# are built for compile speed instead of peak speed. Behaviour is unchanged;
+# only how fast cold code runs.
+#
+# Measured, cold `cargo build --release -p pibuz`, linux/arm64 at 4 CPUs:
+# ~350 -> ~285 CPU-seconds, ~1m40 -> ~1m24 wall (two runs each), when the
+# list also held zbus, mpris-server and jiff, since removed from the build. Do
+# NOT add `aws-lc-sys`: every CDN byte is decrypted through it.
+#
+# The bundled SQLite, only there to read pre-settings.toml stores once (the
+# `sqlite-migrate` feature). Its C compile was 29 s of the build at -O3.
+[profile.release.package.libsqlite3-sys]
+opt-level = 1
+# mDNS responder for pairing, and the CLI's argument parser.
+[profile.release.package.mdns-sd]
+opt-level = 1
+[profile.release.package.clap_builder]
+opt-level = 1
