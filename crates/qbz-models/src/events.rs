@@ -5,8 +5,8 @@
 
 use serde::Serialize;
 
-use crate::playback::{PlaybackState, PlaybackStatus, QueueState, QueueTrack};
-use crate::types::{Playlist, SearchResults, UserSession};
+use crate::playback::{PlaybackState, QueueState, QueueTrack};
+use crate::types::UserSession;
 
 /// All events emitted by QBZ core to frontends
 #[derive(Debug, Clone, Serialize)]
@@ -28,14 +28,8 @@ pub enum CoreEvent {
         duration_secs: u64,
     },
 
-    /// Track finished playing naturally
-    TrackEnded { track_id: u64 },
-
     /// Volume changed
     VolumeChanged { volume: f32 },
-
-    /// Full playback status update
-    PlaybackStatusUpdated { status: PlaybackStatus },
 
     // ============ Queue Events ============
     /// Queue state changed (tracks added/removed/reordered)
@@ -65,38 +59,6 @@ pub enum CoreEvent {
     /// User logged out
     LoggedOut,
 
-    /// Session expired or became invalid
-    SessionExpired,
-
-    // ============ Library Events ============
-    /// Favorites updated
-    FavoritesUpdated {
-        /// Type of favorite that changed: "album", "track", or "artist"
-        favorite_type: String,
-    },
-
-    /// Playlist created
-    PlaylistCreated { playlist: Playlist },
-
-    /// Playlist updated (tracks added/removed)
-    PlaylistUpdated { playlist_id: u64 },
-
-    /// Playlist deleted
-    PlaylistDeleted { playlist_id: u64 },
-
-    // ============ Loading/Progress Events ============
-    /// Loading started for an operation
-    LoadingStarted { operation: String },
-
-    /// Loading completed
-    LoadingCompleted { operation: String },
-
-    /// Download progress for offline content
-    DownloadProgress { track_id: u64, progress_percent: u8 },
-
-    /// Download completed
-    DownloadCompleted { track_id: u64 },
-
     // ============ Error Events ============
     /// An error occurred
     Error {
@@ -108,37 +70,4 @@ pub enum CoreEvent {
 
     /// Playback error (track couldn't play)
     PlaybackError { track_id: u64, message: String },
-
-    /// Network error
-    NetworkError { message: String },
-
-    // ============ Audio System Events ============
-    /// Audio device changed
-    AudioDeviceChanged { device_name: String },
-
-    /// Audio backend changed
-    AudioBackendChanged {
-        /// Backend name: "pipewire", "alsa", "pulse"
-        backend: String,
-    },
-
-    /// Audio system diagnostic info
-    AudioDiagnostic { message: String },
-
-    // ============ Search Events ============
-    /// Search results received
-    SearchResultsReceived {
-        query: String,
-        results: SearchResults,
-    },
-
-    // ============ Navigation Hints ============
-    /// Suggest navigation to album
-    NavigateToAlbum { album_id: String },
-
-    /// Suggest navigation to artist
-    NavigateToArtist { artist_id: u64 },
-
-    /// Suggest navigation to playlist
-    NavigateToPlaylist { playlist_id: u64 },
 }

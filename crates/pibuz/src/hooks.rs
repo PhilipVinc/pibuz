@@ -165,7 +165,7 @@ fn state_label(state: PlaybackState) -> &'static str {
 /// Map one bus event onto the script's `QBZ_*` environment, or None for
 /// events the hook does not forward. Deliberately excluded: `PositionUpdated`
 /// (a fork every ~2 s), `QueueUpdated` (bulky, and queue state is one
-/// `GET /api/status` away), and everything on the SSE suppress list. The
+/// `GET /api/status` away), and `ShuffleChanged` and `RepeatModeChanged`. The
 /// `LoggedIn` session payload (auth token) is NEVER forwarded — the event
 /// name alone is.
 fn hook_env(ev: &CoreEvent) -> Option<Vec<(String, String)>> {
@@ -198,10 +198,6 @@ fn hook_env(ev: &CoreEvent) -> Option<Vec<(String, String)>> {
             push("EVENT", "PlaybackStateChanged".into());
             push("STATE", state_label(*state).into());
         }
-        TrackEnded { track_id } => {
-            push("EVENT", "TrackEnded".into());
-            push("TRACK_ID", track_id.to_string());
-        }
         VolumeChanged { volume } => {
             push("EVENT", "VolumeChanged".into());
             // 0-100, the same scale the `pibuz volume` verb speaks.
@@ -224,7 +220,6 @@ fn hook_env(ev: &CoreEvent) -> Option<Vec<(String, String)>> {
         }
         LoggedIn { .. } => push("EVENT", "LoggedIn".into()),
         LoggedOut => push("EVENT", "LoggedOut".into()),
-        SessionExpired => push("EVENT", "SessionExpired".into()),
         Error {
             code,
             message,
@@ -239,10 +234,6 @@ fn hook_env(ev: &CoreEvent) -> Option<Vec<(String, String)>> {
             push("EVENT", "PlaybackError".into());
             push("TRACK_ID", track_id.to_string());
             push("MESSAGE", message.clone());
-        }
-        AudioDeviceChanged { device_name } => {
-            push("EVENT", "AudioDeviceChanged".into());
-            push("DEVICE_NAME", device_name.clone());
         }
         _ => return None,
     }
@@ -351,10 +342,6 @@ mod tests {
         })
         .is_none());
         assert!(hook_env(&CoreEvent::ShuffleChanged { enabled: true }).is_none());
-        assert!(hook_env(&CoreEvent::LoadingStarted {
-            operation: "x".into()
-        })
-        .is_none());
     }
 
     fn state(state: PlaybackState) -> CoreEvent {
