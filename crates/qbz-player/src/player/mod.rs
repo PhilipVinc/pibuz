@@ -6163,9 +6163,7 @@ impl Player {
         // other door.
         let choose = self.destination_chooser(track_id, "PREFETCH");
         let result: Result<Option<TrackBytes>, String> =
-            match qbz_qobuz::cmaf::download_full_sized(client, track_id, quality, None, choose)
-                .await
-            {
+            match qbz_qobuz::cmaf::download_full_sized(client, track_id, quality, choose).await {
                 // Already the allocation the cache will share — assembled there
                 // segment by segment, so the track is never resident twice.
                 Ok(qbz_qobuz::DownloadedTrack::Memory(data)) => Ok(Some(data)),
@@ -6471,7 +6469,7 @@ impl Player {
         // audibly, twice, measured mid-write.
         let choose = self.destination_chooser(track_id, "GAPLESS");
 
-        match qbz_qobuz::cmaf::download_full_sized(client, track_id, quality, None, choose).await {
+        match qbz_qobuz::cmaf::download_full_sized(client, track_id, quality, choose).await {
             Ok(qbz_qobuz::DownloadedTrack::File(_)) => {
                 return match self.audio_cache.get_playback_cache().and_then(|c| {
                     c.commit_write(track_id)
