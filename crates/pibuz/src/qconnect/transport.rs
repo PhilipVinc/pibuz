@@ -572,37 +572,6 @@ pub fn save_startup_mode_at(
     put_qconnect_setting_at(path, "startup_mode", mode.as_str())
 }
 
-/// Load the last-known QConnect on/off state, if recorded (`last_known_state` =
-/// "on" | "off").
-///
-/// The persistence half of `QconnectStartupMode::RememberLast`. Both halves are
-/// written and tested but NOT yet wired: `qconnect::start` passes
-/// `last_known = None` (see the P0 note at `qconnect/mod.rs`), so a daemon
-/// configured for `remember_last` currently resolves to off. Wiring these two
-/// calls in is all that mode needs.
-#[allow(dead_code)] // unwired half of RememberLast — see the doc comment
-pub fn load_last_known_state_at(path: &Path) -> Option<bool> {
-    let conn = open_qconnect_settings_conn_at(path)?;
-    let value: Option<String> = conn
-        .query_row(
-            "SELECT value FROM settings WHERE key = 'last_known_state'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .ok();
-    match value.as_deref() {
-        Some("on") => Some(true),
-        Some("off") => Some(false),
-        _ => None,
-    }
-}
-
-/// Persist the last-known on/off state. See [`load_last_known_state_at`].
-#[allow(dead_code)] // unwired half of RememberLast — see load_last_known_state_at
-pub fn save_last_known_state_at(path: &Path, state: bool) -> Result<(), String> {
-    put_qconnect_setting_at(path, "last_known_state", if state { "on" } else { "off" })
-}
-
 /// Load the daemon volume mode (`volume_mode` = "software" | "locked"; 01 §7.4).
 /// NEW daemon key (the desktop never reads it). Fail-open: None when unset.
 pub fn load_volume_mode_at(path: &Path) -> Option<String> {
@@ -1007,7 +976,6 @@ mod tests {
         );
         assert_eq!(load_device_name_at(&tmp), None);
         assert_eq!(load_volume_mode_at(&tmp), None);
-        assert_eq!(load_last_known_state_at(&tmp), None);
         assert!(load_pairing_enabled_at(&tmp), "pairing defaults ON");
         assert_eq!(load_pairing_port_at(&tmp), DEFAULT_PAIRING_PORT);
 
@@ -1015,7 +983,6 @@ mod tests {
         save_startup_mode_at(&tmp, qconnect_app::QconnectStartupMode::On).unwrap();
         persist_device_name_at(&tmp, Some("Living Room")).unwrap();
         save_volume_mode_at(&tmp, "locked").unwrap();
-        save_last_known_state_at(&tmp, true).unwrap();
 
         assert_eq!(
             load_startup_mode_at(&tmp),
@@ -1023,7 +990,6 @@ mod tests {
         );
         assert_eq!(load_device_name_at(&tmp).as_deref(), Some("Living Room"));
         assert_eq!(load_volume_mode_at(&tmp).as_deref(), Some("locked"));
-        assert_eq!(load_last_known_state_at(&tmp), Some(true));
 
         // Clearing the device name removes it.
         persist_device_name_at(&tmp, None).unwrap();
@@ -1064,7 +1030,6 @@ mod tests {
             ),
             ("device_name cleared", persist_device_name_at(&db, None)),
             ("volume_mode", save_volume_mode_at(&db, "locked")),
-            ("last_known_state", save_last_known_state_at(&db, true)),
             ("pairing", save_pairing_enabled_at(&db, false)),
             ("pairing_port", save_pairing_port_at(&db, 9000)),
             ("initial_volume", save_initial_volume_at(&db, 30)),

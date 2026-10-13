@@ -45,7 +45,7 @@ pub use session::{
     JOIN_SESSION_REASON_CONTROLLER_REQUEST, JOIN_SESSION_REASON_RECONNECTION,
     QCONNECT_RENDERER_LOST_TIMEOUT_MS,
 };
-pub use startup::{compute_effective_startup, QconnectStartupMode};
+pub use startup::QconnectStartupMode;
 pub use state::QconnectRuntimeState;
 pub use sync_state::{
     cache_renderer_snapshot, ensure_session_renderer_state, sync_session_renderer_active_flags,

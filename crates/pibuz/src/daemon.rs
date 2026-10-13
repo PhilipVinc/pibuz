@@ -619,7 +619,7 @@ pub(crate) async fn reload_qconnect(state: &crate::api::ApiState) {
     let db = state.roots.data.join("qconnect_settings.db");
     qc.refresh_device_name(&db).await;
     let mode = crate::qconnect::transport::load_startup_mode_at(&db);
-    let should_connect = qconnect_app::compute_effective_startup(mode, None, None);
+    let should_connect = mode.auto_connects();
     if should_connect {
         if let Err(e) = qc.connect().await {
             log::info!("[reload] qconnect connect deferred: {e}");

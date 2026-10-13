@@ -30,8 +30,8 @@ use std::time::Duration;
 use qbz_app::shell::AppRuntime;
 use qbz_models::CoreEvent;
 use qconnect_app::{
-    compute_effective_startup, QconnectApp, QconnectAppEvent, QconnectEventSink,
-    QconnectLifecycleState, QconnectRemoteSyncState, QconnectSessionState, SessionLoopHost,
+    QconnectApp, QconnectAppEvent, QconnectEventSink, QconnectLifecycleState,
+    QconnectRemoteSyncState, QconnectSessionState, SessionLoopHost,
 };
 use qconnect_transport_ws::{NativeWsTransport, WsTransportConfig};
 use tokio::sync::{broadcast, Mutex};
@@ -670,7 +670,7 @@ impl QconnectHandle {
 
 /// Boot step 12: wire QConnect. Mints the daemon's OWN device identity in the
 /// daemon-root KV, decides auto-connect from the persisted startup mode
-/// (`cli_override = None`, `last_known = None` — P0), latches the initial status,
+/// (`QconnectStartupMode::auto_connects`), latches the initial status,
 /// and, when enabled, spawns the connect-on-Ready retry task.
 pub fn start(
     runtime: Runtime,
@@ -686,12 +686,11 @@ pub fn start(
     // cast path reads `playback.quality` from here (upstream#693).
     transport::init_data_root(roots.data.clone());
 
-    // Effective startup decision (Ready-state only). `cli_override` stays None: a
-    // `Some` would permanently shadow the KV store that `pibuz qconnect
-    // enable|disable` (T11) + the TUI (T13) write, making both dead controls.
-    // `last_known` is None in P0 (RememberLast resolves to off).
+    // Effective startup decision (Ready-state only), from the KV store that
+    // `pibuz qconnect enable|disable` and the TUI write. `remember_last`
+    // resolves to off.
     let mode = transport::load_startup_mode_at(&settings_db);
-    let should_auto_connect = compute_effective_startup(mode, None, None);
+    let should_auto_connect = mode.auto_connects();
     let custom_name = transport::load_device_name_at(&settings_db);
     let effective_name = transport::resolve_qconnect_friendly_name(custom_name.as_deref());
 
