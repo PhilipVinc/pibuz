@@ -48,8 +48,8 @@ use symphonia::default::{get_codecs, get_probe};
 use playback_engine::PlaybackEngine;
 use qbz_audio::{
     calculate_gain_factor, db_to_linear, extract_replaygain, AnalyzerMessage, AnalyzerTap,
-    AudioBackendType, AudioDiagnostic, AudioSettings, BackendConfig, BackendManager,
-    BitPerfectMode, DiagnosticSource, DynamicAmplify, LoudnessAnalyzer, LoudnessCache,
+    AudioBackendType, AudioSettings, BackendConfig, BackendManager, BitPerfectMode, DynamicAmplify,
+    LoudnessAnalyzer, LoudnessCache,
 };
 use qbz_cache::TrackBytes;
 use qbz_models::Quality;
@@ -2271,8 +2271,6 @@ pub struct Player {
     pub state: SharedState,
     /// Audio settings (exclusive mode, DAC passthrough, etc.)
     audio_settings: Arc<Mutex<AudioSettings>>,
-    /// Bit-depth diagnostic capture (always available, zero-cost when idle)
-    pub diagnostic: AudioDiagnostic,
     /// Two-level playback cache (L1 memory + optional L2 disk). A track is
     /// cached after its first play so replays start instantly.
     audio_cache: Arc<qbz_cache::AudioCache>,
@@ -2280,7 +2278,7 @@ pub struct Player {
 
 impl Default for Player {
     fn default() -> Self {
-        Self::new(None, AudioSettings::default(), AudioDiagnostic::new(), None)
+        Self::new(None, AudioSettings::default(), None)
     }
 }
 
@@ -2295,7 +2293,6 @@ impl Player {
     pub fn new(
         device_name: Option<String>,
         audio_settings: AudioSettings,
-        diagnostic: AudioDiagnostic,
         data_root: Option<std::path::PathBuf>,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<AudioCommand>();
@@ -2310,9 +2307,6 @@ impl Player {
         // Clone settings for thread
         let settings = Arc::new(Mutex::new(audio_settings.clone()));
         let thread_settings = settings.clone();
-
-        // Clone the diagnostic for the audio thread
-        let thread_diagnostic = diagnostic.clone();
 
         // Where the loudness cache belongs, moved into the thread that opens it.
         let thread_data_root = data_root;
@@ -2335,21 +2329,17 @@ impl Player {
             let _analyzer_handle = LoudnessAnalyzer::spawn(analyzer_rx, loudness_cache.clone());
             let analyzer_enabled = Arc::new(AtomicBool::new(false));
 
-            // Helper to wrap a source with diagnostic capture and normalization
+            // Helper to wrap a source with normalization
             // Pipeline order (normalization ON):
-            //   Diagnostic (raw) → AnalyzerTap → DynamicAmplify → Visualizer
+            //   AnalyzerTap → DynamicAmplify
             // Pipeline order (normalization OFF — bit-perfect):
-            //   Diagnostic (raw) → Visualizer
+            //   the decoded source, untouched
             let wrap_source = |source: Box<dyn Source<Item = f32> + Send>,
                                normalization_gain: Option<f32>,
                                gain_atomic: Option<Arc<AtomicU32>>,
                                analyzer_tx: &SyncSender<AnalyzerMessage>,
                                analyzer_enabled: &Arc<AtomicBool>|
              -> Box<dyn Source<Item = f32> + Send> {
-                // Diagnostic tap (innermost — captures raw decoded samples)
-                let source: Box<dyn Source<Item = f32> + Send> =
-                    Box::new(DiagnosticSource::new(source, thread_diagnostic.clone()));
-
                 // Normalization: dynamic (Phase 2) > static (Phase 1 fallback) > none (bit-perfect)
                 let source: Box<dyn Source<Item = f32> + Send> =
                     if let Some(gain_atomic) = gain_atomic {
@@ -3150,7 +3140,7 @@ impl Player {
                             *current_gain_atomic = gain_atomic.clone();
                             thread_state.set_normalization_gain(normalization);
 
-                            // Wrap source with diagnostic capture and normalization
+                            // Wrap source with normalization
                             let source = wrap_source(
                                 source,
                                 normalization,
@@ -3853,7 +3843,7 @@ impl Player {
                                 );
                             }
 
-                            // Wrap source with diagnostic capture and normalization
+                            // Wrap source with normalization
                             let source_to_play = wrap_source(
                                 source_to_play,
                                 normalization,
@@ -4259,7 +4249,7 @@ impl Player {
                                         }
                                     };
 
-                                // Wrap source with diagnostic capture and normalization
+                                // Wrap source with normalization
                                 // Reuse the gain + atomic from the original Play
                                 let skipped_source = wrap_source(
                                     skipped_source,
@@ -4692,7 +4682,7 @@ impl Player {
                             // Send Reset to analyzer (seek invalidates accumulated samples)
                             let _ = analyzer_tx.try_send(AnalyzerMessage::Reset);
 
-                            // Wrap source with diagnostic capture and normalization
+                            // Wrap source with normalization
                             // Reuse the gain + atomic from the current track
                             let skipped_source = wrap_source(
                                 skipped_source,
@@ -5667,7 +5657,6 @@ impl Player {
             tx,
             state,
             audio_settings: settings,
-            diagnostic,
             audio_cache,
         }
     }
@@ -8561,7 +8550,7 @@ mod play_offset_tests {
 
 #[cfg(test)]
 mod cached_play_duration_tests {
-    use super::{AudioCommand, AudioDiagnostic, AudioSettings, Player, SharedState};
+    use super::{AudioCommand, AudioSettings, Player, SharedState};
     use crate::player::streaming_source::tests::{ramp_wav, temp_wav};
     use qbz_models::Quality;
     use std::sync::mpsc::{self, Receiver};
@@ -8578,7 +8567,6 @@ mod cached_play_duration_tests {
             tx,
             state: SharedState::new(),
             audio_settings: Arc::new(Mutex::new(AudioSettings::default())),
-            diagnostic: AudioDiagnostic::new(),
             audio_cache: Arc::new(qbz_cache::AudioCache::new(16 * 1024 * 1024)),
         };
         (player, rx)
