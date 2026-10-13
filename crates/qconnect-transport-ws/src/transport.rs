@@ -124,19 +124,8 @@ impl InMemoryWsTransport {
         }
     }
 
-    pub async fn inject_inbound(&self, envelope: InboundEnvelope) -> Result<(), WsTransportError> {
-        self.events_tx
-            .send(TransportEvent::InboundReceived(envelope))
-            .map_err(|_| WsTransportError::EventChannelClosed)?;
-        Ok(())
-    }
-
     pub async fn sent_messages(&self) -> Vec<OutboundEnvelope> {
         self.state.lock().await.sent_messages.clone()
-    }
-
-    pub async fn is_connected(&self) -> bool {
-        self.state.lock().await.connected
     }
 }
 
@@ -230,10 +219,6 @@ impl NativeWsTransport {
             runtime: Arc::new(Mutex::new(None)),
             events_tx,
         }
-    }
-
-    pub async fn is_connected(&self) -> bool {
-        self.state.lock().await.connected
     }
 }
 
