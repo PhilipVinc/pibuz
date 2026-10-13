@@ -6,13 +6,11 @@
 //! different queue than the one actually playing (design doc had flagged this
 //! as knowingly unported — design-input/qconnect-headless.md:250-252).
 //!
-//! The gates are the desktop's EXACT set, in the same order: live runtime ->
-//! `is_local_renderer_active` (a peer owns playback -> the peer publishes) ->
-//! offline-only skip -> non-empty -> echo-suppress vs the cloud's last-applied
-//! queue -> per-session `last_pushed_queue_ids` latch -> all-or-nothing
-//! admission (any local/Plex track refuses the WHOLE push; offline
-//! qobuz_download stays eligible — its id is the real Qobuz id). The desktop
-//! toasts on refusal; the daemon logs.
+//! The gates, in order: live runtime -> `is_local_renderer_active` (a peer
+//! owns playback -> the peer publishes) -> non-empty -> echo-suppress vs the
+//! cloud's last-applied queue -> per-session `last_pushed_queue_ids` latch.
+//! The desktop's offline-only skip and local-track admission went with its
+//! local library: every track in a daemon queue is a Qobuz track.
 //!
 //! Trigger: the desktop calls it on every track transition from its poll loop.
 //! The daemon instead runs a debounced `CoreEvent::QueueUpdated` subscriber,
