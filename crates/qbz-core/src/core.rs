@@ -30,13 +30,6 @@ pub struct QbzCore<A: FrontendAdapter> {
     player: Arc<Player>,
     /// Whether the core is initialized
     initialized: Arc<RwLock<bool>>,
-    /// D8 guard: true when the current queue was built from an OFFLINE-ONLY
-    /// local playlist — such a queue must never be pushed to the Qobuz
-    /// Connect cloud. Cleared by every queue REPLACEMENT (`set_queue` /
-    /// `set_queue_with_order` / `clear_queue`); append-style ops preserve it.
-    /// Set explicitly by the frontend's local-playlist play path right after
-    /// its `set_queue`.
-    queue_offline_only: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
@@ -51,27 +44,7 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
             queue: Arc::new(RwLock::new(QueueManager::new())),
             player: Arc::new(player),
             initialized: Arc::new(RwLock::new(false)),
-            queue_offline_only: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
-    }
-
-    /// Mark (or unmark) the current queue as built from an OFFLINE-ONLY local
-    /// playlist (D8). Call right after the `set_queue` that loaded it.
-    ///
-    /// Every caller in this tree passes `false`; the local/offline library
-    /// that set it `true` went with the desktop app. Kept because the
-    /// resetting calls are real and `queue_is_offline_only` is still read by
-    /// qconnect/publish.rs — collapsing the pair is a separate change.
-    pub fn set_queue_offline_only(&self, on: bool) {
-        self.queue_offline_only
-            .store(on, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// True when the current queue originates from an offline-only local
-    /// playlist — QConnect must skip its cloud queue push.
-    pub fn queue_is_offline_only(&self) -> bool {
-        self.queue_offline_only
-            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Initialize the core
@@ -242,7 +215,6 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
     /// slot — use when nothing is actively playing and the user wants a full
     /// reset.
     pub async fn clear_queue(&self, keep_current: bool) {
-        self.set_queue_offline_only(false);
         let queue = self.queue.write().await;
         queue.clear(keep_current);
         self.emit(CoreEvent::QueueUpdated {
@@ -283,9 +255,6 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
 
     /// Set the entire queue (replaces existing)
     pub async fn set_queue(&self, tracks: Vec<QueueTrack>, start_index: Option<usize>) {
-        // Any queue replacement drops the offline-only-playlist stamp; the
-        // local-playlist play path re-sets it right after when it applies.
-        self.set_queue_offline_only(false);
         let queue = self.queue.write().await;
         queue.set_queue(tracks, start_index);
         self.emit(CoreEvent::QueueUpdated {
@@ -302,7 +271,6 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
         shuffle_enabled: bool,
         shuffle_order: Option<Vec<usize>>,
     ) {
-        self.set_queue_offline_only(false);
         let queue = self.queue.write().await;
         queue.set_queue_with_order(tracks, start_index, shuffle_enabled, shuffle_order);
         self.emit(CoreEvent::QueueUpdated {

@@ -61,14 +61,6 @@ pub async fn publish_local_queue_if_changed(
         }
     }
 
-    // A queue built from an OFFLINE-ONLY local playlist never reaches the
-    // Connect cloud. Debug level — this runs after every queue mutation and
-    // must not spam the log.
-    if runtime.core().queue_is_offline_only() {
-        log::debug!("[QConnect] queue is from an offline-only playlist; skipping cloud push");
-        return;
-    }
-
     let (tracks, current_index) = runtime.core().get_all_queue_tracks().await;
     if tracks.is_empty() {
         return;
