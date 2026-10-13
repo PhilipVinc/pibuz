@@ -17,15 +17,10 @@ pub use decoder::decode_queue_server_events;
 pub use decoder::decode_renderer_server_commands;
 pub use decoder::decode_server_errors;
 pub use error::ProtocolError;
-pub use event::{
-    ErrorType, PlaybackErrorEvent, QueueEventType, QueueServerEvent, ServerErrorEvent,
-};
+pub use event::{ErrorType, QueueEventType, QueueServerEvent};
 // Proto message types needed by downstream crates to construct/encode frames
 // (e.g. PlaybackErrorMessage for tests and any future re-encoding path).
-pub use mapper::{
-    build_qconnect_outbound_envelope, build_qconnect_renderer_outbound_envelope,
-    encode_queue_command_batch, encode_renderer_report_batch,
-};
+pub use mapper::{build_qconnect_outbound_envelope, build_qconnect_renderer_outbound_envelope};
 pub use queue_command_proto::{
     PlaybackErrorMessage, QConnectMessage, QConnectMessages, QueueVersionRef,
 };
@@ -33,7 +28,6 @@ pub use renderer::{
     RendererCommandType, RendererReport, RendererReportType, RendererServerCommand,
 };
 pub use wire::{
-    build_outbound_envelope, decode_inbound_json, encode_outbound_json,
-    encode_outbound_payload_bytes, parse_inbound_event, InboundEnvelope, OutboundEnvelope,
-    QCONNECT_BACKEND_DESTINATION, QCONNECT_SERVICE,
+    build_outbound_envelope, decode_inbound_json, encode_outbound_payload_bytes,
+    parse_inbound_event, InboundEnvelope, OutboundEnvelope,
 };
