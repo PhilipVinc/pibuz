@@ -172,6 +172,31 @@ impl std::fmt::Display for AlsaDirectError {
     }
 }
 
+/// Why `AlsaDirectStream::new` failed: the message exactly as the logs have
+/// always shown it, and the errno of the ALSA call that failed, when one did.
+/// A failure of our own making (no format offered was accepted, the rate came
+/// back different) has no errno.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OpenError {
+    pub(crate) errno: Option<i32>,
+    pub(crate) message: String,
+}
+
+impl std::fmt::Display for OpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl From<String> for OpenError {
+    fn from(message: String) -> Self {
+        Self {
+            errno: None,
+            message,
+        }
+    }
+}
+
 /// Whether an output-open failure MESSAGE says the device is held by someone
 /// else. The backends hand the player a `String`, not an `AlsaDirectError`, so
 /// this is read off the text: `AlsaDirectError::DeviceBusy`'s `Display` (the hw
@@ -191,7 +216,45 @@ impl AlsaDirectError {
         matches!(self, AlsaDirectError::UnsupportedFormat(_))
     }
 
-    /// Create from raw ALSA error message
+    /// Classify a failed open. The errno decides wherever it is one that names
+    /// the cause whatever step returned it — busy, not permitted, not there —
+    /// and only the rest falls back to the message. EINVAL in particular says
+    /// nothing until you know WHICH set refused, and only the message's
+    /// "Failed to set ..." prefix says that.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(
+            dead_code,
+            reason = "only the Linux ALSA backend classifies its errors"
+        )
+    )]
+    pub(crate) fn from_open_error(error: &OpenError) -> Self {
+        // Linux's numbers, written out because `libc` is a Linux-only
+        // dependency here and ALSA only ever runs there; spelling them keeps
+        // this testable on every machine.
+        const EPERM: i32 = 1;
+        const ENOENT: i32 = 2;
+        const ENXIO: i32 = 6;
+        const EAGAIN: i32 = 11;
+        const EACCES: i32 = 13;
+        const EBUSY: i32 = 16;
+        const ENODEV: i32 = 19;
+
+        let msg = error.message.clone();
+        match error.errno {
+            Some(EBUSY | EAGAIN) => AlsaDirectError::DeviceBusy(msg),
+            Some(EPERM | EACCES) => AlsaDirectError::PermissionDenied(msg),
+            Some(ENOENT | ENODEV | ENXIO) => AlsaDirectError::DeviceNotFound(msg),
+            _ => Self::from_alsa_error(&error.message),
+        }
+    }
+
+    /// Classify by the message alone, for a failure that carries no errno.
+    ///
+    /// Busy is checked first: the message names the device and the step as
+    /// well as the error, so a word like "format" can come from either of
+    /// those, and a busy device read as an unsupported format is sent to
+    /// plughw instead of waiting for its holder.
     #[cfg_attr(
         not(target_os = "linux"),
         allow(
@@ -202,18 +265,18 @@ impl AlsaDirectError {
     pub(crate) fn from_alsa_error(msg: &str) -> Self {
         let msg_lower = msg.to_lowercase();
 
-        if msg_lower.contains("no supported audio format")
+        if msg_lower.contains("busy")
+            || msg_lower.contains("resource temporarily unavailable")
+            || msg_lower.contains("device or resource busy")
+        {
+            AlsaDirectError::DeviceBusy(msg.to_string())
+        } else if msg_lower.contains("no supported audio format")
             || msg_lower.contains("format")
             || msg_lower.contains("s24_3le")
             || msg_lower.contains("s24le")
             || msg_lower.contains("sample format")
         {
             AlsaDirectError::UnsupportedFormat(msg.to_string())
-        } else if msg_lower.contains("busy")
-            || msg_lower.contains("resource temporarily unavailable")
-            || msg_lower.contains("device or resource busy")
-        {
-            AlsaDirectError::DeviceBusy(msg.to_string())
         } else if msg_lower.contains("permission")
             || msg_lower.contains("access denied")
             || msg_lower.contains("operation not permitted")
@@ -999,7 +1062,7 @@ impl CpalDefaultBackend {
 
 #[cfg(test)]
 mod device_busy_tests {
-    use super::{is_device_busy_error, AlsaDirectError};
+    use super::{is_device_busy_error, AlsaDirectError, OpenError};
 
     #[test]
     fn the_hw_paths_give_up_message_reads_as_busy() {
@@ -1011,6 +1074,75 @@ mod device_busy_tests {
         assert!(matches!(error, AlsaDirectError::DeviceBusy(_)));
         let message = format!("ALSA Direct failed: {error}. Device may be in use or inaccessible.");
         assert!(is_device_busy_error(&message));
+    }
+
+    /// The errno wins over the words: a device whose name or failing step
+    /// mentions a format is still busy when ALSA said EBUSY.
+    #[test]
+    fn a_busy_errno_is_busy_whatever_the_message_says() {
+        let error = OpenError {
+            errno: Some(16),
+            message: "Failed to apply hardware params: ALSA function 'snd_pcm_hw_params' \
+                      failed with error 'Device or resource busy (16)' on plughw:CARD=Format"
+                .to_string(),
+        };
+        assert!(matches!(
+            AlsaDirectError::from_open_error(&error),
+            AlsaDirectError::DeviceBusy(_)
+        ));
+    }
+
+    #[test]
+    fn errnos_that_name_the_cause_decide_it() {
+        let classify = |errno| {
+            AlsaDirectError::from_open_error(&OpenError {
+                errno: Some(errno),
+                message: "Failed to set format".to_string(),
+            })
+        };
+        assert!(matches!(classify(11), AlsaDirectError::DeviceBusy(_)));
+        assert!(matches!(classify(13), AlsaDirectError::PermissionDenied(_)));
+        assert!(matches!(classify(1), AlsaDirectError::PermissionDenied(_)));
+        assert!(matches!(classify(2), AlsaDirectError::DeviceNotFound(_)));
+        assert!(matches!(classify(19), AlsaDirectError::DeviceNotFound(_)));
+    }
+
+    /// EINVAL says only that a set was refused; which set is in the message,
+    /// and that is what sends a format to plughw and a rate to CPAL.
+    #[test]
+    fn einval_and_no_errno_fall_back_to_the_message() {
+        let classify = |errno, message: &str| {
+            AlsaDirectError::from_open_error(&OpenError {
+                errno,
+                message: message.to_string(),
+            })
+        };
+        assert!(matches!(
+            classify(
+                None,
+                "No supported audio format found on 'hw:0' (tried S32_LE)"
+            ),
+            AlsaDirectError::UnsupportedFormat(_)
+        ));
+        assert!(matches!(
+            classify(
+                Some(22),
+                "Failed to set sample rate: ALSA function 'snd_pcm_hw_params_set_rate' \
+                 failed with error 'Invalid argument (22)'"
+            ),
+            AlsaDirectError::InvalidParams(_)
+        ));
+        assert!(matches!(
+            classify(None, "set format: Device or resource busy"),
+            AlsaDirectError::DeviceBusy(_)
+        ));
+    }
+
+    #[test]
+    fn the_message_reads_exactly_as_before() {
+        let error = OpenError::from("Failed to prepare PCM: x".to_string());
+        assert_eq!(error.errno, None);
+        assert_eq!(error.to_string(), "Failed to prepare PCM: x");
     }
 
     #[test]

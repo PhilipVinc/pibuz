@@ -54,6 +54,14 @@ tags on `main`.
 
 ### Fixed
 
+- **A busy output device is recognized as busy by what ALSA said, not by the
+  words in the message.** Failures to open the DAC were sorted into busy,
+  unsupported format, permission and not-found by searching the error text,
+  which also names the device and the step that failed, and "format" was
+  looked for before "busy". A busy device could therefore be taken for one
+  that did not support the format and sent to `plughw:` instead of waiting for
+  whoever held it. The error code ALSA returned now decides wherever it names
+  the cause.
 - **A track that fails to load is reported to the session as a playback
   error**, the way the official renderer does, instead of the controller only
   seeing it stop. The type follows the web player's mapping: no rights or no

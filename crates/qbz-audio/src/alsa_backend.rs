@@ -874,7 +874,7 @@ impl AlsaBackend {
                     return Some(Ok((stream, direct_mode)));
                 }
                 Err(e) => {
-                    let error = super::backend::AlsaDirectError::from_alsa_error(&e);
+                    let error = super::backend::AlsaDirectError::from_open_error(&e);
                     log::warn!("[ALSA Backend] hw attempt failed: {}", error);
 
                     if matches!(error, super::backend::AlsaDirectError::DeviceBusy(_)) {
@@ -977,7 +977,7 @@ impl AlsaBackend {
                 Some(Ok((stream, super::backend::BitPerfectMode::PluginFallback)))
             }
             Err(e) => {
-                let error = super::backend::AlsaDirectError::from_alsa_error(&e);
+                let error = super::backend::AlsaDirectError::from_open_error(&e);
 
                 if matches!(error, super::backend::AlsaDirectError::DeviceBusy(_)) {
                     log::info!("[ALSA Backend] plughw device busy — retrying with backoff");

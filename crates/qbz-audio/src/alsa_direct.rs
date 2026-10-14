@@ -11,6 +11,7 @@
     allow(dead_code, reason = "only the Linux ALSA stream calls these helpers")
 )]
 
+use crate::backend::OpenError;
 #[cfg(target_os = "linux")]
 use alsa::pcm::{Access, Format, Frames, HwParams, PCM};
 #[cfg(target_os = "linux")]
@@ -256,6 +257,20 @@ fn configure_sw_params(
          avail_min {period_frames}, stop_threshold left at the ring length"
     );
     Ok(())
+}
+
+/// `map_err` for an ALSA call during an open: the message reads as it always
+/// has, `"<what>: <alsa error>"`, and the errno travels beside it so the
+/// backend can classify the failure without reading words.
+///
+/// `abs()` because the `alsa` crate stores a code taken from a return value as
+/// the negative it was returned as, and one taken from `errno` as positive.
+#[cfg(target_os = "linux")]
+fn alsa_failed(what: impl std::fmt::Display) -> impl FnOnce(alsa::Error) -> OpenError {
+    move |e| OpenError {
+        errno: Some(e.errno().abs()),
+        message: format!("{what}: {e}"),
+    }
 }
 
 /// Fail closed when ALSA selected a different rate than requested (exclusive /
@@ -858,7 +873,7 @@ fn apply_playback_volume(
 #[cfg(target_os = "linux")]
 impl AlsaDirectStream {
     /// Create new ALSA direct stream
-    pub fn new(device_id: &str, sample_rate: u32, channels: u16) -> Result<Self, String> {
+    pub(crate) fn new(device_id: &str, sample_rate: u32, channels: u16) -> Result<Self, OpenError> {
         log::info!(
             "[ALSA Direct] Opening device: {} ({}Hz, {}ch)",
             device_id,
@@ -867,8 +882,9 @@ impl AlsaDirectStream {
         );
 
         // Open PCM device
-        let pcm = PCM::new(device_id, Direction::Playback, false)
-            .map_err(|e| format!("Failed to open ALSA device '{}': {}", device_id, e))?;
+        let pcm = PCM::new(device_id, Direction::Playback, false).map_err(alsa_failed(format!(
+            "Failed to open ALSA device '{device_id}'"
+        )))?;
 
         // Configure the hardware. Attempted twice at most: once with ALSA's
         // rate conversion DISABLED, and — only if that cannot give us the
@@ -890,7 +906,7 @@ impl AlsaDirectStream {
         // `set_rate` — the latter essentially never fails, which is the whole
         // problem.
         let mut configured: Option<(Format, Frames, Frames, bool)> = None;
-        let mut first_failure: Option<String> = None;
+        let mut first_failure: Option<OpenError> = None;
         for allow_resample in [false, true] {
             match Self::configure_hw(&pcm, device_id, sample_rate, channels, allow_resample) {
                 Ok((format, buffer_frames, period_frames)) => {
@@ -909,14 +925,18 @@ impl AlsaDirectStream {
             }
         }
         let (selected_format, buffer_frames, period_frames, resampled) =
-            configured.ok_or_else(|| "Failed to configure ALSA hardware parameters".to_string())?;
+            configured.ok_or_else(|| {
+                OpenError::from("Failed to configure ALSA hardware parameters".to_string())
+            })?;
 
         if resampled {
             log::warn!(
                 "[ALSA Direct] '{device_id}' cannot deliver {sample_rate} Hz without ALSA's rate \
                  converter ({}). Playing anyway WITH resampling — this stream is NOT bit-perfect. \
                  For bit-perfect output point audio.output_device at a hw: device.",
-                first_failure.as_deref().unwrap_or("reason unknown")
+                first_failure
+                    .as_ref()
+                    .map_or_else(|| "reason unknown".to_string(), ToString::to_string)
             );
         }
 
@@ -926,7 +946,7 @@ impl AlsaDirectStream {
         // itself — but harmless, and it keeps the state explicit at the one
         // point where every constructor agrees on it.
         pcm.prepare()
-            .map_err(|e| format!("Failed to prepare PCM: {}", e))?;
+            .map_err(alsa_failed("Failed to prepare PCM"))?;
 
         Ok(Self {
             pcm: Arc::new(Mutex::new(pcm)),
@@ -963,16 +983,18 @@ impl AlsaDirectStream {
         sample_rate: u32,
         channels: u16,
         allow_resample: bool,
-    ) -> Result<(Format, Frames, Frames), String> {
-        let hwp = HwParams::any(pcm).map_err(|e| format!("Failed to get hardware params: {e}"))?;
+    ) -> Result<(Format, Frames, Frames), OpenError> {
+        let hwp = HwParams::any(pcm).map_err(alsa_failed("Failed to get hardware params"))?;
 
         // Before anything else: a plug layer consulted after the rate is set
         // has already decided to convert.
         hwp.set_rate_resample(allow_resample)
-            .map_err(|e| format!("Failed to set rate_resample({allow_resample}): {e}"))?;
+            .map_err(alsa_failed(format!(
+                "Failed to set rate_resample({allow_resample})"
+            )))?;
 
         hwp.set_access(Access::RWInterleaved)
-            .map_err(|e| format!("Failed to set access: {e}"))?;
+            .map_err(alsa_failed("Failed to set access"))?;
 
         // Which formats to offer, and in which order, depends on whether
         // `set_format` on this PCM reports a fact or grants a wish — see
@@ -1024,23 +1046,23 @@ impl AlsaDirectStream {
         let format = layout.as_format();
 
         hwp.set_channels(u32::from(channels))
-            .map_err(|e| format!("Failed to set channels: {e}"))?;
+            .map_err(alsa_failed("Failed to set channels"))?;
 
         // `ValueOr::Nearest` so ALSA accepts the set; `ensure_exact_rate` below
         // is what fails us closed if the hardware landed somewhere else.
         hwp.set_rate(sample_rate, ValueOr::Nearest)
-            .map_err(|e| format!("Failed to set sample rate: {e}"))?;
+            .map_err(alsa_failed("Failed to set sample rate"))?;
 
         // Buffer length: rate-derived by default, or whatever
         // `audio.alsa_buffer_ms` asks for (see `buffer_frames_for`).
         let requested_buffer = buffer_frames_for(sample_rate);
         hwp.set_buffer_size_near(requested_buffer)
-            .map_err(|e| format!("Failed to set buffer size: {e}"))?;
+            .map_err(alsa_failed("Failed to set buffer size"))?;
         hwp.set_period_size_near(requested_buffer / PERIODS_PER_BUFFER, ValueOr::Nearest)
-            .map_err(|e| format!("Failed to set period size: {e}"))?;
+            .map_err(alsa_failed("Failed to set period size"))?;
 
         pcm.hw_params(&hwp)
-            .map_err(|e| format!("Failed to apply hardware params: {e}"))?;
+            .map_err(alsa_failed("Failed to apply hardware params"))?;
 
         ensure_exact_rate(&hwp, sample_rate, "exclusive PCM")?;
         let (buffer_frames, period_frames) = granted_geometry(&hwp)?;
@@ -1778,8 +1800,14 @@ impl AlsaDirectStream {
 
 #[cfg(not(target_os = "linux"))]
 impl AlsaDirectStream {
-    pub fn new(_device_id: &str, _sample_rate: u32, _channels: u16) -> Result<Self, String> {
-        Err("ALSA Direct is only available on Linux".to_string())
+    pub(crate) fn new(
+        _device_id: &str,
+        _sample_rate: u32,
+        _channels: u16,
+    ) -> Result<Self, OpenError> {
+        Err(OpenError::from(
+            "ALSA Direct is only available on Linux".to_string(),
+        ))
     }
 
     pub fn write_f32(
