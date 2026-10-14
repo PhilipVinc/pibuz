@@ -10,10 +10,14 @@ tags on `main`.
 - **The Qobuz apps show this box as a streamer, not a laptop.** The device
   type announced to Connect is now `STREAMER` (2); it was `COMPUTER` (5), a
   leftover of the desktop app this daemon forked from. It only picks the icon
-  next to the name. `QBZ_QCONNECT_DEVICE_TYPE` still overrides it, and a value
-  outside the protocol's 0-9 now falls back to the default instead of being
-  announced as-is. The LAN pairing surface (mDNS TXT and `get-display-info`),
-  which said `SPEAKER` regardless, now names the same type.
+  next to the name, and `settings set qconnect.device_type <type>` picks
+  another: any of the protocol's names (`speaker`, `streamer`, `tv`,
+  `soundbar`, `computer`, `mobile`, `cast`, `headphones`, `tablet`). Like the
+  name, it applies on the next connect. The LAN pairing surface (mDNS TXT and
+  `get-display-info`), which said `SPEAKER` regardless, now names the same
+  type; the mDNS record follows a change on the next daemon start.
+  **The `QBZ_QCONNECT_DEVICE_TYPE` environment variable is gone**, replaced by
+  the setting; a value left in a service file is now ignored.
 - **`qconnect.volume_mode locked` tells the controller its volume is fixed.**
   The device now advertises remote volume control as NOT_ALLOWED in that mode,
   so the Qobuz controller disables its volume slider instead of offering one

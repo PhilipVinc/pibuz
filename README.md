@@ -3,16 +3,39 @@
 `pibuz` is a standalone binary that turns any Linux box such as a Raspberry Pi into a bit-perfect **Qobuz Connect endpoint** that appears in the
 official Qobuz apps like any other hardware streamer.
 `pibuz` is optimized to run on low cost devices (tested on a Pi 3B+, will run on Pi 3A), but will also run on your fancy gaming pc.
-It was developed for integration with the moode operating system, but will run pretty much anywhere.
+It was developed for integration with [moOde audio](https://moodeaudio.org), but will run pretty much anywhere.
 
 Features:
-- Daemon + control CLI in one binary
-- Live JSON events (`pibuz watch`), service files for systemd/OpenRC/runit
+- Daemon + control CLI in one binary: playback, queue, volume, settings and status
+- Local pairing (no login required): the daemon advertises itself on the LAN like a
+  hardware streamer, so ANY Qobuz account in the household can cast to it from the official app
+- Live JSON events (`pibuz watch`) and generated service files for systemd/OpenRC/runit
 - Event hooks: `pibuz settings set hooks.script /path/to/script` runs your script on
   playback/session events with `QBZ_*` environment variables — push integration for
   audio-box distros (moOde, Volumio, DIY setups), no polling required
-- Local pairing (no login required): the daemon advertises itself on the LAN like a
-  hardware streamer, so ANY Qobuz account in the household can cast to it from the official app.
+
+
+## Running
+
+```bash
+pibuz service systemd > ~/.config/systemd/user/pibuz.service   # or: openrc | runit
+systemctl --user daemon-reload && systemctl --user enable --now pibuz
+sudo loginctl enable-linger "$USER"                              # keep it up after you log out
+```
+
+or simply `pibuz run` in the foreground. The box then shows up in the Qobuz apps on
+the same network; pick it as the output.
+
+```bash
+pibuz status                                    # is it up, connected, what is it playing
+pibuz settings show                             # every setting and its current value
+pibuz qconnect name "Living Room"               # the name the Qobuz apps show
+pibuz settings set qconnect.device_type speaker # the icon next to it (default: streamer)
+pibuz --help                                    # everything else
+```
+
+Settings live in `settings.toml` in the data root; `settings set` says when each change
+takes effect.
 
 
 ## Building
@@ -35,15 +58,15 @@ Tests (whole workspace):
 
 ### aarch64 (Raspberry Pi)
 
-pibuz supports cross compilation through a few scripts in the scripts directory.
-
 ```bash
-./scripts/build-aarch64-pibuz.sh      # native on ARM, or cross via Docker on x86-64
-./scripts/pibuz-to-pi.sh              # copy the binary to the Pi and restart the service
+./scripts/build-aarch64-pibuz.sh      # -> dist/pibuz-aarch64-linux
+./scripts/pibuz-to-pi.sh              # build, copy to the Pi ($PIBUZ_PI, default `moode`) and restart it
 ./scripts/pibuz-to-pi.sh --deb        # same, as a package moOde's renderer page detects
 ```
 
-A 4 GB Pi can build the daemon natively. The cross path uses `Cross.toml` to supply the arm64 dev libs inside the `cross` image.
+`build-aarch64-pibuz.sh` picks the build by host: native on ARM Linux (a 4 GB Pi can
+build it), `cross` on x86-64 Linux (`Cross.toml` supplies the arm64 dev libs), and an
+arm64 Linux container on macOS, which runs natively on Apple silicon.
 
 
 ## Known Issues

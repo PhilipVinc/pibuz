@@ -32,7 +32,7 @@ const DEFAULT_QCONNECT_DEVICE_BRAND: &str = "Pibuz";
 const DEFAULT_QCONNECT_DEVICE_MODEL: &str = "Pibuz";
 // DeviceType as the web player's protobuf enum numbers it. It picks the icon
 // the apps draw next to the name; the daemon is a network streamer, not a
-// "computer".
+// "computer". `qconnect.device_type` picks another.
 const DEFAULT_QCONNECT_DEVICE_TYPE: i32 = DEVICE_TYPE_STREAMER;
 const DEVICE_TYPE_STREAMER: i32 = 2;
 /// Wire value -> the name the LAN pairing surface (mDNS TXT `type`,
@@ -109,18 +109,41 @@ pub(crate) fn resolve_qconnect_device_model() -> String {
         .unwrap_or_else(|| DEFAULT_QCONNECT_DEVICE_MODEL.to_string())
 }
 
-/// `QBZ_QCONNECT_DEVICE_TYPE` overrides the default with a wire value; one the
-/// enum does not define falls back to the default rather than announcing a
-/// type no app knows how to draw.
+/// The configured `qconnect.device_type`, read from settings.toml on every call
+/// like the name, so the cloud announcement and the pairing surface agree. A
+/// name the enum does not define (a hand-edited file) falls back to the default
+/// rather than announcing a type no app knows how to draw.
 pub(crate) fn resolve_qconnect_device_type() -> i32 {
-    device_type_from_env(std::env::var("QBZ_QCONNECT_DEVICE_TYPE").ok().as_deref())
+    device_type_from_setting(
+        DAEMON_DATA_ROOT
+            .get()
+            .and_then(|root| load_device_type_at(root))
+            .as_deref(),
+    )
 }
 
-fn device_type_from_env(value: Option<&str>) -> i32 {
+fn device_type_from_setting(value: Option<&str>) -> i32 {
     value
-        .and_then(|value| value.trim().parse::<i32>().ok())
-        .filter(|kind| device_type_name(*kind).is_some())
+        .and_then(device_type_wire)
         .unwrap_or(DEFAULT_QCONNECT_DEVICE_TYPE)
+}
+
+/// The wire value for a DeviceType name, case-insensitively. `None` for a name
+/// the enum does not define, and for `unknown`, which no one should pick.
+pub(crate) fn device_type_wire(name: &str) -> Option<i32> {
+    let name = name.trim();
+    DEVICE_TYPE_NAMES
+        .iter()
+        .position(|known| known.eq_ignore_ascii_case(name))
+        .filter(|&index| index != 0)
+        .and_then(|index| i32::try_from(index).ok())
+}
+
+/// The names `qconnect.device_type` accepts, lowercase, in wire order.
+pub(crate) fn device_type_choices() -> impl Iterator<Item = String> {
+    DEVICE_TYPE_NAMES[1..]
+        .iter()
+        .map(|name| name.to_ascii_lowercase())
 }
 
 /// The pairing-surface name of a DeviceType wire value, `None` outside the enum.
@@ -399,6 +422,19 @@ pub(crate) fn save_volume_mode_at(root: &Path, mode: &str) -> Result<(), String>
     qconnect_settings::update(root, |s| s.volume_mode = Some(mode.to_string()))
 }
 
+/// Load the configured device type name (`streamer`, `speaker`, ...). None
+/// when unset.
+pub(crate) fn load_device_type_at(root: &Path) -> Option<String> {
+    qconnect_settings::load(root)
+        .device_type
+        .filter(|v| !v.trim().is_empty())
+}
+
+/// Persist the device type name.
+pub(crate) fn save_device_type_at(root: &Path, name: &str) -> Result<(), String> {
+    qconnect_settings::update(root, |s| s.device_type = Some(name.to_string()))
+}
+
 /// Load the pairing-surface switch (pairing.rs). ON when unset — local pairing
 /// is the daemon's reason to exist on a shared-household box.
 pub(crate) fn load_pairing_enabled_at(root: &Path) -> bool {
@@ -639,15 +675,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn device_type_defaults_to_streamer_and_rejects_values_outside_the_enum() {
-        assert_eq!(device_type_from_env(None), DEVICE_TYPE_STREAMER);
-        assert_eq!(device_type_from_env(Some(" 1 ")), 1);
-        assert_eq!(device_type_from_env(Some("9")), 9);
-        assert_eq!(device_type_from_env(Some("10")), DEVICE_TYPE_STREAMER);
-        assert_eq!(device_type_from_env(Some("-1")), DEVICE_TYPE_STREAMER);
-        assert_eq!(device_type_from_env(Some("tv")), DEVICE_TYPE_STREAMER);
+    fn device_type_defaults_to_streamer_and_rejects_names_outside_the_enum() {
+        assert_eq!(device_type_from_setting(None), DEVICE_TYPE_STREAMER);
+        assert_eq!(device_type_from_setting(Some(" speaker ")), 1);
+        assert_eq!(device_type_from_setting(Some("TV")), 3);
+        assert_eq!(device_type_from_setting(Some("tablet")), 9);
+        assert_eq!(
+            device_type_from_setting(Some("unknown")),
+            DEVICE_TYPE_STREAMER
+        );
+        assert_eq!(device_type_from_setting(Some("2")), DEVICE_TYPE_STREAMER);
+        assert_eq!(
+            device_type_from_setting(Some("laptop")),
+            DEVICE_TYPE_STREAMER
+        );
         assert_eq!(device_type_name(2), Some("STREAMER"));
         assert_eq!(device_type_name(10), None);
+    }
+
+    /// Every name `settings set` offers maps back to the wire value whose
+    /// pairing-surface name it is, so the cloud and the LAN name one type.
+    #[test]
+    fn every_device_type_choice_round_trips() {
+        let choices: Vec<String> = device_type_choices().collect();
+        assert_eq!(choices.len(), 9);
+        assert_eq!(choices[1], "streamer");
+        for choice in &choices {
+            let wire = device_type_wire(choice).expect(choice);
+            assert_eq!(
+                device_type_name(wire).unwrap().to_ascii_lowercase(),
+                *choice
+            );
+        }
     }
 
     #[test]
@@ -765,6 +824,7 @@ mod tests {
         );
         assert_eq!(load_device_name_at(&root), None);
         assert_eq!(load_volume_mode_at(&root), None);
+        assert_eq!(load_device_type_at(&root), None);
         assert!(load_pairing_enabled_at(&root), "pairing defaults ON");
         assert_eq!(load_pairing_port_at(&root), DEFAULT_PAIRING_PORT);
         assert_eq!(load_initial_volume_at(&root), None);
@@ -773,6 +833,7 @@ mod tests {
         save_startup_mode_at(&root, qconnect_app::QconnectStartupMode::On).unwrap();
         persist_device_name_at(&root, Some("Living Room")).unwrap();
         save_volume_mode_at(&root, "locked").unwrap();
+        save_device_type_at(&root, "speaker").unwrap();
         save_initial_volume_at(&root, 30).unwrap();
 
         assert_eq!(
@@ -780,6 +841,7 @@ mod tests {
             qconnect_app::QconnectStartupMode::On
         );
         assert_eq!(load_device_name_at(&root).as_deref(), Some("Living Room"));
+        assert_eq!(load_device_type_at(&root).as_deref(), Some("speaker"));
         assert_eq!(load_volume_mode_at(&root).as_deref(), Some("locked"));
         assert_eq!(load_initial_volume_at(&root), Some(30));
 

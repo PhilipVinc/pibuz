@@ -28,6 +28,10 @@ pub struct QconnectSettings {
     pub startup_mode: String,
     /// `software` | `locked` | `external`; unset is `software`.
     pub volume_mode: Option<String>,
+    /// The icon the Qobuz apps draw next to the name, as the protocol's
+    /// DeviceType names it in lowercase (`streamer`, `speaker`, ...); unset is
+    /// `streamer`.
+    pub device_type: Option<String>,
     /// Percent to set when a session picks this device; `0` keeps the
     /// player's volume.
     pub initial_volume: u8,
@@ -43,6 +47,7 @@ impl Default for QconnectSettings {
             device_name: None,
             startup_mode: "off".to_string(),
             volume_mode: None,
+            device_type: None,
             initial_volume: 0,
             pairing: true,
             pairing_port: DEFAULT_PAIRING_PORT,

@@ -119,6 +119,10 @@ const KEY_TABLE: &[(&str, ApplyClass)] = &[
     ("qconnect.device_name", ApplyClass::None),
     ("qconnect.startup_mode", ApplyClass::None),
     ("qconnect.volume_mode", ApplyClass::None),
+    // Read whenever a device info is built: the next connect announces it, and
+    // `get-display-info` answers with it at once. The mDNS TXT record is
+    // registered at boot, so that one follows on the next daemon start.
+    ("qconnect.device_type", ApplyClass::None),
     // Applied when a session picks this device, so it takes effect on the next
     // connect rather than needing a restart.
     ("qconnect.initial_volume", ApplyClass::None),
@@ -489,6 +493,18 @@ fn parse_volume_mode(v: &str) -> Result<String, String> {
     }
 }
 
+fn parse_device_type(v: &str) -> Result<String, String> {
+    let name = v.trim().to_ascii_lowercase();
+    if qconnect_kv::device_type_wire(&name).is_some() {
+        return Ok(name);
+    }
+    let choices: Vec<String> = qconnect_kv::device_type_choices().collect();
+    Err(format!(
+        "invalid device type '{name}' — expected one of: {}",
+        choices.join(", ")
+    ))
+}
+
 // ============================ store IO ============================
 
 fn open_audio(roots: &ProfileRoots) -> Result<AudioSettingsStore, String> {
@@ -576,6 +592,9 @@ fn read_all(roots: &ProfileRoots) -> Result<Vec<(&'static str, String)>, String>
             "qconnect.startup_mode" => qconnect_kv::load_startup_mode_at(root).as_str().to_string(),
             "qconnect.volume_mode" => {
                 qconnect_kv::load_volume_mode_at(root).unwrap_or_else(|| "software".to_string())
+            }
+            "qconnect.device_type" => {
+                qconnect_kv::load_device_type_at(root).unwrap_or_else(|| "streamer".to_string())
             }
             "qconnect.initial_volume" => qconnect_kv::load_initial_volume_at(root)
                 .map(|pct| pct.to_string())
@@ -821,6 +840,10 @@ fn write_one(roots: &ProfileRoots, key: &str, raw: &str) -> Result<ApplyClass, S
         "qconnect.volume_mode" => {
             let v = parse_volume_mode(raw).map_err(SetError::Usage)?;
             qconnect_kv::save_volume_mode_at(&roots.data, &v).map_err(SetError::Io)?
+        }
+        "qconnect.device_type" => {
+            let v = parse_device_type(raw).map_err(SetError::Usage)?;
+            qconnect_kv::save_device_type_at(&roots.data, &v).map_err(SetError::Io)?
         }
         "qconnect.initial_volume" => {
             let v = parse_initial_volume(raw).map_err(SetError::Usage)?;
@@ -1529,6 +1552,7 @@ mod tests {
             ("qconnect.device_name", "Moode Qobuz"),
             ("qconnect.startup_mode", "on"),
             ("qconnect.volume_mode", "locked"),
+            ("qconnect.device_type", "speaker"),
             ("qconnect.initial_volume", "10"),
             ("qconnect.pairing", "on"),
             ("qconnect.pairing_port", "8183"),
@@ -1554,6 +1578,17 @@ mod tests {
         }
         assert_eq!(parse_volume_mode("External").as_deref(), Ok("external"));
         assert!(parse_volume_mode("hardware").is_err());
+    }
+
+    #[test]
+    fn device_type_accepts_the_protocol_names_and_nothing_else() {
+        assert_eq!(parse_device_type("streamer").as_deref(), Ok("streamer"));
+        assert_eq!(parse_device_type(" Speaker ").as_deref(), Ok("speaker"));
+        assert_eq!(parse_device_type("tv").as_deref(), Ok("tv"));
+        for bad in ["unknown", "2", "laptop", ""] {
+            let err = parse_device_type(bad).unwrap_err();
+            assert!(err.contains("streamer, tv"), "{bad}: {err}");
+        }
     }
 
     #[test]
