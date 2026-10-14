@@ -27,8 +27,7 @@ use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use qbz_app::settings::bundle::{
-    self, Bundle, DeviceChoice, ExportOptions, ExportSource, ImportOptions, ImportPlan, LiveSystem,
-    ProfilePaths,
+    self, Bundle, DeviceChoice, ExportOptions, ImportOptions, ImportPlan, LiveSystem, ProfilePaths,
 };
 use qbz_app::settings::daemon_prefs;
 use qbz_app::settings::playback::{AutoplayMode, PlaybackPreferencesStore};
@@ -1159,28 +1158,16 @@ fn present_keys(path: &Path) -> std::collections::HashSet<String> {
 
 // ============================ settings export / import (T12) ============================
 
-/// `pibuz settings export [FILE] [--from daemon|desktop] [--include-auth]` (⬇,
-/// 04-settings-portability.md §4.1). Reads the daemon (default) or the desktop's
-/// GLOBAL stores, writes ONE versioned JSON bundle at 0600. Exit: 0 · 1 · 2.
-pub fn export(roots: &ProfileRoots, file: Option<String>, from: &str, include_auth: bool) -> i32 {
-    let source = match from {
-        "daemon" => ExportSource::Daemon(ProfilePaths {
-            config_root: roots.config.clone(),
-            data_root: roots.data.clone(),
-        }),
-        "desktop" => ExportSource::Desktop,
-        other => {
-            eprintln!("error: invalid --from '{other}' — expected 'daemon' or 'desktop'");
-            return 2;
-        }
+/// `pibuz settings export [FILE] [--include-auth]` (⬇, 04-settings-portability.md
+/// §4.1). Reads the daemon profile and writes ONE versioned JSON bundle at 0600.
+/// Exit: 0 · 1.
+pub fn export(roots: &ProfileRoots, file: Option<String>, include_auth: bool) -> i32 {
+    let paths = ProfilePaths {
+        config_root: roots.config.clone(),
+        data_root: roots.data.clone(),
     };
-
-    let bundle = match bundle::export(source, &ExportOptions { include_auth }) {
+    let bundle = match bundle::export(&paths, &ExportOptions { include_auth }) {
         Ok(b) => b,
-        Err(bundle::BundleError::NoDesktopProfile) => {
-            eprintln!("{}", crate::cli::copy::bundle_no_desktop_profile());
-            return 1;
-        }
         Err(e) => {
             eprintln!("error: {e}");
             return 1;

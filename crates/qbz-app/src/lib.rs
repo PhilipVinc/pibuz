@@ -2,7 +2,6 @@ pub mod playback_driver;
 pub mod qconnect_identity;
 pub mod settings;
 pub mod shell;
-pub mod user_data;
 
 /// Install the rustls process-level `CryptoProvider` (aws-lc-rs) exactly once.
 ///

@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use tokio::runtime::Handle;
 
 use qbz_app::settings::bundle::{
-    self, Bundle, ExportOptions, ExportSource, ImportOptions, LiveSystem, ProfilePaths,
+    self, Bundle, ExportOptions, ImportOptions, LiveSystem, ProfilePaths,
 };
 use qbz_app::settings::daemon_prefs;
 use qbz_app::settings::playback::PlaybackPreferencesStore;
@@ -408,7 +408,7 @@ impl App {
                     .unwrap_or_else(|_| (PibuzConfig::default(), Vec::new()));
                 Active::Network(NetworkState::new(&cfg, warns))
             }
-            Screen::Bundle => Active::Bundle(BundleState::new(desktop_profile_present())),
+            Screen::Bundle => Active::Bundle(BundleState::new()),
             Screen::Wizard => Active::Wizard(WizardState::new()),
         };
     }
@@ -1414,11 +1414,11 @@ fn export_bundle(
     dest: &str,
     include_auth: bool,
 ) -> Result<Vec<String>, String> {
-    let source = ExportSource::Daemon(ProfilePaths {
+    let paths = ProfilePaths {
         config_root: roots.config.clone(),
         data_root: roots.data.clone(),
-    });
-    let b = bundle::export(source, &ExportOptions { include_auth }).map_err(|e| e.to_string())?;
+    };
+    let b = bundle::export(&paths, &ExportOptions { include_auth }).map_err(|e| e.to_string())?;
     let path = expand_tilde(dest);
     bundle::write_bundle_file(&path, &b).map_err(|e| e.to_string())?;
 
@@ -1433,11 +1433,6 @@ fn export_bundle(
             "this file contains your Qobuz token — 0600, move it privately, delete after import"
                 .to_string(),
         );
-    }
-    if desktop_profile_present() {
-        for l in s::B_DESKTOP_HINT.lines() {
-            lines.push(l.to_string());
-        }
     }
     Ok(lines)
 }
@@ -1509,12 +1504,6 @@ fn playing_extra(status: &Value) -> Option<String> {
         .and_then(Value::as_u64)?;
     let bd = status.pointer("/audio/bit_depth").and_then(Value::as_u64)?;
     Some(format!("playing {sr} Hz / {bd} bit"))
-}
-
-fn desktop_profile_present() -> bool {
-    dirs::data_dir()
-        .map(|d| d.join("qbz").exists())
-        .unwrap_or(false)
 }
 
 fn expand_tilde(path: &str) -> PathBuf {
@@ -1680,7 +1669,7 @@ mod tests {
             Screen::Network => {
                 Active::Network(NetworkState::new(&PibuzConfig::default(), Vec::new()))
             }
-            Screen::Bundle => Active::Bundle(BundleState::new(false)),
+            Screen::Bundle => Active::Bundle(BundleState::new()),
             Screen::Wizard => Active::Wizard(WizardState::new()),
         };
         App {

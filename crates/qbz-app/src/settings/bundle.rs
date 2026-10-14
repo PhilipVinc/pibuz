@@ -1,6 +1,6 @@
 // crates/qbz-app/src/settings/bundle.rs — the settings portability engine
-// (04-settings-portability.md). ONE module, shared by `pibuz` (P0 CLI) and the
-// desktop Settings modal (P0/OD7, plan T18): `export(source, opts) -> Bundle`,
+// (04-settings-portability.md), used by the `pibuz` CLI and setup TUI:
+// `export(paths, opts) -> Bundle`,
 // `plan(bundle, target, opts, live) -> ImportPlan`, `apply(plan, target, uid)
 // -> ImportReport`.
 //
@@ -54,23 +54,12 @@ pub struct BundleSource {
     pub hostname: String,
 }
 
-/// A profile's config + data roots. For the daemon these are the daemon roots
-/// (`~/.config/pibuz`, `~/.local/share/pibuz`); for the desktop the global roots
-/// (`~/.config/qbz`, `~/.local/share/qbz`).
+/// The daemon profile's config + data roots (`~/.config/pibuz`,
+/// `~/.local/share/pibuz`).
 #[derive(Debug, Clone)]
 pub struct ProfilePaths {
     pub config_root: PathBuf,
     pub data_root: PathBuf,
-}
-
-/// Where an export reads its settings from (04 §4.1).
-pub enum ExportSource {
-    /// The GLOBAL desktop stores at `~/.local/share/qbz` (read-only; the ONLY
-    /// place desktop paths are legal — the per-user `users/<uid>/` copies are
-    /// Tauri-era ghosts, never read).
-    Desktop,
-    /// The daemon's own profile roots.
-    Daemon(ProfilePaths),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -171,8 +160,6 @@ pub enum BundleError {
     VersionMalformed,
     /// Step 2: bundle newer than this importer (§5.6).
     VersionTooNew { bundle: i64, supported: i64 },
-    /// Export: no desktop profile found (§4.1).
-    NoDesktopProfile,
     /// Export: `--include-auth` but the desktop token would not decrypt (IV1,
     /// §4.1 — portal-secret bound to the desktop session).
     TokenDecryptFailed,
@@ -191,7 +178,6 @@ impl std::fmt::Display for BundleError {
                 f,
                 "this bundle is schema v{bundle}; this pibuz understands up to v{supported}"
             ),
-            BundleError::NoDesktopProfile => write!(f, "no desktop profile found"),
             BundleError::TokenDecryptFailed => {
                 write!(f, "could not decrypt the desktop Qobuz token")
             }
@@ -280,26 +266,9 @@ impl Bundle {
 
 // ============================ export (§4.1) ============================
 
-/// Read a profile's settings into a [`Bundle`]. `--from desktop` reads the
-/// GLOBAL desktop stores (the ONLY legal desktop-path access); `--from daemon`
-/// reads the daemon roots. Domains the source cannot provide are ABSENT, never
-/// empty objects (§2.9).
-pub fn export(source: ExportSource, _opts: &ExportOptions) -> Result<Bundle, BundleError> {
-    let (paths, profile) = match &source {
-        ExportSource::Desktop => (desktop_paths(), "desktop"),
-        ExportSource::Daemon(p) => (
-            ProfilePaths {
-                config_root: p.config_root.clone(),
-                data_root: p.data_root.clone(),
-            },
-            "daemon",
-        ),
-    };
-
-    if matches!(source, ExportSource::Desktop) && !paths.data_root.exists() {
-        return Err(BundleError::NoDesktopProfile);
-    }
-
+/// Read the daemon profile's settings into a [`Bundle`]. Domains the profile
+/// cannot provide are ABSENT, never empty objects (§2.9).
+pub fn export(paths: &ProfilePaths, _opts: &ExportOptions) -> Result<Bundle, BundleError> {
     let mut domains: Map<String, Value> = Map::new();
 
     // playback — PlaybackPreferences (global playback_preferences.db)
@@ -314,39 +283,15 @@ pub fn export(source: ExportSource, _opts: &ExportOptions) -> Result<Bundle, Bun
         }
     }
 
-    // prefs.streaming_quality — daemon_prefs (daemon) / ui_prefs.json (desktop)
-    let streaming_quality = match &source {
-        ExportSource::Daemon(_) => Some(daemon_prefs::load_at(&paths.data_root).streaming_quality),
-        ExportSource::Desktop => read_ui_prefs_streaming_quality(&paths.data_root),
-    };
-    if let Some(q) = streaming_quality {
-        let mut prefs = Map::new();
-        prefs.insert("streaming_quality".into(), Value::String(q));
-        domains.insert("prefs".into(), Value::Object(prefs));
-    }
+    // prefs.streaming_quality — daemon_prefs
+    let quality = daemon_prefs::load_at(&paths.data_root).streaming_quality;
+    let mut prefs = Map::new();
+    prefs.insert("streaming_quality".into(), Value::String(quality));
+    domains.insert("prefs".into(), Value::Object(prefs));
 
     // qconnect — device_name + startup_mode (device_uuid is NEVER exported, §2.4)
     if let Some(qc) = read_qconnect_domain(&paths.data_root) {
         domains.insert("qconnect".into(), qc);
-    }
-
-    // per-user domains — resolve the source uid.
-    let uid = match &source {
-        ExportSource::Desktop => crate::user_data::load_last_user_id(),
-        ExportSource::Daemon(_) => read_last_user_id(&paths.data_root),
-    };
-    match uid {
-        Some(_uid) => {
-            if let Some(folders) = read_library_folders(&paths.data_root) {
-                domains.insert("library_folders".into(), folders);
-            }
-        }
-        None => {
-            log::info!(
-                "[bundle] no last_user_id under this profile — per-user domains \
-                 (integrations, library_folders) omitted"
-            );
-        }
     }
 
     Ok(Bundle {
@@ -354,7 +299,7 @@ pub fn export(source: ExportSource, _opts: &ExportOptions) -> Result<Bundle, Bun
         created_at: now_rfc3339(),
         source: BundleSource {
             app_version: env!("CARGO_PKG_VERSION").to_string(),
-            profile: profile.to_string(),
+            profile: "daemon".to_string(),
             hostname: hostname(),
         },
         domains,
@@ -1326,37 +1271,6 @@ fn playback_to_json(p: &PlaybackPreferences) -> Value {
     serde_json::to_value(p).unwrap_or(Value::Null)
 }
 
-fn read_library_folders(data_root: &Path) -> Option<Value> {
-    // Global desktop library DB (`<data>/qbz/library.db`); network_fs is
-    // derived at runtime on the desktop and is cosmetic for the daemon (which
-    // always skips this domain), so it is emitted false here.
-    let db = data_root.join("library.db");
-    if !db.exists() {
-        return None;
-    }
-    let conn = rusqlite::Connection::open(&db).ok()?;
-    let mut stmt = conn
-        .prepare("SELECT path FROM library_folders ORDER BY path")
-        .ok()?;
-    let rows = stmt
-        .query_map([], |row| row.get::<_, String>(0))
-        .ok()?
-        .filter_map(Result::ok);
-    let arr: Vec<Value> = rows
-        .map(|path| {
-            let mut o = Map::new();
-            o.insert("path".into(), Value::String(path));
-            o.insert("network_fs".into(), Value::Bool(false));
-            Value::Object(o)
-        })
-        .collect();
-    if arr.is_empty() {
-        None
-    } else {
-        Some(Value::Array(arr))
-    }
-}
-
 fn read_qconnect_domain(data_root: &Path) -> Option<Value> {
     let db = data_root.join("qconnect_settings.db");
     if !db.exists() {
@@ -1374,18 +1288,6 @@ fn read_qconnect_domain(data_root: &Path) -> Option<Value> {
     } else {
         Some(Value::Object(obj))
     }
-}
-
-fn read_ui_prefs_streaming_quality(data_root: &Path) -> Option<String> {
-    // Minimal serde read of ~90-field ui_prefs.json — serde ignores the rest
-    // (§2.3; the 890-line ui_prefs.rs is NOT moved).
-    #[derive(Deserialize)]
-    struct MinimalUiPrefs {
-        streaming_quality: Option<String>,
-    }
-    let text = std::fs::read_to_string(data_root.join("ui_prefs.json")).ok()?;
-    let p: MinimalUiPrefs = serde_json::from_str(&text).ok()?;
-    p.streaming_quality
 }
 
 // ---- qconnect KV (self-contained rusqlite — the engine must be desktop-callable) ----
@@ -1435,20 +1337,7 @@ fn read_last_user_id(data_root: &Path) -> Option<u64> {
         .ok()
 }
 
-// ---- desktop paths + misc ----
-fn desktop_paths() -> ProfilePaths {
-    let config_root = dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("qbz");
-    let data_root = dirs::data_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("qbz");
-    ProfilePaths {
-        config_root,
-        data_root,
-    }
-}
-
+// ---- misc ----
 fn hostname() -> String {
     std::env::var("HOSTNAME")
         .ok()

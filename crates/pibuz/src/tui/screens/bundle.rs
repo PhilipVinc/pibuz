@@ -69,7 +69,6 @@ pub struct BundleState {
     import_path: String,
     export_dest: String,
     include_auth: bool,
-    has_desktop: bool,
     // review mode:
     pending: Option<PendingImport>,
     device_picker: Option<SelectPopup>,
@@ -79,14 +78,13 @@ pub struct BundleState {
 }
 
 impl BundleState {
-    pub fn new(has_desktop: bool) -> Self {
+    pub fn new() -> Self {
         Self {
             focus: 0,
             editor: None,
             import_path: String::new(),
             export_dest: format!("~/{}", bundle::default_filename()),
             include_auth: false,
-            has_desktop,
             pending: None,
             device_picker: None,
             picker_entries: Vec::new(),
@@ -466,14 +464,6 @@ impl BundleState {
             BField::Export,
             s::B_EXPORT_ACTION,
         );
-        if self.has_desktop {
-            export_lines.push(widgets::blank());
-            export_lines.extend(widgets::wrapped_note(
-                s::B_DESKTOP_HINT,
-                width,
-                theme::dim(),
-            ));
-        }
         let export_active = matches!(
             cur,
             BField::ExportDest | BField::IncludeAuth | BField::Export

@@ -133,14 +133,6 @@ next: copy it to the daemon box and run:  pibuz settings import {base}"
     )
 }
 
-/// Missing desktop profile on `--from desktop` (04 §4.1, verbatim).
-pub fn bundle_no_desktop_profile() -> String {
-    "error: no desktop profile found at ~/.local/share/qbz
-  is desktop QBZ installed on this box? To export this daemon's settings instead:
-  pibuz settings export            (daemon profile is the default)"
-        .to_string()
-}
-
 /// Version-skew rejection, bundle newer than importer (04 §5.6, verbatim).
 pub fn bundle_version_too_new(bundle: i64, supported: i64) -> String {
     format!(

@@ -427,11 +427,7 @@ fn roundtrip_same_box_is_noop() {
         .unwrap();
     }
 
-    let src = ExportSource::Daemon(ProfilePaths {
-        config_root: p.config_root.clone(),
-        data_root: p.data_root.clone(),
-    });
-    let bundle = export(src, &ExportOptions::default()).expect("export");
+    let bundle = export(&p, &ExportOptions::default()).expect("export");
 
     let plan = plan(&bundle, &p, &ImportOptions::default(), &live()).expect("plan");
 

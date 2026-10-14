@@ -255,11 +255,6 @@ pub const B_EXPORT_AUTH_WARNING: &str = "embeds your decrypted Qobuz token — a
 pub fn b_export_success(path: &str) -> String {
     format!("saved. on the daemon box: pibuz settings import {path}")
 }
-/// Success-panel hint when a desktop profile is detected (§3.6): desktop export
-/// is the CLI's job.
-pub const B_DESKTOP_HINT: &str =
-    "a desktop QBZ profile was found on this box — to export IT instead:\n  pibuz settings export --from desktop";
-
 pub fn b_import_done(applied: usize, adapted: usize, skipped: usize) -> String {
     format!("imported: {applied} applied, {adapted} adapted, {skipped} skipped")
 }

@@ -261,8 +261,6 @@ enum PlaylistCmd {
 enum SettingsCmd {
     Export {
         file: Option<String>,
-        #[arg(long, default_value = "daemon")]
-        from: String, // daemon|desktop
         #[arg(long)]
         include_auth: bool,
     },
@@ -450,11 +448,9 @@ async fn main() {
             match cmd {
                 SettingsCmd::Show { json } => cli::settings::show(json, &roots),
                 SettingsCmd::Set { key, value } => cli::settings::set(&roots, &key, &value),
-                SettingsCmd::Export {
-                    file,
-                    from,
-                    include_auth,
-                } => cli::settings::export(&roots, file, &from, include_auth),
+                SettingsCmd::Export { file, include_auth } => {
+                    cli::settings::export(&roots, file, include_auth)
+                }
                 SettingsCmd::Import {
                     file,
                     include_auth,
