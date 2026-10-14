@@ -132,3 +132,45 @@ jobs:
           if [ -n "$hits" ]; then
             echo "::error::pibuz graph resolves Slint crates:"; echo "$hits"; exit 1
           fi
+
+  # The Pi's architecture. The x86-64 job above already compiles every
+  # cfg(linux) line, so this is not for coverage of the source: it is for what
+  # differs by arch (`c_char` is unsigned here, ALSA's FFI types, the timing
+  # of the engine tests on slower cores), and it is what makes "green on
+  # linux/arm64" a checked fact rather than a claim in CLAUDE.md. fmt, the JACK
+  # check and the dep-graph gates are arch-independent and stay above.
+  test-arm64:
+    name: cargo test (workspace, arm64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config mold libasound2-dev
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+          shared-key: test-crates-linux-arm64
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        env:
+          CARGO_TERM_COLOR: always
+          RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+        run: ./scripts/cargo-test.sh
