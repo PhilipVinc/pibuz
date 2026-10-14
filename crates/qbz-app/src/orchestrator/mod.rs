@@ -8,7 +8,7 @@ use tokio::sync::RwLock;
 
 use qbz_models::{
     Album, CoreEvent, FrontendAdapter, Playlist, Quality, QueueState, QueueTrack, RepeatMode,
-    StreamUrl, Track, TrackToAnalyse, TracksContainer, UserSession,
+    StreamUrl, Track, TracksContainer,
 };
 use qbz_player::{PlaybackState, Player, QueueManager};
 use qbz_qobuz::QobuzClient;
@@ -39,7 +39,7 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
     ///
     /// The Player must be created by the caller with appropriate audio settings.
     /// QbzCore orchestrates playback through this player.
-    pub fn new(adapter: A, player: Player) -> Self {
+    pub(crate) fn new(adapter: A, player: Player) -> Self {
         Self {
             adapter: Arc::new(adapter),
             client: Arc::new(RwLock::new(None)),
@@ -56,7 +56,7 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
     /// core still finishes initialization so queue manager and player remain
     /// usable. API calls will then return `CoreError::NotInitialized` until the
     /// client is rebuilt with tokens.
-    pub async fn init(&self) -> Result<(), CoreError> {
+    pub(crate) async fn init(&self) -> Result<(), CoreError> {
         let mut initialized = self.initialized.write().await;
         if *initialized {
             return Ok(());
@@ -107,31 +107,6 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
         *self.client.write().await = Some(client);
         log::info!("QbzCore: API client initialized lazily");
         Ok(())
-    }
-
-    /// Login with email and password
-    pub async fn login(&self, email: &str, password: &str) -> Result<UserSession, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-
-        match client.login(email, password).await {
-            Ok(session) => {
-                self.emit(CoreEvent::LoggedIn {
-                    session: session.clone(),
-                })
-                .await;
-                Ok(session)
-            }
-            Err(e) => {
-                self.emit(CoreEvent::Error {
-                    code: "AUTH_FAILED".to_string(),
-                    message: e.to_string(),
-                    recoverable: true,
-                })
-                .await;
-                Err(CoreError::AuthFailed(e.to_string()))
-            }
-        }
     }
 
     // ==================== Queue Operations ====================
@@ -215,16 +190,6 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
         .await;
     }
 
-    /// Add a track to the end of the queue
-    pub async fn add_track(&self, track: QueueTrack) {
-        let queue = self.queue.write().await;
-        queue.add_track(track);
-        self.emit(CoreEvent::QueueUpdated {
-            state: queue.get_state(),
-        })
-        .await;
-    }
-
     /// Add multiple tracks to the queue
     pub async fn add_tracks(&self, tracks: Vec<QueueTrack>) {
         let queue = self.queue.write().await;
@@ -282,32 +247,6 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
         removed
     }
 
-    /// Remove a track from the upcoming list by position
-    pub async fn remove_upcoming_track(&self, upcoming_index: usize) -> Option<QueueTrack> {
-        let queue = self.queue.write().await;
-        let removed = queue.remove_upcoming_track(upcoming_index);
-        self.emit(CoreEvent::QueueUpdated {
-            state: queue.get_state(),
-        })
-        .await;
-        removed
-    }
-
-    /// Remove every upcoming track after `upcoming_index` in the current play
-    /// order; the track at `upcoming_index` is kept. Shuffle-aware. Emits a
-    /// single `QueueUpdated` when anything was removed. Returns the count.
-    pub async fn remove_upcoming_after(&self, upcoming_index: usize) -> usize {
-        let queue = self.queue.write().await;
-        let removed = queue.remove_upcoming_after(upcoming_index);
-        if removed > 0 {
-            self.emit(CoreEvent::QueueUpdated {
-                state: queue.get_state(),
-            })
-            .await;
-        }
-        removed
-    }
-
     /// Move a track from one position to another
     pub async fn move_track(&self, from_index: usize, to_index: usize) -> bool {
         let queue = self.queue.write().await;
@@ -325,18 +264,6 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
     pub async fn play_index(&self, index: usize) -> Option<QueueTrack> {
         let queue = self.queue.write().await;
         let track = queue.play_index(index);
-        self.emit(CoreEvent::QueueUpdated {
-            state: queue.get_state(),
-        })
-        .await;
-        track
-    }
-
-    /// Jump to a track by its position in the upcoming list. Shuffle-aware:
-    /// resolves through `shuffle_order` when shuffle is active.
-    pub async fn play_upcoming_at(&self, upcoming_index: usize) -> Option<QueueTrack> {
-        let queue = self.queue.write().await;
-        let track = queue.play_upcoming_at(upcoming_index);
         self.emit(CoreEvent::QueueUpdated {
             state: queue.get_state(),
         })
@@ -397,7 +324,7 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
     }
 
     /// Advance to next track in queue
-    pub async fn next_track(&self) -> Option<QueueTrack> {
+    pub(crate) async fn next_track(&self) -> Option<QueueTrack> {
         let queue = self.queue.write().await;
         let track = queue.next();
         self.emit(CoreEvent::QueueUpdated {
@@ -419,7 +346,7 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
     }
 
     /// Get multiple upcoming tracks without advancing (for prefetching)
-    pub async fn peek_upcoming(&self, count: usize) -> Vec<QueueTrack> {
+    pub(crate) async fn peek_upcoming(&self, count: usize) -> Vec<QueueTrack> {
         let queue = self.queue.read().await;
         queue.peek_upcoming(count)
     }
@@ -438,15 +365,10 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
         self.queue.write().await.clear_stop_after();
     }
 
-    /// Read the current "stop after" marker, if any.
-    pub async fn get_stop_after(&self) -> Option<u64> {
-        self.queue.read().await.get_stop_after()
-    }
-
     /// One-shot consume: if `finished_track_id` matches the marker, clear it and
     /// return true (the auto-advance driver then halts instead of advancing).
     /// Only the natural end-of-track path may call this — never a manual skip.
-    pub async fn consume_stop_after_if(&self, finished_track_id: u64) -> bool {
+    pub(crate) async fn consume_stop_after_if(&self, finished_track_id: u64) -> bool {
         self.queue
             .write()
             .await
@@ -571,22 +493,6 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
 
         client
             .get_tracks_batch(track_ids)
-            .await
-            .map_err(CoreError::Api)
-    }
-
-    /// Dynamic mix suggestions with the `track_to_analysed` payload — the
-    /// PRIMARY DailyQ/WeeklyQ path (see `QobuzClient::get_dynamic_suggest_full`).
-    pub async fn get_dynamic_suggest_full(
-        &self,
-        listened_track_ids: &[u64],
-        tracks_to_analyse: &[TrackToAnalyse],
-        limit: u32,
-    ) -> Result<Vec<Track>, CoreError> {
-        let client = self.client.read().await;
-        let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
-        client
-            .get_dynamic_suggest_full(listened_track_ids, tracks_to_analyse, limit)
             .await
             .map_err(CoreError::Api)
     }

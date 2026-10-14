@@ -1,11 +1,7 @@
 //! Authentication and request signing
 
-use chrono::{TimeZone, Utc};
 use md5::{Digest, Md5};
 use std::time::{SystemTime, UNIX_EPOCH};
-
-use super::error::{ApiError, Result};
-use qbz_models::UserSession;
 
 /// Generate MD5 signature for protected API endpoints
 ///
@@ -58,118 +54,6 @@ pub(crate) fn get_timestamp() -> u64 {
         .as_secs()
 }
 
-/// Parse user login response
-pub(crate) fn parse_login_response(response: &serde_json::Value) -> Result<UserSession> {
-    let user = response
-        .get("user")
-        .ok_or_else(|| ApiError::AuthenticationError("No user in response".to_string()))?;
-
-    let user_auth_token = response
-        .get("user_auth_token")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| ApiError::AuthenticationError("No auth token in response".to_string()))?
-        .to_string();
-
-    let user_id = user
-        .get("id")
-        .and_then(|v| v.as_u64())
-        .ok_or_else(|| ApiError::AuthenticationError("No user id".to_string()))?;
-
-    let email = user
-        .get("email")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-
-    let display_name = user
-        .get("display_name")
-        .and_then(|v| v.as_str())
-        .or_else(|| user.get("login").and_then(|v| v.as_str()))
-        .unwrap_or("")
-        .to_string();
-
-    // Check subscription
-    let credential = user.get("credential");
-    let subscription_label = credential
-        .and_then(|c| c.get("parameters"))
-        .and_then(|p| p.get("short_label"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("Unknown")
-        .to_string();
-
-    fn parse_subscription_valid_until(parameters: &serde_json::Value) -> Option<String> {
-        // Try common string fields first.
-        let string_keys = [
-            "end_date",
-            "expiration_date",
-            "valid_until",
-            "expires_at",
-            "expiry_date",
-        ];
-        for key in string_keys {
-            if let Some(s) = parameters.get(key).and_then(|v| v.as_str()) {
-                let trimmed = s.trim();
-                if !trimmed.is_empty() {
-                    return Some(trimmed.to_string());
-                }
-            }
-        }
-
-        // Try common timestamp fields (seconds).
-        let ts_keys = [
-            "end_date_ts",
-            "expires_at_ts",
-            "expiration_ts",
-            "valid_until_ts",
-        ];
-        for key in ts_keys {
-            if let Some(ts) = parameters.get(key).and_then(|v| v.as_i64()) {
-                if ts > 0 {
-                    return Some(Utc.timestamp_opt(ts, 0).single()?.date_naive().to_string());
-                }
-            }
-        }
-
-        None
-    }
-
-    let subscription_valid_until = credential
-        .and_then(|c| c.get("parameters"))
-        .and_then(parse_subscription_valid_until);
-
-    // Account territory + language (snake_case wire names, verbatim in Qobuz's
-    // own embedded /user/login fixture). Absent on older captures -> None.
-    let country_code = user
-        .get("country_code")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let language_code = user
-        .get("language_code")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-
-    // Check if user has valid subscription
-    let has_subscription = credential
-        .and_then(|c| c.get("parameters"))
-        .map(|p| !p.is_null() && p.as_object().map(|o| !o.is_empty()).unwrap_or(false))
-        .unwrap_or(false);
-
-    if !has_subscription {
-        return Err(ApiError::IneligibleUser);
-    }
-
-    Ok(UserSession {
-        user_auth_token,
-        user_id,
-        email,
-        display_name,
-        subscription_label,
-        subscription_valid_until,
-        country_code,
-        language_code,
-    })
-}
-
 /// Generate CMAF signature for session/start endpoint.
 ///
 /// `seed` comes from the live webplayer bundle via
@@ -205,42 +89,5 @@ mod tests {
     fn test_sign_get_file_url() {
         let sig = sign_get_file_url(123456, 27, 1234567890, "testsecret");
         assert_eq!(sig.len(), 32);
-    }
-
-    fn login_response(user_extra: serde_json::Value) -> serde_json::Value {
-        let mut user = serde_json::json!({
-            "id": 1705826,
-            "email": "a@b.c",
-            "display_name": "Tester",
-            "credential": {"parameters": {"short_label": "Studio"}}
-        });
-        user.as_object_mut()
-            .unwrap()
-            .extend(user_extra.as_object().unwrap().clone());
-        serde_json::json!({
-            "user_auth_token": "token",
-            "user": user,
-        })
-    }
-
-    #[test]
-    fn parse_login_response_captures_country_and_language() {
-        let response = login_response(serde_json::json!({
-            "country_code": "FR",
-            "language_code": "fr",
-        }));
-        let session = parse_login_response(&response).expect("valid login response");
-        assert_eq!(session.country_code.as_deref(), Some("FR"));
-        assert_eq!(session.language_code.as_deref(), Some("fr"));
-    }
-
-    #[test]
-    fn parse_login_response_tolerates_missing_country_and_language() {
-        // Older captures / partial payloads: both stay None,
-        // the rest of the session parses as before.
-        let response = login_response(serde_json::json!({}));
-        let session = parse_login_response(&response).expect("valid login response");
-        assert_eq!(session.country_code, None);
-        assert_eq!(session.language_code, None);
     }
 }

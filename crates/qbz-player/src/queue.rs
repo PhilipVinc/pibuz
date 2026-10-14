@@ -65,16 +65,9 @@ impl QueueManager {
         }
     }
 
-    /// The track at the current playback index, if any.
-    pub fn current(&self) -> Option<QueueTrack> {
-        let state = self.state.lock().unwrap();
-        state
-            .current_index
-            .and_then(|idx| state.tracks.get(idx).cloned())
-    }
-
     /// Add a track to the end of the queue
-    pub fn add_track(&self, track: QueueTrack) {
+    #[cfg(test)]
+    pub(crate) fn add_track(&self, track: QueueTrack) {
         let mut state = self.state.lock().unwrap();
         state.tracks.push(track);
 
@@ -302,114 +295,6 @@ impl QueueManager {
         Some(removed)
     }
 
-    /// Remove a track by its position in the upcoming list
-    pub fn remove_upcoming_track(&self, upcoming_index: usize) -> Option<QueueTrack> {
-        let mut state = self.state.lock().unwrap();
-
-        let actual_index = if state.shuffle {
-            let shuffle_pos = state.shuffle_position + 1 + upcoming_index;
-            if shuffle_pos >= state.shuffle_order.len() {
-                return None;
-            }
-            state.shuffle_order[shuffle_pos]
-        } else {
-            match state.current_index {
-                Some(curr_idx) => curr_idx + 1 + upcoming_index,
-                None => upcoming_index,
-            }
-        };
-
-        if actual_index >= state.tracks.len() {
-            return None;
-        }
-
-        log::info!(
-            "remove_upcoming_track: upcoming_index={} -> actual_index={}",
-            upcoming_index,
-            actual_index
-        );
-
-        let removed = state.tracks.remove(actual_index);
-
-        // Invalidate marker if the removed track matches
-        if state.stop_after_track_id == Some(removed.id) {
-            state.stop_after_track_id = None;
-        }
-
-        if let Some(curr_idx) = state.current_index {
-            if actual_index < curr_idx {
-                state.current_index = Some(curr_idx - 1);
-            } else if actual_index == curr_idx && curr_idx >= state.tracks.len() {
-                state.current_index = if state.tracks.is_empty() {
-                    None
-                } else {
-                    Some(state.tracks.len() - 1)
-                };
-            }
-        }
-
-        // Keep history indices aligned with current track list after removal.
-        state.history.retain(|&hist_idx| hist_idx != actual_index);
-        for hist_idx in state.history.iter_mut() {
-            if *hist_idx > actual_index {
-                *hist_idx -= 1;
-            }
-        }
-
-        if state.shuffle {
-            Self::remove_index_from_shuffle_internal(&mut state, actual_index);
-        }
-        Some(removed)
-    }
-
-    /// Number of upcoming tracks (those after the current one) in the current
-    /// play order. Mirrors `get_state_full`'s upcoming computation: shuffle-aware
-    /// when shuffle is on, otherwise the tail of `tracks` after `current_index`.
-    fn upcoming_len(state: &InternalState) -> usize {
-        match state.current_index {
-            Some(curr) => {
-                if state.shuffle {
-                    state
-                        .shuffle_order
-                        .len()
-                        .saturating_sub(state.shuffle_position + 1)
-                } else {
-                    state.tracks.len().saturating_sub(curr + 1)
-                }
-            }
-            None => state.tracks.len(),
-        }
-    }
-
-    /// Remove every upcoming track positioned AFTER `upcoming_index` in the
-    /// current play order; the track at `upcoming_index` is kept. Works in
-    /// UPCOMING space (not absolute `tracks` indices), so it stays correct under
-    /// shuffle by reusing `remove_upcoming_track`, which resolves upcoming
-    /// positions through `shuffle_order`. Peels positions off the tail inward so
-    /// the surviving positions never shift under it. Returns the count removed.
-    ///
-    /// A second, absolute-index version used to sit below it, not
-    /// play-order-aware under shuffle and kept (its own comment said so) only
-    /// for its unit coverage. It is gone.
-    pub fn remove_upcoming_after(&self, upcoming_index: usize) -> usize {
-        let mut upcoming_len = {
-            let state = self.state.lock().unwrap();
-            Self::upcoming_len(&state)
-        };
-        if upcoming_index + 1 >= upcoming_len {
-            return 0;
-        }
-        let mut removed = 0usize;
-        while upcoming_len > upcoming_index + 1 {
-            if self.remove_upcoming_track(upcoming_len - 1).is_none() {
-                break;
-            }
-            removed += 1;
-            upcoming_len -= 1;
-        }
-        removed
-    }
-
     /// Move a track from one position to another
     pub fn move_track(&self, from_index: usize, to_index: usize) -> bool {
         let mut state = self.state.lock().unwrap();
@@ -502,14 +387,6 @@ impl QueueManager {
         }
 
         true
-    }
-
-    /// Get current track
-    pub fn current_track(&self) -> Option<QueueTrack> {
-        let state = self.state.lock().unwrap();
-        state
-            .current_index
-            .and_then(|idx| state.tracks.get(idx).cloned())
     }
 
     /// Get multiple upcoming tracks without advancing
@@ -681,28 +558,6 @@ impl QueueManager {
         state.tracks.get(target).cloned().map(|t| (t, moved))
     }
 
-    /// Jump to a track by its position in the `upcoming` list as returned by
-    /// `get_state`. The method resolves it to the correct canonical index even
-    /// when shuffle is active (where the play order differs from the canonical
-    /// `tracks` order).
-    ///
-    /// Fixes issue #327, where shuffle mode caused a different track than the
-    /// one chosen to be played.
-    pub fn play_upcoming_at(&self, upcoming_index: usize) -> Option<QueueTrack> {
-        let canonical_index = {
-            let state = self.state.lock().unwrap();
-            match state.current_index {
-                Some(_) if state.shuffle => state
-                    .shuffle_order
-                    .get(state.shuffle_position + 1 + upcoming_index)
-                    .copied(),
-                Some(curr_idx) => Some(curr_idx + 1 + upcoming_index),
-                None => Some(upcoming_index),
-            }
-        };
-        canonical_index.and_then(|idx| self.play_index(idx))
-    }
-
     /// Jump to a specific track by index
     pub fn play_index(&self, index: usize) -> Option<QueueTrack> {
         let mut state = self.state.lock().unwrap();
@@ -822,7 +677,8 @@ impl QueueManager {
     }
 
     /// Read current marker (used by `get_state()` for serialization).
-    pub fn get_stop_after(&self) -> Option<u64> {
+    #[cfg(test)]
+    pub(crate) fn get_stop_after(&self) -> Option<u64> {
         self.state.lock().unwrap().stop_after_track_id
     }
 
@@ -1531,47 +1387,6 @@ mod tests {
     }
 
     #[test]
-    fn test_play_upcoming_at_without_shuffle_uses_linear_offset() {
-        let queue = QueueManager::new();
-        for i in 1..=5 {
-            queue.add_track(create_test_track(i));
-        }
-        queue.play_index(1); // current = track id 2
-
-        // upcoming list is [3, 4, 5]; clicking position 1 must play id 4
-        let track = queue.play_upcoming_at(1).expect("track");
-        assert_eq!(track.id, 4);
-    }
-
-    #[test]
-    fn test_play_upcoming_at_with_shuffle_follows_shuffle_order() {
-        let queue = QueueManager::new();
-        for i in 1..=5 {
-            queue.add_track(create_test_track(i));
-        }
-
-        // Authoritative shuffle: playing head is shuffle[0]=2 (id 3),
-        // upcoming order becomes [5, 2, 4, 1] (track ids).
-        queue.set_queue_with_order(
-            (1..=5).map(create_test_track).collect(),
-            Some(2),
-            true,
-            Some(vec![2, 4, 1, 3, 0]),
-        );
-
-        let state = queue.get_state();
-        assert_eq!(
-            state.upcoming.iter().map(|t| t.id).collect::<Vec<_>>(),
-            vec![5, 2, 4, 1]
-        );
-
-        // Clicking upcoming position 2 must play track id 4, not id 5
-        // (which would be the "current_index + 2 + 1" = 5 broken path).
-        let track = queue.play_upcoming_at(2).expect("track");
-        assert_eq!(track.id, 4);
-    }
-
-    #[test]
     fn test_set_shuffle_with_order_uses_authoritative_order() {
         let queue = QueueManager::new();
         for i in 1..=5 {
@@ -1981,110 +1796,6 @@ mod tests {
         queue.move_track(1, 0); // 102 moves to position 0
 
         assert_eq!(queue.get_stop_after(), Some(102));
-    }
-
-    #[test]
-    fn test_remove_upcoming_after_linear() {
-        let queue = QueueManager::new();
-        // 101 playing, upcoming = [102, 103, 104, 105].
-        queue.set_queue((101..=105).map(create_test_track).collect(), Some(0));
-
-        // Keep upcoming positions 0..=1 (102, 103); drop 2, 3 (104, 105).
-        let removed = queue.remove_upcoming_after(1);
-
-        assert_eq!(removed, 2);
-        let state = queue.get_state_full();
-        assert_eq!(state.current_track.map(|t| t.id), Some(101));
-        assert_eq!(
-            state.upcoming.iter().map(|t| t.id).collect::<Vec<_>>(),
-            vec![102, 103]
-        );
-    }
-
-    #[test]
-    fn test_remove_upcoming_after_on_last_upcoming_is_noop() {
-        let queue = QueueManager::new();
-        queue.set_queue((101..=103).map(create_test_track).collect(), Some(0));
-        // Upcoming = [102, 103]; position 1 is the last, nothing after it.
-        let removed = queue.remove_upcoming_after(1);
-        assert_eq!(removed, 0);
-        assert_eq!(queue.get_state().total_tracks, 3);
-    }
-
-    #[test]
-    fn test_remove_upcoming_after_no_current_track() {
-        let queue = QueueManager::new();
-        // No current index -> every track is upcoming.
-        queue.set_queue((101..=104).map(create_test_track).collect(), None);
-        let removed = queue.remove_upcoming_after(0);
-        assert_eq!(removed, 3);
-        let state = queue.get_state_full();
-        assert_eq!(
-            state.upcoming.iter().map(|t| t.id).collect::<Vec<_>>(),
-            vec![101]
-        );
-    }
-
-    #[test]
-    fn test_remove_upcoming_after_respects_shuffle_play_order() {
-        let queue = QueueManager::new();
-        // tracks: 101..105 at indices 0..4. Shuffle play order = [2,0,4,1,3]
-        // -> 103(current), then upcoming 101, 105, 102, 104.
-        queue.set_queue_with_order(
-            (101..=105).map(create_test_track).collect(),
-            Some(2),
-            true,
-            Some(vec![2, 0, 4, 1, 3]),
-        );
-
-        // Keep upcoming positions 0..=1 (101, 105); drop 2, 3 (102, 104).
-        let removed = queue.remove_upcoming_after(1);
-
-        assert_eq!(removed, 2);
-        let state = queue.get_state_full();
-        assert_eq!(state.current_track.map(|t| t.id), Some(103));
-        assert_eq!(
-            state.upcoming.iter().map(|t| t.id).collect::<Vec<_>>(),
-            vec![101, 105]
-        );
-    }
-
-    #[test]
-    fn test_remove_upcoming_after_invalidates_marker_in_removed_range() {
-        let queue = QueueManager::new();
-        queue.set_queue((101..=105).map(create_test_track).collect(), Some(0));
-        queue.set_stop_after(104); // upcoming position 2 -> removed by after(1)
-
-        queue.remove_upcoming_after(1);
-
-        assert_eq!(queue.get_stop_after(), None);
-    }
-
-    /// The marker must survive a removal that does not reach it. These two
-    /// cases used to be covered against `remove_after`, an absolute-index
-    /// truncation that was not play-order-aware and had no caller — its own
-    /// comment admitted it was kept only for these tests. The coverage moves
-    /// here, onto the function the queue action actually calls.
-    #[test]
-    fn test_remove_upcoming_after_keeps_marker_before_the_pivot() {
-        let queue = QueueManager::new();
-        queue.set_queue((101..=105).map(create_test_track).collect(), Some(0));
-        queue.set_stop_after(102); // upcoming position 0 — ahead of the pivot
-
-        queue.remove_upcoming_after(1); // drops upcoming 2,3 (104, 105)
-
-        assert_eq!(queue.get_stop_after(), Some(102));
-    }
-
-    #[test]
-    fn test_remove_upcoming_after_keeps_marker_at_the_pivot() {
-        let queue = QueueManager::new();
-        queue.set_queue((101..=105).map(create_test_track).collect(), Some(0));
-        queue.set_stop_after(103); // upcoming position 1 — the pivot itself, kept
-
-        queue.remove_upcoming_after(1);
-
-        assert_eq!(queue.get_stop_after(), Some(103));
     }
 
     #[test]

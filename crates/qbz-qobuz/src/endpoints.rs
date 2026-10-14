@@ -8,7 +8,6 @@ pub(crate) const BASE_URL: &str = "https://www.qobuz.com/api.json/0.2";
 /// Endpoint paths
 pub(crate) mod paths {
     // User
-    pub(crate) const USER_LOGIN: &str = "/user/login";
 
     // Track
     pub(crate) const TRACK_GET: &str = "/track/get";
@@ -17,7 +16,6 @@ pub(crate) mod paths {
 
     // Album
     pub(crate) const ALBUM_GET: &str = "/album/get";
-    pub(crate) const DYNAMIC_SUGGEST: &str = "/dynamic/suggest";
 
     // Artist
     pub(crate) const ARTIST_GET: &str = "/artist/get";

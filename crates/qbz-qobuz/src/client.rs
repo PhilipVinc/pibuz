@@ -6,8 +6,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use super::auth::{
-    get_timestamp, parse_login_response, sign_file_url, sign_get_file_url, sign_request,
-    sign_session_start,
+    get_timestamp, sign_file_url, sign_get_file_url, sign_request, sign_session_start,
 };
 use super::bundle::{self, BundleTokens};
 use super::endpoints::{self, paths};
@@ -395,40 +394,6 @@ impl QobuzClient {
         )))
     }
 
-    /// Login with email and password
-    pub async fn login(&self, email: &str, password: &str) -> Result<UserSession> {
-        let url = endpoints::build_url(paths::USER_LOGIN);
-        let response = self
-            .http
-            .get(&url)
-            .headers(self.app_id_headers().await?)
-            .query(&[("email", email), ("password", password)])
-            .send()
-            .await?;
-
-        match response.status() {
-            StatusCode::OK => {
-                let json: Value = response.json().await?;
-                let session = parse_login_response(&json)?;
-                *self.session.write().await = Some(session.clone());
-                Ok(session)
-            }
-            StatusCode::UNAUTHORIZED => Err(ApiError::AuthenticationError(
-                "Invalid credentials".to_string(),
-            )),
-            StatusCode::BAD_REQUEST => Err(ApiError::InvalidAppId),
-            status => Err(ApiError::ApiResponse(format!(
-                "Unexpected status: {}",
-                status
-            ))),
-        }
-    }
-
-    /// Check if logged in
-    pub async fn is_logged_in(&self) -> bool {
-        self.session.read().await.is_some()
-    }
-
     /// Get user auth token header value
     pub async fn auth_token(&self) -> Result<String> {
         self.session
@@ -445,20 +410,6 @@ impl QobuzClient {
     /// user session, when present, always outranks it.
     pub async fn set_bearer_api_token(&self, jwt: Option<String>) {
         *self.bearer_api_jwt.write().await = jwt;
-    }
-
-    /// X-App-Id only — for sign-in requests, which must never carry a stray
-    /// credential (in particular not the pairing Bearer token, which belongs
-    /// to whoever cast to this device, not to the account logging in).
-    async fn app_id_headers(&self) -> Result<reqwest::header::HeaderMap> {
-        use reqwest::header::{HeaderMap, HeaderValue};
-        let mut headers = HeaderMap::new();
-        let app_id = self.app_id().await?;
-        headers.insert(
-            "X-App-Id",
-            HeaderValue::from_str(&app_id).map_err(|_| ApiError::InvalidAppId)?,
-        );
-        Ok(headers)
     }
 
     /// Build standard API headers.
@@ -622,41 +573,6 @@ impl QobuzClient {
 
         let response: Value = http_response.json().await?;
         Ok(serde_json::from_value(response)?)
-    }
-
-    /// `/dynamic/suggest` carrying the `track_to_analysed` payload — the
-    /// PRIMARY DailyQ/WeeklyQ path.
-    pub async fn get_dynamic_suggest_full(
-        &self,
-        listened_track_ids: &[u64],
-        tracks_to_analyse: &[TrackToAnalyse],
-        limit: u32,
-    ) -> Result<Vec<Track>> {
-        let url = endpoints::build_url(paths::DYNAMIC_SUGGEST);
-        let body = serde_json::json!({
-            "limit": limit,
-            "listened_tracks_ids": listened_track_ids,
-            "track_to_analysed": tracks_to_analyse,
-        });
-        let http_response = self
-            .http()?
-            .post(&url)
-            .headers(self.authenticated_headers().await?)
-            .json(&body)
-            .send()
-            .await?;
-        let status = http_response.status();
-        if !status.is_success() {
-            return Err(ApiError::ApiResponse(format!(
-                "get_dynamic_suggest status {status}"
-            )));
-        }
-        let response: Value = http_response.json().await?;
-        Ok(qbz_models::lenient::parse_items_array(
-            &response,
-            "tracks",
-            "dynamic-suggest track",
-        ))
     }
 
     /// Get track by ID
@@ -913,7 +829,11 @@ impl QobuzClient {
     // === Authenticated endpoints ===
 
     /// Get stream URL for a track (requires auth + signature)
-    pub async fn get_stream_url(&self, track_id: u64, quality: Quality) -> Result<StreamUrl> {
+    pub(crate) async fn get_stream_url(
+        &self,
+        track_id: u64,
+        quality: Quality,
+    ) -> Result<StreamUrl> {
         // Back off before the network if the 403 breaker is open (issue #637).
         self.forbidden_guard()?;
         log::info!(

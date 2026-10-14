@@ -2177,10 +2177,6 @@ impl SharedState {
         self.is_playing.load(Ordering::SeqCst)
     }
 
-    pub fn position(&self) -> u64 {
-        self.position.load(Ordering::SeqCst)
-    }
-
     pub fn duration(&self) -> u64 {
         self.duration.load(Ordering::SeqCst)
     }
@@ -7216,17 +7212,6 @@ impl Player {
         } else {
             Err("Failed to lock audio settings".to_string())
         }
-    }
-
-    /// Get current playback state with real-time position
-    pub fn get_state(&self) -> Result<PlaybackState, String> {
-        Ok(PlaybackState {
-            is_playing: self.state.is_playing(),
-            position: self.state.current_position(),
-            duration: self.state.duration(),
-            track_id: self.state.current_track_id(),
-            volume: self.state.volume(),
-        })
     }
 
     /// Get a snapshot of the playback state as a `PlaybackEvent`
