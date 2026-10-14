@@ -230,11 +230,6 @@ fn secrets_double_gate() {
     // §3/§6: secrets present but no import-side --include-auth → skipped, and the
     // auth token is NOT queued for validation.
     let p = scratch("secrets");
-    // A user must exist for the scrobbler secret to reach the gate (else §5.7
-    // no-user skip fires first).
-    std::fs::create_dir_all(&p.data_root).unwrap();
-    write_last_user_id(&p.data_root, 1234567).unwrap();
-
     let bundle = bundle_with(json!({
         "integrations": { "scrobblers": { "lastfm_session_key": "d580secret" } },
         "auth": { "user_auth_token": "Bo4Asecret", "user_id": 1234567 }
@@ -255,17 +250,16 @@ fn secrets_double_gate() {
 
     let secret = find(&plan.skipped, "integrations.scrobblers.lastfm_session_key")
         .expect("scrobbler secret skipped");
-    assert!(secret.why.contains("--include-auth"), "{}", secret.why);
+    assert!(secret.why.contains("no effect in pibuz"), "{}", secret.why);
     cleanup(&p);
 }
 
 #[test]
 fn secret_applies_with_gate() {
-    // The other half of the double gate: with --include-auth the token is queued
-    // for validation and the scrobbler secret applies.
+    // The other half of the double gate: with --include-auth the token is
+    // queued for validation. The scrobbler secret still goes nowhere: pibuz
+    // does not scrobble.
     let p = scratch("secret-gate");
-    std::fs::create_dir_all(&p.data_root).unwrap();
-    write_last_user_id(&p.data_root, 1234567).unwrap();
     let bundle = bundle_with(json!({
         "integrations": { "scrobblers": { "lastfm_session_key": "d580secret" } },
         "auth": { "user_auth_token": "Bo4Asecret", "user_id": 1234567 }
@@ -279,7 +273,8 @@ fn secret_applies_with_gate() {
 
     assert_eq!(plan.auth_token.as_deref(), Some("Bo4Asecret"));
     assert_eq!(plan.bundle_user_id, Some(1234567));
-    assert!(find(&plan.applied, "integrations.scrobblers.lastfm_session_key").is_some());
+    assert!(find(&plan.skipped, "integrations.scrobblers.lastfm_session_key").is_some());
+    assert!(plan.writes.is_empty(), "{:?}", plan.writes);
     cleanup(&p);
 }
 
@@ -614,11 +609,9 @@ fn parse_rejects_missing_version() {
 
 #[test]
 fn secret_values_never_render_in_summary() {
-    // §5.4: SECRET-class values are MASKED in the summary lines — the raw value
-    // rides only the write list (terminal scrollback / CI logs must never see it).
+    // §5.4: a secret value never reaches the summary lines (terminal
+    // scrollback / CI logs must never see it), even with --include-auth.
     let p = scratch("mask");
-    std::fs::create_dir_all(&p.data_root).unwrap();
-    write_last_user_id(&p.data_root, 1).unwrap();
     let bundle = bundle_with(json!({
         "integrations": { "scrobblers": {
             "lastfm_session_key": "d580REALSECRET",
@@ -632,10 +625,8 @@ fn secret_values_never_render_in_summary() {
 
     let plan = plan(&bundle, &p, &opts, &live()).expect("plan");
 
-    let key_line = find(&plan.applied, "integrations.scrobblers.lastfm_session_key").unwrap();
-    assert_eq!(key_line.new, "(secret, applied)");
-    let empty_line = find(&plan.applied, "integrations.scrobblers.listenbrainz_token").unwrap();
-    assert_eq!(empty_line.new, "(empty)");
+    assert!(find(&plan.skipped, "integrations.scrobblers.lastfm_session_key").is_some());
+    assert!(find(&plan.skipped, "integrations.scrobblers.listenbrainz_token").is_some());
 
     // No rendered bucket line anywhere carries the raw secret.
     let rendered = format!("{:?} {:?} {:?}", plan.applied, plan.adapted, plan.skipped);
@@ -643,11 +634,10 @@ fn secret_values_never_render_in_summary() {
         !rendered.contains("d580REALSECRET"),
         "secret leaked into summary: {rendered}"
     );
-
-    // The write list still carries the real value so apply works.
-    assert_eq!(
-        write_of(&plan, "integrations.scrobblers.lastfm_session_key"),
-        Some(&json!("d580REALSECRET"))
+    assert!(
+        plan.writes.is_empty(),
+        "nothing to write: {:?}",
+        plan.writes
     );
     cleanup(&p);
 }

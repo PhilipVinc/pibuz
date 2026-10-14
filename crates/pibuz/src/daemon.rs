@@ -7,7 +7,6 @@ use qbz_app::settings::daemon_prefs;
 use qbz_app::shell::AppRuntime;
 use qbz_models::CoreEvent;
 use tokio::sync::broadcast;
-use tokio::task::JoinHandle;
 
 use crate::adapter::DaemonAdapter;
 use crate::config::PibuzConfig;
@@ -23,11 +22,6 @@ pub(crate) struct BootedRuntime {
     pub(crate) runtime: Arc<AppRuntime<DaemonAdapter>>,
     pub(crate) shared: Arc<Mutex<DaemonShared>>,
     pub(crate) bus: broadcast::Sender<CoreEvent>,
-    /// Background session-restore retry (network-class boot failure only). Held
-    /// so shutdown can abort+join it BEFORE releasing the audio device: it holds
-    /// an `Arc<AppRuntime>` clone, so leaving it running would keep the Player
-    /// alive past `drop(booted)` and break the #521 clock-release ordering.
-    pub(crate) auth_retry: Option<JoinHandle<()>>,
 }
 
 /// `pibuz run` — boot the daemon in the foreground, park on signals, shut down
@@ -94,7 +88,7 @@ pub(crate) async fn run(
     }
 
     // 6.-9. compose the daemon-root stores and the runtime.
-    let mut booted = boot(&roots, &cfg, warns.len()).await?;
+    let booted = boot(&roots, &cfg, warns.len()).await?;
 
     // Attach the CoreEvent bus to the shared state so the qconnect lifecycle
     // latches can publish `QconnectSessionChanged` (SSE + the event hook).
@@ -245,14 +239,7 @@ pub(crate) async fn run(
         hooks.abort();
         let _ = hooks.await;
     }
-    // The background auth-retry task also holds an Arc<AppRuntime> clone — abort
-    // AND join it so its Arc is dropped before `drop(booted)`; otherwise the
-    // ordering claim below (drop releases the device) breaks once playback has
-    // engaged a real device.
-    if let Some(retry) = booted.auth_retry.take() {
-        retry.abort();
-        let _ = retry.await;
-    }
+
     // Stop the API thread and JOIN it: its `ApiState` holds an `Arc<AppRuntime>`
     // clone, which must drop before `drop(booted)` releases the audio device
     // ahead of the #521 pair — the same ordering constraint as the driver and
@@ -318,13 +305,10 @@ async fn boot(
     //    Connect handoff supplies its own `jwt_api` streaming credential
     //    (see qconnect/pairing.rs), so there is nothing on disk to restore
     //    and nothing to retry — the renderer simply waits to be cast to.
-    let auth_retry = None;
-
     Ok(BootedRuntime {
         runtime,
         shared,
         bus,
-        auth_retry,
     })
 }
 

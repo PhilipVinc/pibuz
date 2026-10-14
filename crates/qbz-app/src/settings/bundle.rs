@@ -350,17 +350,6 @@ fn build_plan(
 
     let mut plan = ImportPlan::default();
 
-    // Does a uid exist (or will one after auth validation)? Drives whether
-    // per-user domains apply (§5.7).
-    let auth_present = bundle
-        .domains
-        .get("auth")
-        .and_then(Value::as_object)
-        .map(|a| a.contains_key("user_auth_token"))
-        .unwrap_or(false);
-    let uid_will_exist =
-        (opts.include_auth && auth_present) || read_last_user_id(&target.data_root).is_some();
-
     // Step 3+4: classify each present domain.
     for (domain, value) in &bundle.domains {
         match domain.as_str() {
@@ -368,7 +357,7 @@ fn build_plan(
             "audio" => plan_audio(value, target, opts, live, &forced_device, &mut plan),
             "prefs" => plan_prefs(value, &mut plan),
             "qconnect" => plan_qconnect(value, target, &mut plan),
-            "integrations" => plan_integrations(value, opts, uid_will_exist, &mut plan),
+            "integrations" => plan_integrations(value, &mut plan),
             "library_folders" => plan_library_folders(value, &mut plan),
             "auth" => plan_auth(value, opts, &mut plan),
             // §1 corollary: a top-level `volume` domain is NEVER-class, always.
@@ -385,14 +374,6 @@ fn build_plan(
 }
 
 // ============================ apply (§5.3 step 6) ============================
-
-/// Test-only since the account path went: nothing in the import writes a
-/// `last_user_id` any more, but the fixtures still need to plant one.
-#[cfg(test)]
-fn write_last_user_id(data_root: &Path, uid: u64) -> Result<(), String> {
-    std::fs::create_dir_all(data_root).map_err(|e| e.to_string())?;
-    std::fs::write(data_root.join("last_user_id"), uid.to_string()).map_err(|e| e.to_string())
-}
 
 /// Execute a plan against the daemon-root stores. Reached only after every
 /// check passed (validate-all-then-apply). Pure setter writes — re-running is
@@ -415,7 +396,6 @@ pub fn apply(
     let mut audio_writes: Vec<(&str, &Value)> = Vec::new();
     let mut prefs_quality: Option<&Value> = None;
     let mut qconnect_writes: Vec<(&str, &Value)> = Vec::new();
-    let mut scrobbler_writes: Vec<(&str, &Value)> = Vec::new();
 
     for (key, value) in &plan.writes {
         if let Some(rest) = key.strip_prefix("audio.") {
@@ -424,8 +404,6 @@ pub fn apply(
             prefs_quality = Some(value);
         } else if let Some(rest) = key.strip_prefix("qconnect.") {
             qconnect_writes.push((rest, value));
-        } else if let Some(rest) = key.strip_prefix("integrations.scrobblers.") {
-            scrobbler_writes.push((rest, value));
         }
     }
 
@@ -477,24 +455,6 @@ fn applied_line(plan: &mut ImportPlan, key: &str, value: &Value, why: &str) {
         old: None,
         new: render_value(value),
         why: why.to_string(),
-    });
-    plan.writes.push((key.to_string(), value.clone()));
-}
-
-/// SECRET-class applied line (§5.4): the VALUE COLUMN IS MASKED — the real
-/// value goes only into the write list, never into the rendered summary
-/// (terminal scrollback and CI logs are not a place for bearer tokens).
-/// Non-empty → `(secret, applied)`; empty → `(empty)`, matching the §5.4 example.
-fn applied_secret_line(plan: &mut ImportPlan, key: &str, value: &Value) {
-    let masked = match value.as_str() {
-        Some(s) if !s.is_empty() => "(secret, applied)",
-        _ => "(empty)",
-    };
-    plan.applied.push(PlanLine {
-        key: key.to_string(),
-        old: None,
-        new: masked.to_string(),
-        why: String::new(),
     });
     plan.writes.push((key.to_string(), value.clone()));
 }
@@ -1002,56 +962,30 @@ fn plan_qconnect(value: &Value, target: &ProfilePaths, plan: &mut ImportPlan) {
     }
 }
 
-// ---- integrations.scrobblers (§2.5) ----
-const SCROBBLER_PORTABLE: &[&str] = &[
-    "enabled",
-    "lastfm_enabled",
-    "lastfm_username",
-    "listenbrainz_enabled",
-    "listenbrainz_username",
-];
-const SCROBBLER_SECRET: &[&str] = &["lastfm_session_key", "listenbrainz_token"];
+// ---- integrations (§2.5) ----
+// The desktop app exports its scrobbler settings here. pibuz does not scrobble,
+// so every key is listed as skipped. Nothing is written, and no value, secret
+// or not, reaches the summary: a skipped line carries only its key.
+const INTEGRATIONS_WHY: &str = "no effect in pibuz (it does not scrobble)";
 
-fn plan_integrations(
-    value: &Value,
-    opts: &ImportOptions,
-    uid_will_exist: bool,
-    plan: &mut ImportPlan,
-) {
-    let Some(scrob) = value.get("scrobblers").and_then(Value::as_object) else {
-        // Unknown integration domain.
-        if let Some(map) = value.as_object() {
-            for k in map.keys() {
-                plan.skipped
-                    .push(skip_line(&format!("integrations.{k}"), UNKNOWN_WHY));
-            }
-        }
+fn plan_integrations(value: &Value, plan: &mut ImportPlan) {
+    let Some(map) = value.as_object() else {
         return;
     };
-
-    for (k, v) in scrob {
-        let full = format!("integrations.scrobblers.{k}");
-        if !uid_will_exist {
-            plan.skipped.push(skip_line(
-                &full,
-                "scrobbler settings need a per-user store this daemon does not have",
-            ));
-            continue;
-        }
-        if SCROBBLER_PORTABLE.contains(&k.as_str()) {
-            applied_line(plan, &full, v, "");
-        } else if SCROBBLER_SECRET.contains(&k.as_str()) {
-            if opts.include_auth {
-                applied_secret_line(plan, &full, v);
-            } else {
-                plan.skipped
-                    .push(skip_line(&full, "secrets require --include-auth"));
+    for (domain, inner) in map {
+        match inner.as_object() {
+            Some(keys) => {
+                for k in keys.keys() {
+                    plan.skipped.push(skip_line(
+                        &format!("integrations.{domain}.{k}"),
+                        INTEGRATIONS_WHY,
+                    ));
+                }
             }
-        } else if k == "ui_collapsed" {
-            plan.skipped
-                .push(skip_line(&full, "not imported (desktop UI state)"));
-        } else {
-            plan.skipped.push(skip_line(&full, UNKNOWN_WHY));
+            None => plan.skipped.push(skip_line(
+                &format!("integrations.{domain}"),
+                INTEGRATIONS_WHY,
+            )),
         }
     }
 }
@@ -1218,15 +1152,6 @@ fn read_qconnect_domain(data_root: &Path) -> Option<Value> {
     }
     obj.insert("startup_mode".into(), Value::String(qc.startup_mode));
     Some(Value::Object(obj))
-}
-
-// ---- last_user_id under an arbitrary root (daemon-safe) ----
-fn read_last_user_id(data_root: &Path) -> Option<u64> {
-    std::fs::read_to_string(data_root.join("last_user_id"))
-        .ok()?
-        .trim()
-        .parse::<u64>()
-        .ok()
 }
 
 // ---- misc ----

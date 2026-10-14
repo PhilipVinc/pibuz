@@ -165,8 +165,8 @@ pub(crate) fn quality_tier(quality: Quality) -> u8 {
 ///
 /// The controller's `max_audio_quality` is a REQUEST, not an instruction: a
 /// phone asking for Ultra Hi-Res must not override a renderer configured to cap
-/// at CD (upstream#693 — the local cap was applied only on the local playback
-/// path, so casting bypassed it entirely). `cap` of `None` means uncapped, and a
+/// at CD. (The local cap was once applied only on the local playback path, so
+/// casting bypassed it entirely.) `cap` of `None` means uncapped, and a
 /// cap ABOVE the request never upgrades it — the lower of the two always wins.
 pub(crate) fn cap_quality(requested: Quality, cap: Option<Quality>) -> Quality {
     match cap {
@@ -525,7 +525,7 @@ mod tests {
         );
     }
 
-    /// upstream#693 — the cap is a CEILING on the controller's request.
+    /// The cap is a CEILING on the controller's request.
     #[test]
     fn cap_quality_is_a_ceiling_and_never_a_floor() {
         use Quality::{HiRes, Lossless, Mp3, UltraHiRes};

@@ -1385,7 +1385,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // upstream#693 — the local quality cap binds the CAST path too.
+    // The local quality cap binds the CAST path too.
     //
     // The bug: a renderer configured for CD streamed 24/192 whenever a phone
     // asked for it, because these seams took the controller's
