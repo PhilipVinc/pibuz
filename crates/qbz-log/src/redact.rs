@@ -13,7 +13,7 @@
 
 use std::sync::{OnceLock, RwLock};
 
-use regex::Regex;
+use regex_lite::Regex;
 
 const REPLACEMENT: &str = "***REDACTED***";
 /// Live secret values shorter than this are ignored (too generic to scrub safely).
@@ -47,7 +47,9 @@ fn patterns() -> &'static Vec<Regex> {
             r#"(?i)(token=)[^&\s"']+"#,
         ]
         .iter()
-        .filter_map(|p| Regex::new(p).ok())
+        // A pattern that fails to compile is a secret that stops being redacted,
+        // so it must not be skipped quietly; `every_pattern_compiles` pins it.
+        .map(|p| Regex::new(p).expect("redaction pattern"))
         .collect()
     })
 }
@@ -109,6 +111,11 @@ pub fn redact(line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_pattern_compiles() {
+        assert_eq!(patterns().len(), 10);
+    }
 
     #[test]
     fn redacts_all_known_shapes() {

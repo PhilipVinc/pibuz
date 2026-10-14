@@ -65,9 +65,6 @@ base64 = "0.22"
 # Time
 chrono = "0.4"
 
-# Regex
-regex = "1"
-
 # Audio
 symphonia = { version = "0.5", features = ["all"] }
 

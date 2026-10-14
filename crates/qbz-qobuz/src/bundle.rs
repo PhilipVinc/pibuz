@@ -3,13 +3,14 @@
 //! Extracts app_id and secrets from the Qobuz JavaScript bundle.
 //! This is necessary because Qobuz doesn't provide a public API.
 
-use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Duration;
 
 use super::error::{ApiError, Result};
+
+mod scan;
 
 const LOGIN_PAGE_URL: &str = "https://play.qobuz.com/login";
 const BUNDLE_BASE_URL: &str = "https://play.qobuz.com";
@@ -275,43 +276,27 @@ pub async fn extract_bundle_tokens(client: &Client) -> Result<BundleTokens> {
 
 fn extract_bundle_url(html: &str) -> Result<String> {
     // Pattern: <script src="/resources/X.X.X-bXXX/bundle.js"></script>
-    let re =
-        Regex::new(r#"<script src="(/resources/\d+\.\d+\.\d+-[a-z]\d{3}/bundle\.js)"></script>"#)
-            .expect("Invalid regex");
-
-    re.captures(html)
-        .and_then(|caps| caps.get(1))
-        .map(|m| m.as_str().to_string())
+    scan::bundle_url(html)
+        .map(str::to_string)
         .ok_or_else(|| ApiError::BundleExtractionError("Bundle URL not found".to_string()))
 }
 
 fn extract_app_id(bundle: &str) -> Result<String> {
     // Pattern: production:{api:{appId:"XXXXXXXXX"
-    let re = Regex::new(r#"production:\{api:\{appId:"(?P<app_id>\d{9})""#).expect("Invalid regex");
-
-    re.captures(bundle)
-        .and_then(|caps| caps.name("app_id"))
-        .map(|m| m.as_str().to_string())
+    scan::app_id(bundle)
+        .map(str::to_string)
         .ok_or_else(|| ApiError::BundleExtractionError("App ID not found".to_string()))
 }
 
 fn extract_secrets(bundle: &str) -> Result<Vec<String>> {
     // Extract seeds with their timezone keys
     // Pattern: X.initialSeed("SEED",window.utimezone.TIMEZONE)
-    let seed_re = Regex::new(
-        r#"[a-z]\.initialSeed\("(?P<seed>[\w=]+)",window\.utimezone\.(?P<timezone>[a-z]+)\)"#,
-    )
-    .expect("Invalid regex");
-
     let mut seeds: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut timezones: Vec<String> = Vec::new();
 
-    for caps in seed_re.captures_iter(bundle) {
-        if let (Some(seed), Some(tz)) = (caps.name("seed"), caps.name("timezone")) {
-            let tz_str = tz.as_str().to_string();
-            seeds.insert(tz_str.clone(), seed.as_str().to_string());
-            timezones.push(tz_str);
-        }
+    for (seed, tz) in scan::seeds(bundle) {
+        seeds.insert(tz.to_string(), seed.to_string());
+        timezones.push(tz.to_string());
     }
 
     log::debug!(
@@ -326,7 +311,7 @@ fn extract_secrets(bundle: &str) -> Result<Vec<String>> {
         ));
     }
 
-    // Build dynamic regex with found timezones (capitalize first letter for matching)
+    // Match the info entries for the found timezones (capitalized in the bundle)
     // Pattern: name:"\w+/Timezone",info:"INFO",extras:"EXTRAS"
     let tz_pattern: Vec<String> = timezones
         .iter()
@@ -340,53 +325,31 @@ fn extract_secrets(bundle: &str) -> Result<Vec<String>> {
         })
         .collect();
 
-    let tz_alternatives = tz_pattern.join("|");
-    let info_pattern = format!(
-        r#"name:"\w+/(?P<timezone>{})",info:"(?P<info>[\w=]+)",extras:"(?P<extras>[\w=]+)""#,
-        tz_alternatives
-    );
-
-    log::debug!("Info regex pattern: {}", info_pattern);
-
-    let info_re = Regex::new(&info_pattern).expect("Invalid info regex");
-
     let mut secrets = Vec::new();
 
-    for caps in info_re.captures_iter(bundle) {
-        if let (Some(tz), Some(info), Some(extras)) = (
-            caps.name("timezone"),
-            caps.name("info"),
-            caps.name("extras"),
-        ) {
-            // Convert capitalized timezone back to lowercase for lookup
-            let tz_lower = tz.as_str().to_lowercase();
-            if let Some(seed) = seeds.get(&tz_lower) {
-                // Concatenate seed + info + extras, remove last 44 chars, base64 decode
-                let combined = format!("{}{}{}", seed, info.as_str(), extras.as_str());
-                log::debug!(
-                    "Combined length: {}, timezone: {}",
-                    combined.len(),
-                    tz_lower
-                );
+    for (tz, info, extras) in scan::infos(bundle, &tz_pattern) {
+        // Convert capitalized timezone back to lowercase for lookup
+        let tz_lower = tz.to_lowercase();
+        if let Some(seed) = seeds.get(&tz_lower) {
+            // Concatenate seed + info + extras, remove last 44 chars, base64 decode
+            let combined = format!("{}{}{}", seed, info, extras);
+            log::debug!(
+                "Combined length: {}, timezone: {}",
+                combined.len(),
+                tz_lower
+            );
 
-                if combined.len() > 44 {
-                    let trimmed = &combined[..combined.len() - 44];
-                    match base64::Engine::decode(
-                        &base64::engine::general_purpose::STANDARD,
-                        trimmed,
-                    ) {
-                        Ok(decoded) => {
-                            if let Ok(secret) = String::from_utf8(decoded) {
-                                log::info!(
-                                    "Successfully extracted secret for timezone: {}",
-                                    tz_lower
-                                );
-                                secrets.push(secret);
-                            }
+            if combined.len() > 44 {
+                let trimmed = &combined[..combined.len() - 44];
+                match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, trimmed) {
+                    Ok(decoded) => {
+                        if let Ok(secret) = String::from_utf8(decoded) {
+                            log::info!("Successfully extracted secret for timezone: {}", tz_lower);
+                            secrets.push(secret);
                         }
-                        Err(e) => {
-                            log::debug!("Base64 decode failed for {}: {}", tz_lower, e);
-                        }
+                    }
+                    Err(e) => {
+                        log::debug!("Base64 decode failed for {}: {}", tz_lower, e);
                     }
                 }
             }
@@ -397,12 +360,11 @@ fn extract_secrets(bundle: &str) -> Result<Vec<String>> {
     // that might work for some bundle versions
     if secrets.is_empty() {
         log::warn!("Complex extraction failed, trying simple appSecret pattern");
-        let simple_re = Regex::new(r#"appSecret:"([a-f0-9]{32})""#).expect("Invalid regex");
-        for caps in simple_re.captures_iter(bundle) {
-            if let Some(secret) = caps.get(1) {
-                secrets.push(secret.as_str().to_string());
-            }
-        }
+        secrets.extend(
+            scan::app_secret_literals(bundle)
+                .into_iter()
+                .map(str::to_string),
+        );
     }
 
     log::info!("Extracted app secrets from bundle");
@@ -471,23 +433,19 @@ fn char_bounded(s: &str, lo: usize, hi: usize) -> &str {
 /// An empty result is a normal outcome, not an error — it means this bundle
 /// exposes no seed in a shape this sees, and CMAF is simply unavailable.
 pub fn extract_cmaf_seed_candidates(bundle: &str, known_secrets: &[String]) -> Vec<String> {
-    let re = Regex::new(r#""([0-9a-f]{32})""#).expect("Invalid regex");
-
     // Best score wins per distinct value: the same literal can appear more than
     // once, and only its most promising neighbourhood matters.
     let mut scored: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
 
-    for caps in re.captures_iter(bundle) {
-        let Some(m) = caps.get(1) else { continue };
-        let value = m.as_str();
+    for (start, value) in scan::hex32_literals(bundle) {
         if known_secrets.iter().any(|s| s == value) {
             continue;
         }
 
         let context = char_bounded(
             bundle,
-            m.start().saturating_sub(CMAF_SEED_CONTEXT),
-            m.end() + CMAF_SEED_CONTEXT,
+            start.saturating_sub(CMAF_SEED_CONTEXT),
+            start + value.len() + CMAF_SEED_CONTEXT,
         )
         .to_ascii_lowercase();
 
@@ -532,11 +490,7 @@ pub fn extract_cmaf_seed_candidates(bundle: &str, known_secrets: &[String]) -> V
 
 fn extract_private_key(bundle: &str) -> Option<String> {
     // Pattern: privateKey:"VALUE" (the static OAuth key used in /oauth/callback)
-    let re = Regex::new(r#"privateKey:\s*"(?P<key>[A-Za-z0-9]{6,30})""#).expect("Invalid regex");
-
-    re.captures(bundle)
-        .and_then(|caps| caps.name("key"))
-        .map(|m| m.as_str().to_string())
+    scan::private_key(bundle).map(str::to_string)
 }
 
 #[cfg(test)]

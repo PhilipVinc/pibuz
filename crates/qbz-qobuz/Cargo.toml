@@ -35,7 +35,6 @@ chrono = { workspace = true }
 dirs = "6"
 
 # Regex
-regex = { workspace = true }
 
 # Logging
 log = { workspace = true }

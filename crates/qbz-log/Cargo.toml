@@ -8,9 +8,13 @@ description = "Frontend-agnostic logging core for qbz: TeeLogger (stderr+ring+fi
 
 [dependencies]
 log = { workspace = true }
-regex = { workspace = true }
+# regex-lite, not regex: these are short log lines behind a keyword pre-check,
+# and regex-lite builds in a second where regex takes ten.
+regex-lite = "0.1"
 chrono = { workspace = true }
-env_logger = "0.11"
+# Only its RUST_LOG level filter is used; qbz-log formats every line itself.
+# Default features would add timestamps (jiff), colors and regex filters.
+env_logger = { version = "0.11", default-features = false }
 dirs = "5"
 
 [lints]
