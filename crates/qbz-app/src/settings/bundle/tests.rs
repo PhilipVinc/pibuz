@@ -65,15 +65,9 @@ fn write_of<'a>(plan: &'a ImportPlan, key: &str) -> Option<&'a Value> {
 
 #[test]
 fn portable_fields_apply_verbatim() {
-    // §3 PORTABLE: playback.*, the audio portable subset, prefs.streaming_quality.
+    // §3 PORTABLE: the audio portable subset, prefs.streaming_quality.
     let p = scratch("portable");
     let bundle = bundle_with(json!({
-        "playback": {
-            "autoplay_mode": "infinite",
-            "show_context_icon": false,
-            "persist_session": true,
-            "resume_playback_position": false
-        },
         "audio": {
             "gapless_enabled": true,
             "stream_buffer_seconds": 4,
@@ -91,16 +85,6 @@ fn portable_fields_apply_verbatim() {
         plan.adapted
     );
     assert_eq!(
-        find(&plan.applied, "playback.autoplay_mode").unwrap().new,
-        "infinite"
-    );
-    assert_eq!(
-        find(&plan.applied, "playback.show_context_icon")
-            .unwrap()
-            .new,
-        "false"
-    );
-    assert_eq!(
         find(&plan.applied, "audio.gapless_enabled").unwrap().new,
         "true"
     );
@@ -114,6 +98,40 @@ fn portable_fields_apply_verbatim() {
         find(&plan.applied, "prefs.streaming_quality").unwrap().new,
         "hires_plus"
     );
+    cleanup(&p);
+}
+
+#[test]
+fn desktop_playback_preferences_are_skipped_not_written() {
+    // pibuz has no store for the desktop's playback preferences: it never read
+    // them. A bundle carrying them must list every one as skipped, and plan no
+    // write for any of them.
+    let p = scratch("playback-skip");
+    let bundle = bundle_with(json!({
+        "playback": {
+            "autoplay_mode": "infinite",
+            "show_context_icon": false,
+            "persist_session": true,
+            "resume_playback_position": false,
+            "volume": 0.9
+        }
+    }));
+
+    let plan = plan(&bundle, &p, &ImportOptions::default(), &live()).expect("plan");
+
+    for key in [
+        "playback.autoplay_mode",
+        "playback.show_context_icon",
+        "playback.persist_session",
+        "playback.resume_playback_position",
+    ] {
+        let l = find(&plan.skipped, key).unwrap_or_else(|| panic!("{key} must skip"));
+        assert!(l.why.contains("no effect in pibuz"), "{key}: {}", l.why);
+    }
+    let vol = find(&plan.skipped, "playback.volume").expect("volume skipped");
+    assert!(vol.why.contains("volume hazard"), "{}", vol.why);
+    assert!(plan.applied.is_empty() && plan.adapted.is_empty());
+    assert!(plan.writes.is_empty());
     cleanup(&p);
 }
 
@@ -350,13 +368,13 @@ fn found_device_applies_verbatim() {
 fn absent_fields_leave_target_untouched() {
     // §7: only present fields have effects.
     let p = scratch("absent");
-    let bundle = bundle_with(json!({ "playback": { "autoplay_mode": "track_only" } }));
+    let bundle = bundle_with(json!({ "prefs": { "streaming_quality": "cd" } }));
 
     let plan = plan(&bundle, &p, &ImportOptions::default(), &live()).expect("plan");
 
     // Exactly one write (the single present field); nothing audio/qconnect/etc.
     assert_eq!(plan.writes.len(), 1);
-    assert_eq!(plan.writes[0].0, "playback.autoplay_mode");
+    assert_eq!(plan.writes[0].0, "prefs.streaming_quality");
     assert!(plan.writes.iter().all(|(k, _)| !k.starts_with("audio.")));
     cleanup(&p);
 }
@@ -409,9 +427,6 @@ fn roundtrip_same_box_is_noop() {
             .set_quality_fallback_behavior("always_fallback")
             .unwrap();
         audio.set_gapless_enabled(true).unwrap();
-
-        let pb = PlaybackPreferencesStore::new_at(&p.data_root).unwrap();
-        pb.set_persist_session(true).unwrap();
 
         qconnect_kv_write(
             &p.data_root.join("qconnect_settings.db"),
@@ -561,12 +576,6 @@ fn apply_writes_are_idempotent_and_persist() {
     assert_eq!(audio.output_device.as_deref(), Some("hw:1,0"));
     assert_eq!(audio.backend_type, Some(AudioBackendType::Alsa));
     assert!(audio.gapless_enabled);
-
-    let pb = PlaybackPreferencesStore::new_at(&p.data_root)
-        .unwrap()
-        .get_preferences()
-        .unwrap();
-    assert!(!pb.persist_session);
 
     assert_eq!(daemon_prefs::load_at(&p.data_root).streaming_quality, "cd");
     assert_eq!(

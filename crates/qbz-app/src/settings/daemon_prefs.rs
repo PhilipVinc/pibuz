@@ -1,5 +1,5 @@
 // crates/qbz-app/src/settings/daemon_prefs.rs
-//! The daemon's 2 player prefs (01-architecture.md §10.3). Lives in qbz-app so
+//! The daemon's player prefs (01-architecture.md §10.3). Lives in qbz-app so
 //! pibuz AND settings::bundle share one struct (D2). NOT read by the desktop.
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -9,8 +9,6 @@ use std::path::Path;
 pub struct DaemonPrefs {
     /// "mp3" | "cd" | "hires" | "hires_plus".
     pub streaming_quality: String,
-    /// Restored at boot; NEVER imported (04 §3 — power-amp hazard).
-    pub volume: f32,
     /// Whether the daemon publishes MPRIS system media controls at boot
     /// (CONSOLE ext). Default ON; the `QBZD_MPRIS` env var overrides it when
     /// set. Toggling this needs a daemon restart (the service spawns at boot).
@@ -26,7 +24,6 @@ impl Default for DaemonPrefs {
     fn default() -> Self {
         Self {
             streaming_quality: "hires_plus".into(),
-            volume: 0.5,
             mpris_enabled: true,
             hook_script: String::new(),
         }
@@ -41,6 +38,7 @@ pub fn load_at(data_root: &Path) -> DaemonPrefs {
                 // forward-compatible: unknown fields ignored WITH a warning (01 §10.3)
                 if let Some(obj) = v.as_object() {
                     for k in obj.keys() {
+                        // `volume` was written by older versions and never read.
                         if k != "streaming_quality"
                             && k != "volume"
                             && k != "mpris_enabled"
@@ -90,7 +88,6 @@ mod tests {
         let dir = unique_test_dir("missing");
         let prefs = load_at(&dir);
         assert_eq!(prefs.streaming_quality, "hires_plus");
-        assert_eq!(prefs.volume, 0.5);
     }
 
     #[test]
@@ -98,7 +95,6 @@ mod tests {
         let dir = unique_test_dir("roundtrip");
         let prefs = DaemonPrefs {
             streaming_quality: "cd".into(),
-            volume: 0.72,
             // Non-default (default is true) so the roundtrip actually exercises
             // the field, not just its presence.
             mpris_enabled: false,
@@ -110,7 +106,6 @@ mod tests {
         let loaded = load_at(&dir);
 
         assert_eq!(loaded.streaming_quality, "cd");
-        assert_eq!(loaded.volume, 0.72);
         assert!(!loaded.mpris_enabled);
         assert_eq!(loaded.hook_script, "/usr/local/bin/qbz-hook.sh");
         let _ = std::fs::remove_dir_all(&dir);
@@ -129,7 +124,6 @@ mod tests {
         let loaded = load_at(&dir);
 
         assert_eq!(loaded.streaming_quality, "mp3");
-        assert_eq!(loaded.volume, 0.3);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

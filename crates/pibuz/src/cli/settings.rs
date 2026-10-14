@@ -2,9 +2,8 @@
 // `pibuz qconnect enable|disable|name`, `pibuz config path|show`
 // (02-cli-and-api.md §2.2). ALL ⬇ daemon-down capable (§2.4): every verb here
 // reads/writes the daemon's REAL stores directly at the daemon roots
-// (`AudioSettingsStore::new_at`, `PlaybackPreferencesStore::new_at`,
-// `daemon_prefs`, the qconnect KV `_at` helpers — T9) and best-effort nudges a
-// running daemon via `POST /api/settings/reload` afterwards
+// (`AudioSettingsStore::new_at`, `daemon_prefs`, the qconnect KV `_at` helpers
+// — T9) and best-effort nudges a running daemon via `POST /api/settings/reload` afterwards
 // (`login::nudge_reload` — the same ping-then-reload pattern `login`/`logout`
 // already use), never the other way around (§1.1: the CLI holds no daemon
 // state of its own). Export/import land in T12.
@@ -30,7 +29,6 @@ use qbz_app::settings::bundle::{
     self, Bundle, DeviceChoice, ExportOptions, ImportOptions, ImportPlan, LiveSystem, ProfilePaths,
 };
 use qbz_app::settings::daemon_prefs;
-use qbz_app::settings::playback::{AutoplayMode, PlaybackPreferencesStore};
 use qbz_audio::settings::AudioSettingsStore;
 use qbz_audio::{AlsaPlugin, AudioBackendType, BackendManager};
 
@@ -54,7 +52,7 @@ pub enum ApplyClass {
 /// The canonical dotted-key table (NORMATIVE for this build): `settings show`
 /// lists exactly these, in this order; `settings set` accepts exactly these
 /// keys and nothing else. Domains: `audio.*` (`AudioSettingsStore`),
-/// `playback.*` (daemon_prefs.streaming_quality + `PlaybackPreferencesStore`),
+/// `playback.*` (daemon_prefs),
 /// `qconnect.*` (the daemon-root `qconnect_settings.db` KV, T9),
 /// `hooks.*` (daemon_prefs, CONSOLE ext).
 ///
@@ -76,6 +74,10 @@ pub enum ApplyClass {
 /// `settings::bundle` still imports and exports them, so a bundle exported by
 /// the desktop round-trips unchanged. What went is only this CLI's offer to set
 /// them. Do not re-add one without a consumer to point at.
+///
+/// Three more went later, from a store the daemon never read at all: the
+/// desktop's playback preferences. They are in [`IGNORED_KEYS`] rather than
+/// simply gone, because moOde sends two of them on every renderer start.
 const KEY_TABLE: &[(&str, ApplyClass)] = &[
     // --- audio (Reinit — 03-setup-tui.md §4.3's 9-field list) -------------
     ("audio.backend", ApplyClass::Reinit),
@@ -117,11 +119,8 @@ const KEY_TABLE: &[(&str, ApplyClass)] = &[
     ("audio.normalization_target_lufs", ApplyClass::Reload),
     ("audio.pw_force_bitperfect", ApplyClass::Reload),
     ("audio.reserve_dac_while_running", ApplyClass::Reload),
-    // --- playback (daemon_prefs + PlaybackPreferencesStore) ----------------
+    // --- playback (daemon_prefs) --------------------------------------------
     ("playback.quality", ApplyClass::None),
-    ("playback.autoplay", ApplyClass::None),
-    ("playback.persist_session", ApplyClass::None),
-    ("playback.resume_playback_position", ApplyClass::None),
     ("playback.mpris", ApplyClass::None),
     // --- qconnect (daemon-root qconnect_settings.db KV, T9) ----------------
     ("qconnect.device_name", ApplyClass::None),
@@ -137,6 +136,18 @@ const KEY_TABLE: &[(&str, ApplyClass)] = &[
     ("qconnect.pairing_port", ApplyClass::None),
     // --- hooks (daemon_prefs, CONSOLE ext) ----------------------------------
     ("hooks.script", ApplyClass::None),
+];
+
+/// Keys `settings set` accepts, warns about and otherwise ignores. They set
+/// the desktop's playback preferences (autoplay, restore the last session,
+/// resume its position), which nothing in pibuz ever read. moOde's
+/// `renderer.php` still sends `persist_session` and `resume_playback_position`
+/// on every renderer start, so refusing them would turn two harmless lines
+/// into two errors in its log. Delete this once moOde stops sending them.
+const IGNORED_KEYS: &[&str] = &[
+    "playback.autoplay",
+    "playback.persist_session",
+    "playback.resume_playback_position",
 ];
 
 fn classify(key: &str) -> Option<ApplyClass> {
@@ -479,18 +490,6 @@ fn parse_streaming_quality(v: &str) -> Result<String, String> {
     }
 }
 
-fn parse_autoplay(v: &str) -> Result<AutoplayMode, String> {
-    serde_json::from_value(serde_json::Value::String(v.to_string())).map_err(|_| {
-        format!("invalid autoplay mode '{v}' — expected one of: continue, track_only, infinite")
-    })
-}
-fn render_autoplay(mode: AutoplayMode) -> String {
-    serde_json::to_value(mode)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_string))
-        .unwrap_or_else(|| "continue".to_string())
-}
-
 fn parse_volume_mode(v: &str) -> Result<String, String> {
     match v.to_ascii_lowercase().as_str() {
         "software" | "locked" | "external" => Ok(v.to_ascii_lowercase()),
@@ -505,15 +504,11 @@ fn parse_volume_mode(v: &str) -> Result<String, String> {
 fn open_audio(roots: &ProfileRoots) -> Result<AudioSettingsStore, String> {
     AudioSettingsStore::new_at(&roots.data)
 }
-fn open_playback(roots: &ProfileRoots) -> Result<PlaybackPreferencesStore, String> {
-    PlaybackPreferencesStore::new_at(&roots.data)
-}
 
 /// Read every canonical key's current value, in [`KEY_TABLE`] order — the
 /// backing for `settings show`. Opens each store once (not once per key).
 fn read_all(roots: &ProfileRoots) -> Result<Vec<(&'static str, String)>, String> {
     let audio = open_audio(roots)?.get_settings()?;
-    let playback = open_playback(roots)?.get_preferences()?;
     let prefs = daemon_prefs::load_at(&roots.data);
     let db = qconnect_db(roots);
 
@@ -588,9 +583,6 @@ fn read_all(roots: &ProfileRoots) -> Result<Vec<(&'static str, String)>, String>
             "audio.pw_force_bitperfect" => render_bool(audio.pw_force_bitperfect),
             "audio.reserve_dac_while_running" => render_bool(audio.reserve_dac_while_running),
             "playback.quality" => prefs.streaming_quality.clone(),
-            "playback.autoplay" => render_autoplay(playback.autoplay_mode),
-            "playback.persist_session" => render_bool(playback.persist_session),
-            "playback.resume_playback_position" => render_bool(playback.resume_playback_position),
             "playback.mpris" => render_bool(prefs.mpris_enabled),
             "qconnect.device_name" => render_opt_string(&qconnect_kv::load_device_name_at(&db)),
             "qconnect.startup_mode" => qconnect_kv::load_startup_mode_at(&db).as_str().to_string(),
@@ -842,27 +834,6 @@ pub(crate) fn write_one(
             prefs.mpris_enabled = v;
             daemon_prefs::save_at(&prefs, &roots.data).map_err(SetError::Io)?;
         }
-        "playback.autoplay" => {
-            let v = parse_autoplay(raw).map_err(SetError::Usage)?;
-            open_playback(roots)
-                .map_err(SetError::Io)?
-                .set_autoplay_mode(v)
-                .map_err(SetError::Io)?
-        }
-        "playback.persist_session" => {
-            let v = parse_bool(raw).map_err(SetError::Usage)?;
-            open_playback(roots)
-                .map_err(SetError::Io)?
-                .set_persist_session(v)
-                .map_err(SetError::Io)?
-        }
-        "playback.resume_playback_position" => {
-            let v = parse_bool(raw).map_err(SetError::Usage)?;
-            open_playback(roots)
-                .map_err(SetError::Io)?
-                .set_resume_playback_position(v)
-                .map_err(SetError::Io)?
-        }
         "qconnect.device_name" => qconnect_kv::persist_device_name_at(
             &qconnect_db(roots),
             parse_output_device(raw).as_deref(),
@@ -985,6 +956,12 @@ pub fn show(json: bool, roots: &ProfileRoots) -> i32 {
 /// `changes apply when the daemon starts` (this task's brief, verbatim)
 /// instead of failing.
 pub fn set(roots: &ProfileRoots, key: &str, value: &str) -> i32 {
+    if IGNORED_KEYS.contains(&key) {
+        eprintln!(
+            "warning: {key} has no effect in pibuz and is ignored; a future release will refuse it"
+        );
+        return 0;
+    }
     let class = match write_one(roots, key, value) {
         Ok(c) => c,
         Err(SetError::Usage(e)) => {
@@ -1525,6 +1502,20 @@ mod tests {
     // ------------------------- key table integrity -------------------------
 
     #[test]
+    fn ignored_keys_succeed_without_writing_and_are_not_shown() {
+        let roots = scratch_roots("ignored-keys");
+        for key in IGNORED_KEYS {
+            assert_eq!(set(&roots, key, "false"), 0, "{key} must still exit 0");
+            assert!(classify(key).is_none(), "{key} must not be a real key");
+        }
+        assert!(
+            !roots.data.exists(),
+            "an ignored key must not create or write any store"
+        );
+        cleanup(&roots);
+    }
+
+    #[test]
     fn unknown_key_is_rejected_and_lists_every_valid_key() {
         let roots = scratch_roots("unknown-key");
         let err = write_one(&roots, "audio.bogus", "x").unwrap_err();
@@ -1667,7 +1658,6 @@ mod tests {
         write_one(&roots, "audio.backend", "alsa").expect("set backend");
         write_one(&roots, "audio.exclusive_mode", "true").expect("set exclusive");
         write_one(&roots, "playback.quality", "cd").expect("set quality");
-        write_one(&roots, "playback.autoplay", "track_only").expect("set autoplay");
         write_one(&roots, "qconnect.device_name", "Kitchen").expect("set device name");
         write_one(&roots, "qconnect.startup_mode", "on").expect("set startup mode");
 
@@ -1676,7 +1666,6 @@ mod tests {
         assert_eq!(values["audio.backend"], "alsa");
         assert_eq!(values["audio.exclusive_mode"], "true");
         assert_eq!(values["playback.quality"], "cd");
-        assert_eq!(values["playback.autoplay"], "track_only");
         assert_eq!(values["qconnect.device_name"], "Kitchen");
         assert_eq!(values["qconnect.startup_mode"], "on");
         cleanup(&roots);
@@ -1811,23 +1800,6 @@ mod tests {
             parse_streaming_quality("hires192").is_err(),
             "not a real key — see report"
         );
-    }
-
-    #[test]
-    fn parse_autoplay_matches_the_playback_preferences_wire_values() {
-        assert_eq!(
-            parse_autoplay("continue").unwrap(),
-            AutoplayMode::ContinueWithinSource
-        );
-        assert_eq!(
-            parse_autoplay("track_only").unwrap(),
-            AutoplayMode::PlayTrackOnly
-        );
-        assert_eq!(
-            parse_autoplay("infinite").unwrap(),
-            AutoplayMode::InfiniteRadio
-        );
-        assert!(parse_autoplay("bogus").is_err());
     }
 
     #[test]

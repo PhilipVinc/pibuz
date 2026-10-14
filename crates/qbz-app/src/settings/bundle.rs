@@ -24,7 +24,6 @@ use qbz_audio::settings::{AudioSettings, AudioSettingsStore};
 use qbz_audio::AudioBackendType;
 
 use crate::settings::daemon_prefs;
-use crate::settings::playback::{PlaybackPreferences, PlaybackPreferencesStore};
 
 /// The bundle schema version this importer implements and this exporter writes
 /// (04 §1). Hard-gated on import (`plan` step 2, §5.6). v1 is the floor.
@@ -271,11 +270,6 @@ impl Bundle {
 pub fn export(paths: &ProfilePaths, _opts: &ExportOptions) -> Result<Bundle, BundleError> {
     let mut domains: Map<String, Value> = Map::new();
 
-    // playback — PlaybackPreferences (global playback_preferences.db)
-    if let Some(prefs) = read_playback_prefs(&paths.data_root) {
-        domains.insert("playback".into(), playback_to_json(&prefs));
-    }
-
     // audio — full-struct serde of AudioSettings (importer owns classification)
     if let Some(audio) = read_audio_settings(&paths.data_root) {
         if let Ok(v) = serde_json::to_value(&audio) {
@@ -417,7 +411,6 @@ pub fn apply(
 
     // group writes by store so each store opens once.
     let mut audio_writes: Vec<(&str, &Value)> = Vec::new();
-    let mut playback_writes: Vec<(&str, &Value)> = Vec::new();
     let mut prefs_quality: Option<&Value> = None;
     let mut qconnect_writes: Vec<(&str, &Value)> = Vec::new();
     let mut scrobbler_writes: Vec<(&str, &Value)> = Vec::new();
@@ -425,8 +418,6 @@ pub fn apply(
     for (key, value) in &plan.writes {
         if let Some(rest) = key.strip_prefix("audio.") {
             audio_writes.push((rest, value));
-        } else if let Some(rest) = key.strip_prefix("playback.") {
-            playback_writes.push((rest, value));
         } else if key == "prefs.streaming_quality" {
             prefs_quality = Some(value);
         } else if let Some(rest) = key.strip_prefix("qconnect.") {
@@ -440,14 +431,6 @@ pub fn apply(
         let r = apply_audio_writes(&target.data_root, &audio_writes);
         let failed = r.is_err();
         report.per_domain.push(("audio".into(), r.clone()));
-        if failed {
-            return Err(BundleError::Io(r.unwrap_err()));
-        }
-    }
-    if !playback_writes.is_empty() {
-        let r = apply_playback_writes(&target.data_root, &playback_writes);
-        let failed = r.is_err();
-        report.per_domain.push(("playback".into(), r.clone()));
         if failed {
             return Err(BundleError::Io(r.unwrap_err()));
         }
@@ -537,28 +520,23 @@ fn render_value(v: &Value) -> String {
     }
 }
 
-// ---- playback — all PORTABLE, applied verbatim (§2.1) ----
-const PLAYBACK_KEYS: &[&str] = &[
-    "autoplay_mode",
-    "show_context_icon",
-    "persist_session",
-    "resume_playback_position",
-];
+// ---- playback — the desktop's playback preferences (§2.1) ----
+// Autoplay, restore-last-session and resume-position. pibuz has no store for
+// them because it never read them, so a bundle carrying them gets them listed
+// as skipped rather than written somewhere nothing looks.
+const PLAYBACK_SKIP_WHY: &str = "no effect in pibuz (desktop playback preference)";
 
 fn plan_playback(value: &Value, plan: &mut ImportPlan) {
     let Some(map) = value.as_object() else {
         return;
     };
-    for (k, v) in map {
-        if k.eq_ignore_ascii_case("volume") {
-            plan.skipped
-                .push(skip_line(&format!("playback.{k}"), VOLUME_SKIP_WHY));
-        } else if PLAYBACK_KEYS.contains(&k.as_str()) {
-            applied_line(plan, &format!("playback.{k}"), v, "");
+    for k in map.keys() {
+        let why = if k.eq_ignore_ascii_case("volume") {
+            VOLUME_SKIP_WHY
         } else {
-            plan.skipped
-                .push(skip_line(&format!("playback.{k}"), UNKNOWN_WHY));
-        }
+            PLAYBACK_SKIP_WHY
+        };
+        plan.skipped.push(skip_line(&format!("playback.{k}"), why));
     }
 }
 
@@ -1197,24 +1175,6 @@ fn apply_audio_writes(data_root: &Path, writes: &[(&str, &Value)]) -> Result<(),
     Ok(())
 }
 
-fn apply_playback_writes(data_root: &Path, writes: &[(&str, &Value)]) -> Result<(), String> {
-    let store = PlaybackPreferencesStore::new_at(data_root)?;
-    for (key, value) in writes {
-        match *key {
-            "autoplay_mode" => {
-                let mode = serde_json::from_value((*value).clone())
-                    .map_err(|e| format!("autoplay_mode: {e}"))?;
-                store.set_autoplay_mode(mode)?;
-            }
-            "show_context_icon" => store.set_show_context_icon(as_bool(value))?,
-            "persist_session" => store.set_persist_session(as_bool(value))?,
-            "resume_playback_position" => store.set_resume_playback_position(as_bool(value))?,
-            other => log::warn!("[bundle] apply: unhandled playback key {other}"),
-        }
-    }
-    Ok(())
-}
-
 fn apply_prefs_quality(data_root: &Path, value: &Value) -> Result<(), String> {
     let mut prefs = daemon_prefs::load_at(data_root);
     if let Some(q) = value.as_str() {
@@ -1256,19 +1216,6 @@ fn read_audio_settings(data_root: &Path) -> Option<AudioSettings> {
     AudioSettingsStore::new_at(data_root)
         .and_then(|s| s.get_settings())
         .ok()
-}
-
-fn read_playback_prefs(data_root: &Path) -> Option<PlaybackPreferences> {
-    if !data_root.join("playback_preferences.db").exists() {
-        return None;
-    }
-    PlaybackPreferencesStore::new_at(data_root)
-        .and_then(|s| s.get_preferences())
-        .ok()
-}
-
-fn playback_to_json(p: &PlaybackPreferences) -> Value {
-    serde_json::to_value(p).unwrap_or(Value::Null)
 }
 
 fn read_qconnect_domain(data_root: &Path) -> Option<Value> {

@@ -19,7 +19,6 @@ use qbz_app::settings::bundle::{
     self, Bundle, ExportOptions, ImportOptions, LiveSystem, ProfilePaths,
 };
 use qbz_app::settings::daemon_prefs;
-use qbz_app::settings::playback::PlaybackPreferencesStore;
 use qbz_audio::settings::{AudioSettings, AudioSettingsStore};
 use qbz_audio::{AudioBackendType, AudioDevice, BackendManager, NegotiatedRate};
 
@@ -382,15 +381,11 @@ impl App {
             }
             Screen::Playback => {
                 let audio = load_audio(&self.roots);
-                let playback = PlaybackPreferencesStore::new_at(&self.roots.data)
-                    .and_then(|s| s.get_preferences())
-                    .unwrap_or_default();
                 let dp = daemon_prefs::load_at(&self.roots.data);
                 Active::Playback(PlaybackState::new(
                     &dp.streaming_quality,
                     dp.mpris_enabled,
                     &audio,
-                    &playback,
                 ))
             }
             Screen::QConnect => {
@@ -1663,7 +1658,6 @@ mod tests {
                 "hires_plus",
                 true,
                 &AudioSettings::default(),
-                &qbz_app::settings::playback::PlaybackPreferences::default(),
             )),
             Screen::QConnect => Active::QConnect(QConnectState::new(false, None, None)),
             Screen::Network => {
