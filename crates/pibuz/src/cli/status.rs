@@ -393,14 +393,17 @@ fn memory_section(b: &mut Block, p: &Value) {
     b.section("memory");
 
     if let Some(mem) = p.get("memory") {
-        let mut host = String::new();
-        if let Some(kb) = mem.get("total_kb").and_then(|v| v.as_u64()) {
-            host.push_str(&format!("{} RAM · ", fmt_bytes(kb.saturating_mul(1024))));
-        }
-        host.push_str(&format!(
-            "{} profile",
-            mem.get("class").and_then(|v| v.as_str()).unwrap_or("?")
-        ));
+        // The daemon's classes are "low" and "normal"; shown as low/high,
+        // which is the distinction the reader is after.
+        let profile = match mem.get("class").and_then(|v| v.as_str()) {
+            Some("normal") => "high memory profile".to_string(),
+            Some(class) => format!("{class} memory profile"),
+            None => "? memory profile".to_string(),
+        };
+        let mut host = match mem.get("total_kb").and_then(|v| v.as_u64()) {
+            Some(kb) => format!("{} RAM ({profile})", fmt_bytes(kb.saturating_mul(1024))),
+            None => profile,
+        };
         if mem.get("gapless_prefetch").and_then(|v| v.as_bool()) == Some(false) {
             host.push_str(" · no gapless");
         }
@@ -800,7 +803,7 @@ mod tests {
 
         let verbose = render(&healthy_payload(), "127.0.0.1:8182", true);
         assert!(
-            verbose.contains("host      3.8 GB RAM · normal profile"),
+            verbose.contains("host      3.8 GB RAM (high memory profile)"),
             "{verbose}"
         );
         assert!(
@@ -906,7 +909,7 @@ mod tests {
         let mut p = healthy_payload();
         p["memory"]["total_kb"] = Value::Null;
         let block = render(&p, "127.0.0.1:8182", true);
-        assert!(block.contains("host      normal profile"), "{block}");
+        assert!(block.contains("host      high memory profile"), "{block}");
         assert!(!block.contains("RAM"), "{block}");
     }
 
@@ -922,7 +925,7 @@ mod tests {
         p["memory"]["total_kb"] = Value::from(926_832);
         let block = render(&p, "127.0.0.1:8182", true);
         assert!(
-            block.contains("host      905 MB RAM · low profile"),
+            block.contains("host      905 MB RAM (low memory profile)"),
             "{block}"
         );
         assert!(!block.contains("Hi-Res"), "{block}");
