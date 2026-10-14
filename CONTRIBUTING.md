@@ -90,8 +90,8 @@ for the Pi without tagging.
    - Use an `external` branch name so it's obvious these commits are third-party authored:
    - `git branch -m <type>/external/<topic>`
 4. **Run checks**
-   - Build/validate a touched crate: `cargo check -p <crate>` (run from
-     `crates/`), or the whole workspace with `./scripts/cargo-test.sh`.
+   - Build/validate a touched crate: `cargo check -p <crate>`, or test the
+     whole workspace with `cargo test --workspace --no-fail-fast`.
 5. **Merge to main** — `git merge --no-ff <type>/external/<topic>`, then push.
 
 ### Merge strategy note (to preserve “external” authorship)

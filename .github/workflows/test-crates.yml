@@ -19,7 +19,6 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "clippy.toml"
-      - "scripts/cargo-test.sh"
       - ".github/workflows/test-crates.yml"
   push:
     branches: [main]
@@ -28,7 +27,6 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "clippy.toml"
-      - "scripts/cargo-test.sh"
       - ".github/workflows/test-crates.yml"
   workflow_dispatch:
 
@@ -107,7 +105,7 @@ jobs:
           cargo -V
           echo "::endgroup::"
           START=$(date +%s)
-          ./scripts/cargo-test.sh
+          cargo test --workspace --no-fail-fast
           END=$(date +%s)
           echo "cargo test wall time: $((END - START))s"
 
@@ -181,4 +179,4 @@ jobs:
         env:
           CARGO_TERM_COLOR: always
           RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
-        run: ./scripts/cargo-test.sh
+        run: cargo test --workspace --no-fail-fast

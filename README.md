@@ -53,7 +53,7 @@ The optional JACK output backend (`--features qbz-audio/jack`) also needs
 Tests (whole workspace):
 
 ```bash
-./scripts/cargo-test.sh
+cargo test --workspace --no-fail-fast
 ```
 
 ### aarch64 (Raspberry Pi)

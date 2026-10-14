@@ -60,7 +60,7 @@ tests use (`qbz_audio::VirtualAudioOut`) stays `pub`.
 
 ```bash
 cargo build --release -p pibuz
-./scripts/cargo-test.sh          # whole workspace, same command CI runs
+cargo test --workspace --no-fail-fast   # whole workspace, the command CI runs
 ./scripts/build-aarch64-pibuz.sh  # Pi binary: native on ARM, cross via Docker on x86-64
 ./scripts/pibuz-to-pi.sh          # copy to the Pi, restart the service
 ./scripts/pibuz-to-pi.sh --deb    # same, as a dpkg package moOde's renderer page detects
@@ -69,7 +69,7 @@ cargo build --release -p pibuz
 
 ## Tests and lints: the suite is GREEN, keep it that way
 
-`./scripts/cargo-test.sh` passes clean — 0 failures — on macOS and
+`cargo test --workspace` passes clean — 0 failures — on macOS and
 linux/arm64. `cargo clippy --workspace --all-targets -- -D warnings` is clean on
 both too, and CI enforces fmt + clippy + tests. **A failure is a regression.**
 
