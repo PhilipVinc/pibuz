@@ -31,6 +31,7 @@
 pub mod events;
 pub mod lenient;
 pub mod playback;
+pub mod settings_file;
 pub mod system_capabilities;
 pub mod traits;
 pub mod types;

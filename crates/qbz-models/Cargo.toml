@@ -17,6 +17,10 @@ async-trait = { workspace = true }
 # Logging
 log = { workspace = true }
 
+# settings.toml: parse and write it (toml), lock it across processes (libc flock)
+toml = "0.9"
+libc = "0.2"
+
 # Error handling
 
 # Time
