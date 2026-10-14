@@ -5,7 +5,9 @@
 #
 # Repo policy note: `main` is the trunk and the only branch releases are cut
 # from (release.yml refuses a tag that is not on main). This is the
-# workflow that keeps main green. Path-filtered so packaging/docs PRs skip it.
+# workflow that keeps main green. Path-filtered so packaging/docs PRs skip it;
+# the root manifest, lockfile and clippy.toml are in the filter, so a
+# dependency bump or a lint change is tested like a code change.
 
 name: test-crates
 
@@ -14,12 +16,18 @@ on:
     branches: [main]
     paths:
       - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "clippy.toml"
       - "scripts/cargo-test.sh"
       - ".github/workflows/test-crates.yml"
   push:
     branches: [main]
     paths:
       - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "clippy.toml"
       - "scripts/cargo-test.sh"
       - ".github/workflows/test-crates.yml"
   workflow_dispatch:
