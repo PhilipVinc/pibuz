@@ -7,8 +7,7 @@ It was developed for integration with the moode operating system, but will run p
 
 Features:
 - Daemon + control CLI in one binary
-- HiFi wizard with copyable audio-stack config blocks (clipboard works over SSH)
-- MPRIS out of the box, live JSON events (`pibuz watch`), service files for systemd/OpenRC/runit
+- Live JSON events (`pibuz watch`), service files for systemd/OpenRC/runit
 - Event hooks: `pibuz settings set hooks.script /path/to/script` runs your script on
   playback/session events with `QBZ_*` environment variables — push integration for
   audio-box distros (moOde, Volumio, DIY setups), no polling required
@@ -24,8 +23,9 @@ Standard Cargo workspace — manifest at the repo root, members under `crates/`.
 cargo build --release -p pibuz        # -> target/release/pibuz
 ```
 
-System dependencies (Debian/Ubuntu): `build-essential pkg-config libasound2-dev
-libjack-jackd2-dev libdbus-1-dev libssl-dev`.
+System dependencies (Debian/Ubuntu): `build-essential pkg-config libasound2-dev`.
+The optional JACK output backend (`--features qbz-audio/jack`) also needs
+`libjack-jackd2-dev`.
 
 Tests (whole workspace):
 
