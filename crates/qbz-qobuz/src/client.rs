@@ -1002,6 +1002,8 @@ impl QobuzClient {
                     bit_depth: json["bit_depth"].as_u64().map(|v| v as u32),
                     track_id,
                     restrictions,
+                    sample: json["sample"].as_bool().unwrap_or(false),
+                    duration_secs: json["duration"].as_u64(),
                 })
             }
             StatusCode::BAD_REQUEST => Err(ApiError::InvalidAppSecret),
@@ -1040,10 +1042,24 @@ impl QobuzClient {
             log::info!("Trying quality: {:?}", quality);
             match self.get_stream_url(track_id, *quality).await {
                 Ok(url) if !url.has_restrictions() => {
-                    log::info!(
-                        "Got stream URL for requested quality format_id={}",
-                        quality.id()
-                    );
+                    if url.sample {
+                        let codes: Vec<&str> =
+                            url.restrictions.iter().map(|r| r.code.as_str()).collect();
+                        log::warn!(
+                            "Track {} is a {}s PREVIEW, not the track (format_id={}, restrictions: {:?})",
+                            track_id,
+                            url.duration_secs.unwrap_or(0),
+                            url.format_id,
+                            codes
+                        );
+                    } else {
+                        log::info!(
+                            "Got stream URL for quality {:?}: format_id={} {}",
+                            quality,
+                            url.format_id,
+                            url.mime_type
+                        );
+                    }
                     return Ok(url);
                 }
                 Ok(_) => {

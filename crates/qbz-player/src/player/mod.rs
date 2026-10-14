@@ -4245,7 +4245,16 @@ impl Player {
                             }
 
                             if let Some(ref engine) = *current_engine {
-                                engine.play();
+                                // A resume after the track ran out is a no-op:
+                                // the engine has nothing left, and claiming
+                                // `playing` here would freeze the clock on a
+                                // track that will never report its end again.
+                                if !engine.play() {
+                                    log::info!(
+                                        "Audio thread: resume ignored, the track has already ended"
+                                    );
+                                    return;
+                                }
                                 let current_pos = thread_state.position.load(Ordering::SeqCst);
                                 thread_state.start_playback_timer(current_pos);
                                 thread_state.is_playing.store(true, Ordering::SeqCst);
@@ -6045,7 +6054,9 @@ impl Player {
         // Store the legacy download in the cache for instant replay. Converted
         // once here, then shared with both the cache and the audio thread.
         let audio_data: TrackBytes = audio_data.into();
-        if !skip_cache {
+        // Never cache a preview: the cache is keyed by track id alone, so a
+        // later hit would replay the 30 s preview as if it were the track.
+        if !skip_cache && !stream_url.sample {
             self.audio_cache.insert(track_id, audio_data.clone());
         }
 
@@ -6162,6 +6173,15 @@ impl Player {
                     // so it goes through the same chooser: memory, card, or not
                     // at all. It used to land in a `Vec` whatever its size.
                     match client.get_stream_url_with_fallback(track_id, quality).await {
+                        Ok(stream_url) if stream_url.sample => {
+                            // Not the track, and keyed as if it were — see
+                            // `play_track`. It is fetched when it plays.
+                            log::info!(
+                                "[PREFETCH] Track {track_id} is only a preview, not prefetching it"
+                            );
+                            self.audio_cache.unmark_fetching(track_id);
+                            return Ok(());
+                        }
                         Ok(stream_url) => {
                             let choose = self.destination_chooser(track_id, "PREFETCH");
                             match qbz_qobuz::cmaf::download_plain_sized(
@@ -6478,6 +6498,13 @@ impl Player {
                 return None;
             }
         };
+        // Not a preview: it would land in a cache keyed as if it were the
+        // track. Left out, the current track ends and advances normally, and
+        // the preview is resolved then and played with its own length.
+        if stream_url.sample {
+            log::info!("[GAPLESS] Track {track_id} is only a preview, not fetching it");
+            return None;
+        }
         // The URL names the format, so a successor gapless cannot use is known
         // before a byte of it is fetched. The engine drops a rate change on the
         // floor (`format mismatch ... ignoring PlayNext`) — after the download,

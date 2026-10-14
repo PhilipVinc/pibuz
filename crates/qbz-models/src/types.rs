@@ -104,9 +104,30 @@ pub struct StreamUrl {
     pub bit_depth: Option<u32>,
     pub track_id: u64,
     pub restrictions: Vec<StreamRestriction>,
+    /// Qobuz's own `sample` flag: the URL is a preview, not the track. A track
+    /// the account cannot stream (`TrackRestrictedByPurchaseCredentials` — a
+    /// purchase-only release, say) answers EVERY quality with `200 OK`, a
+    /// playable MP3 URL, `format_id` 5 and `sample: true`.
+    #[serde(default)]
+    pub sample: bool,
+    /// The FILE's length in seconds, as `getFileUrl` states it. For a full
+    /// stream this is the catalog duration; for a preview it is the preview's
+    /// (30 s), which is the only length the player can honour.
+    #[serde(default)]
+    pub duration_secs: Option<u64>,
 }
 
 impl StreamUrl {
+    /// How long playback of THIS file runs: the preview's own length when it
+    /// is one, otherwise `catalog_secs`. A preview played against the catalog
+    /// length shows a progress bar that never reaches the end.
+    pub fn playable_duration_secs(&self, catalog_secs: u64) -> u64 {
+        match (self.sample, self.duration_secs) {
+            (true, Some(secs)) if secs > 0 => secs,
+            _ => catalog_secs,
+        }
+    }
+
     /// Check if the stream has restrictions that prevent playback
     pub fn has_restrictions(&self) -> bool {
         self.restrictions.iter().any(|r| {
