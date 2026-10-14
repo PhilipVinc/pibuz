@@ -16,7 +16,7 @@ use crate::paths::ProfileRoots;
 /// The frozen exit-code taxonomy. `exit_code()` is the ONLY source of
 /// a networked verb's process exit code; scripts encode these numbers forever.
 #[derive(Debug)]
-pub enum CliError {
+pub(crate) enum CliError {
     /// exit 3 — connect refused / timeout on the target (carries `host` for the
     /// daemon-down copy).
     Unreachable(String),
@@ -31,7 +31,7 @@ pub enum CliError {
 }
 
 impl CliError {
-    pub fn exit_code(&self) -> i32 {
+    pub(crate) fn exit_code(&self) -> i32 {
         match self {
             CliError::Runtime(_) | CliError::ApiSkew { .. } => 1,
             CliError::Unreachable(_) => 3,
@@ -68,15 +68,15 @@ impl std::error::Error for CliError {}
 
 /// A resolved target host + whether it is the local daemon (governs whether the
 /// local `pibuz.toml` token and the linger check apply).
-pub struct Target {
-    pub addr: String,
+pub(crate) struct Target {
+    pub(crate) addr: String,
     pub is_local: bool,
 }
 
 /// Target discovery: `--host` > `QBZD_HOST` > local `127.0.0.1:8182`. An
 /// explicit override (flag or env) is treated as remote — only the local
 /// default reads the local token / runs the linger check.
-pub fn resolve_host(flag: Option<String>) -> Target {
+pub(crate) fn resolve_host(flag: Option<String>) -> Target {
     if let Some(h) = flag.filter(|h| !h.is_empty()) {
         return Target {
             addr: normalize_hostport(&h),
@@ -123,7 +123,7 @@ pub(crate) fn resolve_token(target: &Target, roots: &ProfileRoots) -> Option<Str
 }
 
 /// A thin skin over one HTTP request to the daemon.
-pub struct ApiClient {
+pub(crate) struct ApiClient {
     base: String,
     host: String,
     is_local: bool,
@@ -151,7 +151,7 @@ impl ApiClient {
     }
 
     /// The target `ip:port` (for the daemon-down copy + the status header line).
-    pub fn host(&self) -> &str {
+    pub(crate) fn host(&self) -> &str {
         &self.host
     }
 
@@ -167,7 +167,7 @@ impl ApiClient {
 
     /// Mutation transport — consumed by the transport verbs
     /// (play/pause/toggle/stop/next/prev/seek/volume/mute).
-    pub async fn post(&self, path: &str, body: Value) -> Result<Value, CliError> {
+    pub(crate) async fn post(&self, path: &str, body: Value) -> Result<Value, CliError> {
         let req = self.bearer(
             self.client
                 .post(format!("{}{}", self.base, path))

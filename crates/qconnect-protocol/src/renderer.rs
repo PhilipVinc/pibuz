@@ -14,7 +14,7 @@ pub enum RendererCommandType {
 }
 
 impl RendererCommandType {
-    pub const fn as_message_type(self) -> &'static str {
+    pub(crate) const fn as_message_type(self) -> &'static str {
         match self {
             Self::SrvrRndrSetState => "MESSAGE_TYPE_SRVR_RNDR_SET_STATE",
             Self::SrvrRndrSetVolume => "MESSAGE_TYPE_SRVR_RNDR_SET_VOLUME",
@@ -54,7 +54,7 @@ pub enum RendererReportType {
 }
 
 impl RendererReportType {
-    pub const fn as_message_type(self) -> &'static str {
+    pub(crate) const fn as_message_type(self) -> &'static str {
         match self {
             Self::RndrSrvrJoinSession => "MESSAGE_TYPE_RNDR_SRVR_JOIN_SESSION",
             Self::RndrSrvrDeviceInfoUpdated => "MESSAGE_TYPE_RNDR_SRVR_DEVICE_INFO_UPDATED",
@@ -77,7 +77,7 @@ impl RendererReportType {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RendererReport {
-    pub report_type: RendererReportType,
+    pub(crate) report_type: RendererReportType,
     pub action_uuid: String,
     pub queue_version_ref: QueueVersion,
     #[serde(default)]

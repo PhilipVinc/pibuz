@@ -42,7 +42,7 @@ pub enum QconnectLifecycleState {
 /// Playing-state wire value for PLAYING (the renderer reports
 /// playing_state == 2 while actively playing). `pub(crate)` so the
 /// session-apply/watchdog logic in `app.rs` reads the same constant.
-pub(crate) const PLAYING_STATE_PLAYING: i32 = 2;
+pub const PLAYING_STATE_PLAYING: i32 = 2;
 
 /// Playing-state wire value for UNKNOWN (== 0). The freeze path stamps a dead
 /// renderer's cached `playing_state` to UNKNOWN so the projection stops lying.
@@ -52,18 +52,21 @@ pub(crate) const PLAYING_STATE_UNKNOWN: i32 = 0;
 /// runtime is a controller request, a join after a transport drop carries the
 /// reconnection reason so the server treats it as session continuity rather
 /// than a brand-new controller.
-pub const JOIN_SESSION_REASON_CONTROLLER_REQUEST: i32 = 1;
+pub(crate) const JOIN_SESSION_REASON_CONTROLLER_REQUEST: i32 = 1;
 pub const JOIN_SESSION_REASON_RECONNECTION: i32 = 2;
 
 /// Official "renderer LOST" silence budget. A *playing* active peer renderer
 /// that sends no RENDERER_STATE_UPDATED for this long is considered
 /// unreachable (webplayer arms setTimeout(...,12e3) on onPlayerStateUpdated
 /// while playingState==PLAY).
-pub const QCONNECT_RENDERER_LOST_TIMEOUT_MS: u64 = 12_000;
+pub(crate) const QCONNECT_RENDERER_LOST_TIMEOUT_MS: u64 = 12_000;
 
 /// Pure arming predicate for the renderer-liveness watchdog: arm only while the
 /// active renderer is a peer AND its reported playing_state is PLAYING.
-pub fn should_arm_renderer_watchdog(playing_state: Option<i32>, is_active_peer: bool) -> bool {
+pub(crate) fn should_arm_renderer_watchdog(
+    playing_state: Option<i32>,
+    is_active_peer: bool,
+) -> bool {
     is_active_peer && playing_state == Some(PLAYING_STATE_PLAYING)
 }
 
@@ -80,13 +83,13 @@ pub fn should_arm_renderer_watchdog(playing_state: Option<i32>, is_active_peer: 
 /// grab an idle session uninvited.) Nor does it ever
 /// push its own queue on connect: the cloud's queue is the truth, and the local
 /// one is only a copy of an earlier session's.
-pub fn should_reclaim_render(was_active: bool, server_idle: bool) -> bool {
+pub(crate) fn should_reclaim_render(was_active: bool, server_idle: bool) -> bool {
     was_active && server_idle
 }
 
 /// Pure selector for the JoinSession `reason`: a post-drop rejoin carries
 /// RECONNECTION, the first join from a fresh runtime carries CONTROLLER_REQUEST.
-pub fn deferred_join_reason(has_disconnected: bool) -> i32 {
+pub(crate) fn deferred_join_reason(has_disconnected: bool) -> i32 {
     if has_disconnected {
         JOIN_SESSION_REASON_RECONNECTION
     } else {
@@ -97,7 +100,7 @@ pub fn deferred_join_reason(has_disconnected: bool) -> i32 {
 /// Pure predicate: keep re-asking for queue state after a Lagged
 /// broadcast drop until the session_uuid is confirmed or the attempt budget is
 /// spent. Stops immediately once the session_uuid is known.
-pub fn should_reask_queue_state(
+pub(crate) fn should_reask_queue_state(
     session_uuid_known: bool,
     attempts: u32,
     max_attempts: u32,
@@ -112,14 +115,14 @@ pub fn should_reask_queue_state(
 /// map to INACTIVE.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum RendererStatus {
+pub(crate) enum RendererStatus {
     ActiveConnected,
     ActiveDisconnected,
     Inactive,
 }
 
 impl RendererStatus {
-    pub fn from_wire(value: Option<i64>) -> Self {
+    pub(crate) fn from_wire(value: Option<i64>) -> Self {
         match value {
             Some(1) => Self::ActiveConnected,
             Some(2) => Self::ActiveDisconnected,
@@ -135,7 +138,7 @@ impl RendererStatus {
 /// 4 ~ Hi-Res (>96kHz), 5/None ~ uncapped. The qbz `Quality` enum only has
 /// four variants (Mp3, Lossless, HiRes, UltraHiRes), so 4 and uncapped both
 /// resolve to UltraHiRes.
-pub fn quality_from_max_audio_quality(level: Option<i32>) -> Quality {
+pub(crate) fn quality_from_max_audio_quality(level: Option<i32>) -> Quality {
     match level {
         Some(l) if l <= 1 => Quality::Mp3,
         Some(2) => Quality::Lossless,
@@ -149,7 +152,7 @@ pub fn quality_from_max_audio_quality(level: Option<i32>) -> Quality {
 /// tiers can be compared. Spelled out rather than leaning on the enum's
 /// discriminants (5/6/7/27), which happen to sort correctly today but are Qobuz
 /// format ids, not a rank.
-pub fn quality_tier(quality: Quality) -> u8 {
+pub(crate) fn quality_tier(quality: Quality) -> u8 {
     match quality {
         Quality::Mp3 => 0,
         Quality::Lossless => 1,
@@ -165,7 +168,7 @@ pub fn quality_tier(quality: Quality) -> u8 {
 /// at CD (upstream#693 — the local cap was applied only on the local playback
 /// path, so casting bypassed it entirely). `cap` of `None` means uncapped, and a
 /// cap ABOVE the request never upgrades it — the lower of the two always wins.
-pub fn cap_quality(requested: Quality, cap: Option<Quality>) -> Quality {
+pub(crate) fn cap_quality(requested: Quality, cap: Option<Quality>) -> Quality {
     match cap {
         Some(cap) if quality_tier(cap) < quality_tier(requested) => cap,
         _ => requested,
@@ -187,7 +190,7 @@ pub struct QconnectSessionRendererState {
     pub active: Option<bool>,
     pub playing_state: Option<i32>,
     pub current_position_ms: Option<u64>,
-    pub current_queue_item_id: Option<u64>,
+    pub(crate) current_queue_item_id: Option<u64>,
     pub volume: Option<i32>,
     pub muted: Option<bool>,
     pub max_audio_quality: Option<i32>,
@@ -200,16 +203,16 @@ pub struct QconnectSessionRendererState {
 /// who is in the session, who is active, and which renderer is us.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct QconnectSessionState {
-    pub session_uuid: Option<String>,
+    pub(crate) session_uuid: Option<String>,
     pub active_renderer_id: Option<i32>,
     pub local_renderer_id: Option<i32>,
-    pub renderers: Vec<QconnectRendererInfo>,
+    pub(crate) renderers: Vec<QconnectRendererInfo>,
 }
 
 /// One renderer registered in the QConnect session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QconnectRendererInfo {
-    pub renderer_id: i32,
+pub(crate) struct QconnectRendererInfo {
+    pub(crate) renderer_id: i32,
     pub device_uuid: Option<String>,
     pub friendly_name: Option<String>,
     pub brand: Option<String>,
@@ -218,7 +221,7 @@ pub struct QconnectRendererInfo {
     /// capabilities.volume_remote_control: 1 == NOT_ALLOWED, 2 == ALLOWED (the
     /// web player's enum). None == not advertised.
     #[serde(default)]
-    pub volume_remote_control: Option<i32>,
+    pub(crate) volume_remote_control: Option<i32>,
 }
 
 /// Resolved local-device identity injected by the host into the session layer.
@@ -246,7 +249,10 @@ pub struct QconnectFileAudioQualitySnapshot {
 /// Resolve the local renderer id within the session by matching the injected
 /// local identity: first by exact device_uuid, then by a unique device
 /// fingerprint (name+brand+model+type), then a looser name+type fingerprint.
-pub fn refresh_local_renderer_id(session: &mut QconnectSessionState, identity: &LocalIdentity) {
+pub(crate) fn refresh_local_renderer_id(
+    session: &mut QconnectSessionState,
+    identity: &LocalIdentity,
+) {
     if let Some(renderer_id) = session
         .renderers
         .iter()
@@ -286,7 +292,7 @@ pub fn refresh_local_renderer_id(session: &mut QconnectSessionState, identity: &
     session.local_renderer_id = None;
 }
 
-pub fn normalize_active_renderer_id(value: Option<i64>) -> Option<i32> {
+pub(crate) fn normalize_active_renderer_id(value: Option<i64>) -> Option<i32> {
     value
         .filter(|renderer_id| *renderer_id >= 0)
         .and_then(|renderer_id| i32::try_from(renderer_id).ok())
@@ -336,7 +342,7 @@ pub fn is_local_renderer_active(session: &QconnectSessionState) -> bool {
     local_renderer_role(session).unwrap_or(false)
 }
 
-pub fn find_unique_renderer_id(
+pub(crate) fn find_unique_renderer_id(
     session: &QconnectSessionState,
     predicate: impl Fn(&QconnectRendererInfo) -> bool,
 ) -> Option<i32> {
@@ -361,7 +367,7 @@ pub fn find_unique_renderer_id(
 
 /// Snapshot the queue item a cursor points at, normalizing the queue_item_id for
 /// in-queue cursors (autoplay items carry their own id verbatim).
-pub fn queue_item_snapshot_for_cursor(
+pub(crate) fn queue_item_snapshot_for_cursor(
     queue: &QConnectQueueState,
     cursor: QconnectOrderedQueueCursor,
 ) -> Option<QueueItem> {

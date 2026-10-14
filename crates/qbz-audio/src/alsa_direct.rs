@@ -3,6 +3,14 @@
 //! Provides bit-perfect playback for hw:X,Y devices that CPAL cannot open.
 //! This module bypasses rodio/CPAL completely for direct hardware access.
 
+// The stream is Linux-only; elsewhere this module's pure helpers compile only
+// so their unit tests run, and nothing else calls them. Linux builds keep the
+// full dead-code check.
+#![cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "only the Linux ALSA stream calls these helpers")
+)]
+
 #[cfg(target_os = "linux")]
 use alsa::pcm::{Access, Format, Frames, HwParams, PCM};
 #[cfg(target_os = "linux")]
@@ -85,7 +93,7 @@ pub fn dac_keepalive_ms() -> u32 {
 ///
 /// The depth costs nothing where it is spent: at a gap, the next track's audio
 /// simply queues behind the silence. It is not start-up latency.
-pub fn resolve_keepalive_depth_ms(configured_ms: u32, ring_ms: u32) -> u32 {
+pub(crate) fn resolve_keepalive_depth_ms(configured_ms: u32, ring_ms: u32) -> u32 {
     if configured_ms == 0 {
         return 0;
     }
@@ -118,14 +126,8 @@ fn buffer_frames_for(sample_rate: u32) -> Frames {
 #[cfg(target_os = "linux")]
 const PERIODS_PER_BUFFER: Frames = 4;
 
-/// Log a PCM recovery and record it as a network-throttle underrun signal.
-///
-/// Each call to ALSA's `pcm.recover()` that returns successfully indicates
-/// that the writer thread fell behind the kernel's playback buffer — i.e.
-/// an audio underrun. The network throttle treats this as the strongest
-/// possible "slow down" signal and immediately drops the prefetch cap to
-/// zero for `PANIC_WINDOW_SECS`, so the live stream gets the full pipe to
-/// recover.
+/// Log a PCM recovery: a `pcm.recover()` that succeeded means the writer
+/// thread fell behind the kernel's playback buffer, an audio underrun.
 #[cfg(target_os = "linux")]
 fn log_pcm_recovery(suffix: &str) {
     if suffix.is_empty() {
@@ -133,7 +135,6 @@ fn log_pcm_recovery(suffix: &str) {
     } else {
         log::warn!("[ALSA Direct] Recovered from PCM error {}", suffix);
     }
-    crate::network_throttle::state().record_underrun();
 }
 
 /// Recover a failed write. `snd_pcm_recover` handles EPIPE/ESTRPIPE but NOT
@@ -279,7 +280,7 @@ fn ensure_exact_rate(hwp: &HwParams<'_>, requested: u32, kind: &str) -> Result<(
 /// the byte order of every sample — beyond the reach of a test on any other
 /// machine. This enum costs one `match` and makes it testable everywhere.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum SampleLayout {
+pub(crate) enum SampleLayout {
     /// 32-bit float, native range.
     F32Le,
     /// 32-bit signed.
@@ -299,7 +300,7 @@ impl SampleLayout {
     /// Linux-only because `alsa::Format` is; the enum itself stays portable so
     /// the byte-order arithmetic can be tested anywhere.
     #[cfg(target_os = "linux")]
-    pub fn for_format(format: Format) -> Option<Self> {
+    pub(crate) fn for_format(format: Format) -> Option<Self> {
         match format {
             Format::FloatLE => Some(SampleLayout::F32Le),
             Format::S32LE => Some(SampleLayout::S32Le),
@@ -320,7 +321,7 @@ impl SampleLayout {
     /// which is noise or a wrong depth, not an error. `as_format_round_trips_through_for_format`
     /// is what catches that.
     #[cfg(target_os = "linux")]
-    pub fn as_format(self) -> Format {
+    pub(crate) fn as_format(self) -> Format {
         match self {
             SampleLayout::F32Le => Format::FloatLE,
             SampleLayout::S32Le => Format::S32LE,
@@ -332,7 +333,7 @@ impl SampleLayout {
 
     /// The name `snd_pcm_format_name` would print, so a log line and a
     /// libasound message about the same format read the same.
-    pub fn alsa_name(self) -> &'static str {
+    pub(crate) fn alsa_name(self) -> &'static str {
         match self {
             SampleLayout::F32Le => "FLOAT_LE",
             SampleLayout::S32Le => "S32_LE",
@@ -355,7 +356,7 @@ impl SampleLayout {
     ///
     /// Only a preference, never a requirement: nothing here refuses to play.
     /// See [`FormatRegime::formats`] for what it is used for and why.
-    pub fn is_meter_readable(self) -> bool {
+    pub(crate) fn is_meter_readable(self) -> bool {
         match self {
             SampleLayout::S32Le | SampleLayout::S24Le | SampleLayout::S16Le => true,
             SampleLayout::S24Le3 | SampleLayout::F32Le => false,
@@ -363,7 +364,7 @@ impl SampleLayout {
     }
 
     /// Bytes one sample occupies on the wire.
-    pub fn bytes_per_sample(self) -> usize {
+    pub(crate) fn bytes_per_sample(self) -> usize {
         match self {
             SampleLayout::F32Le | SampleLayout::S32Le | SampleLayout::S24Le => 4,
             SampleLayout::S24Le3 => 3,
@@ -378,7 +379,7 @@ impl SampleLayout {
 /// One classifier, so the format list and the log line that explains it cannot
 /// come to different conclusions about the same device.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum FormatRegime {
+pub(crate) enum FormatRegime {
     /// `hw:…` — the request reaches the kernel driver with nothing in between,
     /// so a refusal means the hardware genuinely cannot clock it. `set_format`
     /// is a PROBE and its answer is the truth.
@@ -407,7 +408,7 @@ impl FormatRegime {
     /// an open one, since `device_filter::is_probe_safe_pcm_id` reasons that
     /// their slave is always a kernel PCM while `raw_open_ids` records that
     /// snd-aloop's `front` routes through softvol.
-    pub fn of(device_id: &str) -> Self {
+    pub(crate) fn of(device_id: &str) -> Self {
         let raw_card = device_id
             .trim()
             .strip_prefix("hw:")
@@ -464,7 +465,7 @@ impl FormatRegime {
     /// Neither list may DROP a format. This is a preference, not a
     /// requirement, and a chain that accepts only the packed or float layout
     /// must still play.
-    pub fn formats(self) -> &'static [SampleLayout] {
+    pub(crate) fn formats(self) -> &'static [SampleLayout] {
         match self {
             FormatRegime::Probe => &[
                 SampleLayout::S24Le3,
@@ -504,7 +505,7 @@ impl FormatRegime {
 /// One place, five layouts. Each used to be its own arm with its own write and
 /// its own recovery, which is how duplicated paths in this codebase have
 /// repeatedly drifted apart.
-pub fn encode_into(layout: SampleLayout, samples: &[f32], out: &mut Vec<u8>) {
+pub(crate) fn encode_into(layout: SampleLayout, samples: &[f32], out: &mut Vec<u8>) {
     // APPENDS. Several callers reuse one hoisted buffer and `clear()` it
     // themselves; the fade builds its ramp and pad into the same `Vec`. The
     // base offset below is what makes that safe, and
@@ -565,7 +566,11 @@ pub fn encode_into(layout: SampleLayout, samples: &[f32], out: &mut Vec<u8>) {
 /// Bounding each step by `avail` is what makes the write interruptible — a
 /// `writei` that asks for no more than the reported space cannot block — so an
 /// error here would either reintroduce the hang or spin.
-pub fn frames_this_step(avail_frames: usize, remaining_bytes: usize, frame_bytes: usize) -> usize {
+pub(crate) fn frames_this_step(
+    avail_frames: usize,
+    remaining_bytes: usize,
+    frame_bytes: usize,
+) -> usize {
     if frame_bytes == 0 {
         return 0;
     }
@@ -581,7 +586,7 @@ pub fn frames_this_step(avail_frames: usize, remaining_bytes: usize, frame_bytes
 ///
 /// `None` when the device did not report a buffer size — nothing to compare
 /// against, and a made-up denominator would invent a fill level.
-pub fn ring_fill_pct(avail_frames: usize, buffer_frames: usize) -> Option<u8> {
+pub(crate) fn ring_fill_pct(avail_frames: usize, buffer_frames: usize) -> Option<u8> {
     if buffer_frames == 0 {
         return None;
     }
@@ -635,10 +640,10 @@ fn should_log_ring_fill(pct: u8, last_logged_ms: u64, now_ms: u64, every_ms: u64
 /// zero that step is a click — one after every song, at every sample rate,
 /// which is exactly how it was reported. Landing on silence first makes the
 /// stop happen from a settled state.
-pub const STOP_PAD_MS: u32 = 60;
+pub(crate) const STOP_PAD_MS: u32 = 60;
 
 /// Frames in a silence pad of `pad_ms` at `sample_rate`.
-pub fn pad_frames(sample_rate: u32, pad_ms: u32) -> usize {
+pub(crate) fn pad_frames(sample_rate: u32, pad_ms: u32) -> usize {
     ((u64::from(sample_rate) * u64::from(pad_ms)) / 1000) as usize
 }
 
@@ -653,7 +658,7 @@ pub fn pad_frames(sample_rate: u32, pad_ms: u32) -> usize {
 /// 10 ms is long enough that the ramp is inaudible as a fade and short enough
 /// that nobody hears the end of the track being shortened. It is the figure
 /// hardware mute circuits and every other renderer's fade-out use.
-pub const FADE_MS: u32 = 10;
+pub(crate) const FADE_MS: u32 = 10;
 
 /// Fill `out` with `frames` of a raised-cosine ramp from `from` down to silence.
 ///
@@ -666,7 +671,7 @@ pub const FADE_MS: u32 = 10;
 ///
 /// Interleaved, `from.len()` samples per frame. A `from` of all zeros yields
 /// silence, which is the right answer and costs nothing to compute.
-pub fn fade_ramp_into(from: &[f32], frames: usize, out: &mut Vec<f32>) {
+pub(crate) fn fade_ramp_into(from: &[f32], frames: usize, out: &mut Vec<f32>) {
     let channels = from.len();
     if channels == 0 || frames == 0 {
         return;
@@ -703,7 +708,7 @@ pub fn fade_ramp_into(from: &[f32], frames: usize, out: &mut Vec<f32>) {
 /// on the hosts that need the keep-alive most. So the keep-alive holds a thin
 /// floor of silence and nothing more: enough that the clock never stops,
 /// little enough that the wait it imposes on the next track is inaudible.
-pub fn silence_frames_needed(held_frames: usize, target_frames: usize) -> usize {
+pub(crate) fn silence_frames_needed(held_frames: usize, target_frames: usize) -> usize {
     target_frames.saturating_sub(held_frames)
 }
 
@@ -731,18 +736,18 @@ pub fn silence_frames_needed(held_frames: usize, target_frames: usize) -> usize 
 /// the `cfg(target_os = "linux")` block on purpose: the write path itself
 /// cannot be compiled or tested anywhere else, so the arithmetic is kept where
 /// it can be.
-pub fn f32_to_s16(sample: f32) -> i16 {
+pub(crate) fn f32_to_s16(sample: f32) -> i16 {
     (sample * 32_768.0).clamp(-32_768.0, 32_767.0) as i16
 }
 
 /// See [`f32_to_s16`]. 24-bit, in the low 24 bits of an `i32`.
-pub fn f32_to_s24(sample: f32) -> i32 {
+pub(crate) fn f32_to_s24(sample: f32) -> i32 {
     (sample * 8_388_608.0).clamp(-8_388_608.0, 8_388_607.0) as i32
 }
 
 /// See [`f32_to_s16`]. i32::MAX is not representable in f32 — a clamp to it
 /// would round up to 2^31 and do nothing — so the saturating cast is the guard.
-pub fn f32_to_s32(sample: f32) -> i32 {
+pub(crate) fn f32_to_s32(sample: f32) -> i32 {
     (sample * 2_147_483_648.0) as i32
 }
 
@@ -813,7 +818,7 @@ pub struct AlsaDirectStream {
 ///
 /// `None` for anything that does not name a card, virtual PCMs included: they
 /// have no mixer, and that is the case `alsa_mixer_device` exists to answer.
-pub fn mixer_ctl_name(device_id: &str) -> Option<String> {
+pub(crate) fn mixer_ctl_name(device_id: &str) -> Option<String> {
     let rest = device_id
         .strip_prefix("hw:")
         .or_else(|| device_id.strip_prefix("plughw:"))
@@ -1100,7 +1105,7 @@ impl AlsaDirectStream {
     /// reads as "nothing outstanding", which is the safe direction: the
     /// reported position can lag reality briefly, but never claims audio was
     /// heard that was not.
-    pub fn delay_frames(&self) -> usize {
+    pub(crate) fn delay_frames(&self) -> usize {
         let Ok(pcm) = self.pcm.lock() else {
             return 0;
         };
@@ -1134,7 +1139,7 @@ impl AlsaDirectStream {
     /// - the writer's prime deadline, for a source too slow to fill the ring.
     ///
     /// A no-op in every other state, so it is safe to call speculatively.
-    pub fn start_if_prepared(&self) -> Result<(), String> {
+    pub(crate) fn start_if_prepared(&self) -> Result<(), String> {
         let pcm = self
             .pcm
             .lock()
@@ -1192,11 +1197,11 @@ impl AlsaDirectStream {
     }
 
     /// The ring and period the driver granted, in frames.
-    pub fn buffer_frames(&self) -> usize {
+    pub(crate) fn buffer_frames(&self) -> usize {
         self.buffer_frames.max(0) as usize
     }
 
-    pub fn period_frames(&self) -> usize {
+    pub(crate) fn period_frames(&self) -> usize {
         self.period_frames.max(0) as usize
     }
 
@@ -1216,7 +1221,7 @@ impl AlsaDirectStream {
     /// Silence here is digital zero, which is silence in every PCM layout this
     /// path supports.
     #[cfg(target_os = "linux")]
-    pub fn write_silence_to_depth(
+    pub(crate) fn write_silence_to_depth(
         &self,
         target_ms: u32,
         cancel: &AtomicBool,
@@ -1441,7 +1446,7 @@ impl AlsaDirectStream {
     }
 
     /// Drain and stop playback
-    pub fn drain(&self) -> Result<(), String> {
+    pub(crate) fn drain(&self) -> Result<(), String> {
         // The end of a song is where this matters most. The drain below waits
         // for the queued tail to clock out, which it detects by the stream
         // UNDERRUNNING — and an underrun is the clock stopping on whatever
@@ -1606,7 +1611,7 @@ impl AlsaDirectStream {
     /// What this does remove is the xrun. Without it a pause simply stops
     /// writing: the device plays out a ring's worth of audio nobody asked for
     /// and then underruns, so every pause ends in a click.
-    pub fn discard_queued(&self) -> Result<(), String> {
+    pub(crate) fn discard_queued(&self) -> Result<(), String> {
         let pcm = self
             .pcm
             .lock()
@@ -1675,7 +1680,7 @@ impl AlsaDirectStream {
     /// Called after construction because the value comes from settings
     /// (`audio.alsa_mixer_device`) rather than from the PCM open. An empty or
     /// absent value leaves the mixer derived from the output device.
-    pub fn set_mixer_device(&mut self, device: Option<String>) {
+    pub(crate) fn set_mixer_device(&mut self, device: Option<String>) {
         self.mixer_device = device.filter(|d| !d.trim().is_empty());
     }
 
@@ -1746,7 +1751,7 @@ impl AlsaDirectStream {
 
     /// Check if device is a bit-perfect hardware device
     /// Includes: hw:X,Y, plughw:X,Y, and front:CARD=X,DEV=Y
-    pub fn is_hw_device(device_id: &str) -> bool {
+    pub(crate) fn is_hw_device(device_id: &str) -> bool {
         device_id.starts_with("hw:")
             || device_id.starts_with("plughw:")
             || device_id.starts_with("front:CARD=")
@@ -1792,27 +1797,27 @@ impl AlsaDirectStream {
         Err("ALSA Direct is only available on Linux".to_string())
     }
 
-    pub fn buffer_frames(&self) -> usize {
+    pub(crate) fn buffer_frames(&self) -> usize {
         0
     }
 
-    pub fn period_frames(&self) -> usize {
+    pub(crate) fn period_frames(&self) -> usize {
         0
     }
 
-    pub fn delay_frames(&self) -> usize {
+    pub(crate) fn delay_frames(&self) -> usize {
         0
     }
 
-    pub fn start_if_prepared(&self) -> Result<(), String> {
+    pub(crate) fn start_if_prepared(&self) -> Result<(), String> {
         Ok(())
     }
 
-    pub fn discard_queued(&self) -> Result<(), String> {
+    pub(crate) fn discard_queued(&self) -> Result<(), String> {
         Ok(())
     }
 
-    pub fn write_silence_to_depth(
+    pub(crate) fn write_silence_to_depth(
         &self,
         _target_ms: u32,
         _cancel: &std::sync::atomic::AtomicBool,
@@ -1820,7 +1825,7 @@ impl AlsaDirectStream {
         Ok(0)
     }
 
-    pub fn drain(&self) -> Result<(), String> {
+    pub(crate) fn drain(&self) -> Result<(), String> {
         Ok(())
     }
 
@@ -1837,7 +1842,7 @@ impl AlsaDirectStream {
     }
 
     /// Check if device is a bit-perfect hardware device (always false on non-Linux)
-    pub fn is_hw_device(_device_id: &str) -> bool {
+    pub(crate) fn is_hw_device(_device_id: &str) -> bool {
         false
     }
 
@@ -1845,7 +1850,7 @@ impl AlsaDirectStream {
         false
     }
 
-    pub fn set_mixer_device(&mut self, _device: Option<String>) {}
+    pub(crate) fn set_mixer_device(&mut self, _device: Option<String>) {}
 }
 
 #[cfg(all(test, target_os = "linux"))]

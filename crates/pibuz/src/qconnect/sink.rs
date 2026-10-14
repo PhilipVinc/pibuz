@@ -29,9 +29,9 @@ use super::engine::DaemonRendererEngine;
 use super::transport::resolve_local_identity;
 
 /// Concrete `QconnectApp` type used by the daemon adapter.
-pub type DaemonQconnectApp = QconnectApp<NativeWsTransport, DaemonEventSink>;
+pub(crate) type DaemonQconnectApp = QconnectApp<NativeWsTransport, DaemonEventSink>;
 
-pub struct DaemonEventSink {
+pub(crate) struct DaemonEventSink {
     /// Renderer seam — forwards the `qconnect_app::renderer` orchestration onto
     /// `runtime.core()` + the protected player.
     engine: DaemonRendererEngine,
@@ -86,7 +86,7 @@ impl DaemonEventSink {
     }
 
     /// Wire the owning app after construction. Idempotent (OnceLock).
-    pub fn set_app(&self, app: &Arc<DaemonQconnectApp>) {
+    pub(crate) fn set_app(&self, app: &Arc<DaemonQconnectApp>) {
         let _ = self.app.set(Arc::downgrade(app));
     }
 

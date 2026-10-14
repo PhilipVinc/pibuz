@@ -33,7 +33,7 @@ pub enum QueueEventType {
 }
 
 impl QueueEventType {
-    pub const fn as_message_type(self) -> &'static str {
+    pub(crate) const fn as_message_type(self) -> &'static str {
         match self {
             Self::SrvrCtrlQueueState => "MESSAGE_TYPE_SRVR_CTRL_QUEUE_STATE",
             Self::SrvrCtrlQueueTracksAdded => "MESSAGE_TYPE_SRVR_CTRL_QUEUE_TRACKS_ADDED",
@@ -122,7 +122,7 @@ pub enum ErrorType {
 }
 
 impl ErrorType {
-    pub fn from_wire(value: i32) -> Self {
+    pub(crate) fn from_wire(value: i32) -> Self {
         match value {
             1 => Self::TrackNotFound,
             2 => Self::TrackNotStreamable,

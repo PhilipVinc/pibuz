@@ -15,12 +15,12 @@ use std::future::Future;
 use std::time::Duration;
 
 /// Number of attempts: 1 initial try + 2 retries.
-pub const DEFAULT_MAX_ATTEMPTS: u32 = 3;
+pub(crate) const DEFAULT_MAX_ATTEMPTS: u32 = 3;
 
 /// A fetch error tagged with whether it is worth retrying. Used by the CMAF
 /// CDN fetch path, whose underlying errors are otherwise stringly-typed.
 #[derive(Debug)]
-pub enum FetchError {
+pub(crate) enum FetchError {
     /// Worth retrying: network/timeout/connect/body error, 5xx, or 429.
     Transient(String),
     /// Not worth retrying: 4xx (other than 429), or a definitive failure.
@@ -28,7 +28,7 @@ pub enum FetchError {
 }
 
 impl FetchError {
-    pub fn is_transient(&self) -> bool {
+    pub(crate) fn is_transient(&self) -> bool {
         matches!(self, FetchError::Transient(_))
     }
 }
@@ -43,14 +43,14 @@ impl std::fmt::Display for FetchError {
 
 /// True for reqwest errors worth retrying: timeout, connect, request-build,
 /// and body/decode errors are all transient transport-level problems.
-pub fn reqwest_is_transient(e: &reqwest::Error) -> bool {
+pub(crate) fn reqwest_is_transient(e: &reqwest::Error) -> bool {
     e.is_timeout() || e.is_connect() || e.is_request() || e.is_body()
 }
 
 /// Classify a reqwest error into a `FetchError`. All reqwest transport errors
 /// are treated as transient — a definitive "gone" answer comes back as a 404
 /// *status*, not a transport error.
-pub fn classify_reqwest(e: &reqwest::Error, context: &str) -> FetchError {
+pub(crate) fn classify_reqwest(e: &reqwest::Error, context: &str) -> FetchError {
     // Redacted, not raw: this wraps the CMAF segment fetch, whose URL carries
     // the signed token, and the message is logged.
     // The host is kept, so classification and diagnosis are unchanged.
@@ -63,7 +63,7 @@ pub fn classify_reqwest(e: &reqwest::Error, context: &str) -> FetchError {
 
 /// Classify a non-success HTTP status into a `FetchError`. 5xx and 429 are
 /// transient; everything else (404, 403, ...) is terminal.
-pub fn classify_status(status: reqwest::StatusCode, context: &str) -> FetchError {
+pub(crate) fn classify_status(status: reqwest::StatusCode, context: &str) -> FetchError {
     let msg = format!("{}: HTTP {}", context, status);
     if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
         FetchError::Transient(msg)
@@ -94,7 +94,7 @@ fn backoff_delay(attempt: u32) -> Duration {
 /// Run `op` (which takes the 1-based attempt number) and retry while it
 /// returns a transient error, sleeping with exponential backoff between
 /// attempts. Terminal errors and the final attempt return immediately.
-pub async fn retry_transient<F, Fut, T, E>(
+pub(crate) async fn retry_transient<F, Fut, T, E>(
     max_attempts: u32,
     log_tag: &str,
     is_transient: impl Fn(&E) -> bool,

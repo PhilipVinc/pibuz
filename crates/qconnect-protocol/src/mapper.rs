@@ -38,7 +38,7 @@ pub fn build_qconnect_outbound_envelope(
     Ok(envelope)
 }
 
-pub fn encode_queue_command_batch(command: &QueueCommand) -> Result<Vec<u8>, ProtocolError> {
+pub(crate) fn encode_queue_command_batch(command: &QueueCommand) -> Result<Vec<u8>, ProtocolError> {
     let message = map_queue_command(command)?;
     let batch = QConnectMessages {
         messages_time: Some(now_ms()),
@@ -64,7 +64,9 @@ pub fn build_qconnect_renderer_outbound_envelope(
     Ok(envelope)
 }
 
-pub fn encode_renderer_report_batch(report: &RendererReport) -> Result<Vec<u8>, ProtocolError> {
+pub(crate) fn encode_renderer_report_batch(
+    report: &RendererReport,
+) -> Result<Vec<u8>, ProtocolError> {
     let message = map_renderer_report(report)?;
     let batch = QConnectMessages {
         messages_time: Some(now_ms()),

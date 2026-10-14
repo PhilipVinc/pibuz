@@ -25,31 +25,36 @@ keep turning up: whole crates have gone because their only entry points took an
 argument every call site passed `None`. If a feature here looks orphaned, check
 whether anything actually calls it before assuming it is load-bearing.
 
-### Finding dead code: the probe
+### Visibility: `pub` means another crate uses it
 
-`pub fn` has NO dead-code lint — anything reachable from the crate root counts
-as used — so a grep is the only thing most sweeps have to go on, and a grep
-cannot see through `Type::name(...)` call syntax, serde attribute strings, or a
-same-named method on another type. Get the compiler to answer instead:
+`pub` items have NO dead-code lint: anything reachable from a crate root counts
+as used. So the tree keeps `pub` for what another crate actually uses and
+`pub(crate)` for everything else, and rustc's dead_code lint then covers the
+rest like any private item. **Default to `pub(crate)`;** reach for `pub` only
+when another crate needs the item.
 
-1. rewrite the candidates `pub fn` -> `pub(crate) fn` (a PROBE, reverted after),
-2. `cargo clippy --all-targets -- -D warnings`; dead_code now names the truly
-   unreachable ones, transitively and through serde attribute paths,
-3. **run the probe in the arm64 container too, and delete only the
-   INTERSECTION.** `dsd_mode` was reported dead on macOS and was live on Linux.
+`scripts/visibility-probe.sh` re-derives that split. It narrows every `pub`
+item, field, module and re-export to `pub(crate)`, then builds and puts back
+`pub` on each name rustc says another crate needs (`E0603`, `E0624`, `E0616`,
+`E0364`/`E0365`, `private_interfaces`) until the workspace builds, and prints
+what is left unused. Run it from a clean tree and review the diff:
 
-For a LIBRARY crate the same trick needs one more turn, because `pub` there is
-also the cross-crate API. Rewrite every `pub` item in the crate to `pub(crate)`,
-build the WHOLE workspace, and iterate: each round, put back to `pub` every name
-rustc names in an error (`E0603`, `E0364`/`E0365` for re-exports, and the plain
-`type ... is private` of `private_interfaces`), then rebuild. **Only once the
-workspace is at zero errors is the warning list meaningful** — before that, a
-still-private root drags its whole live call tree into the "dead" list with it.
+1. in the arm64 container (Linux compiles the ALSA code),
+2. then `scripts/visibility-probe.sh --resume` on macOS over the result (the
+   CoreAudio code), which only ever restores,
+3. **delete only what both platforms report.** `dsd_mode` was once reported
+   dead on macOS and was live on Linux.
+
+Modules whose callers are all Linux-only (`alsa_direct`) carry
+`cfg_attr(not(target_os = "linux"), allow(dead_code, reason = ...))`: their
+pure helpers still compile, and are unit-tested, everywhere, and Linux keeps
+the full check.
 
 Two classes the lint names that you should NOT delete: an item reachable only
 from other dead code (it goes when that does, not before), and an item whose
-only caller is a test that covers real behaviour — move the coverage rather than
-dropping it.
+only caller is a test that covers real behaviour — gate it `#[cfg(test)]`, or
+move the coverage, rather than dropping it. Test-harness API another crate's
+tests use (`qbz_audio::VirtualAudioOut`) stays `pub`.
 
 ## Commands
 

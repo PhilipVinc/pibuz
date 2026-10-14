@@ -2,9 +2,9 @@
 //!
 //! Queue and renderer-state domain primitives for Qobuz Connect.
 
-pub mod pending;
-pub mod queue;
-pub mod reducer;
+pub(crate) mod pending;
+pub(crate) mod queue;
+pub(crate) mod reducer;
 pub mod renderer;
 
 pub use pending::{PendingActionError, PendingActionSlot, PendingCorrelation, PendingQueueAction};

@@ -58,7 +58,7 @@ pub fn load(root: &Path) -> QconnectSettings {
 }
 
 /// Whether anything has ever written Connect settings here.
-pub fn exists(root: &Path) -> bool {
+pub(crate) fn exists(root: &Path) -> bool {
     legacy::migrate(root);
     settings_file::has_section(root, SECTION)
 }

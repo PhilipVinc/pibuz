@@ -79,7 +79,7 @@ impl ApiError {
     /// limiting. Terminal errors — a real 404 `TrackUnavailable`, auth or
     /// parse failures — return false and should propagate to the (bounded)
     /// skip path instead of being retried.
-    pub fn is_transient(&self) -> bool {
+    pub(crate) fn is_transient(&self) -> bool {
         match self {
             ApiError::NetworkError(e) => crate::retry::reqwest_is_transient(e),
             ApiError::RateLimited(_) | ApiError::ServerError(_) => true,

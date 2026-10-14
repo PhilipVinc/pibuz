@@ -12,9 +12,9 @@ use crate::redact;
 /// Wraps `env_logger`'s built `Logger` and tees every record to stderr and
 /// (optionally) the on-disk log file, with secret redaction applied once at this single
 /// write choke point. Both sinks receive the redacted text.
-pub struct TeeLogger {
+pub(crate) struct TeeLogger {
     pub(crate) inner: env_logger::Logger,
-    pub(crate) file: Option<Mutex<BufWriter<File>>>,
+    pub file: Option<Mutex<BufWriter<File>>>,
 }
 
 fn now_epoch_ms() -> i64 {

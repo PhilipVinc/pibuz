@@ -12,7 +12,7 @@ use std::time::Duration;
 /// from "daemon up but the reload was refused/500" (exit 1 with the restart
 /// hint) — a single bool conflates them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NudgeOutcome {
+pub(crate) enum NudgeOutcome {
     /// Ping answered and the reload returned 2xx.
     Reloaded,
     /// Ping did not answer — no daemon to nudge (never an error).
@@ -24,7 +24,7 @@ pub enum NudgeOutcome {
 /// Best-effort `GET /api/ping` → `POST /api/settings/reload` against a local
 /// daemon. `token` carries the opt-in `[server] token` as
 /// `Authorization: Bearer` when present.
-pub fn nudge_reload_outcome(host: &str, token: Option<&str>) -> NudgeOutcome {
+pub(crate) fn nudge_reload_outcome(host: &str, token: Option<&str>) -> NudgeOutcome {
     if !http_request_2xx(host, "GET", "/api/ping", token) {
         return NudgeOutcome::DaemonDown;
     }
@@ -39,7 +39,7 @@ pub fn nudge_reload_outcome(host: &str, token: Option<&str>) -> NudgeOutcome {
 /// "did a running daemon acknowledge?" (`settings set` and friends — they work
 /// daemon-down, so any non-reload is just "the daemon picks it up on next
 /// start").
-pub fn nudge_reload(host: &str, token: Option<&str>) -> bool {
+pub(crate) fn nudge_reload(host: &str, token: Option<&str>) -> bool {
     nudge_reload_outcome(host, token) == NudgeOutcome::Reloaded
 }
 

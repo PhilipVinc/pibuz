@@ -1,7 +1,7 @@
-pub mod crypto;
+pub(crate) mod crypto;
 pub mod error;
-pub mod map;
-pub mod parser;
+pub(crate) mod map;
+pub(crate) mod parser;
 pub mod vault;
 
 pub use crypto::{compute_request_sig, decrypt_frame, derive_session_key, unwrap_content_key};

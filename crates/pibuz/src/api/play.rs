@@ -33,7 +33,7 @@ use super::{err_json, json, ApiState};
 /// not their entire catalogue.
 const ARTIST_TOP_LIMIT: u32 = 50;
 
-pub fn play(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
+pub(crate) fn play(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
     let selector = match parse_selector(body) {
         Ok(s) => s,
         Err((message, hint)) => return err_json(400, "bad_request", &message, &hint),

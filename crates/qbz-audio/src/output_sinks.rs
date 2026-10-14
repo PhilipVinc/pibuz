@@ -19,12 +19,12 @@ pub struct OutputSinkInfo {
     pub name: String,
     /// User-friendly description. On PipeWire the CPAL name is already
     /// user-readable; on macOS/Windows the name itself is descriptive.
-    pub description: String,
+    pub(crate) description: String,
     /// Current volume percentage (0–100). CPAL does not expose this so
     /// it is always `None` here.
     pub volume: Option<u32>,
     /// Whether this is the default sink.
-    pub is_default: bool,
+    pub(crate) is_default: bool,
 }
 
 /// Resolve the CPAL `description().name()` for a device, returning `None`

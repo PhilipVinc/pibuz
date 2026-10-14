@@ -45,13 +45,13 @@ type Runtime = Arc<AppRuntime<DaemonAdapter>>;
 /// sync accumulator, the service inner (lifecycle gating + teardown + config
 /// re-latch), the sink (lifecycle emit), the runtime (track-duration + volume
 /// reads), and the daemon shared state (status latching for `/api/status`).
-pub struct DaemonSessionLoopHost {
-    pub app: Arc<DaemonQconnectApp>,
-    pub sync_state: Arc<Mutex<QconnectRemoteSyncState>>,
-    pub inner: Arc<Mutex<DaemonQconnectInner>>,
-    pub sink: Arc<DaemonEventSink>,
-    pub runtime: Runtime,
-    pub shared: Arc<std::sync::Mutex<DaemonShared>>,
+pub(crate) struct DaemonSessionLoopHost {
+    pub(crate) app: Arc<DaemonQconnectApp>,
+    pub(crate) sync_state: Arc<Mutex<QconnectRemoteSyncState>>,
+    pub(crate) inner: Arc<Mutex<DaemonQconnectInner>>,
+    pub(crate) sink: Arc<DaemonEventSink>,
+    pub(crate) runtime: Runtime,
+    pub(crate) shared: Arc<std::sync::Mutex<DaemonShared>>,
     /// Resolved volume policy — the deferred renderer join reports 100 in
     /// `Locked` mode, the real player volume otherwise.
     pub volume_mode: VolumeMode,
@@ -61,14 +61,14 @@ pub struct DaemonSessionLoopHost {
     pub initial_volume: Option<u8>,
     /// Pairing: reconnect credential re-resolve prefers a live
     /// handed-over token, mirroring the preference in `connect()`.
-    pub pairing_store: super::pairing::PairingStore,
+    pub(crate) pairing_store: super::pairing::PairingStore,
     /// Pairing: one-shot latch armed by a handoff takeover. The
     /// handoff IS the user's output selection, so the next renderer join must
     /// claim the active slot (official receivers join with is_active=true
     /// after a handoff — qobuz-proxy/StreamCore32 parity). Joining available
     /// leaves the session's active renderer pointing at the PREVIOUS output
     /// and the app's play command never reaches this device.
-    pub handoff_join_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) handoff_join_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[async_trait::async_trait]
@@ -167,7 +167,7 @@ impl SessionLoopHost for DaemonSessionLoopHost {
 /// Controller-side bootstrap: JoinSession (works without a session_uuid) then ask
 /// for the current queue state. The renderer-side join is deferred until the
 /// server sends SESSION_STATE with a session_uuid (handled in the session loop).
-pub async fn bootstrap_remote_presence(
+pub(crate) async fn bootstrap_remote_presence(
     app: &Arc<DaemonQconnectApp>,
     custom_device_name: Option<String>,
 ) -> Result<(), String> {
@@ -236,7 +236,7 @@ fn join_volume_fraction(initial_volume: Option<u8>, mode: VolumeMode) -> Option<
 /// session_uuid arrives. Idempotent per uuid. Reads the current track duration
 /// via `runtime.core().get_track` and the current volume via
 /// `runtime.core().get_playback_state()`.
-pub async fn deferred_renderer_join(
+pub(crate) async fn deferred_renderer_join(
     app: &Arc<DaemonQconnectApp>,
     sync_state: &Arc<Mutex<QconnectRemoteSyncState>>,
     runtime: &Runtime,

@@ -13,7 +13,7 @@
 pub mod install;
 mod line;
 pub mod redact;
-pub mod tee;
+pub(crate) mod tee;
 
 pub use install::install;
 pub use redact::{redact, register_secret};

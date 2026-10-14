@@ -13,14 +13,14 @@
 //! retry schedule. QConnect reads NOTHING from pibuz.toml — only the
 //! `[qconnect]` section of the data root's settings.toml.
 
-pub mod engine;
+pub(crate) mod engine;
 pub mod pairing;
-pub mod publish;
-pub mod remote_stream;
-pub mod report;
+pub(crate) mod publish;
+pub(crate) mod remote_stream;
+pub(crate) mod report;
 pub mod session;
-pub mod sink;
-pub mod transport;
+pub(crate) mod sink;
+pub(crate) mod transport;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -50,12 +50,12 @@ type SharedState = Arc<std::sync::Mutex<DaemonShared>>;
 /// The live QConnect runtime for one connected session (app + its config + the
 /// spawned event loop + the shared sync accumulator).
 pub(crate) struct DaemonQconnectRuntime {
-    pub app: Arc<DaemonQconnectApp>,
+    pub(crate) app: Arc<DaemonQconnectApp>,
     /// Re-latched by `bootstrap_after_reconnect` on a credential re-resolve;
     /// consumed by the full-reconnect path + status/endpoint reporting.
-    pub config: WsTransportConfig,
-    pub event_loop: JoinHandle<()>,
-    pub sync_state: Arc<Mutex<QconnectRemoteSyncState>>,
+    pub(crate) config: WsTransportConfig,
+    pub(crate) event_loop: JoinHandle<()>,
+    pub(crate) sync_state: Arc<Mutex<QconnectRemoteSyncState>>,
     /// This session's volume policy, for the volume publish (publish.rs).
     pub volume_mode: engine::VolumeMode,
 }
@@ -65,13 +65,13 @@ pub(crate) struct DaemonQconnectRuntime {
 /// reconnect-exhausted.
 #[derive(Default)]
 pub(crate) struct DaemonQconnectInner {
-    pub runtime: Option<DaemonQconnectRuntime>,
+    pub(crate) runtime: Option<DaemonQconnectRuntime>,
     /// Latched connect/loop error; surfaced by `pibuz status` QConnect block.
-    pub last_error: Option<String>,
-    pub lifecycle_state: QconnectLifecycleState,
+    pub(crate) last_error: Option<String>,
+    pub(crate) lifecycle_state: QconnectLifecycleState,
     /// Last local queue ids this session pushed to the cloud (the publish.rs
     /// echo latch). Cleared on every connect.
-    pub last_pushed_queue_ids: Option<Vec<u64>>,
+    pub(crate) last_pushed_queue_ids: Option<Vec<u64>>,
 }
 
 /// The configured `qconnect.volume_mode` (unset or unknown -> `Software`).
@@ -139,7 +139,7 @@ pub(crate) async fn update_lifecycle_state_if_running(
 }
 
 /// The headless QConnect connect service.
-pub struct DaemonQconnectService {
+pub(crate) struct DaemonQconnectService {
     inner: Arc<Mutex<DaemonQconnectInner>>,
     runtime: Runtime,
     shared: SharedState,
@@ -528,7 +528,7 @@ impl DaemonQconnectService {
 
 /// Owner handle held by the daemon boot for the process lifetime. Drives runtime
 /// enable/disable and the ordered shutdown.
-pub struct QconnectHandle {
+pub(crate) struct QconnectHandle {
     service: Arc<DaemonQconnectService>,
     watcher: Option<JoinHandle<()>>,
     /// The local pairing surface (mDNS + /streamcore listener). Shut down FIRST
@@ -556,7 +556,7 @@ pub struct QconnectHandle {
 /// already in the target state), so the reload path can call either
 /// unconditionally without checking current status first.
 #[derive(Clone)]
-pub struct QconnectControl(Arc<DaemonQconnectService>);
+pub(crate) struct QconnectControl(Arc<DaemonQconnectService>);
 
 impl QconnectControl {
     pub async fn connect(&self) -> Result<(), String> {
@@ -590,7 +590,7 @@ impl QconnectControl {
     /// Re-cache the device-name override from settings.toml (see
     /// [`DaemonQconnectService::refresh_device_name`] — applies on the NEXT
     /// connect, never forces a reconnect for a rename alone).
-    pub async fn refresh_device_name(&self, root: &std::path::Path) {
+    pub(crate) async fn refresh_device_name(&self, root: &std::path::Path) {
         self.0.refresh_device_name(root).await;
     }
 }
@@ -602,7 +602,7 @@ impl QconnectHandle {
     /// returns, since QConnect boots AFTER the HTTP server: boot steps 11/12).
     /// Carries none of the `JoinHandle`s `QconnectHandle` owns — those stay
     /// daemon-shutdown-only.
-    pub fn control(&self) -> QconnectControl {
+    pub(crate) fn control(&self) -> QconnectControl {
         QconnectControl(Arc::clone(&self.service))
     }
 
@@ -610,7 +610,7 @@ impl QconnectHandle {
     /// session BEFORE the daemon stops playback. Aborts + joins the watcher and
     /// the event loop so every `Arc<AppRuntime>` clone this handle owns drops
     /// ahead of `drop(booted)` (the #521 clock-release ordering).
-    pub async fn shutdown(&mut self) {
+    pub(crate) async fn shutdown(&mut self) {
         // Stop the pairing surface FIRST (no new handoffs), then kill any
         // in-flight takeover, so nothing can resurrect a session after the
         // final disconnect below. The listener join is a blocking call and the

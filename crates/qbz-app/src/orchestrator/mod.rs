@@ -109,16 +109,6 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
         Ok(())
     }
 
-    /// Check if a user session exists
-    pub async fn has_session(&self) -> bool {
-        let client = self.client.read().await;
-        if let Some(c) = client.as_ref() {
-            c.is_logged_in().await
-        } else {
-            false
-        }
-    }
-
     /// Login with email and password
     pub async fn login(&self, email: &str, password: &str) -> Result<UserSession, CoreError> {
         let client = self.client.read().await;
@@ -394,7 +384,7 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
 
     /// Resolve the bytes for a GAPLESS successor, L1/L2 → network. Returns
     /// bytes to hand to `Player::play_next`, or None.
-    pub async fn fetch_for_gapless_resolved(
+    pub(crate) async fn fetch_for_gapless_resolved(
         &self,
         track_id: u64,
         quality: Quality,
@@ -418,7 +408,7 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
     }
 
     /// Go to previous track in queue
-    pub async fn previous_track(&self) -> Option<QueueTrack> {
+    pub(crate) async fn previous_track(&self) -> Option<QueueTrack> {
         let queue = self.queue.write().await;
         let track = queue.previous();
         self.emit(CoreEvent::QueueUpdated {
@@ -628,14 +618,4 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
     pub fn client(&self) -> Arc<RwLock<Option<QobuzClient>>> {
         Arc::clone(&self.client)
     }
-}
-
-/// Normalize an artist name for dedupe: trim, lowercase, collapse
-/// whitespace, so "Iron  Maiden" and "iron maiden" hash to the same key.
-pub fn normalize_artist_name(name: &str) -> String {
-    name.trim()
-        .to_lowercase()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
 }

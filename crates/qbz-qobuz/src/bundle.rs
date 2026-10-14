@@ -26,36 +26,36 @@ const BUNDLE_EXTRACTION_RETRIES: usize = 2;
 #[derive(Debug, Clone)]
 pub struct BundleTokens {
     pub app_id: String,
-    pub secrets: Vec<String>,
+    pub(crate) secrets: Vec<String>,
     /// OAuth private key used for the /oauth/callback exchange.
     /// Present in recent bundle versions; None on older bundles.
-    pub private_key: Option<String>,
+    pub(crate) private_key: Option<String>,
     /// CMAF seed CANDIDATES, best-scoring first — see
     /// [`extract_cmaf_seed_candidates`]. The bundle gives no label to match on,
     /// so the winner is decided by `QobuzClient::cmaf_seed`, which signs a
     /// `session/start` with each in turn exactly as `secret()` does with
     /// `test_secret`. Empty is not the end of CMAF: the client probes the
     /// decoded `secrets` after these (`client::cmaf_seed_candidates`).
-    pub cmaf_seeds: Vec<String>,
+    pub(crate) cmaf_seeds: Vec<String>,
 }
 
 /// On-disk cache of the extracted tokens, keyed by the Qobuz bundle version
 /// (e.g. `8.1.0-b019`) so we can detect when Qobuz rotates the bundle and the
 /// secrets change. Lives in the regenerable cache dir, never in precious data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CachedBundle {
-    pub bundle_version: String,
+pub(crate) struct CachedBundle {
+    pub(crate) bundle_version: String,
     pub app_id: String,
-    pub secrets: Vec<String>,
+    pub(crate) secrets: Vec<String>,
     #[serde(default)]
-    pub private_key: Option<String>,
+    pub(crate) private_key: Option<String>,
     /// `default` so a cache file written before CMAF seeds were extracted still
     /// deserializes. It reports no candidates, which no longer costs CMAF: the
     /// client falls back to probing the decoded `secrets`.
     #[serde(default)]
-    pub cmaf_seeds: Vec<String>,
+    pub(crate) cmaf_seeds: Vec<String>,
     /// Unix seconds when these tokens were fetched (freshness only; not a TTL).
-    pub fetched_at: i64,
+    pub(crate) fetched_at: i64,
 }
 
 impl From<CachedBundle> for BundleTokens {
@@ -76,7 +76,7 @@ fn cache_path() -> Option<PathBuf> {
 /// Load cached tokens if a valid cache file exists. Returns `None` on any error
 /// (missing file, malformed JSON, empty fields) so the caller falls back to a
 /// live fetch.
-pub fn load_cached_bundle() -> Option<CachedBundle> {
+pub(crate) fn load_cached_bundle() -> Option<CachedBundle> {
     let path = cache_path()?;
     let data = std::fs::read(&path).ok()?;
     match serde_json::from_slice::<CachedBundle>(&data) {
@@ -203,7 +203,7 @@ async fn extract_bundle_tokens_once(client: &Client) -> Result<(BundleTokens, St
 /// This is the network ("cold") path. Prefer [`load_cached_bundle`] +
 /// [`refresh_bundle_if_changed`] on warm starts so startup never blocks on the
 /// 7 MB download.
-pub async fn extract_and_cache_bundle_tokens(client: &Client) -> Result<BundleTokens> {
+pub(crate) async fn extract_and_cache_bundle_tokens(client: &Client) -> Result<BundleTokens> {
     let mut last_err: Option<ApiError> = None;
     let attempts = BUNDLE_EXTRACTION_RETRIES + 1;
     for attempt in 1..=attempts {
@@ -246,7 +246,7 @@ pub async fn extract_and_cache_bundle_tokens(client: &Client) -> Result<BundleTo
 /// rotated the bundle, re-extract (and re-cache) the new secrets and return
 /// them; if unchanged, just bump the cache freshness timestamp and return
 /// `None`. Call from a spawned task: it is network-bound.
-pub async fn refresh_bundle_if_changed(
+pub(crate) async fn refresh_bundle_if_changed(
     client: &Client,
     cached_version: &str,
 ) -> Option<BundleTokens> {
@@ -265,12 +265,6 @@ pub async fn refresh_bundle_if_changed(
         version
     );
     extract_and_cache_bundle_tokens(client).await.ok()
-}
-
-/// One-shot extraction (no caching), for a caller that just wants a live
-/// fetch; startup uses [`extract_and_cache_bundle_tokens`] instead.
-pub async fn extract_bundle_tokens(client: &Client) -> Result<BundleTokens> {
-    extract_bundle_tokens_once(client).await.map(|(t, _)| t)
 }
 
 fn extract_bundle_url(html: &str) -> Result<String> {
@@ -373,7 +367,7 @@ fn extract_secrets(bundle: &str) -> Result<Vec<String>> {
 /// How many candidates `QobuzClient::cmaf_seed` may spend a `session/start`
 /// probe on. Each costs one request, but only on a cold cache or after Qobuz
 /// rotates the bundle — the winner is cached by bundle version.
-pub const MAX_CMAF_SEED_CANDIDATES: usize = 8;
+pub(crate) const MAX_CMAF_SEED_CANDIDATES: usize = 8;
 
 /// Bytes either side of a literal that count as its context when scoring.
 const CMAF_SEED_CONTEXT: usize = 512;
@@ -431,7 +425,7 @@ fn char_bounded(s: &str, lo: usize, hi: usize) -> &str {
 ///
 /// An empty result is a normal outcome, not an error — it means this bundle
 /// exposes no seed in a shape this sees, and CMAF is simply unavailable.
-pub fn extract_cmaf_seed_candidates(bundle: &str, known_secrets: &[String]) -> Vec<String> {
+pub(crate) fn extract_cmaf_seed_candidates(bundle: &str, known_secrets: &[String]) -> Vec<String> {
     // Best score wins per distinct value: the same literal can appear more than
     // once, and only its most promising neighbourhood matters.
     let mut scored: std::collections::HashMap<String, u32> = std::collections::HashMap::new();

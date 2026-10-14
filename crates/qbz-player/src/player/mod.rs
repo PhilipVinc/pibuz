@@ -118,11 +118,6 @@ enum AudioCommand {
     Seek(u64),
     /// Reinitialize audio device (releases and re-acquires)
     ReinitDevice { device_name: Option<String> },
-    /// Release the output device WITHOUT reopening it: drops the active
-    /// stream (freeing an exclusive ALSA `hw:` grab)
-    /// and un-suspends / un-forces anything we parked, so PipeWire can
-    /// reclaim a device we were holding.
-    ReleaseDevice,
     /// Append next track to current engine for gapless playback
     PlayNext {
         audio: TrackAudio,
@@ -144,7 +139,6 @@ impl AudioCommand {
             AudioCommand::SetVolume(_) => "SetVolume",
             AudioCommand::Seek(_) => "Seek",
             AudioCommand::ReinitDevice { .. } => "ReinitDevice",
-            AudioCommand::ReleaseDevice => "ReleaseDevice",
             AudioCommand::PlayNext { .. } => "PlayNext",
         }
     }
@@ -1883,20 +1877,20 @@ impl SharedState {
     }
 
     /// See [`SharedState::volume_external`].
-    pub fn volume_external(&self) -> bool {
+    pub(crate) fn volume_external(&self) -> bool {
         self.volume_external.load(Ordering::SeqCst)
     }
 
-    pub fn set_disk_spill_available(&self, available: bool) {
+    pub(crate) fn set_disk_spill_available(&self, available: bool) {
         self.disk_spill_available.store(available, Ordering::SeqCst);
     }
 
     /// See [`SharedState::disk_spill_available`].
-    pub fn disk_spill_available(&self) -> bool {
+    pub(crate) fn disk_spill_available(&self) -> bool {
         self.disk_spill_available.load(Ordering::SeqCst)
     }
 
-    pub fn set_stream_error(&self, error: bool) {
+    pub(crate) fn set_stream_error(&self, error: bool) {
         self.stream_error.store(error, Ordering::SeqCst);
         if !error {
             if let Ok(mut m) = self.stream_error_message.write() {
@@ -1905,15 +1899,9 @@ impl SharedState {
         }
     }
 
-    /// Whether the current stream has recorded an error.
-    ///
-    pub fn has_stream_error(&self) -> bool {
-        self.stream_error.load(Ordering::SeqCst)
-    }
-
     /// Whether an error message is recorded and not yet drained — so a
     /// generic follow-up does not overwrite the specific cause.
-    pub fn has_pending_stream_error(&self) -> bool {
+    pub(crate) fn has_pending_stream_error(&self) -> bool {
         self.stream_error_message
             .read()
             .map(|m| m.is_some())
@@ -1923,7 +1911,7 @@ impl SharedState {
     /// Record a user-readable error explanation alongside `stream_error=true`.
     /// The message is drained once via `take_stream_error_message` so the
     /// driver reports it exactly once per error.
-    pub fn record_stream_error(&self, message: impl Into<String>) {
+    pub(crate) fn record_stream_error(&self, message: impl Into<String>) {
         self.stream_error.store(true, Ordering::SeqCst);
         if let Ok(mut m) = self.stream_error_message.write() {
             *m = Some(message.into());
@@ -1977,7 +1965,7 @@ impl SharedState {
         self.current_play_generation() == gen
     }
 
-    pub fn set_stream_quality(&self, sample_rate: u32, bit_depth: u32) {
+    pub(crate) fn set_stream_quality(&self, sample_rate: u32, bit_depth: u32) {
         self.sample_rate.store(sample_rate, Ordering::SeqCst);
         self.bit_depth.store(bit_depth, Ordering::SeqCst);
     }
@@ -1985,14 +1973,14 @@ impl SharedState {
     /// Record the rate the freshly-created output device actually runs at.
     /// Called from the stream-creation paths, which are the only places that
     /// learn it — the requested rate is only a request.
-    pub fn set_output_sample_rate(&self, sample_rate: u32) {
+    pub(crate) fn set_output_sample_rate(&self, sample_rate: u32) {
         self.output_sample_rate.store(sample_rate, Ordering::SeqCst);
     }
 
     /// Rate the output device runs at, or None before any stream exists.
     /// Compare against `get_sample_rate()`: a mismatch means something in
     /// the chain is resampling.
-    pub fn get_output_sample_rate(&self) -> Option<u32> {
+    pub(crate) fn get_output_sample_rate(&self) -> Option<u32> {
         match self.output_sample_rate.load(Ordering::SeqCst) {
             0 => None,
             rate => Some(rate),
@@ -2001,7 +1989,7 @@ impl SharedState {
 
     /// Set the current bit-perfect mode for the active stream.
     /// Pass None when no stream is active (e.g., after stop).
-    pub fn set_bit_perfect_mode(&self, mode: Option<BitPerfectMode>) {
+    pub(crate) fn set_bit_perfect_mode(&self, mode: Option<BitPerfectMode>) {
         let code = match mode {
             None => 0,
             Some(BitPerfectMode::Disabled) => 1,
@@ -2014,7 +2002,7 @@ impl SharedState {
 
     /// Get the current bit-perfect mode for the active stream.
     /// Returns None when no stream has been initialized yet.
-    pub fn get_bit_perfect_mode(&self) -> Option<BitPerfectMode> {
+    pub(crate) fn get_bit_perfect_mode(&self) -> Option<BitPerfectMode> {
         match self.bit_perfect_mode.load(Ordering::SeqCst) {
             0 => None,
             1 => Some(BitPerfectMode::Disabled),
@@ -2035,14 +2023,14 @@ impl SharedState {
 
     /// Set the current normalization gain factor.
     /// Stores f32 as u32 bits. Pass None (or 0.0) to indicate no normalization.
-    pub fn set_normalization_gain(&self, gain: Option<f32>) {
+    pub(crate) fn set_normalization_gain(&self, gain: Option<f32>) {
         let bits = gain.unwrap_or(0.0).to_bits();
         self.normalization_gain.store(bits, Ordering::SeqCst);
     }
 
     /// Get the current normalization gain factor.
     /// Returns None if normalization is not active (gain is 0.0).
-    pub fn get_normalization_gain(&self) -> Option<f32> {
+    pub(crate) fn get_normalization_gain(&self) -> Option<f32> {
         let bits = self.normalization_gain.load(Ordering::SeqCst);
         let gain = f32::from_bits(bits);
         if gain == 0.0 {
@@ -2053,13 +2041,13 @@ impl SharedState {
     }
 
     /// Set streaming buffer progress (0.0 to 1.0). Pass 0.0 when not streaming.
-    pub fn set_buffer_progress(&self, progress: f32) {
+    pub(crate) fn set_buffer_progress(&self, progress: f32) {
         self.buffer_progress
             .store(progress.to_bits(), Ordering::SeqCst);
     }
 
     /// Get streaming buffer progress (0.0 to 1.0). Returns None if not streaming.
-    pub fn get_buffer_progress(&self) -> Option<f32> {
+    pub(crate) fn get_buffer_progress(&self) -> Option<f32> {
         let bits = self.buffer_progress.load(Ordering::SeqCst);
         let progress = f32::from_bits(bits);
         if progress <= 0.0 || progress >= 1.0 {
@@ -2069,7 +2057,7 @@ impl SharedState {
         }
     }
 
-    pub fn set_current_device(&self, device: Option<String>) {
+    pub(crate) fn set_current_device(&self, device: Option<String>) {
         if let Ok(mut d) = self.current_device.write() {
             *d = device;
         }
@@ -2079,19 +2067,19 @@ impl SharedState {
         self.current_device.read().ok().and_then(|d| d.clone())
     }
 
-    pub fn set_gapless_ready(&self, ready: bool) {
+    pub(crate) fn set_gapless_ready(&self, ready: bool) {
         self.gapless_ready.store(ready, Ordering::SeqCst);
     }
 
-    pub fn is_gapless_ready(&self) -> bool {
+    pub(crate) fn is_gapless_ready(&self) -> bool {
         self.gapless_ready.load(Ordering::SeqCst)
     }
 
-    pub fn set_gapless_next_track_id(&self, track_id: u64) {
+    pub(crate) fn set_gapless_next_track_id(&self, track_id: u64) {
         self.gapless_next_track_id.store(track_id, Ordering::SeqCst);
     }
 
-    pub fn get_gapless_next_track_id(&self) -> u64 {
+    pub(crate) fn get_gapless_next_track_id(&self) -> u64 {
         self.gapless_next_track_id.load(Ordering::SeqCst)
     }
 
@@ -2201,7 +2189,7 @@ impl SharedState {
         self.current_track_id.load(Ordering::SeqCst)
     }
 
-    pub fn set_loaded_audio(&self, loaded: bool) {
+    pub(crate) fn set_loaded_audio(&self, loaded: bool) {
         self.has_loaded_audio.store(loaded, Ordering::SeqCst);
     }
 
@@ -4708,31 +4696,6 @@ impl Player {
                             // Keep current_audio_data and current_streaming_source
                             // intact so Resume can recreate the engine and seek.
                         }
-                        AudioCommand::ReleaseDevice => {
-                            log::info!("Audio thread: releasing output device (user-requested)");
-                            // Cancel any deferred drop and tear the stream down NOW so
-                            // the device is freed immediately (no warm-stream lingering).
-                            *pause_suspend_deadline = None;
-                            if let Some(engine) = current_engine.take() {
-                                engine.stop();
-                            }
-                            drop(stream_opt.take());
-                            // Undo anything we parked so PipeWire / WirePlumber can
-                            // reclaim the device (e.g. a DAC left invisible to other
-                            // apps after bit-perfect ALSA Direct held it exclusively).
-                            // Both calls are self-gating no-ops if we didn't set them.
-                            #[cfg(target_os = "linux")]
-                            {
-                                qbz_audio::alsa_backend::resume_suspended_sink();
-                                qbz_audio::pipewire_backend::PipeWireBackend::reset_pipewire_clock(
-                                );
-                            }
-                            thread_state.pause_playback_timer();
-                            thread_state.is_playing.store(false, Ordering::SeqCst);
-                            // Keep current_audio_data / current_streaming_source intact
-                            // so a later Play / Resume reopens and continues.
-                            log::info!("Audio thread: output device released");
-                        }
                         AudioCommand::PlayNext {
                             audio,
                             track_id,
@@ -6215,7 +6178,7 @@ impl Player {
     /// runs, the one this whole function exists for, is unreachable. A settable
     /// global would not fix that either: the cases run in one process, so
     /// whichever test set it first would decide for all of them.
-    pub fn release_finished_track_on(
+    pub(crate) fn release_finished_track_on(
         &self,
         track_id: u64,
         class: qbz_models::system_capabilities::MemoryClass,
@@ -6659,10 +6622,7 @@ impl Player {
                     } else {
                         0.0
                     };
-                    // Feed the adaptive prefetch throttle with the cumulative
-                    // MB/s the log already reports; also the offline detector's
-                    // positive liveness signal (#467, #591).
-                    qbz_audio::network_throttle::state().record_segment_bandwidth(mbps);
+
                     log::info!(
                         "[CMAF-STREAM] Segment {}/{} ({:.1} MB held, {:.1} MB/s)",
                         seg,
@@ -6941,85 +6901,8 @@ impl Player {
             })
     }
 
-    /// Play from streaming source (starts playback before full download).
-    /// Returns the BufferWriter so caller can push data as it downloads.
-    /// `start_position_secs` > 0 turns this into a session-resume play
-    /// (#315): the audio thread waits for enough buffer to cover the
-    /// offset and pre-skips decoder output up to that point.
-    pub fn play_streaming(
-        &self,
-        track_id: u64,
-        sample_rate: u32,
-        channels: u16,
-        content_length: u64,
-        buffer_seconds: u8,
-        duration_secs: u64,
-        start_position_secs: u64,
-    ) -> Result<BufferWriter, String> {
-        let _gen = self.begin_play();
-        self.apply_play_streaming(
-            track_id,
-            sample_rate,
-            channels,
-            content_length,
-            buffer_seconds,
-            duration_secs,
-            start_position_secs,
-        )
-    }
-
-    /// `play_streaming` without bumping generation (used by play paths that
-    /// already did their own `begin_play` + supersede checks; a mid-intent
-    /// bump here would invalidate a strictly newer play that started in the
-    /// meantime).
-    fn apply_play_streaming(
-        &self,
-        track_id: u64,
-        sample_rate: u32,
-        channels: u16,
-        content_length: u64,
-        buffer_seconds: u8,
-        duration_secs: u64,
-        start_position_secs: u64,
-    ) -> Result<BufferWriter, String> {
-        log::info!(
-            "Player: Starting streaming playback for track {} ({}Hz, {}ch, {} bytes total, {}s, start={}s)",
-            track_id,
-            sample_rate,
-            channels,
-            content_length,
-            duration_secs,
-            start_position_secs
-        );
-
-        // Use StreamingConfig::from_seconds for proper buffer sizing
-        let config = StreamingConfig::from_seconds(buffer_seconds);
-
-        let (source, writer) = BufferedMediaSource::new(config, Some(content_length));
-        let source = Arc::new(source);
-
-        self.tx
-            .send(AudioCommand::PlayStreaming {
-                source: source.clone(),
-                track_id,
-                sample_rate,
-                channels,
-                duration_secs,
-                start_position_secs,
-                content_length,
-                play_gen: self.state.current_play_generation(),
-            })
-            .map_err(|e| {
-                log::error!("Player: Failed to send streaming command: {}", e);
-                format!("Failed to send streaming play command: {}", e)
-            })?;
-
-        log::info!("Player: Streaming playback initiated");
-        Ok(writer)
-    }
-
     /// Play from streaming source with dynamic buffer based on measured speed.
-    /// `start_position_secs` > 0 signals session resume (see `play_streaming`).
+    /// `start_position_secs` > 0 signals session resume.
     ///
     /// `seek_mode` describes what the caller's feeder can do. Pass
     /// [`StreamSeekMode::RangeRequests`] only when it honors the buffer's
@@ -7322,17 +7205,6 @@ impl Player {
         self.tx
             .send(AudioCommand::ReinitDevice { device_name })
             .map_err(|e| format!("Failed to send reinit command: {}", e))
-    }
-
-    /// Release the output device without reopening it. Drops the active
-    /// stream — freeing an exclusive ALSA `hw:` grab — and un-suspends /
-    /// un-forces anything we parked, so PipeWire/WirePlumber can reclaim a
-    /// device we were holding (e.g. a DAC left invisible to other apps after
-    /// bit-perfect ALSA Direct).
-    pub fn release_device(&self) -> Result<(), String> {
-        self.tx
-            .send(AudioCommand::ReleaseDevice)
-            .map_err(|e| format!("Failed to send release command: {}", e))
     }
 
     /// Reload audio settings from fresh config (e.g., after a settings change)

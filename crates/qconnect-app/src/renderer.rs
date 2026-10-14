@@ -23,7 +23,7 @@ use crate::{QConnectQueueState, QConnectRendererState, QconnectRemoteSyncState, 
 
 /// QConnect protocol `playing_state` wire values. Single source of truth for the
 /// renderer orchestration and the host's reports.
-pub const PLAYING_STATE_UNKNOWN: i32 = 0;
+pub(crate) const PLAYING_STATE_UNKNOWN: i32 = 0;
 pub const PLAYING_STATE_STOPPED: i32 = 1;
 pub const PLAYING_STATE_PLAYING: i32 = 2;
 pub const PLAYING_STATE_PAUSED: i32 = 3;
@@ -42,7 +42,7 @@ const HANDOFF_ECHO_WINDOW: Duration = Duration::from_millis(1_500);
 
 /// Source tag stamped on remote queue tracks materialized from a QConnect cloud
 /// queue.
-pub const QCONNECT_REMOTE_QUEUE_SOURCE: &str = "qobuz_connect_remote";
+pub(crate) const QCONNECT_REMOTE_QUEUE_SOURCE: &str = "qobuz_connect_remote";
 
 pub fn qconnect_repeat_mode_from_loop_mode(loop_mode: i32) -> Option<RepeatMode> {
     // QConnect protocol loop mode values: 1 = off, 2 = repeat one, 3 = repeat all.
@@ -64,11 +64,11 @@ pub fn loop_mode_from_repeat_mode(mode: RepeatMode) -> i32 {
     }
 }
 
-pub fn normalize_volume_to_fraction(volume: i32) -> f32 {
+pub(crate) fn normalize_volume_to_fraction(volume: i32) -> f32 {
     volume.clamp(0, 100) as f32 / 100.0
 }
 
-pub fn model_track_to_core_queue_track(track: &Track) -> QueueTrack {
+pub(crate) fn model_track_to_core_queue_track(track: &Track) -> QueueTrack {
     let artwork_url = track
         .album
         .as_ref()
@@ -124,7 +124,7 @@ pub fn model_track_to_core_queue_track(track: &Track) -> QueueTrack {
 // "not initialized yet" guard — and dispatches here, so the hard-won
 // echo/cursor/materialize/shuffle logic is never re-derived per host.
 
-pub fn queue_state_needs_materialization(
+pub(crate) fn queue_state_needs_materialization(
     previous: Option<&QConnectQueueState>,
     next: &QConnectQueueState,
 ) -> bool {
@@ -141,7 +141,7 @@ pub fn queue_state_needs_materialization(
         || previous.autoplay_items != next.autoplay_items
 }
 
-pub fn should_reload_remote_track(playback_state: &PlaybackState, track_id: u64) -> bool {
+pub(crate) fn should_reload_remote_track(playback_state: &PlaybackState, track_id: u64) -> bool {
     // Only reload when the track ID actually changed. The previous
     // !has_loaded_audio gate fired during the buffering window of an
     // initial load (fetching had started but the audio engine hasn't
@@ -206,7 +206,7 @@ fn frame_position_ms(
 /// watermark is silently ignored by the audio thread, so streaming from 0 left
 /// the first takeback playing from the start (bad for audiobooks). The protected
 /// bit-perfect seams + the HTTP feeder live behind `start_track_stream`.
-pub async fn ensure_remote_track_loaded(
+pub(crate) async fn ensure_remote_track_loaded(
     engine: &impl QconnectRendererEngine,
     sync_state: &Arc<Mutex<QconnectRemoteSyncState>>,
     track_id: u64,
@@ -262,7 +262,7 @@ pub async fn ensure_remote_track_loaded(
 /// the peer's last position in `renderer_state.current_position_ms`), so a long
 /// track / audiobook does not restart from 0. Resume is honored by the protected
 /// `play_streaming_dynamic` session-resume path behind `start_track_stream`.
-pub async fn force_remote_track_stream(
+pub(crate) async fn force_remote_track_stream(
     engine: &impl QconnectRendererEngine,
     sync_state: &Arc<Mutex<QconnectRemoteSyncState>>,
     track_id: u64,

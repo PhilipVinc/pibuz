@@ -82,23 +82,23 @@ pub struct AudioDevice {
     pub name: String,
 
     /// Detailed description (optional)
-    pub description: Option<String>,
+    pub(crate) description: Option<String>,
 
     /// Whether this is the system default device
-    pub is_default: bool,
+    pub(crate) is_default: bool,
 
     /// Maximum supported sample rate (if known)
-    pub max_sample_rate: Option<u32>,
+    pub(crate) max_sample_rate: Option<u32>,
 
     /// Supported sample rates (common audio rates that the device supports)
     /// Contains values like 44100, 48000, 88200, 96000, 176400, 192000, etc.
-    pub supported_sample_rates: Option<Vec<u32>>,
+    pub(crate) supported_sample_rates: Option<Vec<u32>>,
 
     /// Device bus type (for PipeWire): "usb", "pci", "bluetooth", or None
-    pub device_bus: Option<String>,
+    pub(crate) device_bus: Option<String>,
 
     /// Whether this is a hardware device (has HARDWARE flag in PipeWire)
-    pub is_hardware: bool,
+    pub(crate) is_hardware: bool,
 }
 
 /// Audio backend configuration
@@ -183,12 +183,23 @@ pub fn is_device_busy_error(message: &str) -> bool {
 
 impl AlsaDirectError {
     /// Check if this error allows fallback to plughw
-    pub fn allows_plughw_fallback(&self) -> bool {
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "only the Linux ALSA backend asks")
+    )]
+    pub(crate) fn allows_plughw_fallback(&self) -> bool {
         matches!(self, AlsaDirectError::UnsupportedFormat(_))
     }
 
     /// Create from raw ALSA error message
-    pub fn from_alsa_error(msg: &str) -> Self {
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(
+            dead_code,
+            reason = "only the Linux ALSA backend classifies its errors"
+        )
+    )]
+    pub(crate) fn from_alsa_error(msg: &str) -> Self {
         let msg_lower = msg.to_lowercase();
 
         if msg_lower.contains("no supported audio format")
@@ -447,7 +458,7 @@ impl BackendManager {
 /// "default" PCM (Linux, which routes to PipeWire/Pulse/dmix for shared mixing).
 /// No platform-specific commands (no `pactl`); opens at the device's negotiated
 /// rate with rodio resampling, so it mixes with other apps like any normal player.
-pub struct CpalDefaultBackend {
+pub(crate) struct CpalDefaultBackend {
     host: rodio::cpal::Host,
 }
 

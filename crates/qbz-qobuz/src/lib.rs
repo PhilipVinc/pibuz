@@ -30,17 +30,17 @@
 //! let stream_url = client.get_stream_url(track_id, quality).await?;
 //! ```
 
-pub mod auth;
+pub(crate) mod auth;
 pub mod bundle;
 pub mod cdn;
 pub mod client;
 pub mod cmaf;
 pub mod endpoints;
 pub mod error;
-pub mod forbidden_breaker;
+pub(crate) mod forbidden_breaker;
 pub mod link_resolver;
 pub mod redact;
-pub mod retry;
+pub(crate) mod retry;
 
 // Re-export main types
 pub use bundle::BundleTokens;

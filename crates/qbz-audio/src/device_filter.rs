@@ -25,7 +25,7 @@
 /// True for the ALSA `null` PCM, whose CPAL description is
 /// "Discard all samples (playback) or generate zero samples (capture)".
 /// It never reaches hardware, so it must never appear in an output picker.
-pub fn is_discard_sink(display: &str) -> bool {
+pub(crate) fn is_discard_sink(display: &str) -> bool {
     display
         .trim()
         .to_ascii_lowercase()
@@ -86,7 +86,7 @@ fn id_rank(id: &str) -> u8 {
 /// Generic over the caller's row type so both the `AudioDevice` enumeration
 /// and the `OutputSinkInfo` diagnostic reuse one tested implementation:
 /// `id_of` yields the re-openable device id, `display_of` the shown name.
-pub fn retain_real_outputs<T>(
+pub(crate) fn retain_real_outputs<T>(
     items: Vec<T>,
     id_of: impl Fn(&T) -> &str,
     display_of: impl Fn(&T) -> &str,
@@ -155,7 +155,7 @@ pub fn retain_real_outputs<T>(
 ///
 /// Non-Linux PCM ids never match, which is correct — this predicate only
 /// guards the ALSA probe, and callers on other platforms skip the check.
-pub fn is_probe_safe_pcm_id(id: &str) -> bool {
+pub(crate) fn is_probe_safe_pcm_id(id: &str) -> bool {
     let id = id.trim();
     // Kernel PCMs, numeric (`hw:2,0`) or by-name (`hw:CARD=IQaudIODAC,DEV=0`).
     if let Some(rest) = id
@@ -187,7 +187,7 @@ pub fn is_probe_safe_pcm_id(id: &str) -> bool {
 ///
 /// The one list, so [`is_named_config_pcm`] and
 /// `AlsaDirectStream::supports_direct_open` cannot drift apart.
-pub const GENERIC_ALSA_ALIASES: &[&str] = &[
+pub(crate) const GENERIC_ALSA_ALIASES: &[&str] = &[
     "default",
     "sysdefault",
     "pulse",
@@ -207,7 +207,7 @@ pub const GENERIC_ALSA_ALIASES: &[&str] = &[
 /// Deliberately NOT the complement of [`is_probe_safe_pcm_id`]. The generic
 /// aliases are not probe-safe either, but rodio is the only way to open them,
 /// so treating them the same way would leave no path at all.
-pub fn is_named_config_pcm(id: &str) -> bool {
+pub(crate) fn is_named_config_pcm(id: &str) -> bool {
     let id = id.trim();
     !id.is_empty() && !id.contains(':') && !GENERIC_ALSA_ALIASES.contains(&id)
 }
@@ -234,7 +234,7 @@ pub fn must_not_reach_rodio(device_id: &str) -> bool {
 /// NOT `description().name()`: that is the human label ("IQaudIODAC, IQaudIO
 /// DAC HiFi pcm512x-hifi-0"), a different string, and treating the two as
 /// interchangeable is how a lookup keyed on PCM ids came to match nothing.
-pub fn cpal_pcm_id(device: &rodio::cpal::Device) -> Option<String> {
+pub(crate) fn cpal_pcm_id(device: &rodio::cpal::Device) -> Option<String> {
     use rodio::cpal::traits::DeviceTrait;
     device.id().ok().map(|id| id.1)
 }

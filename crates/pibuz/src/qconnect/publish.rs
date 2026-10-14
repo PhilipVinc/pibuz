@@ -33,7 +33,7 @@ use crate::adapter::DaemonAdapter;
 /// by construction: the inbound materialize path sets `last_applied_queue_state`
 /// to the very queue it materialized locally, so a controller-pushed queue
 /// compares equal and is never bounced back.
-pub async fn publish_local_queue_if_changed(
+pub(crate) async fn publish_local_queue_if_changed(
     inner: &Arc<Mutex<DaemonQconnectInner>>,
     runtime: &Arc<AppRuntime<DaemonAdapter>>,
 ) {
@@ -136,7 +136,7 @@ pub async fn publish_local_queue_if_changed(
 /// and a mode that came FROM the session is already equal to it. Never pushed
 /// while the session's mode is still unknown, so connecting does not overwrite
 /// the session with whatever this box last played in.
-pub async fn publish_local_loop_mode_if_changed(
+pub(crate) async fn publish_local_loop_mode_if_changed(
     inner: &Arc<Mutex<DaemonQconnectInner>>,
     runtime: &Arc<AppRuntime<DaemonAdapter>>,
 ) {
@@ -184,7 +184,7 @@ fn loop_mode_to_publish(local: RepeatMode, session: Option<i32>) -> Option<i32> 
 /// `Arc` clones of the qconnect inner + the runtime, so the handle is
 /// aborted+joined in `QconnectHandle::shutdown` ahead of `drop(booted)` (the
 /// #521 ordering), exactly like the report scheduler.
-pub fn spawn_queue_cloud_publish(
+pub(crate) fn spawn_queue_cloud_publish(
     inner: Arc<Mutex<DaemonQconnectInner>>,
     runtime: Arc<AppRuntime<DaemonAdapter>>,
     mut rx: broadcast::Receiver<CoreEvent>,
@@ -242,7 +242,7 @@ pub fn spawn_queue_cloud_publish(
 /// OUR volume (`session_renderer_states`, updated from every
 /// `CTRL_VOLUME_CHANGED` it sends) is compared first, so a level that came from
 /// the controller — or that we already reported — goes nowhere.
-pub async fn publish_local_volume_if_changed(
+pub(crate) async fn publish_local_volume_if_changed(
     inner: &Arc<Mutex<DaemonQconnectInner>>,
     runtime: &Arc<AppRuntime<DaemonAdapter>>,
 ) {
@@ -300,7 +300,7 @@ fn volume_report_is_redundant(ours: i32, theirs: Option<i32>, muted: bool) -> bo
 /// (a slider drag) over a short window, then runs
 /// [`publish_local_volume_if_changed`] once. Same #521 contract as
 /// [`spawn_queue_cloud_publish`]: aborted+joined in `QconnectHandle::shutdown`.
-pub fn spawn_volume_cloud_publish(
+pub(crate) fn spawn_volume_cloud_publish(
     inner: Arc<Mutex<DaemonQconnectInner>>,
     runtime: Arc<AppRuntime<DaemonAdapter>>,
     mut rx: broadcast::Receiver<CoreEvent>,

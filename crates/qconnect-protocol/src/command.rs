@@ -27,7 +27,7 @@ pub enum QueueCommandType {
 }
 
 impl QueueCommandType {
-    pub const fn as_message_type(self) -> &'static str {
+    pub(crate) const fn as_message_type(self) -> &'static str {
         match self {
             Self::CtrlSrvrJoinSession => "MESSAGE_TYPE_CTRL_SRVR_JOIN_SESSION",
             Self::CtrlSrvrSetPlayerState => "MESSAGE_TYPE_CTRL_SRVR_SET_PLAYER_STATE",

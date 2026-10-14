@@ -15,7 +15,7 @@ use super::ApiState;
 /// (never a tokio worker), so the async reload orchestration runs via
 /// `state.rt.block_on` — the same pattern `status::assemble_live` already uses
 /// for its queue read.
-pub fn reload(state: &ApiState) -> Response<Cursor<Vec<u8>>> {
+pub(crate) fn reload(state: &ApiState) -> Response<Cursor<Vec<u8>>> {
     state.rt.block_on(crate::daemon::reload(state));
     super::status::status(state)
 }

@@ -13,7 +13,7 @@ pub mod queue_resolution;
 pub mod renderer;
 mod renderer_engine;
 pub mod session;
-pub mod startup;
+pub(crate) mod startup;
 mod state;
 mod sync_state;
 
@@ -30,7 +30,7 @@ pub use session::{
 pub use startup::QconnectStartupMode;
 pub use sync_state::{cache_renderer_snapshot, QconnectRemoteSyncState};
 
-pub(crate) use error::QconnectAppError;
-pub(crate) use qconnect_core::{QConnectQueueState, QConnectRendererState};
-pub(crate) use state::QconnectRuntimeState;
+pub use error::QconnectAppError;
+pub use qconnect_core::{QConnectQueueState, QConnectRendererState};
+pub use state::QconnectRuntimeState;
 pub(crate) use sync_state::{ensure_session_renderer_state, sync_session_renderer_active_flags};

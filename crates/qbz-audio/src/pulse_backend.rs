@@ -7,7 +7,7 @@ use super::backend::{AudioBackend, AudioBackendType, AudioDevice, BackendConfig,
 use super::pipewire_backend::PipeWireBackend;
 use rodio::MixerDeviceSink;
 
-pub struct PulseBackend {
+pub(crate) struct PulseBackend {
     // Reuse PipeWire backend implementation (they're compatible)
     inner: PipeWireBackend,
 }

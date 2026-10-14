@@ -91,14 +91,14 @@ where
     }
 
     #[cfg(test)]
-    pub fn state_handle(&self) -> Arc<Mutex<QconnectRuntimeState>> {
+    pub(crate) fn state_handle(&self) -> Arc<Mutex<QconnectRuntimeState>> {
         Arc::clone(&self.state)
     }
 
     /// Shared handle to the remote-sync accumulator. The host uses this so its
     /// event sink, service loop, and renderer engine lock the very same Mutex
     /// the app's own session/watchdog methods lock.
-    pub fn sync_handle(&self) -> Arc<Mutex<QconnectRemoteSyncState>> {
+    pub(crate) fn sync_handle(&self) -> Arc<Mutex<QconnectRemoteSyncState>> {
         Arc::clone(&self.sync)
     }
 
@@ -310,7 +310,7 @@ where
         state.renderer.current_duration_ms = Some(duration_ms);
     }
 
-    pub async fn handle_transport_event(
+    pub(crate) async fn handle_transport_event(
         &self,
         event: TransportEvent,
     ) -> Result<(), QconnectAppError> {
@@ -381,7 +381,7 @@ where
         Ok(())
     }
 
-    pub async fn handle_inbound_envelope(
+    pub(crate) async fn handle_inbound_envelope(
         &self,
         inbound: InboundEnvelope,
     ) -> Result<(), QconnectAppError> {
@@ -1568,15 +1568,15 @@ where
 /// frame is applied, plus the server's classified active state derived from the
 /// incoming payload. Drives takeover arbitration after the apply.
 #[derive(Debug, Clone, Copy)]
-pub struct SessionStateTakeoverInput {
-    pub was_active: bool,
+pub(crate) struct SessionStateTakeoverInput {
+    pub(crate) was_active: bool,
     /// The incoming SESSION_STATE names no active renderer.
-    pub server_idle: bool,
+    pub(crate) server_idle: bool,
 }
 
 /// Preview the first 8 `track_id`s under `payload[key]` for diagnostic emits.
 /// Pure.
-pub fn queue_payload_track_preview(payload: &Value, key: &str) -> Vec<i64> {
+pub(crate) fn queue_payload_track_preview(payload: &Value, key: &str) -> Vec<i64> {
     payload
         .get(key)
         .and_then(Value::as_array)
@@ -1599,7 +1599,7 @@ where
     /// the incoming SESSION_STATE names no active renderer. Pure-ish read;
     /// takes no decision. Locks `self.sync` (the same accumulator the apply
     /// path mutates).
-    pub async fn capture_session_state_takeover_input(
+    pub(crate) async fn capture_session_state_takeover_input(
         &self,
         payload: &Value,
     ) -> SessionStateTakeoverInput {
@@ -1637,7 +1637,10 @@ where
     /// the current active renderer or the id is invalid. Never resets reconnect
     /// counters (#358 latch untouched). The request payload is
     /// `{ "renderer_id": <i32> }`.
-    pub async fn send_set_active_renderer(&self, target_renderer_id: i32) -> Result<bool, String> {
+    pub(crate) async fn send_set_active_renderer(
+        &self,
+        target_renderer_id: i32,
+    ) -> Result<bool, String> {
         if target_renderer_id < 0 {
             return Ok(false);
         }
@@ -1685,7 +1688,7 @@ where
     /// Ask the server for the current queue state (Lagged-recovery / generic
     /// re-sync). The reply is not reducer-correlated, so its pending slot is
     /// cleared.
-    pub async fn ask_for_queue_state(&self) -> Result<(), String> {
+    pub(crate) async fn ask_for_queue_state(&self) -> Result<(), String> {
         let cmd = self
             .build_queue_command(
                 QueueCommandType::CtrlSrvrAskForQueueState,

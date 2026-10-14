@@ -79,7 +79,8 @@ impl StreamingConfig {
     ///
     /// For Hi-Res FLAC at 192kHz/24bit stereo, bitrate is roughly 9.2 Mbps
     /// We estimate ~1MB per second as a conservative approximation
-    pub fn from_seconds(seconds: u8) -> Self {
+    #[cfg(test)]
+    pub(crate) fn from_seconds(seconds: u8) -> Self {
         // Minimum 256KB to ensure format detection works
         let bytes = ((seconds as usize) * 1024 * 1024).max(256 * 1024);
         Self {
@@ -103,7 +104,7 @@ impl StreamingConfig {
     /// otherwise inflate to 2 MB, which is exactly the wrong direction
     /// when "slow connection" is itself a symptom of swap thrash
     /// (issue #331, Pi 3B).
-    pub fn from_speed_mbps(speed_mbps: f64) -> Self {
+    pub(crate) fn from_speed_mbps(speed_mbps: f64) -> Self {
         let cap = MAX_INITIAL_BUFFER_BYTES.load(std::sync::atomic::Ordering::Relaxed);
         let cfg = Self::from_speed_mbps_with_cap(speed_mbps, cap);
 
@@ -129,7 +130,7 @@ impl StreamingConfig {
     /// initial buffer and clamps to `cap` without touching global state
     /// or logging. Exposed for unit tests; production callers should use
     /// `from_speed_mbps`, which reads the process-wide cap.
-    pub fn from_speed_mbps_with_cap(speed_mbps: f64, cap: usize) -> Self {
+    pub(crate) fn from_speed_mbps_with_cap(speed_mbps: f64, cap: usize) -> Self {
         let raw_initial_buffer = raw_initial_buffer_for_speed(speed_mbps);
         Self {
             initial_buffer_bytes: raw_initial_buffer.min(cap),
@@ -718,7 +719,7 @@ impl BufferState {
 }
 
 /// Disarms [`BufferedMediaSource::interrupt_when_superseded`] when dropped.
-pub struct InterruptGuard {
+pub(crate) struct InterruptGuard {
     shared: Arc<SharedBuffer>,
 }
 
@@ -861,7 +862,8 @@ impl PlanOrigin {
     }
 
     /// True when a reader is blocked until this body delivers.
-    pub fn is_live_demand(self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_live_demand(self) -> bool {
         matches!(
             self,
             PlanOrigin::Initial | PlanOrigin::ReaderRequest | PlanOrigin::Resume
@@ -986,7 +988,7 @@ impl BufferedMediaSource {
 
     /// Whether a seek on this source can jump straight to its target
     /// instead of waiting for the download to reach it.
-    pub fn supports_range_requests(&self) -> bool {
+    pub(crate) fn supports_range_requests(&self) -> bool {
         self.shared
             .state
             .lock()
@@ -1011,7 +1013,7 @@ impl BufferedMediaSource {
 
     /// The whole file's size, when the feeder was told it. For a range stream
     /// this is exact (`Content-Length`, or the CMAF segment table).
-    pub fn total_bytes(&self) -> Option<u64> {
+    pub(crate) fn total_bytes(&self) -> Option<u64> {
         self.shared
             .state
             .lock()
@@ -1035,7 +1037,7 @@ impl BufferedMediaSource {
     /// decoder still AUDIBLE is an older reader over the same buffer, and
     /// interrupting it would cut the old track off mid-note — the new command
     /// stops it properly a moment later.
-    pub fn interrupt_when_superseded(
+    pub(crate) fn interrupt_when_superseded(
         &self,
         generation: Arc<AtomicU64>,
         expected: u64,
@@ -1071,7 +1073,7 @@ impl BufferedMediaSource {
     /// download is rate-matched to playback. `is_complete()` used to serve that
     /// purpose and no longer can: with a bounded window a track completes at
     /// the END of itself rather than seventeen seconds in.
-    pub fn window_full(&self) -> bool {
+    pub(crate) fn window_full(&self) -> bool {
         self.shared
             .state
             .lock()
@@ -1092,7 +1094,7 @@ impl BufferedMediaSource {
     /// the format probe reads, so it is the gate for building a decoder —
     /// as opposed to [`has_min_buffer`], which measures from wherever
     /// playback is about to start.
-    pub fn head_bytes(&self) -> u64 {
+    pub(crate) fn head_bytes(&self) -> u64 {
         if let Ok(state) = self.shared.state.lock() {
             state.contiguous_from(0).max(state.header.len() as u64)
         } else {
@@ -1102,7 +1104,7 @@ impl BufferedMediaSource {
 
     /// Offset playback reads from: 0, or the target of the last range
     /// request. Buffer-fill checks are measured from here.
-    pub fn primary_offset(&self) -> u64 {
+    pub(crate) fn primary_offset(&self) -> u64 {
         if let Ok(state) = self.shared.state.lock() {
             state.primary_offset
         } else {
@@ -1129,7 +1131,7 @@ impl BufferedMediaSource {
     /// call site (`Arc::from(Vec)` never adopts the buffer). Building the Arc
     /// once, straight from the buffer's slice, halves the peak — which on a 1 GB
     /// Pi is the difference between promoting a track and being OOM-killed.
-    pub fn take_complete_data(&self) -> Option<TrackBytes> {
+    pub(crate) fn take_complete_data(&self) -> Option<TrackBytes> {
         let state = self.shared.state.lock().ok()?;
         if !state.download_complete || state.download_error.is_some() {
             return None;
@@ -1147,7 +1149,7 @@ impl BufferedMediaSource {
     /// Returns the contiguous run from byte 0, even if incomplete. Useful
     /// for extracting file-level metadata (e.g., ReplayGain tags) which are
     /// typically in the first few KB of the file.
-    pub fn get_buffered_data(&self) -> Option<Vec<u8>> {
+    pub(crate) fn get_buffered_data(&self) -> Option<Vec<u8>> {
         let state = self.shared.state.lock().ok()?;
         state
             .head_run()
@@ -1159,7 +1161,7 @@ impl BufferedMediaSource {
     /// Get download progress as a fraction (0.0 to 1.0)
     ///
     /// Returns None if total size is unknown
-    pub fn progress(&self) -> Option<f32> {
+    pub(crate) fn progress(&self) -> Option<f32> {
         let state = self.shared.state.lock().ok()?;
         state.total_size.map(|total| {
             if total == 0 {
@@ -1184,7 +1186,7 @@ impl BufferedMediaSource {
     ///
     /// Capped at the window too: the feeder parks there, so a target above it
     /// would be the same wait by a different route.
-    pub fn has_min_buffer(&self) -> bool {
+    pub(crate) fn has_min_buffer(&self) -> bool {
         if let Ok(state) = self.shared.state.lock() {
             let target = (self.config.initial_buffer_bytes as u64).min(state.window_bytes);
             state.ahead_bytes() >= target || state.download_complete
@@ -1196,7 +1198,7 @@ impl BufferedMediaSource {
     /// Error reported by the feeder, if any. Lets waiters (the initial
     /// buffer fill loop) bail out immediately instead of sitting through
     /// the full buffer timeout when the feeder has already died.
-    pub fn download_error(&self) -> Option<String> {
+    pub(crate) fn download_error(&self) -> Option<String> {
         self.shared
             .state
             .lock()
@@ -1842,11 +1844,6 @@ pub struct IncrementalStreamingSource {
     finished: bool,
     /// Number of packets decoded (for stats)
     packets_decoded: u64,
-    /// True while inside a WouldBlock stall episode (playback caught up
-    /// with the download). Set on the first WouldBlock after at least one
-    /// decoded packet, cleared on the next successful decode — so each
-    /// episode records exactly one underrun with the network throttle.
-    stalled: bool,
 }
 
 impl IncrementalStreamingSource {
@@ -1908,7 +1905,6 @@ impl IncrementalStreamingSource {
             track_id,
             finished: false,
             packets_decoded: 0,
-            stalled: false,
         })
     }
 
@@ -1918,7 +1914,7 @@ impl IncrementalStreamingSource {
     }
 
     /// Get the number of channels
-    pub fn get_channels(&self) -> u16 {
+    pub(crate) fn get_channels(&self) -> u16 {
         self.channels
     }
 
@@ -1936,7 +1932,7 @@ impl IncrementalStreamingSource {
     /// any time in the track is fair game. On a sequential source it blocks
     /// until the download walks there — callers must only invoke it for
     /// times within the downloaded watermark.
-    pub fn seek_to(&mut self, time: Duration) -> Result<(), String> {
+    pub(crate) fn seek_to(&mut self, time: Duration) -> Result<(), String> {
         self.format
             .seek(
                 SeekMode::Accurate,
@@ -1970,13 +1966,6 @@ impl IncrementalStreamingSource {
                 {
                     // Not enough data buffered yet - wait briefly and retry
                     // This happens when playback catches up with download
-                    if !self.stalled && self.packets_decoded > 0 {
-                        // Mid-playback stall, not initial buffering (≥1 packet
-                        // already decoded): put the prefetch throttle in panic
-                        // mode so the live stream gets the pipe to itself (#591).
-                        self.stalled = true;
-                        qbz_audio::network_throttle::state().record_underrun();
-                    }
                     std::thread::sleep(Duration::from_millis(5));
                     continue;
                 }
@@ -2010,9 +1999,6 @@ impl IncrementalStreamingSource {
                     self.sample_queue
                         .extend(sample_buf.samples().iter().copied());
                     self.packets_decoded += 1;
-                    // Successful decode ends any stall episode; the next
-                    // WouldBlock streak records a fresh underrun.
-                    self.stalled = false;
                 }
                 Err(SymphoniaError::DecodeError(e)) => {
                     log::warn!("Decode error (skipping packet): {}", e);
@@ -2180,7 +2166,7 @@ impl InMemorySource {
     /// the same seek on the in-memory streaming path. Symphonia over a seekable
     /// `MediaSource` bisects instead, which on local storage is a handful of
     /// small reads.
-    pub fn from_cached_file(file: &qbz_cache::CachedFile) -> Result<Self, String> {
+    pub(crate) fn from_cached_file(file: &qbz_cache::CachedFile) -> Result<Self, String> {
         let reader = file
             .open()
             .map_err(|e| format!("open {} for seeking: {e}", file.path().display()))?;
@@ -2236,7 +2222,7 @@ impl InMemorySource {
         })
     }
 
-    pub fn seek_to(&mut self, time: Duration) -> Result<(), String> {
+    pub(crate) fn seek_to(&mut self, time: Duration) -> Result<(), String> {
         self.format
             .seek(
                 SeekMode::Accurate,

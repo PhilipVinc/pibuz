@@ -30,7 +30,7 @@ use crate::adapter::DaemonAdapter;
 // and injected into the engine + session host.
 /// How the daemon treats a controller's remote volume command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum VolumeMode {
+pub(crate) enum VolumeMode {
     /// The DEFAULT. Remote `SetVolume` is applied to the player via the core,
     /// and the player's real volume is reported back to the controller.
     #[default]
@@ -52,7 +52,7 @@ impl VolumeMode {
     /// Parse the stored `volume_mode` value. Anything but the literals
     /// `"locked"` and `"external"` (unset, empty, unknown) falls back to
     /// `Software` — the default.
-    pub fn from_kv(value: Option<&str>) -> Self {
+    pub(crate) fn from_kv(value: Option<&str>) -> Self {
         match value.map(str::trim) {
             Some("locked") => VolumeMode::Locked,
             Some("external") => VolumeMode::External,
@@ -63,13 +63,13 @@ impl VolumeMode {
     /// Whether a controller's remote `SetVolume` should reach the player. True
     /// in `Software` and `External` — in `External` the player stores and
     /// reports the level without applying it; `Locked` acknowledges-but-ignores.
-    pub fn applies_remote_volume(self) -> bool {
+    pub(crate) fn applies_remote_volume(self) -> bool {
         matches!(self, VolumeMode::Software | VolumeMode::External)
     }
 
     /// Whether the player's level must be kept off the samples and the mixer
     /// (`Player::set_volume_external`).
-    pub fn is_external(self) -> bool {
+    pub(crate) fn is_external(self) -> bool {
         matches!(self, VolumeMode::External)
     }
 
@@ -77,7 +77,7 @@ impl VolumeMode {
     /// real 0.0-1.0 fraction. `Software` and `External` report the real
     /// (rounded) percent; `Locked` always reports 100 regardless of the
     /// player's actual level.
-    pub fn reported_volume_pct(self, real_fraction: f32) -> i32 {
+    pub(crate) fn reported_volume_pct(self, real_fraction: f32) -> i32 {
         match self {
             VolumeMode::Software | VolumeMode::External => {
                 (real_fraction.clamp(0.0, 1.0) * 100.0).round() as i32
@@ -91,7 +91,7 @@ impl VolumeMode {
 /// runtime and forwards every trait method through `runtime.core()`; the async
 /// feeder spawns on the ambient tokio runtime (`start_track_stream` is always
 /// awaited from a runtime task).
-pub struct DaemonRendererEngine {
+pub(crate) struct DaemonRendererEngine {
     runtime: Arc<AppRuntime<DaemonAdapter>>,
     /// Resolved volume policy for this session (read at connect).
     volume_mode: VolumeMode,
@@ -122,7 +122,7 @@ pub struct DaemonRendererEngine {
 /// as `(track_id, ErrorType)`, so the scheduler — which owns the session and
 /// resolves queue item ids — can tell the cloud with a `PlaybackError`.
 #[derive(Default)]
-pub struct BufferingLatch {
+pub(crate) struct BufferingLatch {
     current: std::sync::Mutex<Option<Buffering>>,
     failed: std::sync::Mutex<Option<(u64, i32)>>,
 }
@@ -144,7 +144,7 @@ const BUFFERING_MAX: std::time::Duration = std::time::Duration::from_secs(90);
 impl BufferingLatch {
     /// Mark `track_id` as buffering from `start_position_secs` (replacing any
     /// previous track).
-    pub fn begin(&self, track_id: u64, start_position_secs: u64, duration_secs: u64) {
+    pub(crate) fn begin(&self, track_id: u64, start_position_secs: u64, duration_secs: u64) {
         if let Ok(mut guard) = self.current.lock() {
             *guard = Some(Buffering {
                 track_id,
@@ -158,7 +158,7 @@ impl BufferingLatch {
     /// Record that the load of `track_id` failed with `error_type`, replacing
     /// any failure not yet reported: only the latest one names the track the
     /// controller is looking at.
-    pub fn fail(&self, track_id: u64, error_type: i32) {
+    pub(crate) fn fail(&self, track_id: u64, error_type: i32) {
         if let Ok(mut guard) = self.failed.lock() {
             *guard = Some((track_id, error_type));
         }
@@ -166,7 +166,7 @@ impl BufferingLatch {
 
     /// The failure recorded since the last call, if any, as
     /// `(track_id, error_type)`.
-    pub fn take_failure(&self) -> Option<(u64, i32)> {
+    pub(crate) fn take_failure(&self) -> Option<(u64, i32)> {
         self.failed.lock().ok().and_then(|mut guard| guard.take())
     }
 
@@ -201,7 +201,11 @@ impl BufferingLatch {
     /// audible, so the controller kept a spinner up for a second of music it
     /// was already playing.
     #[cfg(test)]
-    pub fn in_flight(&self, player_track_id: u64, position_ms: u64) -> Option<(u64, u64, u64)> {
+    pub(crate) fn in_flight(
+        &self,
+        player_track_id: u64,
+        position_ms: u64,
+    ) -> Option<(u64, u64, u64)> {
         self.in_flight_with_state(player_track_id, position_ms, true)
     }
 
@@ -210,7 +214,7 @@ impl BufferingLatch {
     /// `is_playing == false` on the LOADING track is the second way a load
     /// ends: it arrived, and the controller had asked for a pause. See
     /// `a_track_that_loads_straight_into_a_pause_is_not_buffering`.
-    pub fn in_flight_with_state(
+    pub(crate) fn in_flight_with_state(
         &self,
         player_track_id: u64,
         position_ms: u64,
@@ -286,7 +290,7 @@ const ERROR_TYPE_OTHER_ERRORS: i32 = 100;
 /// typed `ApiError` is flattened to a string inside `QbzCore`. The phrases are
 /// `ApiError`'s own `Display`, and the tests build them from the variants, so
 /// rewording one fails a test instead of silently reclassifying.
-pub fn playback_error_type(error: &str) -> Option<i32> {
+pub(crate) fn playback_error_type(error: &str) -> Option<i32> {
     const NOT_STREAMABLE: [&str; 3] = [
         "Track is not streamable",
         "No valid quality available",
@@ -345,7 +349,7 @@ impl DaemonRendererEngine {
     ///
     /// One place, because the join report and the join-time re-assertion must
     /// not be able to disagree about it.
-    pub fn reported_volume_pct(&self) -> i32 {
+    pub(crate) fn reported_volume_pct(&self) -> i32 {
         self.volume_mode
             .reported_volume_pct(self.core().get_playback_state().volume)
     }

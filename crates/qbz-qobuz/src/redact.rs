@@ -20,7 +20,7 @@
 /// answered, whether DNS went somewhere unexpected — and carries no secret. A
 /// URL that was only a host is left exactly as it was, so nothing is marked
 /// redacted that wasn't.
-pub fn redact_urls(text: &str) -> String {
+pub(crate) fn redact_urls(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
 

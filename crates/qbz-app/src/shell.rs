@@ -73,9 +73,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn core_reports_no_session_before_login() {
+    async fn core_reports_no_api_before_init() {
         let rt = test_runtime();
-        assert!(!rt.core().has_session().await);
         assert!(!rt.core().is_api_initialized().await);
     }
 }

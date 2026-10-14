@@ -6,28 +6,28 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize, Serialize)] // Serialize: `pibuz config show --json`
 #[serde(default)]
-pub struct PibuzConfig {
-    pub config_version: u32,
+pub(crate) struct PibuzConfig {
+    pub(crate) config_version: u32,
     pub data_root: Option<String>, // container override; cache root derived
-    pub server: ServerCfg,
-    pub log: LogCfg,
+    pub(crate) server: ServerCfg,
+    pub(crate) log: LogCfg,
 }
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
-pub struct ServerCfg {
-    pub bind: String,
-    pub port: u16,
+pub(crate) struct ServerCfg {
+    pub(crate) bind: String,
+    pub(crate) port: u16,
     /// Opt-in shared secret. Default `None` = the control plane is
     /// UNAUTHENTICATED (loopback and LAN alike). When set, every route except
     /// `GET /api/ping` requires `Authorization: Bearer <token>`; a mismatch is
     /// `401 invalid_token`. A plain config value the user writes — there is no
     /// generated file and no rotation verb (rotate = edit this + restart).
-    pub token: Option<String>,
+    pub(crate) token: Option<String>,
 }
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
-pub struct LogCfg {
-    pub level: String,
+pub(crate) struct LogCfg {
+    pub(crate) level: String,
 }
 
 impl Default for ServerCfg {

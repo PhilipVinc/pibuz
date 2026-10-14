@@ -41,7 +41,7 @@ use super::{err_json, json, ApiState};
 /// table — a played row rendered ABOVE the current track — is unreproducible
 /// from the response. `history_len` is unchanged; nothing existing is renamed
 /// or removed.
-pub fn list(state: &ApiState, query: &str) -> Response<Cursor<Vec<u8>>> {
+pub(crate) fn list(state: &ApiState, query: &str) -> Response<Cursor<Vec<u8>>> {
     let (offset, limit) = parse_offset_limit(query);
     let queue = state
         .rt
@@ -87,7 +87,7 @@ pub fn list(state: &ApiState, query: &str) -> Response<Cursor<Vec<u8>>> {
 /// `track_ids` element or unknown `position` literal — both parses are
 /// STRICT and run before any core call, so a rejected body never partially
 /// mutates the queue).
-pub fn add(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
+pub(crate) fn add(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
     let track_ids = match parse_track_ids(body) {
         Ok(ids) => ids,
         Err((message, hint)) => return err_json(400, "bad_request", &message, &hint),
@@ -146,7 +146,7 @@ pub fn add(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
 /// 404 `not_found` (index out of range), 400 `bad_request` (index is the
 /// playing track, with the fixed hint below; also a
 /// missing or non-integer `index` field, with distinct messages).
-pub fn remove(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
+pub(crate) fn remove(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
     let index = match parse_remove_index(body) {
         Ok(i) => i,
         Err((message, hint)) => return err_json(400, "bad_request", &message, &hint),
@@ -226,7 +226,7 @@ pub fn clear(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
 
 /// `POST /api/queue/move`. Body `{"from": N, "to": N}` (0-based). Reorders
 /// via core `move_track`. 404 when either index is out of range.
-pub fn reorder(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
+pub(crate) fn reorder(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
     let from = match body.get("from").and_then(|v| v.as_u64()) {
         Some(n) => n as usize,
         None => {
@@ -267,7 +267,7 @@ pub fn reorder(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
 /// synchronous (the 404 contract is immediate); the resolve+play leg is
 /// spawn-and-ack (see `playback::advance`) so a slow fetch can't starve the
 /// single-threaded API — failures latch into `last_errors.stream`.
-pub fn jump(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
+pub(crate) fn jump(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
     let index = match body.get("index").and_then(|v| v.as_u64()) {
         Some(n) => n as usize,
         None => {
@@ -315,7 +315,7 @@ pub fn jump(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
 /// `POST /api/queue/stop-after`. Body `{"track_id": N}` |
 /// `{"current": true}` | `{"off": true}`. Sets/clears the stop-after gate
 /// (core `set_stop_after`/`clear_stop_after`).
-pub fn stop_after(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
+pub(crate) fn stop_after(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
     if body.get("off").and_then(|v| v.as_bool()).unwrap_or(false) {
         state.rt.block_on(state.runtime.core().clear_stop_after());
         return json(200, serde_json::json!({"stop_after_track_id": Value::Null}));

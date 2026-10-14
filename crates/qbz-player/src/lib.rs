@@ -33,7 +33,7 @@
 //! ```
 
 pub mod player;
-pub mod queue;
+pub(crate) mod queue;
 
 // Re-export main types
 pub use player::{

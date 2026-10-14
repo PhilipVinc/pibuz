@@ -76,7 +76,7 @@ use crate::{
 /// One call the orchestration made on the player. Recorded in order so a test
 /// can assert what the renderer actually DID, not only what it said.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EngineCall {
+pub(crate) enum EngineCall {
     Resume,
     Pause,
     Stop,
@@ -165,7 +165,7 @@ struct FakePlayer {
 /// That matters — half the renderer logic branches on `has_loaded_audio()` and
 /// `get_playback_state().track_id`, so a mock that always answers the same
 /// thing walks a single path through code whose bugs live in the others.
-pub struct FakeEngine {
+pub(crate) struct FakeEngine {
     player: StdMutex<FakePlayer>,
     calls: StdMutex<Vec<EngineCall>>,
     /// Seconds reported for every synthetic catalog track.
@@ -184,7 +184,7 @@ impl FakeEngine {
         }
     }
 
-    pub fn calls(&self) -> Vec<EngineCall> {
+    pub(crate) fn calls(&self) -> Vec<EngineCall> {
         self.calls.lock().expect("engine calls").clone()
     }
 
@@ -192,7 +192,7 @@ impl FakeEngine {
         self.calls.lock().expect("engine calls").push(call);
     }
 
-    pub fn snapshot(&self) -> PlaybackState {
+    pub(crate) fn snapshot(&self) -> PlaybackState {
         let player = self.player.lock().expect("fake player");
         PlaybackState {
             is_playing: player.playing,
@@ -206,7 +206,7 @@ impl FakeEngine {
     /// Adopt the next track from inside the player, the way a gapless hand-off
     /// does: no command, no load, no report — the audio simply moves on and the
     /// cloud does not know yet.
-    pub fn advance_gaplessly_to(&self, track_id: u64) {
+    pub(crate) fn advance_gaplessly_to(&self, track_id: u64) {
         let mut player = self.player.lock().expect("fake player");
         player.track_id = track_id;
         player.position_ms = 0;
@@ -230,7 +230,7 @@ impl FakeEngine {
     /// matches the target while no audio exists, so anything deciding on the id
     /// alone skips the reload and the following resume dies with "no audio data
     /// available".
-    pub fn tear_down_for_handoff(&self) {
+    pub(crate) fn tear_down_for_handoff(&self) {
         let mut player = self.player.lock().expect("fake player");
         player.playing = false;
         player.loaded_audio = false;
@@ -244,7 +244,7 @@ impl FakeEngine {
     }
 
     /// Move the playback clock forward, as the audio thread would.
-    pub fn advance(&self, ms: u64) {
+    pub(crate) fn advance(&self, ms: u64) {
         let mut player = self.player.lock().expect("fake player");
         if player.playing {
             player.position_ms = player.position_ms.saturating_add(ms);
@@ -258,12 +258,12 @@ impl FakeEngine {
     /// `start_track_stream` and the first sample the player STILL REPORTS THE
     /// OUTGOING TRACK at the outgoing clock. Several guards exist only for that
     /// window, and with an instantly-adopting fake they are unreachable.
-    pub fn make_the_audio_thread_lag(&self) {
+    pub(crate) fn make_the_audio_thread_lag(&self) {
         self.player.lock().expect("fake player").audio_thread_lags = true;
     }
 
     /// Whether a stream has been opened that the audio thread has not adopted.
-    pub fn is_catching_up(&self) -> bool {
+    pub(crate) fn is_catching_up(&self) -> bool {
         self.player
             .lock()
             .expect("fake player")
@@ -272,7 +272,7 @@ impl FakeEngine {
     }
 
     /// The first samples of the pending stream arrive.
-    pub fn catch_up(&self) {
+    pub(crate) fn catch_up(&self) {
         let mut player = self.player.lock().expect("fake player");
         if let Some((track_id, position_ms, duration_ms)) = player.pending_track.take() {
             player.track_id = track_id;
@@ -289,7 +289,7 @@ impl FakeEngine {
     /// Models `qbz_player::player::fail_play`, which is what the real audio
     /// thread does on every failure arm: it lands on the track it was asked
     /// for, at the offset asked for, NOT playing and with NOTHING loaded.
-    pub fn fail_the_pending_load(&self) {
+    pub(crate) fn fail_the_pending_load(&self) {
         let mut player = self.player.lock().expect("fake player");
         if let Some((track_id, position_ms, duration_ms)) = player.pending_track.take() {
             player.track_id = track_id;
@@ -301,12 +301,12 @@ impl FakeEngine {
     }
 
     /// The next `start_track_stream` fails with `error` before opening anything.
-    pub fn fail_the_next_stream(&self, error: &str) {
+    pub(crate) fn fail_the_next_stream(&self, error: &str) {
         self.player.lock().expect("fake player").next_stream_fails = Some(error.to_string());
     }
 
     /// What the player holds: how many tracks, and which one the cursor names.
-    pub fn queue(&self) -> (Vec<u64>, Option<u64>) {
+    pub(crate) fn queue(&self) -> (Vec<u64>, Option<u64>) {
         let player = self.player.lock().expect("fake player");
         let ids: Vec<u64> = player.queue.iter().map(|track| track.id).collect();
         let current = player.queue_index.and_then(|index| ids.get(index).copied());
@@ -494,7 +494,7 @@ type HarnessApp = QconnectApp<InMemoryWsTransport, HarnessSink>;
 /// The divergence risk is real and is the argument for the next step: making
 /// `DaemonEventSink` generic over its engine and transport so this harness can
 /// mount the daemon's own sink instead of a copy of its shape.
-pub struct HarnessSink {
+pub(crate) struct HarnessSink {
     engine: Arc<FakeEngine>,
     sync_state: Arc<Mutex<QconnectRemoteSyncState>>,
     events: Arc<StdMutex<Vec<QconnectAppEvent>>>,
@@ -539,7 +539,7 @@ impl QconnectEventSink for HarnessSink {
 
 /// What the controller's transport control is drawing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Transport {
+pub(crate) enum Transport {
     /// Nothing has been reported yet.
     Unknown,
     Stopped,
@@ -554,11 +554,11 @@ pub enum Transport {
 /// Fields are `Option` because the protocol can genuinely blank them, and
 /// blanking is the bug: `total_ms: None` is a progress bar reading `0:00`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ControllerView {
-    pub transport: Transport,
+pub(crate) struct ControllerView {
+    pub(crate) transport: Transport,
     pub track_id: Option<u64>,
-    pub elapsed_ms: Option<u64>,
-    pub total_ms: Option<u64>,
+    pub(crate) elapsed_ms: Option<u64>,
+    pub(crate) total_ms: Option<u64>,
     pub volume: Option<i32>,
     pub muted: Option<bool>,
 }
@@ -643,37 +643,37 @@ fn as_stated_ms(value: &Value) -> Option<u64> {
 
 /// One recorded step: a gesture, and everything that followed from it.
 #[derive(Debug, Clone)]
-pub struct Step {
+pub(crate) struct Step {
     pub label: String,
-    pub view: ControllerView,
+    pub(crate) view: ControllerView,
     /// Reports the renderer sent during this step, as `(message_type, payload)`.
-    pub reports: Vec<(String, Value)>,
+    pub(crate) reports: Vec<(String, Value)>,
     /// Engine calls the renderer made during this step.
-    pub engine_calls: Vec<EngineCall>,
+    pub(crate) engine_calls: Vec<EngineCall>,
     /// The subset of those calls the renderer made while handling the CLOUD's
     /// ECHO of its own report — which must always be empty. Acting on an echo is
     /// how a pause becomes two pauses and a resume fights the user.
-    pub echo_engine_calls: Vec<EngineCall>,
+    pub(crate) echo_engine_calls: Vec<EngineCall>,
     /// Track ids in the player's queue after this step.
-    pub player_queue: Vec<u64>,
+    pub(crate) player_queue: Vec<u64>,
     /// The track the player's CURSOR names — what `pibuz status` and the moOde
     /// overlay would call the now-playing title.
-    pub cursor_track: Option<u64>,
+    pub(crate) cursor_track: Option<u64>,
     /// The track that is actually AUDIBLE. When this and `cursor_track` disagree
     /// outside a load, the title on screen belongs to a different song than the
     /// one coming out of the speakers.
-    pub audible_track: u64,
+    pub(crate) audible_track: u64,
     /// Track ids in the queue the CLOUD holds.
-    pub cloud_queue: Vec<u64>,
+    pub(crate) cloud_queue: Vec<u64>,
     /// A stream is open that the audio thread has not adopted yet.
-    pub audio_catching_up: bool,
+    pub(crate) audio_catching_up: bool,
 }
 
 // =================================================================== the cloud
 
 /// The qws frontend: relays the controller's frames, folds the renderer's
 /// reports into the screen, and echoes state reports back at the renderer.
-pub struct FakeCloud {
+pub(crate) struct FakeCloud {
     /// How many outbound envelopes have already been folded in.
     drained: StdMutex<usize>,
     view: StdMutex<ControllerView>,
@@ -690,7 +690,7 @@ impl FakeCloud {
         fresh
     }
 
-    pub fn view(&self) -> ControllerView {
+    pub(crate) fn view(&self) -> ControllerView {
         self.view.lock().expect("view").clone()
     }
 }
@@ -698,7 +698,7 @@ impl FakeCloud {
 // ============================================================== the controller
 
 /// The phone. Gestures expand into the frames the cloud sends for them.
-pub struct VirtualController {
+pub(crate) struct VirtualController {
     harness: Arc<HarnessInner>,
     next_queue_item_id: StdMutex<u64>,
 }
@@ -711,7 +711,7 @@ impl VirtualController {
     /// Queue item ids are minted fresh on every call, exactly as the cloud does
     /// — so pushing the same track ids twice is a re-announcement of the same
     /// QUEUE, not of the same items.
-    pub async fn push_queue(&self, track_ids: &[u64], selected: usize) -> Vec<QueueItem> {
+    pub(crate) async fn push_queue(&self, track_ids: &[u64], selected: usize) -> Vec<QueueItem> {
         let items = self.queue_items(track_ids);
         self.announce_queue(&items, selected).await;
         items
@@ -723,7 +723,7 @@ impl VirtualController {
     /// AskForQueueState, an edit elsewhere in the queue. Handing the same items
     /// back is the whole point: minting fresh ids would make it a different
     /// queue, and the renderer would be right to rebuild.
-    pub async fn announce_queue(&self, items: &[QueueItem], selected: usize) {
+    pub(crate) async fn announce_queue(&self, items: &[QueueItem], selected: usize) {
         let payload = json!({
             "tracks": items.iter().map(queue_item_json).collect::<Vec<_>>(),
             "queue_position": selected,
@@ -752,7 +752,7 @@ impl VirtualController {
     /// `[126886853, 123452387, 126886854]` — the head carries its track id while
     /// the rest carry small ones, which is what
     /// `normalize_current_queue_item_id_from_queue_state` reads.
-    pub async fn push_fresh_release_and_play(&self, track_ids: &[u64], selected: usize) {
+    pub(crate) async fn push_fresh_release_and_play(&self, track_ids: &[u64], selected: usize) {
         let items = fresh_release_items(track_ids);
         self.announce_queue(&items, selected).await;
         self.tap_track(&items, selected).await;
@@ -761,13 +761,13 @@ impl VirtualController {
     /// Tap play on a queue the controller just picked: the cloud pushes
     /// `QUEUE_TRACKS_LOADED` naming the selection, then a `SET_STATE` naming the
     /// track. This is the ordinary "user tapped a track in an album" flow.
-    pub async fn push_queue_and_play(&self, track_ids: &[u64], selected: usize) {
+    pub(crate) async fn push_queue_and_play(&self, track_ids: &[u64], selected: usize) {
         let items = self.push_queue(track_ids, selected).await;
         self.tap_track(&items, selected).await;
     }
 
     /// The `SET_STATE` that follows a push: play THIS item of THAT queue.
-    pub async fn tap_track(&self, items: &[QueueItem], selected: usize) {
+    pub(crate) async fn tap_track(&self, items: &[QueueItem], selected: usize) {
         let current = items[selected].clone();
         let next = items.get(selected + 1).cloned();
         self.harness
@@ -787,7 +787,7 @@ impl VirtualController {
 
     /// Tap pause. The real controller sends state ONLY — no position, no track.
     /// That shape is why pause has been the source of so many of these bugs.
-    pub async fn tap_pause(&self) {
+    pub(crate) async fn tap_pause(&self) {
         self.harness
             .step("tap pause", |_| {
                 vec![renderer_command(
@@ -799,7 +799,7 @@ impl VirtualController {
     }
 
     /// Tap play on an already-loaded track. State only, same as pause.
-    pub async fn tap_play(&self) {
+    pub(crate) async fn tap_play(&self) {
         self.harness
             .step("tap play", |_| {
                 vec![renderer_command(
@@ -812,7 +812,7 @@ impl VirtualController {
 
     /// Drag the progress bar. The controller sends a position and NOTHING else
     /// (issue #387) — no playing_state, no track.
-    pub async fn drag_seek(&self, position_ms: u64) {
+    pub(crate) async fn drag_seek(&self, position_ms: u64) {
         self.harness
             .step(&format!("seek to {position_ms}ms"), |_| {
                 vec![renderer_command(
@@ -836,7 +836,7 @@ impl VirtualController {
     }
 
     /// Tap next: the cloud names the new track and its successor, at position 0.
-    pub async fn tap_next_track(&self, track_id: u64, next_track_id: Option<u64>) {
+    pub(crate) async fn tap_next_track(&self, track_id: u64, next_track_id: Option<u64>) {
         let current = self.mint_item(track_id);
         let next = next_track_id.map(|id| self.mint_item(id));
         self.harness
@@ -859,7 +859,7 @@ impl VirtualController {
     /// The controller does send this — the track is stated, the position is
     /// not. A new track starts at zero; filling the blank in from the cloud's
     /// cached position starts it wherever the PREVIOUS one had got to.
-    pub async fn tap_next_track_without_a_position(
+    pub(crate) async fn tap_next_track_without_a_position(
         &self,
         track_id: u64,
         next_track_id: Option<u64>,
@@ -904,7 +904,7 @@ impl VirtualController {
     /// correction, a queue_item_id refresh — and it re-states `current_position`
     /// as 0 while doing so. Treating each one as a fresh load is the "first
     /// track hiccups on album change" and "needs several taps" report.
-    pub async fn reemits_the_current_state(&self, track_id: u64, queue_item_id: u64) {
+    pub(crate) async fn reemits_the_current_state(&self, track_id: u64, queue_item_id: u64) {
         let item = QueueItem {
             track_context_uuid: "ctx-harness".to_string(),
             track_id,
@@ -925,7 +925,7 @@ impl VirtualController {
     }
 
     /// Press the volume-up key: a RELATIVE step, with no absolute level.
-    pub async fn nudge_volume(&self, delta: i32) {
+    pub(crate) async fn nudge_volume(&self, delta: i32) {
         self.harness
             .step(&format!("volume {delta:+}"), |_| {
                 vec![renderer_command(
@@ -938,7 +938,7 @@ impl VirtualController {
 
     /// Announce the ceiling for stream quality. The controller sends this on
     /// join and whenever the user changes the streaming-quality preference.
-    pub async fn set_max_audio_quality(&self, level: i32) {
+    pub(crate) async fn set_max_audio_quality(&self, level: i32) {
         self.harness
             .step(&format!("max audio quality {level}"), |_| {
                 vec![renderer_command(
@@ -950,7 +950,7 @@ impl VirtualController {
     }
 
     /// Set the repeat mode from the controller. 1 = off, 2 = one, 3 = all.
-    pub async fn set_loop_mode(&self, loop_mode: i32) {
+    pub(crate) async fn set_loop_mode(&self, loop_mode: i32) {
         self.harness
             .step(&format!("loop mode {loop_mode}"), |_| {
                 vec![renderer_command(
@@ -975,7 +975,7 @@ impl VirtualController {
     }
 
     /// Tap the mute button.
-    pub async fn set_muted(&self, muted: bool) {
+    pub(crate) async fn set_muted(&self, muted: bool) {
         self.harness
             .step(if muted { "mute" } else { "unmute" }, |_| {
                 vec![renderer_command(
@@ -987,7 +987,7 @@ impl VirtualController {
     }
 
     /// Hand the render role to this device.
-    pub async fn take_renderer(&self) {
+    pub(crate) async fn take_renderer(&self) {
         self.harness
             .step("set active", |_| {
                 vec![renderer_command(
@@ -1200,7 +1200,7 @@ impl HarnessInner {
 }
 
 /// The harness. One per test.
-pub struct ControllerHarness {
+pub(crate) struct ControllerHarness {
     inner: Arc<HarnessInner>,
     controller: VirtualController,
 }
@@ -1263,31 +1263,31 @@ impl ControllerHarness {
         Self { inner, controller }
     }
 
-    pub fn controller(&self) -> &VirtualController {
+    pub(crate) fn controller(&self) -> &VirtualController {
         &self.controller
     }
 
-    pub fn engine(&self) -> &FakeEngine {
+    pub(crate) fn engine(&self) -> &FakeEngine {
         &self.inner.engine
     }
 
-    pub fn view(&self) -> ControllerView {
+    pub(crate) fn view(&self) -> ControllerView {
         self.inner.cloud.view()
     }
 
-    pub fn timeline(&self) -> Vec<Step> {
+    pub(crate) fn timeline(&self) -> Vec<Step> {
         self.inner.timeline.lock().expect("timeline").clone()
     }
 
     /// The timeline as a human reads it. Pass it to every assertion message:
     /// the question is always "what did the screen do", never "what did the
     /// assert say".
-    pub fn rendered_timeline(&self) -> String {
+    pub(crate) fn rendered_timeline(&self) -> String {
         render_timeline(&self.timeline())
     }
 
     /// Every engine call so far, across all steps.
-    pub fn engine_calls(&self) -> Vec<EngineCall> {
+    pub(crate) fn engine_calls(&self) -> Vec<EngineCall> {
         self.inner.engine.calls()
     }
 
@@ -1296,7 +1296,7 @@ impl ControllerHarness {
     ///
     /// Seeded directly rather than driven through `SESSION_STATE`, because the
     /// session-management arm lives in the daemon's sink, not here.
-    pub async fn become_active_renderer(&self) {
+    pub(crate) async fn become_active_renderer(&self) {
         let mut state = self.inner.sync_state.lock().await;
         state.session.session_uuid = Some("sess-harness".to_string());
         state.session.local_renderer_id = Some(1);
@@ -1319,7 +1319,7 @@ impl ControllerHarness {
     /// sink does on that transition — local playback is torn down. The audio
     /// buffer is gone but the player still remembers the track id, which is
     /// exactly the state the takeback path has to cope with.
-    pub async fn peer_takes_the_render(&self) {
+    pub(crate) async fn peer_takes_the_render(&self) {
         self.inner.engine.tear_down_for_handoff();
         let mut state = self.inner.sync_state.lock().await;
         state.session.active_renderer_id = Some(2);
@@ -1336,7 +1336,7 @@ impl ControllerHarness {
     }
 
     /// Advance the playback clock, as the audio thread would.
-    pub fn advance_playback(&self, ms: u64) {
+    pub(crate) fn advance_playback(&self, ms: u64) {
         self.inner.engine.advance(ms);
     }
 
@@ -1346,7 +1346,7 @@ impl ControllerHarness {
     /// player, with no command and no report around it — so afterwards the
     /// cloud's `current_track` is a track BEHIND what is audible. That gap is
     /// where the state-only commands get dangerous.
-    pub fn advance_gaplessly_to(&self, track_id: u64) {
+    pub(crate) fn advance_gaplessly_to(&self, track_id: u64) {
         self.inner.engine.advance_gaplessly_to(track_id);
     }
 
@@ -1367,7 +1367,7 @@ impl ControllerHarness {
     /// or teaching the renderer to take its clock as a parameter — which is the
     /// real fix, and the reason this helper carries a warning instead of being
     /// quietly convenient.
-    pub fn let_the_load_windows_expire(&self) {
+    pub(crate) fn let_the_load_windows_expire(&self) {
         let sync = Arc::clone(&self.inner.sync_state);
         // The lock is never contended between steps, so try_lock is enough and
         // keeps this helper synchronous at the call site.
@@ -1379,27 +1379,27 @@ impl ControllerHarness {
 
     /// From here on, a stream that opens is not instantly audible. See
     /// [`FakeEngine::make_the_audio_thread_lag`].
-    pub fn make_the_audio_thread_lag(&self) {
+    pub(crate) fn make_the_audio_thread_lag(&self) {
         self.inner.engine.make_the_audio_thread_lag();
     }
 
     /// The first samples of the pending stream arrive.
-    pub fn audio_thread_catches_up(&self) {
+    pub(crate) fn audio_thread_catches_up(&self) {
         self.inner.engine.catch_up();
     }
 
     /// The pending stream fails to open. See [`FakeEngine::fail_the_pending_load`].
-    pub fn the_pending_load_fails(&self) {
+    pub(crate) fn the_pending_load_fails(&self) {
         self.inner.engine.fail_the_pending_load();
     }
 
     /// The next stream fails before it opens. See [`FakeEngine::fail_the_next_stream`].
-    pub fn the_next_stream_fails(&self, error: &str) {
+    pub(crate) fn the_next_stream_fails(&self, error: &str) {
         self.inner.engine.fail_the_next_stream(error);
     }
 
     /// The queue the PLAYER holds, and the track its cursor names.
-    pub fn player_queue(&self) -> (Vec<u64>, Option<u64>) {
+    pub(crate) fn player_queue(&self) -> (Vec<u64>, Option<u64>) {
         self.inner.engine.queue()
     }
 
@@ -1409,7 +1409,7 @@ impl ControllerHarness {
     /// `align_queue_cursor` falls back to a single-track queue when the cloud
     /// names a track the player does not hold. So this is asserted where a test
     /// means it, rather than everywhere.
-    pub fn assert_player_queue_matches_the_cloud(&self) {
+    pub(crate) fn assert_player_queue_matches_the_cloud(&self) {
         let timeline = self.timeline();
         let Some(step) = timeline.last() else {
             panic!("no steps recorded");
@@ -1424,11 +1424,11 @@ impl ControllerHarness {
         );
     }
 
-    pub async fn queue_snapshot(&self) -> QConnectQueueState {
+    pub(crate) async fn queue_snapshot(&self) -> QConnectQueueState {
         self.inner.app.queue_state_snapshot().await
     }
 
-    pub async fn renderer_state(&self) -> QConnectRendererState {
+    pub(crate) async fn renderer_state(&self) -> QConnectRendererState {
         self.inner.app.state_handle().lock().await.renderer.clone()
     }
 
@@ -1439,7 +1439,7 @@ impl ControllerHarness {
     /// Each rule below is a bug that actually shipped. Adding a rule here makes
     /// every existing test enforce it, which is the point of asserting against
     /// the screen rather than against a protocol field.
-    pub fn assert_invariants(&self) {
+    pub(crate) fn assert_invariants(&self) {
         let timeline = self.timeline();
         let mut violations = Vec::new();
         let mut previous: Option<&Step> = None;
@@ -1536,7 +1536,7 @@ impl ControllerHarness {
 
 /// The timeline as a human reads it. Printed on every failure, because the
 /// question is always "what did the screen do", not "what did the assert say".
-pub fn render_timeline(timeline: &[Step]) -> String {
+pub(crate) fn render_timeline(timeline: &[Step]) -> String {
     timeline
         .iter()
         .map(|step| {
@@ -1583,16 +1583,16 @@ pub fn render_timeline(timeline: &[Step]) -> String {
 
 /// What the renderer is telling the cloud on this tick.
 #[derive(Debug, Clone, Copy)]
-pub struct ReportTick {
+pub(crate) struct ReportTick {
     pub playing_state: i32,
-    pub buffer_state: i32,
-    pub position_ms: u64,
-    pub duration_ms: u64,
+    pub(crate) buffer_state: i32,
+    pub(crate) position_ms: u64,
+    pub(crate) duration_ms: u64,
 }
 
 /// `buffer_state` wire values (`pibuz::qconnect::transport`).
-pub const BUFFER_STATE_OK: i32 = 0;
-pub const BUFFER_STATE_BUFFERING: i32 = 1;
+pub(crate) const BUFFER_STATE_OK: i32 = 0;
+pub(crate) const BUFFER_STATE_BUFFERING: i32 = 1;
 
 impl ControllerHarness {
     /// Run one tick of the renderer's own report loop.
@@ -1601,7 +1601,7 @@ impl ControllerHarness {
     /// position and duration into the app's renderer state (so a later echo can
     /// state them), then send a `RndrSrvrStateUpdated` carrying the same triple
     /// the daemon sends.
-    pub async fn report_tick(&self) {
+    pub(crate) async fn report_tick(&self) {
         let playback = self.inner.engine.snapshot();
         let playing_state = if playback.track_id == 0 {
             1 // STOPPED
@@ -1621,7 +1621,7 @@ impl ControllerHarness {
 
     /// A report tick with the triple stated outright — for the states the fake
     /// player has no way to reach, above all BUFFERING.
-    pub async fn report_tick_as(&self, tick: ReportTick) {
+    pub(crate) async fn report_tick_as(&self, tick: ReportTick) {
         let queue = self.inner.app.queue_state_snapshot().await;
         let queue_version = queue.version;
         // Mirrors `resolve_queue_item_ids_by_track_id`: the daemon does not

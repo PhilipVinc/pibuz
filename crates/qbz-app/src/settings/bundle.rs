@@ -28,7 +28,7 @@ use crate::settings::{daemon_prefs, qconnect};
 
 /// The bundle schema version this importer implements and this exporter writes
 /// (§1). Hard-gated on import (`plan` step 2, §5.6). v1 is the floor.
-pub const SCHEMA_VERSION: i64 = 1;
+pub(crate) const SCHEMA_VERSION: i64 = 1;
 
 // ============================ public types ============================
 
@@ -131,10 +131,10 @@ pub struct ImportPlan {
     pub auth_token: Option<String>,
     /// Cross-check uid from the bundle (`auth.user_id`); the authoritative uid
     /// is the validated login's (§5.7).
-    pub bundle_user_id: Option<u64>,
+    pub(crate) bundle_user_id: Option<u64>,
     /// The typed write actions backing `applied` + `adapted` (display strings
     /// are lossy — e.g. `(auto)` — so execution rides raw JSON values here).
-    pub writes: Vec<(String, Value)>,
+    pub(crate) writes: Vec<(String, Value)>,
     /// True when a routing-critical field (backend/device/exclusive) changed —
     /// the CLI's reload line owns the honesty note (§5.3 step 7).
     pub routing_critical_changed: bool,
@@ -147,7 +147,7 @@ pub struct ImportReport {
     pub applied: usize,
     pub adapted: usize,
     pub skipped: usize,
-    pub per_domain: Vec<(String, Result<(), String>)>,
+    pub(crate) per_domain: Vec<(String, Result<(), String>)>,
 }
 
 /// Everything that can go wrong in the engine. `Display` renders a plain
@@ -193,7 +193,7 @@ impl std::error::Error for BundleError {}
 
 impl Bundle {
     /// Serialize to pretty JSON (the on-disk `.qbzb` form — plain JSON).
-    pub fn to_json_string(&self) -> Result<String, BundleError> {
+    pub(crate) fn to_json_string(&self) -> Result<String, BundleError> {
         serde_json::to_string_pretty(self).map_err(|e| BundleError::Io(e.to_string()))
     }
 

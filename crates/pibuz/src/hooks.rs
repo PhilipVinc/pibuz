@@ -27,7 +27,7 @@ use crate::paths::ProfileRoots;
 
 /// Resolve the configured hook script: `QBZD_HOOK` when set (empty string
 /// disables), else the persisted `hooks.script` setting; None = hooks off.
-pub fn script(roots: &ProfileRoots) -> Option<PathBuf> {
+pub(crate) fn script(roots: &ProfileRoots) -> Option<PathBuf> {
     let raw = match std::env::var("QBZD_HOOK") {
         Ok(v) => v,
         Err(_) => qbz_app::settings::daemon_prefs::load_at(&roots.data).hook_script,

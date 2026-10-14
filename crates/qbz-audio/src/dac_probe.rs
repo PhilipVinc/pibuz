@@ -23,7 +23,7 @@ pub struct NegotiatedRate {
     /// ALSA hardware format string as reported (e.g. "S32_LE", "S24_3LE").
     /// Note: 24-bit audio is commonly carried in an `S32_LE` container — this is
     /// the ALSA container format, so a caller should key on the RATE.
-    pub format: String,
+    pub(crate) format: String,
     /// Channel count (e.g. 2).
     pub channels: u32,
 }
@@ -32,7 +32,7 @@ pub struct NegotiatedRate {
 ///
 /// Returns `None` when the device is idle (`closed`), empty, or has no `rate:`
 /// line. Pure (no I/O) so it is unit-testable against captured fixtures.
-pub fn parse_hw_params(content: &str) -> Option<NegotiatedRate> {
+pub(crate) fn parse_hw_params(content: &str) -> Option<NegotiatedRate> {
     let trimmed = content.trim();
     if trimmed.is_empty() || trimmed == "closed" {
         return None;
@@ -61,7 +61,7 @@ pub fn parse_hw_params(content: &str) -> Option<NegotiatedRate> {
 
 /// Pure helper: find the ALSA card number backing a PipeWire sink `node.name`
 /// in `pw-dump` JSON. Reads `api.alsa.pcm.card` / `alsa.card` (string or int).
-pub fn parse_alsa_card_for_node(json: &str, node_name: &str) -> Option<u32> {
+pub(crate) fn parse_alsa_card_for_node(json: &str, node_name: &str) -> Option<u32> {
     let root: serde_json::Value = serde_json::from_str(json).ok()?;
     let arr = root.as_array()?;
     for obj in arr {

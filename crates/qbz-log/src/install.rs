@@ -37,7 +37,7 @@ pub fn install(default_level: &str) {
 }
 
 /// Path to the current-run log file (`~/.local/share/qbz/logs/qbz.log`), if a data dir exists.
-pub fn log_file_path() -> Option<PathBuf> {
+pub(crate) fn log_file_path() -> Option<PathBuf> {
     Some(dirs::data_dir()?.join("qbz").join("logs").join("qbz.log"))
 }
 

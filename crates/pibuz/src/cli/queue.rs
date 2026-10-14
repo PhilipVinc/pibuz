@@ -21,7 +21,7 @@ use crate::paths::ProfileRoots;
 
 /// `pibuz queue list [--json]` — renders `GET /api/queue`.
 /// Exit: 0 · 1 · 3.
-pub async fn list(host: Option<String>, json: bool, roots: &ProfileRoots) -> i32 {
+pub(crate) async fn list(host: Option<String>, json: bool, roots: &ProfileRoots) -> i32 {
     let client = ApiClient::new(host, roots);
     match client.get("/api/queue").await {
         Ok(v) => {
@@ -127,7 +127,12 @@ fn render_row(is_current: bool, position: usize, track: &Value) -> String {
 
 /// `pibuz queue add <TRACK_ID> [--next]` -> `POST /api/queue/add`.
 /// Exit: 0 · 1 · 3 · 6 (unknown id).
-pub async fn add(host: Option<String>, roots: &ProfileRoots, track_id: u64, next: bool) -> i32 {
+pub(crate) async fn add(
+    host: Option<String>,
+    roots: &ProfileRoots,
+    track_id: u64,
+    next: bool,
+) -> i32 {
     let client = ApiClient::new(host, roots);
     let position = if next { "next" } else { "end" };
     let body = serde_json::json!({"track_ids": [track_id], "position": position});
@@ -177,7 +182,7 @@ fn render_added(v: &Value, next: bool) -> String {
 /// track — server `bad_request`, not one of `error_from_envelope`'s
 /// special-cased codes) · 2 (position 0, local usage error) · 3 ·
 /// 6 (out of range — server `not_found`).
-pub async fn remove(host: Option<String>, roots: &ProfileRoots, index: usize) -> i32 {
+pub(crate) async fn remove(host: Option<String>, roots: &ProfileRoots, index: usize) -> i32 {
     let api_index = match cli_index_to_api(index) {
         Ok(i) => i,
         Err(msg) => {
@@ -203,7 +208,7 @@ pub async fn remove(host: Option<String>, roots: &ProfileRoots, index: usize) ->
 /// (there is no "0th" track) — the ONLY local validation this verb does;
 /// everything else (out of range, playing track) is a server-side 404/400
 /// the daemon is authoritative on.
-pub fn cli_index_to_api(position: usize) -> Result<usize, String> {
+pub(crate) fn cli_index_to_api(position: usize) -> Result<usize, String> {
     position.checked_sub(1).ok_or_else(|| {
         format!(
             "invalid queue position '{position}' — positions start at 1 (see: pibuz queue list)"
@@ -253,7 +258,12 @@ pub async fn clear(host: Option<String>, roots: &ProfileRoots, keep_current: boo
 /// `pibuz queue move <FROM> <TO>` -> `POST /api/queue/move`. FROM/TO are 1-based
 /// positions (the same convention as `queue remove`), translated to 0-based at
 /// this boundary. Exit: 0 · 1 · 2 (position 0) · 3 · 6 (out of range).
-pub async fn move_(host: Option<String>, roots: &ProfileRoots, from: usize, to: usize) -> i32 {
+pub(crate) async fn move_(
+    host: Option<String>,
+    roots: &ProfileRoots,
+    from: usize,
+    to: usize,
+) -> i32 {
     let from_i = match cli_index_to_api(from) {
         Ok(i) => i,
         Err(msg) => {
@@ -289,7 +299,7 @@ pub async fn move_(host: Option<String>, roots: &ProfileRoots, from: usize, to: 
 
 /// `pibuz queue jump <POS>` -> `POST /api/queue/jump`. POS is 1-based; jumping
 /// starts audio (a click-to-play-row). Exit: 0 · 1 · 2 · 3 · 6.
-pub async fn jump(host: Option<String>, roots: &ProfileRoots, position: usize) -> i32 {
+pub(crate) async fn jump(host: Option<String>, roots: &ProfileRoots, position: usize) -> i32 {
     let index = match cli_index_to_api(position) {
         Ok(i) => i,
         Err(msg) => {
@@ -330,7 +340,11 @@ pub async fn jump(host: Option<String>, roots: &ProfileRoots, position: usize) -
 /// `pibuz queue stop-after [current|off]` (bare = current) -> `POST
 /// /api/queue/stop-after`. Stops playback after the current track, or clears
 /// the gate. Exit: 0 · 1 · 2 · 3.
-pub async fn stop_after(host: Option<String>, roots: &ProfileRoots, arg: Option<String>) -> i32 {
+pub(crate) async fn stop_after(
+    host: Option<String>,
+    roots: &ProfileRoots,
+    arg: Option<String>,
+) -> i32 {
     let body = match arg.as_deref() {
         None | Some("current") => serde_json::json!({"current": true}),
         Some("off") => serde_json::json!({"off": true}),

@@ -11,7 +11,7 @@ use crate::paths::ProfileRoots;
 
 /// `pibuz now [--json]` — renders `GET /api/now-playing`.
 /// Exit: 0 · 1 · 3 (via `ApiClient`/`error_from_envelope`, unchanged here).
-pub async fn now(host: Option<String>, json: bool, roots: &ProfileRoots) -> i32 {
+pub(crate) async fn now(host: Option<String>, json: bool, roots: &ProfileRoots) -> i32 {
     let client = ApiClient::new(host, roots);
     match client.get("/api/now-playing").await {
         Ok(v) => {
@@ -94,7 +94,7 @@ async fn transport_state(host: Option<String>, roots: &ProfileRoots, path: &str)
     }
 }
 
-pub async fn play(host: Option<String>, roots: &ProfileRoots) -> i32 {
+pub(crate) async fn play(host: Option<String>, roots: &ProfileRoots) -> i32 {
     transport_state(host, roots, "/api/playback/play").await
 }
 
@@ -102,7 +102,7 @@ pub async fn pause(host: Option<String>, roots: &ProfileRoots) -> i32 {
     transport_state(host, roots, "/api/playback/pause").await
 }
 
-pub async fn toggle(host: Option<String>, roots: &ProfileRoots) -> i32 {
+pub(crate) async fn toggle(host: Option<String>, roots: &ProfileRoots) -> i32 {
     transport_state(host, roots, "/api/playback/toggle").await
 }
 
@@ -151,7 +151,7 @@ pub async fn next(host: Option<String>, roots: &ProfileRoots) -> i32 {
     transport_advance(host, roots, "/api/playback/next").await
 }
 
-pub async fn prev(host: Option<String>, roots: &ProfileRoots) -> i32 {
+pub(crate) async fn prev(host: Option<String>, roots: &ProfileRoots) -> i32 {
     transport_advance(host, roots, "/api/playback/previous").await
 }
 
@@ -160,14 +160,14 @@ pub async fn prev(host: Option<String>, roots: &ProfileRoots) -> i32 {
 /// A parsed `pibuz seek` argument (absolute seconds, `+N`/`-N` relative, or
 /// `mm:ss`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SeekArg {
+pub(crate) enum SeekArg {
     Absolute(u64),
     Delta(i64),
 }
 
 /// `90` -> absolute seconds · `+30`/`-10` -> relative seconds · `1:23` ->
 /// absolute seconds (mm:ss). Usage errors (exit 2) name what was expected.
-pub fn parse_seek_arg(s: &str) -> Result<SeekArg, String> {
+pub(crate) fn parse_seek_arg(s: &str) -> Result<SeekArg, String> {
     let s = s.trim();
     if let Some(rest) = s.strip_prefix('+') {
         return rest
@@ -202,7 +202,7 @@ pub fn parse_seek_arg(s: &str) -> Result<SeekArg, String> {
 
 /// `SeekArg` -> the `POST /api/playback/seek` body: `{"position"}`
 /// (absolute, legacy field name) or `{"delta"}` (additive).
-pub fn seek_body(arg: SeekArg) -> Value {
+pub(crate) fn seek_body(arg: SeekArg) -> Value {
     match arg {
         SeekArg::Absolute(n) => serde_json::json!({"position": n}),
         SeekArg::Delta(n) => serde_json::json!({"delta": n}),
@@ -240,13 +240,13 @@ pub async fn seek(host: Option<String>, roots: &ProfileRoots, arg: String) -> i3
 /// A parsed `pibuz volume` argument (0-100 absolute, or `+N`/`-N` relative —
 /// both in CLI percent-space).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VolumeArg {
+pub(crate) enum VolumeArg {
     Absolute(u8),
     Delta(i32),
 }
 
 /// `80` -> absolute 0-100 · `+5`/`-5` -> relative percent.
-pub fn parse_volume_arg(s: &str) -> Result<VolumeArg, String> {
+pub(crate) fn parse_volume_arg(s: &str) -> Result<VolumeArg, String> {
     let s = s.trim();
     if let Some(rest) = s.strip_prefix('+') {
         return rest
@@ -275,18 +275,18 @@ pub fn parse_volume_arg(s: &str) -> Result<VolumeArg, String> {
 /// request body round-trips imprecisely (`0.8f32 as f64` != the `0.8` JSON
 /// literal); the eventual `as f32` narrowing happens once, server-side,
 /// right before the `Player::set_volume` call.
-pub fn pct_to_fraction(pct: u8) -> f64 {
+pub(crate) fn pct_to_fraction(pct: u8) -> f64 {
     (pct as f64 / 100.0).clamp(0.0, 1.0)
 }
 
-pub fn fraction_to_pct(frac: f64) -> i64 {
+pub(crate) fn fraction_to_pct(frac: f64) -> i64 {
     (frac.clamp(0.0, 1.0) * 100.0).round() as i64
 }
 
 /// `VolumeArg` -> the `POST /api/playback/volume` body: `{"volume"}`
 /// (absolute fraction, legacy field name) or `{"delta"}` (additive fraction —
 /// the CLI's `+N`/`-N` percent converted to the API's 0.0-1.0 space).
-pub fn volume_body(arg: VolumeArg) -> Value {
+pub(crate) fn volume_body(arg: VolumeArg) -> Value {
     match arg {
         VolumeArg::Absolute(pct) => serde_json::json!({"volume": pct_to_fraction(pct)}),
         VolumeArg::Delta(pct) => serde_json::json!({"delta": pct as f64 / 100.0}),
@@ -364,7 +364,7 @@ pub async fn volume(
 /// `None` (bare = toggle) / `Some("on")` / `Some("off")` -> the
 /// `{"mute": "on"|"off"|"toggle"}` body form (the same route as volume, so it
 /// costs no extra route).
-pub fn mute_body(arg: Option<&str>) -> Result<Value, String> {
+pub(crate) fn mute_body(arg: Option<&str>) -> Result<Value, String> {
     match arg {
         None => Ok(serde_json::json!({"mute": "toggle"})),
         Some("on") => Ok(serde_json::json!({"mute": "on"})),
@@ -375,7 +375,11 @@ pub fn mute_body(arg: Option<&str>) -> Result<Value, String> {
 
 /// `pibuz mute [on|off]` — human `muted (was 80%)` / `unmuted · vol 80%`.
 /// Exit: 0 · 1 · 2 (local parse failure) · 3 · 5.
-pub async fn mute(host: Option<String>, roots: &ProfileRoots, state_arg: Option<String>) -> i32 {
+pub(crate) async fn mute(
+    host: Option<String>,
+    roots: &ProfileRoots,
+    state_arg: Option<String>,
+) -> i32 {
     let body = match mute_body(state_arg.as_deref()) {
         Ok(b) => b,
         Err(msg) => {

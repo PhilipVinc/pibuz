@@ -58,15 +58,15 @@ const EXP_SLACK_SECS: u64 = 60;
 /// are unix seconds as sent on the wire; `0` = not provided (treated as
 /// non-expiring — nothing in this repo decodes JWTs to find out more).
 #[derive(Clone)]
-pub struct PairingTokens {
+pub(crate) struct PairingTokens {
     pub session_id: String,
-    pub ws_jwt: String,
-    pub ws_exp: u64,
-    pub ws_endpoint: String,
+    pub(crate) ws_jwt: String,
+    pub(crate) ws_exp: u64,
+    pub(crate) ws_endpoint: String,
     /// Streaming credential (`Authorization: Bearer`), installed on the client
     /// by `reconnect_for_pairing`.
-    pub api_jwt: Option<String>,
-    pub api_exp: u64,
+    pub(crate) api_jwt: Option<String>,
+    pub(crate) api_exp: u64,
 }
 
 impl PairingTokens {
@@ -92,7 +92,7 @@ impl std::fmt::Debug for PairingTokens {
 
 /// Last handed-over tokens, shared between the pairing listener (writer) and
 /// the connect/reconnect paths (readers). In-memory only — see module doc.
-pub type PairingStore = Arc<StdMutex<Option<PairingTokens>>>;
+pub(crate) type PairingStore = Arc<StdMutex<Option<PairingTokens>>>;
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -104,7 +104,7 @@ fn now_secs() -> u64 {
 /// A clone of the stored tokens if their WS credential is still usable.
 /// Expired tokens are dropped from the store on the way out, so the connect
 /// path falls back to `/qws/createToken` instead of retrying a dead JWT.
-pub fn valid_ws_tokens(store: &PairingStore) -> Option<PairingTokens> {
+pub(crate) fn valid_ws_tokens(store: &PairingStore) -> Option<PairingTokens> {
     let mut guard = store.lock().ok()?;
     match guard.as_ref() {
         Some(tokens) if tokens.ws_token_live(now_secs()) => Some(tokens.clone()),
@@ -120,7 +120,7 @@ pub fn valid_ws_tokens(store: &PairingStore) -> Option<PairingTokens> {
 /// Build the WS transport config from handed-over tokens. Field-for-field the
 /// hardened defaults `resolve_transport_config` uses (require_jwt, 60s idle
 /// retry, the default connectionId/backend/controllers channels).
-pub fn transport_config_from(tokens: &PairingTokens) -> WsTransportConfig {
+pub(crate) fn transport_config_from(tokens: &PairingTokens) -> WsTransportConfig {
     WsTransportConfig {
         endpoint_url: tokens.ws_endpoint.clone(),
         jwt_qws: Some(tokens.ws_jwt.clone()),
@@ -207,14 +207,14 @@ fn sanitize_instance_name(name: &str) -> String {
 /// no handoff can land mid-teardown, and joined so its
 /// `Arc<DaemonQconnectService>` (→ `Arc<AppRuntime>`) clone drops ahead of
 /// `drop(booted)` (the #521 clock-release ordering).
-pub struct PairingHandle {
+pub(crate) struct PairingHandle {
     server: Arc<Server>,
     thread: Option<std::thread::JoinHandle<()>>,
     mdns: Option<(ServiceDaemon, String)>,
 }
 
 impl PairingHandle {
-    pub fn shutdown(&mut self) {
+    pub(crate) fn shutdown(&mut self) {
         if let Some((daemon, fullname)) = self.mdns.take() {
             let _ = daemon.unregister(&fullname);
             let _ = daemon.shutdown();
@@ -321,7 +321,10 @@ const REFRESH_LEAD_SECS: u64 = 300;
 /// Daemon-lifetime refresh heartbeat: a no-op until a handoff populates the
 /// store. Held by `QconnectHandle` and abort+joined at shutdown (it clones
 /// `Arc<AppRuntime>` — #521 ordering, same contract as the report scheduler).
-pub fn spawn_token_refresh(store: PairingStore, runtime: Runtime) -> tokio::task::JoinHandle<()> {
+pub(crate) fn spawn_token_refresh(
+    store: PairingStore,
+    runtime: Runtime,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(REFRESH_CHECK_SECS));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);

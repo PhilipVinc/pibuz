@@ -36,7 +36,7 @@ use super::{canon_volume, err_json, json, ApiState};
 /// api_version 1; needed so `pibuz now`'s stopped-state render, "stopped ·
 /// queue 14 tracks", has a count).
 /// `track` is the current `QueueTrack`, or `null` when nothing is loaded.
-pub fn now_playing(state: &ApiState) -> Response<Cursor<Vec<u8>>> {
+pub(crate) fn now_playing(state: &ApiState) -> Response<Cursor<Vec<u8>>> {
     let player = state.runtime.core().player();
     let mut ev = player.get_playback_event();
     let queue = state.rt.block_on(state.runtime.core().get_queue_state());
@@ -70,7 +70,7 @@ pub fn now_playing(state: &ApiState) -> Response<Cursor<Vec<u8>>> {
 
 /// `POST /api/playback/play`. Resume if paused; cold-start the
 /// current queue track when `!has_loaded_audio()`.
-pub fn play(state: &ApiState) -> Response<Cursor<Vec<u8>>> {
+pub(crate) fn play(state: &ApiState) -> Response<Cursor<Vec<u8>>> {
     let player = state.runtime.core().player();
     if player.has_loaded_audio() {
         return match state.runtime.core().resume() {
@@ -100,7 +100,7 @@ pub fn pause(state: &ApiState) -> Response<Cursor<Vec<u8>>> {
 /// resume; nothing loaded -> cold-start (same gate as `play`). Exit 5 is
 /// reserved for the cold-start branch (`cold_start`'s own 503
 /// `audio_unavailable`) — the pause/resume branches use [`runtime_error`] like plain `pause`/`stop`.
-pub fn toggle(state: &ApiState) -> Response<Cursor<Vec<u8>>> {
+pub(crate) fn toggle(state: &ApiState) -> Response<Cursor<Vec<u8>>> {
     let player = state.runtime.core().player();
     let ev = player.get_playback_event();
     if ev.is_playing {

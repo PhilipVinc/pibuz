@@ -58,7 +58,7 @@ const HEADER: &str = "# pibuz loudness cache v1";
 
 /// The most tracks kept. Far past any one listener's rotation; past it the
 /// oldest measurements are dropped when the file is compacted.
-pub const MAX_ENTRIES: usize = 50_000;
+pub(crate) const MAX_ENTRIES: usize = 50_000;
 
 /// Compact only once this many superseded lines have piled up, so a small
 /// file is never rewritten for a handful of re-measurements.
@@ -67,7 +67,7 @@ const COMPACT_MIN_STALE: usize = 1_000;
 #[derive(Debug, Clone)]
 pub struct CachedLoudness {
     pub gain_db: f32,
-    pub peak: f32,
+    pub(crate) peak: f32,
     /// Source of the measurement: "ebur128" or "replaygain"
     pub source: String,
 }

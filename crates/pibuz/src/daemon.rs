@@ -19,21 +19,25 @@ use crate::state::{DaemonShared, LatchedErrors, QconnectStatus};
 /// playback driver on `runtime` + `shared`, serves `bus` over HTTP/SSE and
 /// wires QConnect to all three. Held alive by [`run`] through the signal park
 /// so the core stays up.
-pub struct BootedRuntime {
-    pub runtime: Arc<AppRuntime<DaemonAdapter>>,
-    pub shared: Arc<Mutex<DaemonShared>>,
-    pub bus: broadcast::Sender<CoreEvent>,
+pub(crate) struct BootedRuntime {
+    pub(crate) runtime: Arc<AppRuntime<DaemonAdapter>>,
+    pub(crate) shared: Arc<Mutex<DaemonShared>>,
+    pub(crate) bus: broadcast::Sender<CoreEvent>,
     /// Background session-restore retry (network-class boot failure only). Held
     /// so shutdown can abort+join it BEFORE releasing the audio device: it holds
     /// an `Arc<AppRuntime>` clone, so leaving it running would keep the Player
     /// alive past `drop(booted)` and break the #521 clock-release ordering.
-    pub auth_retry: Option<JoinHandle<()>>,
+    pub(crate) auth_retry: Option<JoinHandle<()>>,
 }
 
 /// `pibuz run` — boot the daemon in the foreground, park on signals, shut down
 /// gracefully. Returns the process exit code (0 = clean shutdown). `warns` are
 /// the unknown-key warnings surfaced by [`PibuzConfig::load`] in `main`.
-pub async fn run(roots: ProfileRoots, cfg: PibuzConfig, warns: Vec<String>) -> Result<i32, String> {
+pub(crate) async fn run(
+    roots: ProfileRoots,
+    cfg: PibuzConfig,
+    warns: Vec<String>,
+) -> Result<i32, String> {
     // 1. argv parse happened in main().
     //
     // 2. instance lock on the DATA ROOT, taken BEFORE any port bind: it, not

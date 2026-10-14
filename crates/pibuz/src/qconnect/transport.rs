@@ -62,14 +62,14 @@ static DAEMON_DATA_ROOT: OnceLock<PathBuf> = OnceLock::new();
 
 /// Point the connect path at the daemon's data root. Idempotent (a second call
 /// is ignored). Called from `qconnect::start(roots)`.
-pub fn init_data_root(path: PathBuf) {
+pub(crate) fn init_data_root(path: PathBuf) {
     let _ = DAEMON_DATA_ROOT.set(path);
 }
 
 /// Persistent QConnect device identity: minted once and kept in the daemon
 /// root's `settings.toml`. An explicit `QBZ_QCONNECT_DEVICE_UUID` env value
 /// still wins. Fail-open: a fresh v4 when `init_data_root` has not run.
-pub fn resolve_qconnect_device_uuid() -> String {
+pub(crate) fn resolve_qconnect_device_uuid() -> String {
     if let Some(explicit) = std::env::var("QBZ_QCONNECT_DEVICE_UUID")
         .ok()
         .map(|value| value.trim().to_string())
@@ -84,7 +84,7 @@ pub fn resolve_qconnect_device_uuid() -> String {
 }
 
 /// `pibuz/<version>` software-version string for the device-info payload.
-pub fn resolve_qconnect_software_version() -> String {
+pub(crate) fn resolve_qconnect_software_version() -> String {
     std::env::var("QBZ_QCONNECT_SOFTWARE_VERSION")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -95,14 +95,14 @@ pub fn resolve_qconnect_software_version() -> String {
         })
 }
 
-pub fn resolve_qconnect_device_brand() -> String {
+pub(crate) fn resolve_qconnect_device_brand() -> String {
     std::env::var("QBZ_QCONNECT_DEVICE_BRAND")
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_QCONNECT_DEVICE_BRAND.to_string())
 }
 
-pub fn resolve_qconnect_device_model() -> String {
+pub(crate) fn resolve_qconnect_device_model() -> String {
     std::env::var("QBZ_QCONNECT_DEVICE_MODEL")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -112,7 +112,7 @@ pub fn resolve_qconnect_device_model() -> String {
 /// `QBZ_QCONNECT_DEVICE_TYPE` overrides the default with a wire value; one the
 /// enum does not define falls back to the default rather than announcing a
 /// type no app knows how to draw.
-pub fn resolve_qconnect_device_type() -> i32 {
+pub(crate) fn resolve_qconnect_device_type() -> i32 {
     device_type_from_env(std::env::var("QBZ_QCONNECT_DEVICE_TYPE").ok().as_deref())
 }
 
@@ -124,14 +124,14 @@ fn device_type_from_env(value: Option<&str>) -> i32 {
 }
 
 /// The pairing-surface name of a DeviceType wire value, `None` outside the enum.
-pub fn device_type_name(kind: i32) -> Option<&'static str> {
+pub(crate) fn device_type_name(kind: i32) -> Option<&'static str> {
     usize::try_from(kind)
         .ok()
         .and_then(|index| DEVICE_TYPE_NAMES.get(index))
         .copied()
 }
 
-pub fn resolve_system_hostname() -> String {
+pub(crate) fn resolve_system_hostname() -> String {
     if let Ok(h) = std::env::var("HOSTNAME") {
         if !h.trim().is_empty() {
             return h.trim().to_string();
@@ -151,12 +151,12 @@ pub fn resolve_system_hostname() -> String {
 /// `QBZ_QCONNECT_DEVICE_NAME`. A box that never set one is renamed in the
 /// Qobuz app by this, which is the point — it is the same endpoint, under the
 /// name the project now has.
-pub fn resolve_default_qconnect_device_name() -> String {
+pub(crate) fn resolve_default_qconnect_device_name() -> String {
     format!("Pibuz ({})", resolve_system_hostname())
 }
 
 /// Effective friendly name: custom override -> env -> "Pibuz ({hostname})".
-pub fn resolve_qconnect_friendly_name(custom_name: Option<&str>) -> String {
+pub(crate) fn resolve_qconnect_friendly_name(custom_name: Option<&str>) -> String {
     custom_name
         .filter(|s| !s.trim().is_empty())
         .map(|s| s.to_string())
@@ -179,10 +179,10 @@ pub fn resolve_qconnect_friendly_name(custom_name: Option<&str>) -> String {
 // the same four tiers `playback.quality` names. Capabilities advertise the
 // device's min/max decode support; VolumeRemoteControl is NOT_ALLOWED(1) or
 // ALLOWED(2), the web player's enum values.
-pub const AUDIO_QUALITY_MP3: i32 = 1;
-pub const AUDIO_QUALITY_CD: i32 = 2;
-pub const AUDIO_QUALITY_HIRES_LEVEL1: i32 = 3;
-pub const AUDIO_QUALITY_HIRES_LEVEL2: i32 = 4;
+pub(crate) const AUDIO_QUALITY_MP3: i32 = 1;
+pub(crate) const AUDIO_QUALITY_CD: i32 = 2;
+pub(crate) const AUDIO_QUALITY_HIRES_LEVEL1: i32 = 3;
+pub(crate) const AUDIO_QUALITY_HIRES_LEVEL2: i32 = 4;
 const VOLUME_REMOTE_CONTROL_NOT_ALLOWED: i32 = 1;
 const VOLUME_REMOTE_CONTROL_ALLOWED: i32 = 2;
 
@@ -197,38 +197,38 @@ fn volume_remote_control(mode: VolumeMode) -> i32 {
     }
 }
 /// Renderer buffer-state wire value for OK/ready.
-pub const BUFFER_STATE_OK: i32 = 2;
+pub(crate) const BUFFER_STATE_OK: i32 = 2;
 /// Renderer buffer-state wire value for "filling the buffer, not yet audible"
 /// (`BufferState.BUFFER_STATE_BUFFERING`, field 2 of the protocol's
 /// RendererState). Reported while a stream is loading so the controller shows a
 /// loading state instead of advancing its progress bar against silence — the
 /// progressive feeder can take seconds to reach a deep resume position, and
 /// claiming OK the whole time is what made the app rubber-band.
-pub const BUFFER_STATE_BUFFERING: i32 = 1;
+pub(crate) const BUFFER_STATE_BUFFERING: i32 = 1;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct QconnectDeviceCapabilitiesPayload {
-    pub min_audio_quality: Option<i32>,
+pub(crate) struct QconnectDeviceCapabilitiesPayload {
+    pub(crate) min_audio_quality: Option<i32>,
     pub max_audio_quality: Option<i32>,
-    pub volume_remote_control: Option<i32>,
+    pub(crate) volume_remote_control: Option<i32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct QconnectDeviceInfoPayload {
+pub(crate) struct QconnectDeviceInfoPayload {
     pub device_uuid: Option<String>,
     pub friendly_name: Option<String>,
     pub brand: Option<String>,
     pub model: Option<String>,
-    pub serial_number: Option<String>,
+    pub(crate) serial_number: Option<String>,
     pub device_type: Option<i32>,
-    pub capabilities: Option<QconnectDeviceCapabilitiesPayload>,
-    pub software_version: Option<String>,
+    pub(crate) capabilities: Option<QconnectDeviceCapabilitiesPayload>,
+    pub(crate) software_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct QconnectJoinSessionRequest {
-    pub session_uuid: Option<String>,
-    pub device_info: Option<QconnectDeviceInfoPayload>,
+pub(crate) struct QconnectJoinSessionRequest {
+    pub(crate) session_uuid: Option<String>,
+    pub(crate) device_info: Option<QconnectDeviceInfoPayload>,
 }
 
 /// Load the persisted custom device name. Fail-open: None when
@@ -282,13 +282,13 @@ fn audio_quality_level(quality: Quality) -> i32 {
 ///
 /// Goes through the SAME `quality_from_key` contract the local path uses, so
 /// the two can never drift: one key table, one meaning of "cd".
-pub fn local_max_quality_at(data_root: &Path) -> Quality {
+pub(crate) fn local_max_quality_at(data_root: &Path) -> Quality {
     playback_driver::quality_from_key(&daemon_prefs::load_at(data_root).streaming_quality)
 }
 
 /// The configured ceiling, or `None` when `init_data_root` never ran (fail-open
 /// = uncapped, matching every other resolver in this module).
-pub fn local_max_quality() -> Option<Quality> {
+pub(crate) fn local_max_quality() -> Option<Quality> {
     DAEMON_DATA_ROOT
         .get()
         .map(|root| local_max_quality_at(root))
@@ -296,7 +296,7 @@ pub fn local_max_quality() -> Option<Quality> {
 
 /// The ceiling as a wire level, for the capability payload and the renderer
 /// report. Uncapped advertises the top tier, which is what it always did.
-pub fn local_max_audio_quality_level() -> i32 {
+pub(crate) fn local_max_audio_quality_level() -> i32 {
     audio_quality_level(local_max_quality().unwrap_or(Quality::UltraHiRes))
 }
 
@@ -308,13 +308,13 @@ pub fn local_max_audio_quality_level() -> i32 {
 /// when the server's ADD_RENDERER omits the uuid the name-fingerprint self-match
 /// fails -> `local_renderer_id = None` -> every renderer report is dropped by the
 /// `is_local_renderer_active` gate (mute renderer, frozen controller seekbar).
-pub fn default_qconnect_device_info() -> QconnectDeviceInfoPayload {
+pub(crate) fn default_qconnect_device_info() -> QconnectDeviceInfoPayload {
     default_qconnect_device_info_with_name(load_persisted_device_name().as_deref())
 }
 
 /// Build the device-info payload, overriding the friendly name when a custom
 /// device name is set.
-pub fn default_qconnect_device_info_with_name(
+pub(crate) fn default_qconnect_device_info_with_name(
     custom_name: Option<&str>,
 ) -> QconnectDeviceInfoPayload {
     QconnectDeviceInfoPayload {
@@ -336,7 +336,7 @@ pub fn default_qconnect_device_info_with_name(
 /// Resolve THIS device's identity for injection into the frontend-agnostic
 /// session-apply logic in qconnect-app (`apply_session_management_event` takes a
 /// `LocalIdentity` so the crate never depends on the persistence layer).
-pub fn resolve_local_identity() -> qconnect_app::LocalIdentity {
+pub(crate) fn resolve_local_identity() -> qconnect_app::LocalIdentity {
     let info = default_qconnect_device_info();
     qconnect_app::LocalIdentity {
         device_uuid: info.device_uuid.unwrap_or_default(),
@@ -360,26 +360,26 @@ pub fn resolve_local_identity() -> qconnect_app::LocalIdentity {
 pub use qconnect_settings::DEFAULT_PAIRING_PORT;
 
 /// Load the persisted custom device name. None when unset or blank.
-pub fn load_device_name_at(root: &Path) -> Option<String> {
+pub(crate) fn load_device_name_at(root: &Path) -> Option<String> {
     qconnect_settings::load(root)
         .device_name
         .filter(|v| !v.trim().is_empty())
 }
 
 /// Persist the custom device name (None clears it).
-pub fn persist_device_name_at(root: &Path, name: Option<&str>) -> Result<(), String> {
+pub(crate) fn persist_device_name_at(root: &Path, name: Option<&str>) -> Result<(), String> {
     qconnect_settings::update(root, |s| s.device_name = name.map(str::to_string))
 }
 
 /// Load the QConnect startup mode (`startup_mode` = "off" | "on"). `Off` (the
 /// default) when unset or unknown.
-pub fn load_startup_mode_at(root: &Path) -> qconnect_app::QconnectStartupMode {
+pub(crate) fn load_startup_mode_at(root: &Path) -> qconnect_app::QconnectStartupMode {
     qconnect_app::QconnectStartupMode::from_str(&qconnect_settings::load(root).startup_mode)
         .unwrap_or_default()
 }
 
 /// Persist the QConnect startup mode.
-pub fn save_startup_mode_at(
+pub(crate) fn save_startup_mode_at(
     root: &Path,
     mode: qconnect_app::QconnectStartupMode,
 ) -> Result<(), String> {
@@ -388,30 +388,30 @@ pub fn save_startup_mode_at(
 
 /// Load the daemon volume mode (`volume_mode` = "software" | "locked" |
 /// "external"). None when unset.
-pub fn load_volume_mode_at(root: &Path) -> Option<String> {
+pub(crate) fn load_volume_mode_at(root: &Path) -> Option<String> {
     qconnect_settings::load(root)
         .volume_mode
         .filter(|v| !v.trim().is_empty())
 }
 
 /// Persist the daemon volume mode.
-pub fn save_volume_mode_at(root: &Path, mode: &str) -> Result<(), String> {
+pub(crate) fn save_volume_mode_at(root: &Path, mode: &str) -> Result<(), String> {
     qconnect_settings::update(root, |s| s.volume_mode = Some(mode.to_string()))
 }
 
 /// Load the pairing-surface switch (pairing.rs). ON when unset — local pairing
 /// is the daemon's reason to exist on a shared-household box.
-pub fn load_pairing_enabled_at(root: &Path) -> bool {
+pub(crate) fn load_pairing_enabled_at(root: &Path) -> bool {
     qconnect_settings::load(root).pairing
 }
 
 /// Persist the pairing-surface switch.
-pub fn save_pairing_enabled_at(root: &Path, enabled: bool) -> Result<(), String> {
+pub(crate) fn save_pairing_enabled_at(root: &Path, enabled: bool) -> Result<(), String> {
     qconnect_settings::update(root, |s| s.pairing = enabled)
 }
 
 /// Load the pairing listener port. The default when unset or 0.
-pub fn load_pairing_port_at(root: &Path) -> u16 {
+pub(crate) fn load_pairing_port_at(root: &Path) -> u16 {
     match qconnect_settings::load(root).pairing_port {
         0 => DEFAULT_PAIRING_PORT,
         port => port,
@@ -419,7 +419,7 @@ pub fn load_pairing_port_at(root: &Path) -> u16 {
 }
 
 /// Persist the pairing listener port.
-pub fn save_pairing_port_at(root: &Path, port: u16) -> Result<(), String> {
+pub(crate) fn save_pairing_port_at(root: &Path, port: u16) -> Result<(), String> {
     qconnect_settings::update(root, |s| s.pairing_port = port)
 }
 
@@ -433,12 +433,12 @@ pub fn save_pairing_port_at(root: &Path, port: u16) -> Result<(), String> {
 /// `--initial-volume`, and moOde exposes it for Spotify and Deezer), and it
 /// exists so a cast does not arrive at full scale on a system with no downstream
 /// volume control.
-pub fn load_initial_volume_at(root: &Path) -> Option<u8> {
+pub(crate) fn load_initial_volume_at(root: &Path) -> Option<u8> {
     Some(qconnect_settings::load(root).initial_volume).filter(|pct| *pct > 0 && *pct <= 100)
 }
 
 /// Persist the join-time volume percentage; `0` disables it.
-pub fn save_initial_volume_at(root: &Path, percent: u8) -> Result<(), String> {
+pub(crate) fn save_initial_volume_at(root: &Path, percent: u8) -> Result<(), String> {
     qconnect_settings::update(root, |s| s.initial_volume = percent)
 }
 
@@ -446,7 +446,9 @@ pub fn save_initial_volume_at(root: &Path, percent: u8) -> Result<(), String> {
 /// `qws/createToken`. The connect path uses defaults + env; there are no
 /// per-option knobs. `require_jwt = true` (hard) and
 /// `reconnect_idle_retry_ms = 60s` match the hardened defaults.
-pub async fn resolve_transport_config(runtime: &Runtime) -> Result<WsTransportConfig, String> {
+pub(crate) async fn resolve_transport_config(
+    runtime: &Runtime,
+) -> Result<WsTransportConfig, String> {
     let mut endpoint_url = normalize_opt_string(std::env::var("QBZ_QCONNECT_WS_ENDPOINT").ok());
     let mut jwt_qws = normalize_opt_string(std::env::var("QBZ_QCONNECT_JWT_QWS").ok())
         .or_else(|| normalize_opt_string(std::env::var("QBZ_QCONNECT_JWT").ok()));
@@ -598,14 +600,14 @@ fn normalize_opt_string(value: Option<String>) -> Option<String> {
     })
 }
 
-pub fn parse_subscribe_channels(items: Vec<String>) -> Result<Vec<Vec<u8>>, String> {
+pub(crate) fn parse_subscribe_channels(items: Vec<String>) -> Result<Vec<Vec<u8>>, String> {
     items
         .into_iter()
         .map(|item| decode_hex_channel(&item))
         .collect()
 }
 
-pub fn decode_hex_channel(raw: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn decode_hex_channel(raw: &str) -> Result<Vec<u8>, String> {
     let normalized = raw.trim().trim_start_matches("0x").trim_start_matches("0X");
     if normalized.is_empty() {
         return Err("empty subscribe channel hex value".to_string());

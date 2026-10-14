@@ -1102,7 +1102,7 @@ impl QobuzClient {
     /// Fix: a double-checked lock pattern on the write guard. Fast path
     /// uses a read guard; slow path acquires the write guard, re-checks
     /// under exclusive ownership, and only one caller hits the network.
-    pub async fn ensure_cmaf_session(&self) -> Result<(String, String)> {
+    pub(crate) async fn ensure_cmaf_session(&self) -> Result<(String, String)> {
         let now = get_timestamp();
 
         // Fast path: existing session with > 60s left.
@@ -1195,7 +1195,11 @@ impl QobuzClient {
     ///
     /// This is the new streaming endpoint that returns encrypted CMAF segments
     /// instead of a direct file URL.
-    pub async fn get_file_url(&self, track_id: u64, quality: Quality) -> Result<TrackFileUrl> {
+    pub(crate) async fn get_file_url(
+        &self,
+        track_id: u64,
+        quality: Quality,
+    ) -> Result<TrackFileUrl> {
         let format_id = quality.id();
         let url = endpoints::build_url(paths::FILE_URL);
 

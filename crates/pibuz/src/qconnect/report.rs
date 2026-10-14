@@ -22,7 +22,7 @@ use super::sink::DaemonQconnectApp;
 use super::transport::{BUFFER_STATE_BUFFERING, BUFFER_STATE_OK};
 use crate::adapter::DaemonAdapter;
 
-pub const QCONNECT_RENDERER_CHANNELS: i32 = 2;
+pub(crate) const QCONNECT_RENDERER_CHANNELS: i32 = 2;
 /// The player's clock has reached the end of the track it is playing.
 ///
 /// Not a proxy for anything subtle: if we are playing and the position has
@@ -103,7 +103,7 @@ async fn report_playback_error(
 /// PEER owns playback), resolves the current/next queue_item_id from the playing
 /// track, sends a `RndrSrvrStateUpdated`, and keeps the app's renderer position
 /// in sync.
-pub async fn report_playback_state(
+pub(crate) async fn report_playback_state(
     app: &Arc<DaemonQconnectApp>,
     sync_state: &Arc<Mutex<QconnectRemoteSyncState>>,
     runtime: &Arc<AppRuntime<DaemonAdapter>>,
@@ -285,7 +285,7 @@ async fn resolve_queue_item_ids_by_track_id(
 //     it only elapses when the edge stream goes quiet (no double-reporting during
 //     active playback); interval-driven reports are additionally gated on
 //     `is_playing`, so a paused/stopped renderer stays silent.
-pub async fn run_report_scheduler(
+pub(crate) async fn run_report_scheduler(
     notify: Arc<tokio::sync::Notify>,
     inner: Arc<Mutex<super::DaemonQconnectInner>>,
     runtime: Arc<AppRuntime<DaemonAdapter>>,
@@ -486,9 +486,9 @@ use qconnect_app::renderer::{PLAYING_STATE_PAUSED, PLAYING_STATE_PLAYING, PLAYIN
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ReportDecision {
     pub playing_state: i32,
-    pub buffer_state: i32,
+    pub(crate) buffer_state: i32,
     pub track_id: u64,
-    pub position_ms: u64,
+    pub(crate) position_ms: u64,
     pub duration_secs: u64,
 }
 
@@ -497,7 +497,7 @@ pub(crate) struct ReportDecision {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PlayerSnapshot {
     pub track_id: u64,
-    pub position_ms: u64,
+    pub(crate) position_ms: u64,
     pub duration_secs: u64,
     pub is_playing: bool,
 }

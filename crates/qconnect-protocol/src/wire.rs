@@ -4,20 +4,20 @@ use serde_json::Value;
 
 use crate::{ProtocolError, QueueCommand, QueueEventType, QueueServerEvent};
 
-pub const QCONNECT_SERVICE: &str = "QConnect";
-pub const QCONNECT_BACKEND_DESTINATION: &str = "Backend";
+pub(crate) const QCONNECT_SERVICE: &str = "QConnect";
+pub(crate) const QCONNECT_BACKEND_DESTINATION: &str = "Backend";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutboundEnvelope {
     pub service: String,
-    pub destination: String,
+    pub(crate) destination: String,
     pub message_type: String,
     pub action_uuid: String,
     pub queue_version_ref: QueueVersion,
     #[serde(default)]
     pub payload: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub payload_bytes: Option<Vec<u8>>,
+    pub(crate) payload_bytes: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

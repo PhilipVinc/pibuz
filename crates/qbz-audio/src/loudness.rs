@@ -6,7 +6,6 @@
 
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use symphonia::core::formats::FormatOptions;
-use symphonia::core::formats::FormatReader;
 use symphonia::core::io::{MediaSource, MediaSourceStream};
 use symphonia::core::meta::{MetadataOptions, StandardTagKey, Tag, Value};
 use symphonia::core::probe::Hint;
@@ -18,7 +17,7 @@ pub struct ReplayGainData {
     /// Gain adjustment in dB (negative = reduce volume, positive = increase)
     pub gain_db: f32,
     /// Peak sample value (0.0-1.0+), used for clipping prevention
-    pub peak: Option<f32>,
+    pub(crate) peak: Option<f32>,
 }
 
 /// Wrapper to make Cursor<Vec<u8>> implement MediaSource
@@ -104,29 +103,6 @@ pub fn extract_replaygain(data: &[u8]) -> Option<ReplayGainData> {
 
     gain_db.map(|db| {
         log::info!("Loudness: found ReplayGain: {:.2} dB, peak: {:?}", db, peak);
-        ReplayGainData { gain_db: db, peak }
-    })
-}
-
-/// Extract ReplayGain data from a Symphonia FormatReader (for streaming sources).
-///
-/// This is used when we already have a probed format reader and don't want
-/// to re-probe the data.
-pub fn extract_replaygain_from_reader(format: &mut dyn FormatReader) -> Option<ReplayGainData> {
-    let mut gain_db: Option<f32> = None;
-    let mut peak: Option<f32> = None;
-
-    let metadata = format.metadata();
-    if let Some(rev) = metadata.current() {
-        extract_from_tags(rev.tags(), &mut gain_db, &mut peak);
-    }
-
-    gain_db.map(|db| {
-        log::info!(
-            "Loudness: found ReplayGain (streaming): {:.2} dB, peak: {:?}",
-            db,
-            peak
-        );
         ReplayGainData { gain_db: db, peak }
     })
 }

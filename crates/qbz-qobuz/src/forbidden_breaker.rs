@@ -40,7 +40,7 @@ struct Inner {
 
 /// A shared, cheaply-clonable 403 circuit breaker. Uses a plain `Mutex` (no
 /// `.await` held) so it is trivially callable from any async path.
-pub struct ForbiddenBreaker {
+pub(crate) struct ForbiddenBreaker {
     inner: Mutex<Inner>,
 }
 
@@ -65,7 +65,7 @@ impl ForbiddenBreaker {
     /// short-circuit (and log how long it is backing off). Returns `None` when
     /// closed OR when the cooldown has just elapsed — in the latter case the
     /// open state is cleared so exactly the next call is a half-open probe.
-    pub fn blocked_for(&self) -> Option<Duration> {
+    pub(crate) fn blocked_for(&self) -> Option<Duration> {
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(until) = g.open_until {
             let now = Instant::now();
@@ -79,7 +79,7 @@ impl ForbiddenBreaker {
     }
 
     /// Record a successful authenticated response: fully resets the breaker.
-    pub fn record_success(&self) {
+    pub(crate) fn record_success(&self) {
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         g.consecutive = 0;
         g.open_until = None;
@@ -89,7 +89,7 @@ impl ForbiddenBreaker {
     /// Record a 403. Opens (or re-opens) the breaker once the threshold is hit.
     /// Returns the cooldown it opened with, if it opened on this call — for
     /// logging.
-    pub fn record_forbidden(&self) -> Option<Duration> {
+    pub(crate) fn record_forbidden(&self) -> Option<Duration> {
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         g.consecutive = g.consecutive.saturating_add(1);
         if g.consecutive >= OPEN_THRESHOLD {

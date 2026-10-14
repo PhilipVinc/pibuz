@@ -6,20 +6,20 @@ use log::Level;
 /// written to stderr or the file (redaction happens at the single write choke point in
 /// [`crate::tee::TeeLogger`]).
 #[derive(Clone)]
-pub struct LogLine {
+pub(crate) struct LogLine {
     /// Capture timestamp, epoch milliseconds (local-clock derived).
-    pub ts: i64,
+    pub(crate) ts: i64,
     /// Severity.
-    pub level: Level,
+    pub(crate) level: Level,
     /// `log` target (usually the module path).
-    pub target: String,
+    pub(crate) target: String,
     /// Redacted message text.
     pub message: String,
 }
 
 impl LogLine {
     /// Fixed-width uppercase level label (`ERROR`/`WARN`/`INFO`/`DEBUG`/`TRACE`).
-    pub fn level_str(&self) -> &'static str {
+    pub(crate) fn level_str(&self) -> &'static str {
         match self.level {
             Level::Error => "ERROR",
             Level::Warn => "WARN",
@@ -31,7 +31,7 @@ impl LogLine {
 
     /// Human-readable local timestamp (`YYYY-MM-DD HH:MM:SS.mmm`) from the epoch ms.
     /// Falls back to the raw epoch value if the timestamp is somehow out of range.
-    pub fn format_ts(&self) -> String {
+    pub(crate) fn format_ts(&self) -> String {
         use chrono::{Local, TimeZone};
         match Local.timestamp_millis_opt(self.ts).single() {
             Some(dt) => dt.format("%Y-%m-%d %H:%M:%S%.3f").to_string(),

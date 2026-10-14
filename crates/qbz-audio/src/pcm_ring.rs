@@ -262,17 +262,6 @@ impl RingLink {
         }
     }
 
-    /// Drop every pending boundary. For a teardown, where the queue's contents
-    /// describe a stream nobody is going to play.
-    pub fn clear_boundaries(&self) {
-        let mut queue = match self.boundaries.lock() {
-            Ok(q) => q,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        queue.clear();
-        self.next_boundary_at.store(u64::MAX, Ordering::Release);
-    }
-
     /// Consumer: wake a decoder that is waiting for room.
     ///
     /// Takes no lock, deliberately: this is called from the real-time writer
@@ -304,7 +293,7 @@ impl RingLink {
         self.space.notify_all();
     }
 
-    pub fn is_closed(&self) -> bool {
+    pub(crate) fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
     }
 }
@@ -654,15 +643,6 @@ mod tests {
             Some(BoundaryKind::TrackStart { offset_frames: 0 })
         );
         assert!(!link.has_queued_boundaries());
-    }
-
-    #[test]
-    fn clearing_boundaries_also_clears_the_fast_path_hint() {
-        let link = RingLink::new();
-        link.push_boundary(BoundaryKind::TrackStart { offset_frames: 0 });
-        link.clear_boundaries();
-        link.add_handed(10_000);
-        assert_eq!(link.take_due_boundary(), None);
     }
 
     /// A closed link must not leave the decoder parked: shutdown joins it.

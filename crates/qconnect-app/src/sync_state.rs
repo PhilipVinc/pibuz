@@ -31,18 +31,18 @@ pub struct QconnectRemoteSyncState {
     pub last_renderer_next_queue_item_id: Option<u64>,
     pub last_renderer_track_id: Option<u64>,
     pub last_renderer_next_track_id: Option<u64>,
-    pub last_renderer_playing_state: Option<i32>,
+    pub(crate) last_renderer_playing_state: Option<i32>,
     /// Last `max_audio_quality` the session announced. Cached because
     /// `materialize_remote_queue` can now start a track (a push that carries
     /// `selected_queue_position` and no following SetState) and has no renderer
     /// state of its own to read the quality from.
-    pub last_renderer_max_audio_quality: Option<i32>,
-    pub last_materialized_start_index: Option<usize>,
-    pub last_materialized_core_shuffle_order: Option<Vec<usize>>,
-    pub last_reported_file_audio_quality: Option<QconnectFileAudioQualitySnapshot>,
+    pub(crate) last_renderer_max_audio_quality: Option<i32>,
+    pub(crate) last_materialized_start_index: Option<usize>,
+    pub(crate) last_materialized_core_shuffle_order: Option<Vec<usize>>,
+    pub(crate) last_reported_file_audio_quality: Option<QconnectFileAudioQualitySnapshot>,
     /// Last reported device (DAC output) audio quality: (sampling_rate, bit_depth, nb_channels).
     /// Used to dedup outbound RndrSrvrDeviceAudioQualityChanged(27) reports.
-    pub last_reported_device_audio_quality: Option<(i32, i32, i32)>,
+    pub(crate) last_reported_device_audio_quality: Option<(i32, i32, i32)>,
     pub last_applied_queue_state: Option<QConnectQueueState>,
     pub last_remote_queue_state: Option<QConnectQueueState>,
     pub session_loop_mode: Option<i32>,
@@ -58,7 +58,7 @@ pub struct QconnectRemoteSyncState {
     /// (ensure_remote_track_loaded and force_remote_track_stream). Used to
     /// suppress redundant reloads when an echo SetState arrives during the
     /// in-progress buffer/decode window of a previously triggered load.
-    pub last_load_attempt: Option<(u64, Instant)>,
+    pub(crate) last_load_attempt: Option<(u64, Instant)>,
     /// The last `SetActive` (message 43) this renderer actually HONOURED.
     ///
     /// The cloud states the active role outright, and the renderer acts on it, so
@@ -80,7 +80,7 @@ pub struct QconnectRemoteSyncState {
 
 /// Set each cached renderer's `active` flag to match the session's current
 /// active renderer id. Pure mutation over the accumulator.
-pub fn sync_session_renderer_active_flags(state: &mut QconnectRemoteSyncState) {
+pub(crate) fn sync_session_renderer_active_flags(state: &mut QconnectRemoteSyncState) {
     for (renderer_id, renderer_state) in &mut state.session_renderer_states {
         renderer_state.active = state
             .session
@@ -91,7 +91,7 @@ pub fn sync_session_renderer_active_flags(state: &mut QconnectRemoteSyncState) {
 
 /// Get-or-insert the cached per-renderer state for `renderer_id`, seeding its
 /// `active` flag from the session's current active renderer. Pure mutation.
-pub fn ensure_session_renderer_state(
+pub(crate) fn ensure_session_renderer_state(
     state: &mut QconnectRemoteSyncState,
     renderer_id: i32,
 ) -> &mut QconnectSessionRendererState {

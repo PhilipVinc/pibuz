@@ -28,13 +28,13 @@
 //! use qbz_models::{Track, Album, CoreEvent, FrontendAdapter};
 //! ```
 
-pub mod events;
+pub(crate) mod events;
 pub mod lenient;
-pub mod playback;
+pub(crate) mod playback;
 pub mod settings_file;
 pub mod system_capabilities;
-pub mod traits;
-pub mod types;
+pub(crate) mod traits;
+pub(crate) mod types;
 
 // Re-export commonly used types at crate root
 pub use events::CoreEvent;

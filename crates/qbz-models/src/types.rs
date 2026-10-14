@@ -16,8 +16,8 @@ use serde::{Deserialize, Serialize};
 pub struct TrackToAnalyse {
     pub track_id: u64,
     pub artist_id: u64,
-    pub genre_id: u64,
-    pub label_id: u64,
+    pub(crate) genre_id: u64,
+    pub(crate) label_id: u64,
 }
 
 // ============ Quality Types ============
@@ -35,7 +35,7 @@ pub enum Quality {
 }
 
 impl Quality {
-    pub fn from_id(id: u32) -> Option<Self> {
+    pub(crate) fn from_id(id: u32) -> Option<Self> {
         match id {
             5 => Some(Quality::Mp3),
             6 => Some(Quality::Lossless),
@@ -212,7 +212,7 @@ pub struct TrackFileUrl {
     #[serde(default)]
     pub n_segments: u8,
     #[serde(default)]
-    pub key_id: Option<String>,
+    pub(crate) key_id: Option<String>,
     #[serde(default)]
     pub key: Option<String>,
     #[serde(default)]
@@ -224,7 +224,7 @@ pub struct TrackFileUrl {
     #[serde(default)]
     pub duration: Option<f64>,
     #[serde(default)]
-    pub n_samples: Option<u64>,
+    pub(crate) n_samples: Option<u64>,
     #[serde(default)]
     pub format_id: Option<u32>,
     #[serde(default)]
@@ -329,18 +329,18 @@ pub struct Album {
     pub artist: Artist,
     #[serde(default)]
     pub image: ImageSet,
-    pub release_date_original: Option<String>,
+    pub(crate) release_date_original: Option<String>,
     /// Date the album becomes available for streaming (ISO YYYY-MM-DD).
     /// When in the future, the album is upcoming and cannot be fetched
     /// via `get_album` yet.
-    pub release_date_stream: Option<String>,
+    pub(crate) release_date_stream: Option<String>,
     /// Whether the album is currently streamable. False for upcoming
     /// releases, regional restrictions, or label takedowns.
     #[serde(default)]
     pub streamable: Option<bool>,
     pub label: Option<Label>,
     pub genre: Option<Genre>,
-    pub tracks_count: Option<u32>,
+    pub(crate) tracks_count: Option<u32>,
     pub duration: Option<u32>,
     #[serde(default)]
     pub hires: bool,
@@ -352,31 +352,31 @@ pub struct Album {
     /// `/label/getAlbums` (DiscographyAlbumDto) and `/discover`-style items
     /// nests quality here; preferred over the flat `maximum_*` fields.
     #[serde(default)]
-    pub audio_info: Option<DiscoverAudioInfo>,
+    pub(crate) audio_info: Option<DiscoverAudioInfo>,
     /// V2 nested release dates (`{original, download, stream}`); preferred
     /// over the flat `release_date_original` when present.
     #[serde(default)]
-    pub dates: Option<DiscoverAlbumDates>,
+    pub(crate) dates: Option<DiscoverAlbumDates>,
     /// The V2 wire spells the album track count `track_count` (no trailing
     /// `s`); the flat shape uses `tracks_count`.
     #[serde(default)]
-    pub track_count: Option<u32>,
+    pub(crate) track_count: Option<u32>,
     /// Explicit release type when provided ("album" | "ep" | "single" |
     /// "live" | "compilation" | ...).
     #[serde(default)]
-    pub release_type: Option<String>,
+    pub(crate) release_type: Option<String>,
     #[serde(default)]
     pub tracks: Option<TracksContainer>,
     /// Universal Product Code for the album
-    pub upc: Option<String>,
+    pub(crate) upc: Option<String>,
     /// Editorial description/review of the album
-    pub description: Option<String>,
+    pub(crate) description: Option<String>,
     /// Album goodies (booklets, liner notes PDFs)
     #[serde(default)]
-    pub goodies: Option<Vec<Goody>>,
+    pub(crate) goodies: Option<Vec<Goody>>,
     /// Editorial awards (Qobuzissime, Album of the Week, press accolades).
     #[serde(default)]
-    pub awards: Option<Vec<AlbumAward>>,
+    pub(crate) awards: Option<Vec<AlbumAward>>,
     /// Parental advisory / explicit content marker.
     #[serde(default)]
     pub parental_warning: Option<bool>,
@@ -384,7 +384,7 @@ pub struct Album {
     /// duplicated here as `roles: ["main-artist"]`; non-main entries are
     /// the album's featured artists.
     #[serde(default)]
-    pub artists: Option<Vec<AlbumArtist>>,
+    pub(crate) artists: Option<Vec<AlbumArtist>>,
     /// Release variant label ("2009 Remaster", "Hi-Res", "Deluxe Edition", …).
     /// Qobuz keeps this out of `title`; the web player appends it in parens so
     /// re-editions of the same album are distinguishable.
@@ -400,11 +400,11 @@ pub struct Album {
 
 /// Album artist contributor entry (main artist + featured artists).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AlbumArtist {
+pub(crate) struct AlbumArtist {
     pub id: u64,
     pub name: String,
     #[serde(default)]
-    pub roles: Option<Vec<String>>,
+    pub(crate) roles: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -444,23 +444,23 @@ pub struct Playlist {
     pub id: u64,
     #[serde(default)]
     pub name: String,
-    pub description: Option<String>,
+    pub(crate) description: Option<String>,
     #[serde(default)]
-    pub owner: PlaylistOwner,
-    pub images: Option<Vec<String>>,
+    pub(crate) owner: PlaylistOwner,
+    pub(crate) images: Option<Vec<String>>,
     #[serde(default)]
-    pub tracks_count: u32,
+    pub(crate) tracks_count: u32,
     #[serde(default)]
     pub duration: u32,
     #[serde(default)]
-    pub is_public: bool,
+    pub(crate) is_public: bool,
     #[serde(default)]
     pub tracks: Option<TracksContainer>,
-    pub genres: Option<Vec<PlaylistGenre>>,
-    pub images150: Option<Vec<String>>,
-    pub images300: Option<Vec<String>>,
-    pub slug: Option<String>,
-    pub users_count: Option<u32>,
+    pub(crate) genres: Option<Vec<PlaylistGenre>>,
+    pub(crate) images150: Option<Vec<String>>,
+    pub(crate) images300: Option<Vec<String>>,
+    pub(crate) slug: Option<String>,
+    pub(crate) users_count: Option<u32>,
 }
 
 // ============ Metadata Types ============
@@ -552,7 +552,7 @@ mod tests {
 ///   list covers the LegacyAwardDto field name the web app never sees
 ///   but the mobile API uses.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct AlbumAward {
+pub(crate) struct AlbumAward {
     #[serde(
         default,
         alias = "awardId",
@@ -567,7 +567,7 @@ pub struct AlbumAward {
         alias = "awardedAt",
         deserialize_with = "deserialize_award_awarded_at"
     )]
-    pub awarded_at: Option<String>,
+    pub(crate) awarded_at: Option<String>,
 }
 
 /// Artist albums container
@@ -578,31 +578,31 @@ pub struct ArtistAlbums {
     #[serde(default)]
     pub offset: u32,
     #[serde(default)]
-    pub limit: u32,
+    pub(crate) limit: u32,
 }
 
 /// Artist biography content
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtistBiography {
-    pub summary: Option<String>,
-    pub content: Option<String>,
+    pub(crate) summary: Option<String>,
+    pub(crate) content: Option<String>,
     pub source: Option<String>,
 }
 
 /// Album dates from discover
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DiscoverAlbumDates {
-    pub download: Option<String>,
-    pub original: Option<String>,
-    pub stream: Option<String>,
+pub(crate) struct DiscoverAlbumDates {
+    pub(crate) download: Option<String>,
+    pub(crate) original: Option<String>,
+    pub(crate) stream: Option<String>,
 }
 
 /// Audio info from discover album
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DiscoverAudioInfo {
+pub(crate) struct DiscoverAudioInfo {
     pub maximum_sampling_rate: Option<f64>,
     pub maximum_bit_depth: Option<u32>,
-    pub maximum_channel_count: Option<u32>,
+    pub(crate) maximum_channel_count: Option<u32>,
 }
 
 /// Genre model
@@ -618,7 +618,7 @@ pub struct Genre {
 
 /// A downloadable extra bundled with an album (e.g. PDF booklet)
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Goody {
+pub(crate) struct Goody {
     #[serde(default)]
     pub id: u64,
     #[serde(default)]
@@ -627,23 +627,23 @@ pub struct Goody {
     pub url: String,
     /// Original (full-size) URL
     #[serde(default)]
-    pub original_url: String,
+    pub(crate) original_url: String,
     /// File format id (e.g. 21 for PDF)
     #[serde(default)]
-    pub file_format_id: Option<u32>,
+    pub(crate) file_format_id: Option<u32>,
     #[serde(default)]
-    pub description: Option<String>,
+    pub(crate) description: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PlaylistGenre {
+pub(crate) struct PlaylistGenre {
     pub id: u64,
     pub name: String,
-    pub slug: Option<String>,
+    pub(crate) slug: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct PlaylistOwner {
+pub(crate) struct PlaylistOwner {
     #[serde(default)]
     pub id: u64,
     #[serde(default)]

@@ -8,28 +8,28 @@ use tiny_http::Response;
 use crate::state::{LatchedErrors, QconnectStatus};
 
 #[derive(Debug, Clone, Serialize)]
-pub struct StatusDoc {
+pub(crate) struct StatusDoc {
     pub version: String,
-    pub api_version: u32,
-    pub uptime_secs: u64,
+    pub(crate) api_version: u32,
+    pub(crate) uptime_secs: u64,
     pub data_root: String,
-    pub driver_tick_age_ms: Option<u64>,
-    pub audio: AudioStatus,
-    pub playback: PlaybackStatus,
+    pub(crate) driver_tick_age_ms: Option<u64>,
+    pub(crate) audio: AudioStatus,
+    pub(crate) playback: PlaybackStatus,
     pub qconnect: QconnectStatus,
-    pub network: NetworkStatus,
+    pub(crate) network: NetworkStatus,
     /// The host's memory class and the sizing that follows from it. Resolved
     /// DAEMON-side on purpose: `memory_profile()` is a `OnceLock` off this
     /// box's `/proc/meminfo`, so a laptop running `pibuz status --host pi`
     /// would otherwise report its own class for the Pi's daemon.
-    pub memory: MemoryStatus,
-    pub cache: CacheStatus,
-    pub buffers: BufferStatus,
-    pub last_errors: LatchedErrors,
+    pub(crate) memory: MemoryStatus,
+    pub(crate) cache: CacheStatus,
+    pub(crate) buffers: BufferStatus,
+    pub(crate) last_errors: LatchedErrors,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct MemoryStatus {
+pub(crate) struct MemoryStatus {
     /// "normal" | "low" — the `MemoryClass` that gates prefetch, gapless,
     /// ring depth and the compressed window.
     pub class: String,
@@ -37,35 +37,35 @@ pub struct MemoryStatus {
     /// Windows, i.e. a dev box. `detect_profile` falls back to the Normal
     /// class by passing `u64::MAX`, which is a sentinel and not a RAM figure:
     /// putting it on the wire would have the status block report 16 EB.
-    pub total_kb: Option<u64>,
+    pub(crate) total_kb: Option<u64>,
     /// Whether a gapless successor can be bounded on this host at all — RAM
     /// above the floor, OR a disk cache to stream an oversized one to. Not
     /// `MemoryProfile::allow_gapless_prefetch`, which is only the RAM half:
     /// on a 512 MB board with `audio.cache_to_disk` on the two disagree, and
     /// this is the one that answers "will my album play gapless".
-    pub gapless_prefetch: bool,
+    pub(crate) gapless_prefetch: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct CacheStatus {
-    pub l1: L1CacheStatus,
+pub(crate) struct CacheStatus {
+    pub(crate) l1: L1CacheStatus,
     /// `null` when `audio.cache_to_disk` is off or the disk cache failed to
     /// open: nothing is being written to the card either way.
     pub l2: Option<L2CacheStatus>,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct L1CacheStatus {
+pub(crate) struct L1CacheStatus {
     pub tracks: usize,
     pub bytes: usize,
     /// The budget in force — `audio.memory_cache_mb` when set, else the
     /// profile's share of RAM.
     pub budget_bytes: usize,
-    pub fetching: usize,
+    pub(crate) fetching: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct L2CacheStatus {
+pub(crate) struct L2CacheStatus {
     pub tracks: usize,
     pub bytes: u64,
     pub budget_bytes: u64,
@@ -74,18 +74,18 @@ pub struct L2CacheStatus {
 
 /// Every buffer between the CDN and the DAC, in the order the bytes cross them.
 #[derive(Debug, Clone, Serialize)]
-pub struct BufferStatus {
+pub(crate) struct BufferStatus {
     /// Compressed read-ahead: `audio.stream_window_seconds` of music, clamped
     /// to `window_max_bytes` (the profile's ceiling) at the top and 2 MB at
     /// the bottom. Seconds rather than bytes because a byte constant is a
     /// different amount of music at every quality. `null` only when the
     /// audio settings could not be read — which is a different fact from `0`.
-    pub window_seconds: Option<u8>,
-    pub window_max_bytes: usize,
+    pub(crate) window_seconds: Option<u8>,
+    pub(crate) window_max_bytes: usize,
     /// Process-wide cap on the initial buffer a stream waits for before it
     /// starts. The actual figure is chosen per track from measured link speed
     /// and clamped to this.
-    pub initial_max_bytes: usize,
+    pub(crate) initial_max_bytes: usize,
     /// Decoded ring depth, as ACTUALLY ALLOCATED when a device is open.
     ///
     /// `audio.pcm_ring_ms` (or the profile's seconds) is only a request: the
@@ -104,15 +104,15 @@ pub struct BufferStatus {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct AudioStatus {
+pub(crate) struct AudioStatus {
     pub backend: Option<String>,
-    pub configured_device: Option<String>,
-    pub device_present: bool,
-    pub device_open: bool,
+    pub(crate) configured_device: Option<String>,
+    pub(crate) device_present: bool,
+    pub(crate) device_open: bool,
     /// A `BitPerfectMode` serde variant (see `bitperfect_label`). Kept as a
     /// plain string here so this crate does not depend on the exact qbz-audio
     /// enum shape.
-    pub bit_perfect: Option<String>,
+    pub(crate) bit_perfect: Option<String>,
     /// Rate the DECODED STREAM runs at — what the file was encoded at.
     pub sample_rate: Option<u32>,
     pub bit_depth: Option<u32>,
@@ -125,15 +125,15 @@ pub struct AudioStatus {
     /// a time, so a command that never finishes blocks every command behind
     /// it while the rest of this document looks healthy — as `driver_tick_age_ms`
     /// did for 18 hours on a Pi whose audio thread was stuck in a resume.
-    pub command_in_flight: Option<String>,
+    pub(crate) command_in_flight: Option<String>,
     /// How long `command_in_flight` has been running. Commands take
     /// milliseconds; a buffer wait can legitimately take tens of seconds; much
     /// more than a minute is a wedge.
-    pub command_in_flight_ms: Option<u64>,
+    pub(crate) command_in_flight_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct PlaybackStatus {
+pub(crate) struct PlaybackStatus {
     pub state: String,
     pub track_id: Option<u64>,
     pub title: Option<String>,
@@ -142,7 +142,7 @@ pub struct PlaybackStatus {
     pub duration: Option<u64>,
     pub volume: f32,
     pub muted: bool,
-    pub queue_len: usize,
+    pub(crate) queue_len: usize,
     /// How much of the streaming track has been downloaded (0.0-1.0). `null`
     /// when not streaming, or once the track is complete.
     pub buffer_progress: Option<f32>,
@@ -154,15 +154,15 @@ pub struct PlaybackStatus {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct NetworkStatus {
-    pub online: bool,
+pub(crate) struct NetworkStatus {
+    pub(crate) online: bool,
 }
 
 // ============================== live handlers ==============================
 
 /// `GET /api/info` — identity for the CLI's version-skew diagnosis (the
 /// single sanctioned second request). Deliberately minimal.
-pub fn info(state: &super::ApiState) -> Response<Cursor<Vec<u8>>> {
+pub(crate) fn info(state: &super::ApiState) -> Response<Cursor<Vec<u8>>> {
     let uptime = state
         .shared
         .lock()
@@ -184,7 +184,7 @@ pub fn info(state: &super::ApiState) -> Response<Cursor<Vec<u8>>> {
 
 /// `GET /api/status` — the composite daemon status. ALWAYS 200;
 /// the CLI maps degradation (a missing device) to exit codes.
-pub fn status(state: &super::ApiState) -> Response<Cursor<Vec<u8>>> {
+pub(crate) fn status(state: &super::ApiState) -> Response<Cursor<Vec<u8>>> {
     let doc = assemble_live(state);
     let mut value = serde_json::to_value(&doc).unwrap_or_else(|_| serde_json::json!({}));
     // `StatusDoc.playback.volume` is f32; plain `to_value` widens it via

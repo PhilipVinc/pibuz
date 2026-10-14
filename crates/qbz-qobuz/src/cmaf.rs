@@ -42,7 +42,7 @@ use crate::client::QobuzClient;
 /// Concurrency cap for the full-download path. 3 segments in flight is the
 /// empirically-determined sweet spot — Akamai CDN rate-limits with 1s windows
 /// past ~5 parallel requests per client IP.
-pub const CMAF_PREFETCH_CONCURRENCY: usize = 3;
+pub(crate) const CMAF_PREFETCH_CONCURRENCY: usize = 3;
 
 /// Info gathered from the CMAF init segment, enough to start streaming
 /// playback. The caller is expected to fetch audio segments 1..n_segments
@@ -226,14 +226,14 @@ impl TrackSink for Vec<u8> {
 /// gives the exact decrypted byte count — so there is no reason to grow into a
 /// `Vec` first. Fill the final allocation directly and the second copy never
 /// exists.
-pub struct ArcSlab {
+pub(crate) struct ArcSlab {
     bytes: std::sync::Arc<[u8]>,
     len: usize,
 }
 
 impl ArcSlab {
     /// A slab of exactly `capacity` bytes, ready to be filled.
-    pub fn with_capacity(capacity: usize) -> Self {
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
         // ZEROED rather than uninitialised on purpose: every byte is then a
         // valid `u8` the moment the allocation exists, so `assume_init` is
         // sound however much of the slab the download goes on to write, and a
@@ -254,7 +254,7 @@ impl ArcSlab {
     /// separate from [`Self::into_arc`] for tests that fill a generous slab and
     /// only care about what came out.
     #[cfg(test)]
-    pub fn filled(&self) -> &[u8] {
+    pub(crate) fn filled(&self) -> &[u8] {
         &self.bytes[..self.len]
     }
 
@@ -264,7 +264,7 @@ impl ArcSlab {
     /// Refusing a short track is the same discipline the straight-to-disk path
     /// applies: whatever comes out of here is treated as a complete track for
     /// ever after, and a short one decodes as garbage on every later play.
-    pub fn into_arc(self) -> std::result::Result<std::sync::Arc<[u8]>, String> {
+    pub(crate) fn into_arc(self) -> std::result::Result<std::sync::Arc<[u8]>, String> {
         if self.len != self.bytes.len() {
             return Err(format!(
                 "assembled {} bytes, segment table said {} — refusing a short track",

@@ -37,7 +37,7 @@ const MAX_OFFLINE_SKIPS: usize = 5;
 /// A side effect the shell must perform this tick. Produced by [`plan_tick`],
 /// executed by [`run_driver`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DriverAction {
+pub(crate) enum DriverAction {
     /// Reconcile the queue cursor to the id the engine is actually playing
     /// (a seamless gapless hand-off).
     SyncCursorTo(u64),
@@ -65,7 +65,7 @@ pub enum DriverAction {
 /// The previous tick's snapshot: track, position and play state (plus duration
 /// for [`DriverState::after`]).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct LastTick {
+pub(crate) struct LastTick {
     pub track_id: u64,
     pub position: u64,
     pub duration: u64,
@@ -86,24 +86,25 @@ impl LastTick {
 /// The driver's carried-over state between ticks, held as a value so the
 /// decision is a pure function of it.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct DriverState {
+pub(crate) struct DriverState {
     /// Previous tick.
-    pub last: LastTick,
+    pub(crate) last: LastTick,
     /// Track id an `ArmGapless` already fired for, so the ticker does not
     /// re-request it every tick.
-    pub gapless_requested_for: u64,
+    pub(crate) gapless_requested_for: u64,
     /// ~4-tick throttle counter for the periodic QConnect report.
-    pub report_tick: u64,
+    pub(crate) report_tick: u64,
     /// Last track id we emitted a `ReportEdge` for.
-    pub last_reported_track_id: u64,
+    pub(crate) last_reported_track_id: u64,
     /// Last play-state we emitted a `ReportEdge` for.
-    pub last_reported_playing: bool,
+    pub(crate) last_reported_playing: bool,
 }
 
 impl DriverState {
     /// A state whose `last` snapshot (and report trackers) come from `ev` — the
     /// "the previous tick looked like this" constructor the tests seed from.
-    pub fn after(ev: &PlaybackEvent) -> DriverState {
+    #[cfg(test)]
+    pub(crate) fn after(ev: &PlaybackEvent) -> DriverState {
         DriverState {
             last: LastTick::from_event(ev),
             gapless_requested_for: 0,
@@ -118,14 +119,14 @@ impl DriverState {
 /// `QbzCore::get_queue_state_full` each tick: the current track id, the `(id, streamable)` upcoming list, the
 /// repeat key and the stop-after marker.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct QueueSnapshot {
+pub(crate) struct QueueSnapshot {
     pub current: u64,
     pub upcoming: Vec<(u64, bool)>,
     pub repeat: String,
-    pub stop_after: Option<u64>,
+    pub(crate) stop_after: Option<u64>,
     /// True when autoplay mode is "infinite" — unsupported, logged and treated
     /// as queue-finished. Nothing sets it yet.
-    pub autoplay_infinite: bool,
+    pub(crate) autoplay_infinite: bool,
 }
 
 /// Whether a gapless successor that has finished downloading is still the one
@@ -150,14 +151,14 @@ pub struct QueueSnapshot {
 ///
 /// Clearing `gapless_pending` when a new track starts is not enough, because
 /// the fetch that produces the next one is still in flight and lands after.
-pub fn gapless_fetch_still_wanted(armed_against: u64, now_playing: u64) -> bool {
+pub(crate) fn gapless_fetch_still_wanted(armed_against: u64, now_playing: u64) -> bool {
     armed_against != 0 && armed_against == now_playing
 }
 
 /// Bounded skip-walk to the first streamable upcoming track. Returns
 /// `(index, track_id)` of the first `playable == true` entry within `max_walk`
 /// steps, or `None` when none is found inside the bound (never walks forever).
-pub fn next_playable(upcoming: &[(u64, bool)], max_walk: usize) -> Option<(usize, u64)> {
+pub(crate) fn next_playable(upcoming: &[(u64, bool)], max_walk: usize) -> Option<(usize, u64)> {
     for (i, &(id, playable)) in upcoming.iter().enumerate() {
         if i >= max_walk {
             break;
@@ -173,7 +174,7 @@ pub fn next_playable(upcoming: &[(u64, bool)], max_walk: usize) -> Option<(usize
 /// live player event, the queue projection and any drained stream error, decide
 /// which [`DriverAction`]s the shell must perform, in the order the shell
 /// executes them.
-pub fn plan_tick(
+pub(crate) fn plan_tick(
     state: &DriverState,
     ev: &PlaybackEvent,
     queue: &QueueSnapshot,
@@ -277,7 +278,7 @@ pub fn plan_tick(
 }
 
 /// The pure state-update rule applied after [`plan_tick`] each tick.
-pub fn advance_state(
+pub(crate) fn advance_state(
     prev: &DriverState,
     ev: &PlaybackEvent,
     actions: &[DriverAction],
@@ -599,7 +600,7 @@ fn repeat_after_manual_skip(mode: RepeatMode) -> Option<RepeatMode> {
 /// atomic cursor movers — `forward` selects which one, so `pibuz next` and
 /// `pibuz prev` share this one ritual instead of duplicating the play →
 /// prefetch tail.
-pub async fn advance_and_play<A: FrontendAdapter + Send + Sync + 'static>(
+pub(crate) async fn advance_and_play<A: FrontendAdapter + Send + Sync + 'static>(
     runtime: &AppRuntime<A>,
     quality: Quality,
     forward: bool,

@@ -11,7 +11,11 @@ use serde_json::Value;
 use crate::cli::client::ApiClient;
 use crate::paths::ProfileRoots;
 
-pub async fn play(host: Option<String>, content: Option<String>, roots: &ProfileRoots) -> i32 {
+pub(crate) async fn play(
+    host: Option<String>,
+    content: Option<String>,
+    roots: &ProfileRoots,
+) -> i32 {
     let content = match content {
         // Bare `play` = resume, the shipped behaviour (one implementation).
         None => return crate::cli::transport::play(host, roots).await,

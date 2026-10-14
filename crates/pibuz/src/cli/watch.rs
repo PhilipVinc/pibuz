@@ -13,7 +13,7 @@ use std::time::Duration;
 use crate::cli::client::{resolve_host, resolve_token, CliError};
 use crate::paths::ProfileRoots;
 
-pub async fn watch(host: Option<String>, raw: bool, roots: &ProfileRoots) -> i32 {
+pub(crate) async fn watch(host: Option<String>, raw: bool, roots: &ProfileRoots) -> i32 {
     let target = resolve_host(host);
     let token = resolve_token(&target, roots);
     let base = format!("http://{}", target.addr);

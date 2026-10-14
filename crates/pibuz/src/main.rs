@@ -13,7 +13,7 @@ mod paths;
 mod qconnect;
 mod state;
 
-pub const API_VERSION: u32 = 1;
+pub(crate) const API_VERSION: u32 = 1;
 
 /// The version this build reports everywhere (`pibuz version`, `--version`,
 /// `/api/status`, the Connect device's softwareVersion). Normally the Cargo
@@ -24,7 +24,7 @@ pub const API_VERSION: u32 = 1;
 /// built straight from a working tree and installed on a Pi, which
 /// `scripts/pibuz-to-pi.sh` stamps `2.4.0.local-<sha>-dirty` so it can be
 /// identified later. Compile-time (`option_env!`), never read at runtime.
-pub const VERSION: &str = match option_env!("PIBUZ_BUILD_ID") {
+pub(crate) const VERSION: &str = match option_env!("PIBUZ_BUILD_ID") {
     Some(id) => id,
     None => env!("CARGO_PKG_VERSION"),
 };

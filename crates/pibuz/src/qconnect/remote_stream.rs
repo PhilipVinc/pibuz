@@ -35,7 +35,7 @@ use qbz_player::{BufferWriter, DiskTee, FetchPlan, Player, StreamSeekMode};
 /// to serve seeks, and a paused track keeps its feeder for as long as the
 /// pause lasts. Without this, the first request after the expiry is the end of
 /// the track.
-pub type UrlRefresher =
+pub(crate) type UrlRefresher =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> + Send + Sync>;
 
 /// Statuses a signed CDN URL answers with once it has expired. `410` is what
@@ -69,12 +69,12 @@ const TRANSIENT_RETRY_DELAYS: [Duration; 3] = if cfg!(test) {
 };
 
 /// Format/size facts sniffed from a remote audio URL before streaming.
-pub struct RemoteStreamInfo {
-    pub content_length: u64,
+pub(crate) struct RemoteStreamInfo {
+    pub(crate) content_length: u64,
     pub sample_rate: u32,
     pub channels: u16,
     pub bit_depth: u32,
-    pub speed_mbps: f64,
+    pub(crate) speed_mbps: f64,
 }
 
 /// Probe + open the progressive sink + spawn the background feeder.
@@ -87,7 +87,7 @@ pub struct RemoteStreamInfo {
 /// Returns the feeder's JoinHandle so the caller can abort a superseded
 /// download on track change (the qconnect engine keeps exactly one feeder
 /// alive).
-pub async fn stream_remote_track_into_player(
+pub(crate) async fn stream_remote_track_into_player(
     player: &Player,
     track_id: u64,
     duration_secs: u64,
@@ -224,7 +224,7 @@ fn spawn_remote_feeder(
 /// into that machinery rather than handed to it. It also changes what
 /// `speed_mbps` measures. Worth a measurement first — see the buffer-ladder note
 /// in `Player::play_streaming_dynamic`, which reads the same estimate.
-pub async fn probe_remote_stream_info(url: &str) -> Result<RemoteStreamInfo, String> {
+pub(crate) async fn probe_remote_stream_info(url: &str) -> Result<RemoteStreamInfo, String> {
     use std::time::Instant;
 
     // Shared process-wide client (`qbz_qobuz::cdn`): the download below reopens
@@ -413,7 +413,7 @@ enum BodyEnd {
 ///   degrades to the old sequential behavior, rather than filling the
 ///   buffer with bytes attributed to the wrong offsets.
 #[allow(clippy::too_many_arguments)]
-pub async fn download_and_stream_remote_track(
+pub(crate) async fn download_and_stream_remote_track(
     url: &str,
     refresh_url: Option<UrlRefresher>,
     writer: BufferWriter,
@@ -862,7 +862,7 @@ pub async fn download_and_stream_remote_track(
 /// diagnosis lives (Akamai's >100-header small-object flood surfaces as hyper's
 /// "message head is too large" two levels down). Walk `source()` and join the
 /// chain so logs AND signature matching see the real cause.
-pub fn describe_reqwest_error(err: &reqwest::Error) -> String {
+pub(crate) fn describe_reqwest_error(err: &reqwest::Error) -> String {
     // Chain-expanded AND redacted: `reqwest::Error`'s Display embeds the signed
     // stream URL, and every caller here puts the result in a log line or an API
     // error string.
@@ -874,7 +874,7 @@ pub fn describe_reqwest_error(err: &reqwest::Error) -> String {
 /// Akamai answers SMALL raw-url objects with ~106 headers (the `X-AK-GRN` /
 /// `X-AK-FWD-ERROR: ERR_POC_FWD_OBJ_TOO_SMALL` flood), so EVERY reqwest fetch
 /// of such an URL fails this way — streaming probe and full download alike.
-pub fn is_header_flood_error(message: &str) -> bool {
+pub(crate) fn is_header_flood_error(message: &str) -> bool {
     let haystack = message.to_ascii_lowercase();
     haystack.contains("message head is too large") || haystack.contains("too many headers")
 }

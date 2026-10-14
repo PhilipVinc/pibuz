@@ -39,7 +39,7 @@ use crate::qconnect::transport as qconnect_kv;
 /// itself via `daemon::audio_routing_changed` — the two are independent copies
 /// of the same table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ApplyClass {
+pub(crate) enum ApplyClass {
     Reinit,
     Reload,
     None,
@@ -885,7 +885,7 @@ fn local_token(roots: &ProfileRoots) -> Option<String> {
 /// `pibuz settings show [--json]`. `--json`: `{"audio.backend": "alsa", ...}`
 /// — every value the plain string `settings set` would accept back (module
 /// doc). Exit: 0 · 1 (a store failed to open/read).
-pub fn show(json: bool, roots: &ProfileRoots) -> i32 {
+pub(crate) fn show(json: bool, roots: &ProfileRoots) -> i32 {
     let values = match read_all(roots) {
         Ok(v) => v,
         Err(e) => {
@@ -951,7 +951,7 @@ pub fn set(roots: &ProfileRoots, key: &str, value: &str) -> i32 {
 
 /// `pibuz qconnect enable`. Writes `startup_mode = on`, nudges reload. The
 /// human line interpolates the device name.
-pub fn qconnect_enable(roots: &ProfileRoots) -> i32 {
+pub(crate) fn qconnect_enable(roots: &ProfileRoots) -> i32 {
     let root = roots.data.as_path();
     if let Err(e) = qconnect_kv::save_startup_mode_at(root, qconnect_app::QconnectStartupMode::On) {
         eprintln!("error: {e}");
@@ -967,7 +967,7 @@ pub fn qconnect_enable(roots: &ProfileRoots) -> i32 {
 
 /// `pibuz qconnect disable`. Writes `startup_mode = off`, nudges reload
 /// (disconnects the live session, per `daemon::reload_qconnect`).
-pub fn qconnect_disable(roots: &ProfileRoots) -> i32 {
+pub(crate) fn qconnect_disable(roots: &ProfileRoots) -> i32 {
     let root = roots.data.as_path();
     if let Err(e) = qconnect_kv::save_startup_mode_at(root, qconnect_app::QconnectStartupMode::Off)
     {
@@ -982,7 +982,7 @@ pub fn qconnect_disable(roots: &ProfileRoots) -> i32 {
 /// `pibuz qconnect name "Living Room"`. Empty clears the override back to the
 /// hostname default. Applies on the NEXT connection, never forces a reconnect
 /// (`daemon::reload_qconnect` / `QconnectControl::refresh_device_name`).
-pub fn qconnect_name(roots: &ProfileRoots, name: &str) -> i32 {
+pub(crate) fn qconnect_name(roots: &ProfileRoots, name: &str) -> i32 {
     let root = roots.data.as_path();
     if let Err(e) = qconnect_kv::persist_device_name_at(root, parse_output_device(name).as_deref())
     {
@@ -999,7 +999,7 @@ pub fn qconnect_name(roots: &ProfileRoots, name: &str) -> i32 {
 /// `pibuz config path`. Process roots + the credential file + the
 /// (conventional, not necessarily installed) systemd user unit path. No
 /// `--json`.
-pub fn config_path(roots: &ProfileRoots) -> i32 {
+pub(crate) fn config_path(roots: &ProfileRoots) -> i32 {
     println!("config : {}", roots.config.display());
     println!("data   : {}", roots.data.display());
     println!("cache  : {}", roots.cache.display());
@@ -1020,7 +1020,7 @@ fn unit_path() -> PathBuf {
 /// `pibuz config show [--json]` — effective `pibuz.toml`, process concerns
 /// only (engine settings live in `settings show`).
 /// Keys the file doesn't set are annotated `(default)` in human mode.
-pub fn config_show(json: bool, roots: &ProfileRoots) -> i32 {
+pub(crate) fn config_show(json: bool, roots: &ProfileRoots) -> i32 {
     let path = roots.config_file();
     let (cfg, _warns) = match crate::config::PibuzConfig::load(&path) {
         Ok(v) => v,
@@ -1130,7 +1130,7 @@ pub fn export(roots: &ProfileRoots, file: Option<String>, include_auth: bool) ->
 /// [--dry-run]`. read → version-gate → plan → (TTY device re-pick / non-tty
 /// safe defaults) → apply → reload-nudge → three-bucket summary. Exit:
 /// 0 · 1 · 2.
-pub async fn import(
+pub(crate) async fn import(
     roots: &ProfileRoots,
     file: &str,
     include_auth: bool,

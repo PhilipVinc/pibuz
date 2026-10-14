@@ -15,15 +15,15 @@ const APP_DIR: &str = "pibuz";
 /// The pre-rename directory name, honoured when it is the one that exists.
 const LEGACY_APP_DIR: &str = "qbzd";
 /// Config file inside the config root.
-pub const CONFIG_FILE: &str = "pibuz.toml";
+pub(crate) const CONFIG_FILE: &str = "pibuz.toml";
 /// The pre-rename config file name, honoured when it is the one that exists.
 const LEGACY_CONFIG_FILE: &str = "qbzd.toml";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProfileRoots {
-    pub config: PathBuf,
+pub(crate) struct ProfileRoots {
+    pub(crate) config: PathBuf,
     pub data: PathBuf,
-    pub cache: PathBuf,
+    pub(crate) cache: PathBuf,
 }
 
 impl ProfileRoots {
@@ -43,7 +43,10 @@ impl ProfileRoots {
     /// The config directory is created (mode 0700 on unix) on first use;
     /// data/cache directories are created by their respective owners
     /// (the instance lock creates the data root, cache writers create theirs).
-    pub fn resolve(config_override: Option<&Path>, data_root_override: Option<&Path>) -> Self {
+    pub(crate) fn resolve(
+        config_override: Option<&Path>,
+        data_root_override: Option<&Path>,
+    ) -> Self {
         let config = match config_override {
             Some(config_file) => config_file
                 .parent()
@@ -71,7 +74,7 @@ impl ProfileRoots {
 
     /// This profile's config file — `pibuz.toml`, or the pre-rename
     /// `qbzd.toml` when that is the file the box actually has.
-    pub fn config_file(&self) -> PathBuf {
+    pub(crate) fn config_file(&self) -> PathBuf {
         config_file_in(&self.config)
     }
 }
@@ -107,7 +110,7 @@ fn default_cache_dir() -> PathBuf {
 /// a pre-rename `qbzd.toml` is sitting there — then that one, so an upgrade
 /// keeps reading (and writing) the settings the box already has rather than
 /// starting a second file beside them.
-pub fn config_file_in(config_dir: &Path) -> PathBuf {
+pub(crate) fn config_file_in(config_dir: &Path) -> PathBuf {
     let current = config_dir.join(CONFIG_FILE);
     if current.is_file() {
         return current;

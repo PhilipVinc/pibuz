@@ -1084,21 +1084,21 @@ fn keepalive_is_stale(
 #[derive(Clone, PartialEq, ::prost::Message)]
 struct Authenticate {
     #[prost(uint32, optional, tag = "1")]
-    pub msg_id: Option<u32>,
+    pub(crate) msg_id: Option<u32>,
     #[prost(uint64, optional, tag = "2")]
-    pub msg_date: Option<u64>,
+    pub(crate) msg_date: Option<u64>,
     #[prost(string, optional, tag = "3")]
-    pub jwt: Option<String>,
+    pub(crate) jwt: Option<String>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
 struct Subscribe {
     #[prost(uint32, optional, tag = "1")]
-    pub msg_id: Option<u32>,
+    pub(crate) msg_id: Option<u32>,
     #[prost(uint64, optional, tag = "2")]
-    pub msg_date: Option<u64>,
+    pub(crate) msg_date: Option<u64>,
     #[prost(uint32, optional, tag = "3")]
-    pub proto: Option<u32>,
+    pub(crate) proto: Option<u32>,
     #[prost(bytes = "vec", repeated, tag = "4")]
     pub channels: Vec<Vec<u8>>,
 }
@@ -1109,27 +1109,27 @@ struct Subscribe {
 #[derive(Clone, PartialEq, ::prost::Message)]
 struct QwsErrorMessage {
     #[prost(uint32, optional, tag = "1")]
-    pub msg_id: Option<u32>,
+    pub(crate) msg_id: Option<u32>,
     #[prost(uint64, optional, tag = "2")]
-    pub msg_date: Option<u64>,
+    pub(crate) msg_date: Option<u64>,
     #[prost(uint32, optional, tag = "3")]
     pub code: Option<u32>,
     #[prost(string, optional, tag = "4")]
-    pub descr: Option<String>,
+    pub(crate) descr: Option<String>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
 struct CloudPayload {
     #[prost(uint32, optional, tag = "1")]
-    pub msg_id: Option<u32>,
+    pub(crate) msg_id: Option<u32>,
     #[prost(uint64, optional, tag = "2")]
-    pub msg_date: Option<u64>,
+    pub(crate) msg_date: Option<u64>,
     #[prost(uint32, optional, tag = "3")]
-    pub proto: Option<u32>,
+    pub(crate) proto: Option<u32>,
     #[prost(bytes = "vec", optional, tag = "4")]
-    pub src: Option<Vec<u8>>,
+    pub(crate) src: Option<Vec<u8>>,
     #[prost(bytes = "vec", repeated, tag = "5")]
-    pub dests: Vec<Vec<u8>>,
+    pub(crate) dests: Vec<Vec<u8>>,
     #[prost(bytes = "vec", optional, tag = "7")]
     pub payload: Option<Vec<u8>>,
 }

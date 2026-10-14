@@ -29,15 +29,14 @@ pub struct MemoryProfile {
     /// How many upcoming Qobuz tracks to prefetch. Hi-Res tracks are
     /// ~60 MB each held in memory, so this is the dominant source of
     /// RSS growth during normal playback.
-    pub prefetch_count: usize,
+    pub(crate) prefetch_count: usize,
     /// Maximum allowed initial streaming buffer size in bytes. Caps the
     /// dynamic-buffer growth that `from_speed_mbps` would otherwise
     /// inflate to 2 MB on slow connections — exactly the wrong direction
     /// on a memory-pressured Pi where slow downloads are themselves a
     /// symptom of swap thrash.
     pub max_initial_buffer_bytes: usize,
-    /// Concurrency cap for prefetch downloads.
-    pub max_concurrent_prefetch: usize,
+
     /// Upper bound for the L1 (in-memory) audio cache. The 400 MB figure
     /// this is capped at is sized for Normal-class desktops; on a Pi 3B
     /// (1 GB total) that single subsystem could consume 40 % of RAM, which
@@ -211,7 +210,7 @@ impl MemoryProfile {
                 mem_total_kb,
                 prefetch_count: 5,
                 max_initial_buffer_bytes: 2 * 1024 * 1024,
-                max_concurrent_prefetch: 2,
+
                 audio_cache_l1_max_bytes: l1_cache_bytes_for_total_kb(mem_total_kb),
                 allow_gapless_prefetch: mem_total_kb >= GAPLESS_MIN_TOTAL_KB,
                 pcm_ring_seconds: PCM_RING_SECONDS_NORMAL,
@@ -223,7 +222,7 @@ impl MemoryProfile {
                 mem_total_kb,
                 prefetch_count: 1,
                 max_initial_buffer_bytes: 256 * 1024,
-                max_concurrent_prefetch: 1,
+
                 audio_cache_l1_max_bytes: l1_cache_bytes_for_total_kb(mem_total_kb),
                 allow_gapless_prefetch: mem_total_kb >= GAPLESS_MIN_TOTAL_KB,
                 pcm_ring_seconds: PCM_RING_SECONDS_LOW_MEMORY,
@@ -235,7 +234,7 @@ impl MemoryProfile {
 
 /// Parse the `MemTotal:` line out of `/proc/meminfo` content.
 /// Returns None if the field is missing or unparseable.
-pub fn parse_meminfo_total_kb(content: &str) -> Option<u64> {
+pub(crate) fn parse_meminfo_total_kb(content: &str) -> Option<u64> {
     parse_meminfo_field_kb(content, "MemTotal:")
 }
 
@@ -253,14 +252,14 @@ fn parse_meminfo_field_kb(content: &str, field_prefix: &str) -> Option<u64> {
 /// Pure detection given `/proc/meminfo` content. Falls back to Normal
 /// when MemTotal is missing or unparseable so we never accidentally
 /// throttle a system whose meminfo we couldn't read.
-pub fn detect_profile_from_meminfo(content: &str) -> MemoryProfile {
+pub(crate) fn detect_profile_from_meminfo(content: &str) -> MemoryProfile {
     parse_meminfo_total_kb(content)
         .map(MemoryProfile::from_total_kb)
         .unwrap_or_else(|| MemoryProfile::from_total_kb(u64::MAX))
 }
 
 /// Name of the development override described on [`parse_forced_mem_total_kb`].
-pub const FORCE_MEM_TOTAL_KB_ENV: &str = "QBZ_FORCE_MEM_TOTAL_KB";
+pub(crate) const FORCE_MEM_TOTAL_KB_ENV: &str = "QBZ_FORCE_MEM_TOTAL_KB";
 
 /// Parse a forced `MemTotal` (in kB) out of [`FORCE_MEM_TOTAL_KB_ENV`]'s value.
 ///
@@ -284,7 +283,7 @@ pub const FORCE_MEM_TOTAL_KB_ENV: &str = "QBZ_FORCE_MEM_TOTAL_KB";
 /// in sync in `bundle.rs` for a value no user should ever set. Rejects zero and
 /// anything unparseable rather than guessing — a typo must not silently hand
 /// back a board nobody meant.
-pub fn parse_forced_mem_total_kb(raw: &str) -> Option<u64> {
+pub(crate) fn parse_forced_mem_total_kb(raw: &str) -> Option<u64> {
     match raw.trim().parse::<u64>() {
         Ok(0) | Err(_) => None,
         Ok(kb) => Some(kb),
@@ -463,7 +462,7 @@ SwapTotal:       2097152 kB
         let profile = MemoryProfile::from_total_kb(938196);
         assert_eq!(profile.class, MemoryClass::LowMemory);
         assert_eq!(profile.prefetch_count, 1);
-        assert_eq!(profile.max_concurrent_prefetch, 1);
+
         assert!(profile.max_initial_buffer_bytes <= 256 * 1024);
         // L1 cap must be a small fraction of total RAM, not the four-tenths
         // the old flat 400 MB reserved on a 1 GB host — but big enough to

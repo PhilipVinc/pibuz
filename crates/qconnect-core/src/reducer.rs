@@ -4,9 +4,9 @@ use crate::queue::{QConnectQueueState, QueueEvent, QueueItem};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReducerOutcome {
-    pub queue_changed: bool,
-    pub version_changed: bool,
-    pub event_name: &'static str,
+    pub(crate) queue_changed: bool,
+    pub(crate) version_changed: bool,
+    pub(crate) event_name: &'static str,
 }
 
 impl ReducerOutcome {

@@ -36,7 +36,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
 /// The file's name inside the daemon's data root.
-pub const FILE_NAME: &str = "settings.toml";
+pub(crate) const FILE_NAME: &str = "settings.toml";
 const LOCK_NAME: &str = "settings.toml.lock";
 const TMP_NAME: &str = "settings.toml.tmp";
 
@@ -68,7 +68,7 @@ pub fn read_section<T: DeserializeOwned + Default>(root: &Path, name: &str) -> T
 /// One section, or its defaults when the file or the section is absent; an
 /// error when either is there but does not parse. For a caller that should
 /// report a broken file rather than paper over it, such as `settings show`.
-pub fn try_read_section<T: DeserializeOwned + Default>(
+pub(crate) fn try_read_section<T: DeserializeOwned + Default>(
     root: &Path,
     name: &str,
 ) -> Result<T, String> {
@@ -131,7 +131,7 @@ impl Sections {
     }
 
     /// Whether the file has a `[name]` table.
-    pub fn has(&self, name: &str) -> bool {
+    pub(crate) fn has(&self, name: &str) -> bool {
         self.table.get(name).is_some_and(toml::Value::is_table)
     }
 

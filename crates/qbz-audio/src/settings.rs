@@ -236,7 +236,7 @@ impl Default for AudioSettings {
             // default output, shared with other apps like any normal player — no
             // bit-perfect, no `pactl`. See AudioBackendType::default(). "Auto"
             // (None) and explicit backends (PipeWire / ALSA) are honored as-is;
-            // this only sets what a fresh install and `reset_all` land on.
+            // this only sets what a fresh install lands on.
             //
             // History: this defaulted to Some(PipeWire) on Linux to dodge a rodio
             // DeviceSink-drop-on-resume race on the CPAL path (#375), but that
@@ -439,12 +439,6 @@ impl AudioSettingsStore {
 
     pub fn set_normalization_target_lufs(&self, target: f32) -> Result<(), String> {
         self.update(|s| s.normalization_target_lufs = target)
-    }
-
-    /// Reset all audio settings to their default values.
-    pub fn reset_all(&self) -> Result<AudioSettings, String> {
-        self.update(|s| *s = AudioSettings::default())?;
-        Ok(AudioSettings::default())
     }
 }
 
@@ -689,8 +683,8 @@ mod tests {
         // A NULL backend_type means "Auto" (system default output). It must be
         // preserved across restarts — never backfilled to a concrete backend on
         // store open (the old #375 backfill hard-coded PipeWire and froze OOTB
-        // playback on hosts without `pactl`, #470). Only an explicit
-        // `reset_all` rewrites settings.
+        // playback on hosts without `pactl`, #470). Only an explicit write
+        // changes it.
         let dir = unique_test_dir("backend-null-auto");
         {
             let store = AudioSettingsStore::new_at(&dir).expect("open store");
@@ -749,21 +743,6 @@ mod tests {
                 .stream_buffer_seconds,
             10
         );
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn reset_all_restores_the_defaults() {
-        let (dir, store) = fresh_store("reset");
-        store.set_output_device(Some("hw:4,0")).expect("set device");
-        store.set_dac_passthrough(true).expect("set dac");
-
-        let reset = store.reset_all().expect("reset settings");
-        let settings = store.get_settings().expect("get settings");
-
-        assert_eq!(reset.output_device, None);
-        assert_eq!(settings.output_device, None);
-        assert!(!settings.dac_passthrough);
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -24,7 +24,7 @@ use qbz_models::CoreEvent;
 
 /// Stream CoreEvents to one client until it disconnects. Runs on a dedicated
 /// thread; `req.respond` blocks here, writing chunked as `SseReader` yields.
-pub fn stream(req: Request, rx: broadcast::Receiver<CoreEvent>) {
+pub(crate) fn stream(req: Request, rx: broadcast::Receiver<CoreEvent>) {
     let headers = vec![
         header("Content-Type", "text/event-stream"),
         header("Cache-Control", "no-cache"),

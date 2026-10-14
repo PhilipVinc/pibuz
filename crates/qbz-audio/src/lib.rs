@@ -38,36 +38,36 @@ pub mod alsa_backend;
 pub mod alsa_direct;
 #[cfg(target_os = "linux")]
 pub mod alsa_error_handler;
-pub mod analyzer_tap;
-pub mod audio_out;
+pub(crate) mod analyzer_tap;
+pub(crate) mod audio_out;
 pub mod backend;
 pub mod coreaudio_direct;
-pub mod dac_capabilities;
+
 pub mod dac_probe;
 pub mod device_filter;
-pub mod dynamic_amplify;
-pub mod health;
+pub(crate) mod dynamic_amplify;
+
 // `jack_backend` is the real client when the `jack` feature is on, and a
 // stub that only knows how to fail when it is off. Same module path and same
 // `JackStream` type either way, so every caller is cfg-free.
 #[cfg(all(target_os = "linux", feature = "jack"))]
-pub mod jack_backend;
+pub(crate) mod jack_backend;
 #[cfg(all(target_os = "linux", not(feature = "jack")))]
 #[path = "jack_unavailable.rs"]
-pub mod jack_backend;
-pub mod loudness;
-pub mod loudness_analyzer;
-pub mod loudness_cache;
-pub mod network_throttle;
+pub(crate) mod jack_backend;
+pub(crate) mod loudness;
+pub(crate) mod loudness_analyzer;
+pub(crate) mod loudness_cache;
+
 pub mod output_sinks;
 pub mod pcm_ring;
 #[cfg(target_os = "linux")]
 pub mod pipewire_backend;
 #[cfg(target_os = "linux")]
-pub mod pulse_backend;
+pub(crate) mod pulse_backend;
 pub mod rt;
 pub mod settings;
-pub mod virtual_out;
+pub(crate) mod virtual_out;
 pub mod volume_curve;
 
 // Re-export commonly used types
@@ -84,13 +84,10 @@ pub use backend::{
     BackendConfig, BackendManager, BackendResult, BitPerfectMode,
 };
 pub use coreaudio_direct::CoreAudioExclusiveGuard;
-pub use dac_capabilities::{query_dac_capabilities, DacCapabilities};
+
 pub use dac_probe::{negotiated_active_rate, negotiated_stream_rate, NegotiatedRate};
 pub use dynamic_amplify::DynamicAmplify;
-pub use health::{
-    audio_stack_health, detect_distro, detect_init, detect_sandbox, AudioStackHealth, Distro,
-    InitSystem, Sandbox,
-};
+
 #[cfg(target_os = "linux")]
 pub use jack_backend::JackStream;
 pub use loudness::{calculate_gain_factor, db_to_linear, extract_replaygain, ReplayGainData};

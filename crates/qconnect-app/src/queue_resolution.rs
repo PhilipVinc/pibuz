@@ -8,12 +8,12 @@
 use crate::QConnectQueueState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QconnectOrderedQueueCursor {
+pub(crate) enum QconnectOrderedQueueCursor {
     Queue(usize),
     Autoplay(usize),
 }
 
-pub fn is_valid_ordered_queue_shuffle_order(order: &[usize], track_count: usize) -> bool {
+pub(crate) fn is_valid_ordered_queue_shuffle_order(order: &[usize], track_count: usize) -> bool {
     if order.len() != track_count {
         return false;
     }
@@ -27,7 +27,7 @@ pub fn is_valid_ordered_queue_shuffle_order(order: &[usize], track_count: usize)
     true
 }
 
-pub fn ordered_queue_cursors(queue: &QConnectQueueState) -> Vec<QconnectOrderedQueueCursor> {
+pub(crate) fn ordered_queue_cursors(queue: &QConnectQueueState) -> Vec<QconnectOrderedQueueCursor> {
     let mut cursors = if queue.shuffle_mode {
         queue
             .shuffle_order
@@ -67,7 +67,7 @@ pub fn ordered_queue_cursors(queue: &QConnectQueueState) -> Vec<QconnectOrderedQ
     cursors
 }
 
-pub fn normalized_queue_item_id_for_cursor(
+pub(crate) fn normalized_queue_item_id_for_cursor(
     queue: &QConnectQueueState,
     cursor: QconnectOrderedQueueCursor,
 ) -> Option<u64> {
@@ -82,7 +82,7 @@ pub fn normalized_queue_item_id_for_cursor(
     }
 }
 
-pub fn find_cursor_index_by_queue_item_id(
+pub(crate) fn find_cursor_index_by_queue_item_id(
     cursors: &[QconnectOrderedQueueCursor],
     queue: &QConnectQueueState,
     queue_item_id: Option<u64>,
@@ -159,7 +159,7 @@ pub fn resolve_queue_item_ids_from_queue_state(
     (None, None, None)
 }
 
-pub fn dedupe_track_ids(queue_state: &QConnectQueueState) -> Vec<u64> {
+pub(crate) fn dedupe_track_ids(queue_state: &QConnectQueueState) -> Vec<u64> {
     let mut unique = Vec::with_capacity(queue_state.queue_items.len());
     for item in &queue_state.queue_items {
         if !unique.contains(&item.track_id) {
@@ -169,7 +169,7 @@ pub fn dedupe_track_ids(queue_state: &QConnectQueueState) -> Vec<u64> {
     unique
 }
 
-pub fn resolve_remote_start_index(
+pub(crate) fn resolve_remote_start_index(
     queue_state: &QConnectQueueState,
     renderer_queue_item_id: Option<u64>,
     renderer_track_id: Option<u64>,
@@ -221,7 +221,7 @@ pub fn resolve_remote_start_index(
     None
 }
 
-pub fn resolve_core_shuffle_order(
+pub(crate) fn resolve_core_shuffle_order(
     queue_state: &QConnectQueueState,
     renderer_queue_item_id: Option<u64>,
     renderer_track_id: Option<u64>,
@@ -322,7 +322,7 @@ fn is_cloud_placeholder_current_queue_item(
             .any(|item| item.queue_item_id < current_item.queue_item_id)
 }
 
-pub fn normalize_current_queue_item_id_from_queue_state(
+pub(crate) fn normalize_current_queue_item_id_from_queue_state(
     queue: &QConnectQueueState,
     current_index: usize,
 ) -> u64 {

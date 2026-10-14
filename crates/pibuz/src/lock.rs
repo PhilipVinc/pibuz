@@ -5,12 +5,12 @@ use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
 #[derive(Debug)]
-pub struct InstanceLock {
+pub(crate) struct InstanceLock {
     _file: std::fs::File,
 }
 
 #[derive(Debug)]
-pub enum LockError {
+pub(crate) enum LockError {
     AlreadyRunning(Option<u32>),
     Io(String),
 }
@@ -20,7 +20,7 @@ impl InstanceLock {
     /// daemons on one root = one device_uuid presented twice + two writers of
     /// one settings.toml — the lock is what protects those invariants, not the
     /// port.
-    pub fn acquire(data_root: &Path) -> Result<Self, LockError> {
+    pub(crate) fn acquire(data_root: &Path) -> Result<Self, LockError> {
         std::fs::create_dir_all(data_root).map_err(|e| LockError::Io(e.to_string()))?;
         let path = data_root.join("pibuz.lock");
         let mut file = OpenOptions::new()

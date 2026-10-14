@@ -12,7 +12,7 @@ use crate::cli::copy;
 use crate::paths::ProfileRoots;
 
 /// `pibuz ping` — liveness. Human `pong`; `--json` the raw body. Exit 0 · 3.
-pub async fn ping(host: Option<String>, json: bool, roots: &ProfileRoots) -> i32 {
+pub(crate) async fn ping(host: Option<String>, json: bool, roots: &ProfileRoots) -> i32 {
     let client = ApiClient::new(host, roots);
     match client.get("/api/ping").await {
         Ok(v) => {
@@ -34,7 +34,12 @@ pub async fn ping(host: Option<String>, json: bool, roots: &ProfileRoots) -> i32
 /// `verbose` (`-v`) adds the memory, cache and buffer sections; `--json` is the
 /// whole payload either way, so a script never has to pass it.
 /// Exit 0 healthy · 3 unreachable · 5 device unopenable.
-pub async fn status(host: Option<String>, json: bool, verbose: bool, roots: &ProfileRoots) -> i32 {
+pub(crate) async fn status(
+    host: Option<String>,
+    json: bool,
+    verbose: bool,
+    roots: &ProfileRoots,
+) -> i32 {
     let client = ApiClient::new(host, roots);
     let payload = match client.get("/api/status").await {
         Ok(v) => v,

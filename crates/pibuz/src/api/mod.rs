@@ -14,12 +14,12 @@
 // The two-call split — `bind` at boot step 5 (stateless, so the foreign-occupant
 // diagnosis runs BEFORE the stores/runtime exist), `serve` at boot step 11 — is
 // what keeps the boot order honest.
-pub mod play;
-pub mod playback;
-pub mod queue;
+pub(crate) mod play;
+pub(crate) mod playback;
+pub(crate) mod queue;
 pub mod settings;
-pub mod sse;
-pub mod status;
+pub(crate) mod sse;
+pub(crate) mod status;
 
 use std::io::Cursor;
 use std::net::SocketAddr;
@@ -40,7 +40,7 @@ use qbz_models::CoreEvent;
 /// iff a shipped client calls it: the inline `route_table_matches_spec_count`
 /// test pins the number so the 68-routes failure shape (a route with no
 /// caller) cannot creep back in.
-pub const P0_ROUTES: &[(&str, &str)] = &[
+pub(crate) const P0_ROUTES: &[(&str, &str)] = &[
     ("GET", "/api/ping"),
     ("GET", "/api/info"),
     ("GET", "/api/status"),
@@ -66,7 +66,7 @@ pub const P0_ROUTES: &[(&str, &str)] = &[
 /// is served: by `route`, or for `/api/events` by the serving loop. The
 /// `p1_route_table_grows_only_with_a_shipped_caller` test pins the count and
 /// forbids overlap with P0.
-pub const P1_ROUTES: &[(&str, &str)] = &[
+pub(crate) const P1_ROUTES: &[(&str, &str)] = &[
     ("POST", "/api/play"),
     ("POST", "/api/playback/shuffle"),
     ("POST", "/api/playback/repeat"),
@@ -79,30 +79,30 @@ pub const P1_ROUTES: &[(&str, &str)] = &[
 /// A socket bound at boot step 5, not yet serving. Wraps the tiny_http server
 /// in an `Arc` so the serving thread and the shutdown handle can both hold it
 /// (`unblock` from the handle terminates the thread's `incoming_requests`).
-pub struct BoundServer {
+pub(crate) struct BoundServer {
     server: Arc<tiny_http::Server>,
 }
 
 /// Everything the route handlers read. Owned by the single serving thread
 /// (moved into it by [`serve`]), so it only needs `Send`, never `Sync`. `token` is the opt-in `[server] token`, read once at
 /// boot (`None` = open).
-pub struct ApiState {
-    pub runtime: Arc<AppRuntime<DaemonAdapter>>,
-    pub shared: Arc<Mutex<DaemonShared>>,
+pub(crate) struct ApiState {
+    pub(crate) runtime: Arc<AppRuntime<DaemonAdapter>>,
+    pub(crate) shared: Arc<Mutex<DaemonShared>>,
     /// The CoreEvent bus (DaemonAdapter sender). `/api/events` subscribes a
     /// receiver per SSE connection; no other route touches it.
-    pub bus: broadcast::Sender<CoreEvent>,
-    pub roots: ProfileRoots,
-    pub token: Option<String>,
+    pub(crate) bus: broadcast::Sender<CoreEvent>,
+    pub(crate) roots: ProfileRoots,
+    pub(crate) token: Option<String>,
     /// The bound address, echoed verbatim by `/api/info`.
-    pub bind: String,
+    pub(crate) bind: String,
     /// Handle to the daemon's tokio runtime — the serving thread is a plain
     /// `std::thread`, so async core calls (`get_queue_state`) run via
     /// `Handle::block_on` (never called from a runtime worker → no panic).
     pub rt: tokio::runtime::Handle,
     /// The daemon-root audio settings, read fresh on every status call.
     /// Supplies `configured_device`/`backend`.
-    pub audio: AudioSettingsStore,
+    pub(crate) audio: AudioSettingsStore,
     /// Cached device enumeration for `device_present` (refreshed on a TTL so a
     /// `status` poll never re-enumerates CPAL on every call).
     pub devices: Mutex<DeviceCache>,
@@ -110,7 +110,7 @@ pub struct ApiState {
     /// `POST /api/settings/reload` can tell whether a routing-critical field
     /// changed since the previous reload (`daemon::audio_routing_changed`) —
     /// reinit only when it did, never on every unrelated nudge.
-    pub audio_snapshot: Mutex<qbz_audio::settings::AudioSettings>,
+    pub(crate) audio_snapshot: Mutex<qbz_audio::settings::AudioSettings>,
     /// The live cell the playback driver's background auto-advance reads
     /// for streaming quality (`daemon.rs::run`'s `quality_cell`) — reload
     /// writes a fresh value here after re-reading `daemon_prefs`.
@@ -119,19 +119,19 @@ pub struct ApiState {
     /// device-name refresh) once `qconnect::start` (boot step 12, AFTER the
     /// API starts serving at step 11) publishes it — empty only in the brief
     /// window between the two, which the reload handler no-ops through.
-    pub qconnect_control: Arc<std::sync::OnceLock<crate::qconnect::QconnectControl>>,
+    pub(crate) qconnect_control: Arc<std::sync::OnceLock<crate::qconnect::QconnectControl>>,
     /// Wakes the events bridge (`events_bridge::spawn`), which otherwise sees a
     /// volume change only on a driver edge or its 2 s poll. Pulsed after a
     /// volume or mute, so `/api/events`, the hook and the controller (the
     /// volume publish, `qconnect/publish.rs`) hear it at once.
-    pub events_edge: Arc<tokio::sync::Notify>,
+    pub(crate) events_edge: Arc<tokio::sync::Notify>,
 }
 
 /// TTL-cached output-device names for the `device_present` check.
 #[derive(Default)]
-pub struct DeviceCache {
-    pub at: Option<Instant>,
-    pub names: Vec<String>,
+pub(crate) struct DeviceCache {
+    pub(crate) at: Option<Instant>,
+    pub(crate) names: Vec<String>,
 }
 
 /// Live serving handle. [`ApiHandle::shutdown`] unblocks the serving thread and
@@ -139,13 +139,13 @@ pub struct DeviceCache {
 /// clone) BEFORE the daemon drops the runtime, preserving the #521 audio
 /// clock-release ordering (the API thread is one more `Arc<AppRuntime>` holder,
 /// exactly like the driver and auth-retry tasks).
-pub struct ApiHandle {
+pub(crate) struct ApiHandle {
     server: Arc<tiny_http::Server>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl ApiHandle {
-    pub fn shutdown(mut self) {
+    pub(crate) fn shutdown(mut self) {
         self.server.unblock();
         if let Some(t) = self.thread.take() {
             let _ = t.join();
@@ -156,14 +156,14 @@ impl ApiHandle {
 /// Why a bind failed — `AddrInUse` is the case the boot step-5 diagnosis probes
 /// (foreign pibuz vs another process); everything else is a generic fatal.
 #[derive(Debug)]
-pub enum BindError {
+pub(crate) enum BindError {
     AddrInUse(SocketAddr),
     Other(String),
 }
 
 /// Boot step 5: bind only — stateless, so the foreign-occupant
 /// diagnosis (in `daemon.rs`) runs BEFORE stores (6) and runtime composition (7).
-pub fn bind(addr: SocketAddr) -> Result<BoundServer, BindError> {
+pub(crate) fn bind(addr: SocketAddr) -> Result<BoundServer, BindError> {
     match tiny_http::Server::http(addr) {
         Ok(server) => Ok(BoundServer {
             server: Arc::new(server),
@@ -187,7 +187,7 @@ fn classify_bind_error(
 /// Best-effort occupant probe for the step-5 diagnosis: `GET /api/ping` and
 /// check the response identifies as pibuz (`"app":"pibuz"`). Loopback, short
 /// timeout, no dependency on reqwest (the CLI's async client is not built here).
-pub fn probe_is_pibuz(addr: SocketAddr) -> bool {
+pub(crate) fn probe_is_pibuz(addr: SocketAddr) -> bool {
     use std::io::{Read, Write};
     use std::net::TcpStream;
     use std::time::Duration;
@@ -211,7 +211,7 @@ pub fn probe_is_pibuz(addr: SocketAddr) -> bool {
 /// Boot step 11: start serving on the already-bound socket. Requests
 /// are handled inline on one thread (serialized). `unblock` (from the handle)
 /// ends `incoming_requests` for graceful shutdown.
-pub fn serve(server: BoundServer, state: ApiState) -> ApiHandle {
+pub(crate) fn serve(server: BoundServer, state: ApiState) -> ApiHandle {
     // The counted P0 surface — logged at boot so an operator sees exactly how
     // many routes this build exposes (and it anchors the const to production).
     log::info!(

@@ -52,7 +52,7 @@ impl VolumeCurve {
     }
 
     /// The amplitude multiplier for `fraction` (0.0–1.0) under this curve.
-    pub fn gain(self, fraction: f32) -> f32 {
+    pub(crate) fn gain(self, fraction: f32) -> f32 {
         let fraction = fraction.clamp(0.0, 1.0);
         match self {
             Self::Linear => fraction,

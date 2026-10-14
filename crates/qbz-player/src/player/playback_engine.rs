@@ -100,7 +100,7 @@ impl<S> SourceQueue<S> {
 }
 
 /// Unified playback engine
-pub enum PlaybackEngine {
+pub(crate) enum PlaybackEngine {
     /// Rodio-based (PipeWire, Pulse, ALSA via CPAL)
     Rodio { sink: RodioPlayer },
     /// Direct ALSA (hw: devices, bit-perfect) with gapless source queue
@@ -155,7 +155,7 @@ pub enum PlaybackEngine {
 
 impl PlaybackEngine {
     /// Create Rodio engine
-    pub fn new_rodio(mixer: &Mixer) -> Result<Self, String> {
+    pub(crate) fn new_rodio(mixer: &Mixer) -> Result<Self, String> {
         let sink = RodioPlayer::connect_new(mixer);
         Ok(Self::Rodio { sink })
     }
@@ -163,7 +163,7 @@ impl PlaybackEngine {
     /// Create ALSA Direct engine with gapless source queue.
     /// Spawns a single writer thread that lives for the engine's lifetime.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub fn new_alsa_direct(stream: Arc<dyn AudioOut>, hardware_volume: bool) -> Self {
+    pub(crate) fn new_alsa_direct(stream: Arc<dyn AudioOut>, hardware_volume: bool) -> Self {
         let is_playing = Arc::new(AtomicBool::new(false));
         let should_stop = Arc::new(AtomicBool::new(false));
         let position_frames = Arc::new(AtomicU64::new(0));
@@ -258,7 +258,7 @@ impl PlaybackEngine {
     /// long-lived feeder thread that resamples each source to the JACK graph rate
     /// and writes it to the client's ring buffer.
     #[cfg(target_os = "linux")]
-    pub fn new_jack(stream: Arc<JackStream>) -> Self {
+    pub(crate) fn new_jack(stream: Arc<JackStream>) -> Self {
         let is_playing = Arc::new(AtomicBool::new(false));
         let should_stop = Arc::new(AtomicBool::new(false));
         let position_frames = Arc::new(AtomicU64::new(0));
@@ -302,7 +302,7 @@ impl PlaybackEngine {
     /// which only releases once the clock passes the offset that was seeked to.
     /// Report frames-since-this-source-started and a seek leaves the controller
     /// spinning, its clock frozen, on a track that is audibly playing.
-    pub fn append<S>(&mut self, source: S, start_offset_secs: u64)
+    pub(crate) fn append<S>(&mut self, source: S, start_offset_secs: u64)
     where
         S: Source<Item = f32> + Send + 'static,
     {
@@ -384,7 +384,7 @@ impl PlaybackEngine {
     /// Play (unpause). Returns whether the engine is now playing: `false` when
     /// the stream has already ended, which a resume cannot undo — only a new
     /// `append` can.
-    pub fn play(&self) -> bool {
+    pub(crate) fn play(&self) -> bool {
         match self {
             Self::Rodio { sink } => {
                 sink.play();
@@ -590,7 +590,7 @@ impl PlaybackEngine {
     /// someone else's to apply, so this must not do what `set_volume(1.0)`
     /// does on a hardware-volume engine — drive the DAC's mixer to full scale
     /// under the integrator who owns it.
-    pub fn set_unity_gain(&self) {
+    pub(crate) fn set_unity_gain(&self) {
         match self {
             Self::Rodio { sink } => sink.set_volume(1.0),
             Self::AlsaDirect {
@@ -603,7 +603,7 @@ impl PlaybackEngine {
     }
 
     /// Check if playback queue is empty (all sources consumed, not playing)
-    pub fn empty(&self) -> bool {
+    pub(crate) fn empty(&self) -> bool {
         match self {
             Self::Rodio { sink } => sink.empty(),
             Self::AlsaDirect {
@@ -622,7 +622,7 @@ impl PlaybackEngine {
 
     /// Check if a gapless source transition just happened.
     /// Returns true once, then resets the flag.
-    pub fn take_source_transition(&self) -> bool {
+    pub(crate) fn take_source_transition(&self) -> bool {
         match self {
             Self::Rodio { .. } => false,
             Self::AlsaDirect {
@@ -652,7 +652,7 @@ impl PlaybackEngine {
     /// same trace as one it did not. This is the number that distinguishes
     /// them, and it has to be read from a thread that is allowed to log —
     /// never from the writer, which is real-time.
-    pub fn take_ring_low_water(&self) -> Option<(u64, u64)> {
+    pub(crate) fn take_ring_low_water(&self) -> Option<(u64, u64)> {
         match self {
             #[cfg(target_os = "linux")]
             Self::AlsaDirect { link, .. } => link.take_low_water(),
@@ -667,7 +667,7 @@ impl PlaybackEngine {
     /// minus `snd_pcm_delay` — so it is what the listener is hearing, not what
     /// the writer has written. The two differ by the whole hardware ring, which
     /// is up to a second on the buffer a Pi is told to use.
-    pub fn position_secs(&self) -> Option<u64> {
+    pub(crate) fn position_secs(&self) -> Option<u64> {
         match self {
             Self::Rodio { .. } => None,
             Self::AlsaDirect {

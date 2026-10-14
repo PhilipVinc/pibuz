@@ -1,32 +1,32 @@
 // crates/pibuz/src/state.rs — shared in-memory daemon state (one
 // `Arc<Mutex<DaemonShared>>` shared by the playback driver + the HTTP API).
 #[derive(Debug, Default, Clone, serde::Serialize)]
-pub struct LatchedErrors {
+pub(crate) struct LatchedErrors {
     // drain-once channels become latches
-    pub stream: Option<String>,
-    pub auth: Option<String>,
-    pub transport: Option<String>,
+    pub(crate) stream: Option<String>,
+    pub(crate) auth: Option<String>,
+    pub(crate) transport: Option<String>,
 }
 
-pub struct DaemonShared {
+pub(crate) struct DaemonShared {
     // one Arc<Mutex<...>> shared by driver + API
-    pub last_errors: LatchedErrors,
-    pub driver_last_tick: Option<std::time::Instant>,
+    pub(crate) last_errors: LatchedErrors,
+    pub(crate) driver_last_tick: Option<std::time::Instant>,
     pub muted: bool,
-    pub premute_volume: f32,
-    pub started_at: std::time::Instant,
-    pub startup_warnings: u32,
+    pub(crate) premute_volume: f32,
+    pub(crate) started_at: std::time::Instant,
+    pub(crate) startup_warnings: u32,
     pub qconnect: QconnectStatus,
     /// Coarse network-reachability signal for `/api/status`'s `network.online`.
     /// Latched ONLY from real network-class outcomes — never active probing:
     /// false on a QConnect reconnect-exhausted, true on a successful QConnect
     /// (re)connect. Defaults true (optimistic) until the first outcome latches
     /// it.
-    pub network_online: std::sync::atomic::AtomicBool,
+    pub(crate) network_online: std::sync::atomic::AtomicBool,
     /// CoreEvent bus handle so state mutations here can publish matching bus
     /// events (`emit_qconnect_session_changed`). None until `daemon::run`
     /// attaches it right after boot; tests leave it None.
-    pub bus: Option<tokio::sync::broadcast::Sender<qbz_models::CoreEvent>>,
+    pub(crate) bus: Option<tokio::sync::broadcast::Sender<qbz_models::CoreEvent>>,
 }
 
 impl DaemonShared {
@@ -34,21 +34,21 @@ impl DaemonShared {
     /// sufficient — this is a coarse status flag read under the same
     /// `Mutex<DaemonShared>` guard as every other field here, not a
     /// synchronization primitive of its own.
-    pub fn network_online(&self) -> bool {
+    pub(crate) fn network_online(&self) -> bool {
         self.network_online
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Latch the network-reachability signal. See the field doc for exactly
     /// which call sites are allowed to call this.
-    pub fn set_network_online(&self, online: bool) {
+    pub(crate) fn set_network_online(&self, online: bool) {
         self.network_online
             .store(online, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Publish an event on the daemon bus (SSE subscribers and the event hook).
     /// A no-op before the bus exists, which is the case during early startup.
-    pub fn emit(&self, event: qbz_models::CoreEvent) {
+    pub(crate) fn emit(&self, event: qbz_models::CoreEvent) {
         if let Some(bus) = &self.bus {
             let _ = bus.send(event);
         }
@@ -60,7 +60,7 @@ impl DaemonShared {
     /// nobody's renderer, and `is_active` used to be written only by the sink's
     /// ownership latch, so `/api/status` went on saying `is_active: true` after
     /// `pibuz qconnect disable` or a reconnect that gave up.
-    pub fn latch_qconnect_session_down(&mut self, state: &str) {
+    pub(crate) fn latch_qconnect_session_down(&mut self, state: &str) {
         self.qconnect.state = state.to_string();
         self.qconnect.session_active = false;
         self.qconnect.is_active = false;
@@ -70,7 +70,7 @@ impl DaemonShared {
     /// event (SSE `/api/events`, `pibuz watch`, the event hook). Call AFTER
     /// mutating `self.qconnect`; a best-effort no-op before the bus attaches
     /// or when no receiver is subscribed.
-    pub fn emit_qconnect_session_changed(&self) {
+    pub(crate) fn emit_qconnect_session_changed(&self) {
         if let Some(bus) = &self.bus {
             let _ = bus.send(qbz_models::CoreEvent::QconnectSessionChanged {
                 state: self.qconnect.state.clone(),
@@ -83,10 +83,10 @@ impl DaemonShared {
 }
 
 #[derive(Debug, Default, Clone, serde::Serialize)]
-pub struct QconnectStatus {
-    pub enabled: bool,
+pub(crate) struct QconnectStatus {
+    pub(crate) enabled: bool,
     pub state: String, // "off"|"connecting"|"connected"|"retrying"|"exhausted"
-    pub session_active: bool,
+    pub(crate) session_active: bool,
     /// The session's ACTIVE RENDERER is this device.
     ///
     /// `is_active` is what every other Qobuz Connect implementation calls this,
@@ -97,9 +97,9 @@ pub struct QconnectStatus {
     /// up: a controller that switches to its own speakers leaves us connected
     /// but no longer rendering. moOde reads this to decide whether the Qobuz
     /// overlay should still own the screen.
-    pub is_active: bool,
+    pub(crate) is_active: bool,
     pub device_name: String,
-    pub last_transport_reconnect: Option<String>,
+    pub(crate) last_transport_reconnect: Option<String>,
     /// The /streamcore pairing listener is serving (mDNS advertisement is
     /// best-effort and may have failed independently).
     pub pairing: bool,

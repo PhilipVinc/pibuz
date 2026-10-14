@@ -3,7 +3,7 @@
 // Variant names mirror the protobuf wire enum verbatim; renaming them to
 // please the lint would break the generated mapping.
 #[allow(clippy::enum_variant_names)]
-pub enum QConnectMessageType {
+pub(crate) enum QConnectMessageType {
     MessageTypePlaybackError = 2,
     MessageTypeRndrSrvrJoinSession = 21,
     MessageTypeRndrSrvrDeviceInfoUpdated = 22,
@@ -101,7 +101,7 @@ pub struct QueueTrackWithContext {
     #[prost(fixed32, optional, tag = "2")]
     pub track_id: Option<u32>,
     #[prost(bytes = "vec", optional, tag = "3")]
-    pub context_uuid: Option<Vec<u8>>,
+    pub(crate) context_uuid: Option<Vec<u8>>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -109,17 +109,17 @@ pub struct SetQueueTrackWithContext {
     #[prost(int32, optional, tag = "1")]
     pub track_id: Option<i32>,
     #[prost(bytes = "vec", optional, tag = "2")]
-    pub context_uuid: Option<Vec<u8>>,
+    pub(crate) context_uuid: Option<Vec<u8>>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct DeviceCapabilitiesMessage {
+pub(crate) struct DeviceCapabilitiesMessage {
     #[prost(int32, optional, tag = "1")]
-    pub min_audio_quality: Option<i32>,
+    pub(crate) min_audio_quality: Option<i32>,
     #[prost(int32, optional, tag = "2")]
     pub max_audio_quality: Option<i32>,
     #[prost(int32, optional, tag = "3")]
-    pub volume_remote_control: Option<i32>,
+    pub(crate) volume_remote_control: Option<i32>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -133,34 +133,34 @@ pub struct DeviceInfoMessage {
     #[prost(string, optional, tag = "4")]
     pub model: Option<String>,
     #[prost(string, optional, tag = "5")]
-    pub serial_number: Option<String>,
+    pub(crate) serial_number: Option<String>,
     #[prost(int32, optional, tag = "6")]
     pub device_type: Option<i32>,
     #[prost(message, optional, tag = "7")]
-    pub capabilities: Option<DeviceCapabilitiesMessage>,
+    pub(crate) capabilities: Option<DeviceCapabilitiesMessage>,
     #[prost(string, optional, tag = "8")]
-    pub software_version: Option<String>,
+    pub(crate) software_version: Option<String>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct JoinSessionMessage {
     #[prost(bytes = "vec", optional, tag = "1")]
-    pub session_uuid: Option<Vec<u8>>,
+    pub(crate) session_uuid: Option<Vec<u8>>,
     #[prost(message, optional, tag = "2")]
-    pub device_info: Option<DeviceInfoMessage>,
+    pub(crate) device_info: Option<DeviceInfoMessage>,
     /// Renderer-only: reason for joining (0=unknown, 1=controller_request, 2=reconnection)
     #[prost(int32, optional, tag = "3")]
-    pub reason: Option<i32>,
+    pub(crate) reason: Option<i32>,
     /// Renderer-only: initial playback state sent on join
     #[prost(message, optional, tag = "4")]
-    pub initial_state: Option<RendererStateMessage>,
+    pub(crate) initial_state: Option<RendererStateMessage>,
     /// Renderer-only: whether this renderer is active
     #[prost(bool, optional, tag = "5")]
-    pub is_active: Option<bool>,
+    pub(crate) is_active: Option<bool>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct SetPlayerStateQueueItemMessage {
+pub(crate) struct SetPlayerStateQueueItemMessage {
     #[prost(message, optional, tag = "1")]
     pub queue_version: Option<QueueVersionRef>,
     #[prost(int32, optional, tag = "2")]
@@ -174,19 +174,19 @@ pub struct SetPlayerStateMessage {
     #[prost(int32, optional, tag = "2")]
     pub current_position: Option<i32>,
     #[prost(message, optional, tag = "3")]
-    pub current_queue_item: Option<SetPlayerStateQueueItemMessage>,
+    pub(crate) current_queue_item: Option<SetPlayerStateQueueItemMessage>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SetActiveRendererMessage {
     #[prost(int32, optional, tag = "1")]
-    pub renderer_id: Option<i32>,
+    pub(crate) renderer_id: Option<i32>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SetVolumeMessage {
     #[prost(int32, optional, tag = "1")]
-    pub renderer_id: Option<i32>,
+    pub(crate) renderer_id: Option<i32>,
     #[prost(int32, optional, tag = "2")]
     pub volume: Option<i32>,
     #[prost(int32, optional, tag = "3")]
@@ -202,15 +202,15 @@ pub struct SetLoopModeMessage {
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MuteVolumeMessage {
     #[prost(int32, optional, tag = "1")]
-    pub renderer_id: Option<i32>,
+    pub(crate) renderer_id: Option<i32>,
     #[prost(bool, optional, tag = "2")]
-    pub value: Option<bool>,
+    pub(crate) value: Option<bool>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SetMaxAudioQualityMessage {
     #[prost(int32, optional, tag = "1")]
-    pub renderer_id: Option<i32>,
+    pub(crate) renderer_id: Option<i32>,
     #[prost(int32, optional, tag = "2")]
     pub max_audio_quality: Option<i32>,
 }
@@ -218,7 +218,7 @@ pub struct SetMaxAudioQualityMessage {
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AskForRendererStateMessage {
     #[prost(int32, optional, tag = "1")]
-    pub renderer_id: Option<i32>,
+    pub(crate) renderer_id: Option<i32>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -236,19 +236,19 @@ pub struct QueueLoadTracksMessage {
     #[prost(bytes = "vec", optional, tag = "2")]
     pub action_uuid: Option<Vec<u8>>,
     #[prost(fixed32, repeated, tag = "3")]
-    pub track_ids: Vec<u32>,
+    pub(crate) track_ids: Vec<u32>,
     #[prost(int32, optional, tag = "4")]
-    pub queue_position: Option<i32>,
+    pub(crate) queue_position: Option<i32>,
     #[prost(fixed32, optional, tag = "5")]
-    pub shuffle_seed: Option<u32>,
+    pub(crate) shuffle_seed: Option<u32>,
     #[prost(int32, optional, tag = "6")]
-    pub shuffle_pivot_index: Option<i32>,
+    pub(crate) shuffle_pivot_index: Option<i32>,
     #[prost(bool, optional, tag = "7")]
     pub shuffle_mode: Option<bool>,
     #[prost(bytes = "vec", optional, tag = "8")]
-    pub context_uuid: Option<Vec<u8>>,
+    pub(crate) context_uuid: Option<Vec<u8>>,
     #[prost(bool, optional, tag = "9")]
-    pub autoplay_reset: Option<bool>,
+    pub(crate) autoplay_reset: Option<bool>,
     #[prost(bool, optional, tag = "10")]
     pub autoplay_loading: Option<bool>,
 }
@@ -260,15 +260,15 @@ pub struct QueueInsertTracksMessage {
     #[prost(bytes = "vec", optional, tag = "2")]
     pub action_uuid: Option<Vec<u8>>,
     #[prost(fixed32, repeated, tag = "3")]
-    pub track_ids: Vec<u32>,
+    pub(crate) track_ids: Vec<u32>,
     #[prost(int32, optional, tag = "4")]
-    pub insert_after: Option<i32>,
+    pub(crate) insert_after: Option<i32>,
     #[prost(fixed32, optional, tag = "5")]
-    pub shuffle_seed: Option<u32>,
+    pub(crate) shuffle_seed: Option<u32>,
     #[prost(bytes = "vec", optional, tag = "6")]
-    pub context_uuid: Option<Vec<u8>>,
+    pub(crate) context_uuid: Option<Vec<u8>>,
     #[prost(bool, optional, tag = "7")]
-    pub autoplay_reset: Option<bool>,
+    pub(crate) autoplay_reset: Option<bool>,
     #[prost(bool, optional, tag = "8")]
     pub autoplay_loading: Option<bool>,
 }
@@ -280,13 +280,13 @@ pub struct QueueAddTracksMessage {
     #[prost(bytes = "vec", optional, tag = "2")]
     pub action_uuid: Option<Vec<u8>>,
     #[prost(fixed32, repeated, tag = "3")]
-    pub track_ids: Vec<u32>,
+    pub(crate) track_ids: Vec<u32>,
     #[prost(fixed32, optional, tag = "4")]
-    pub shuffle_seed: Option<u32>,
+    pub(crate) shuffle_seed: Option<u32>,
     #[prost(bytes = "vec", optional, tag = "5")]
-    pub context_uuid: Option<Vec<u8>>,
+    pub(crate) context_uuid: Option<Vec<u8>>,
     #[prost(bool, optional, tag = "6")]
-    pub autoplay_reset: Option<bool>,
+    pub(crate) autoplay_reset: Option<bool>,
     #[prost(bool, optional, tag = "7")]
     pub autoplay_loading: Option<bool>,
 }
@@ -298,9 +298,9 @@ pub struct QueueRemoveTracksMessage {
     #[prost(bytes = "vec", optional, tag = "2")]
     pub action_uuid: Option<Vec<u8>>,
     #[prost(int32, repeated, packed = "false", tag = "3")]
-    pub queue_item_ids: Vec<i32>,
+    pub(crate) queue_item_ids: Vec<i32>,
     #[prost(bool, optional, tag = "4")]
-    pub autoplay_reset: Option<bool>,
+    pub(crate) autoplay_reset: Option<bool>,
     #[prost(bool, optional, tag = "5")]
     pub autoplay_loading: Option<bool>,
 }
@@ -312,11 +312,11 @@ pub struct QueueReorderTracksMessage {
     #[prost(bytes = "vec", optional, tag = "2")]
     pub action_uuid: Option<Vec<u8>>,
     #[prost(int32, repeated, packed = "false", tag = "3")]
-    pub queue_item_ids: Vec<i32>,
+    pub(crate) queue_item_ids: Vec<i32>,
     #[prost(int32, optional, tag = "4")]
-    pub insert_after: Option<i32>,
+    pub(crate) insert_after: Option<i32>,
     #[prost(bool, optional, tag = "5")]
-    pub autoplay_reset: Option<bool>,
+    pub(crate) autoplay_reset: Option<bool>,
     #[prost(bool, optional, tag = "6")]
     pub autoplay_loading: Option<bool>,
 }
@@ -330,11 +330,11 @@ pub struct SetShuffleModeMessage {
     #[prost(bool, optional, tag = "3")]
     pub shuffle_mode: Option<bool>,
     #[prost(fixed32, optional, tag = "4")]
-    pub shuffle_seed: Option<u32>,
+    pub(crate) shuffle_seed: Option<u32>,
     #[prost(int32, optional, tag = "5")]
-    pub shuffle_pivot_queue_item_id: Option<i32>,
+    pub(crate) shuffle_pivot_queue_item_id: Option<i32>,
     #[prost(bool, optional, tag = "6")]
-    pub autoplay_reset: Option<bool>,
+    pub(crate) autoplay_reset: Option<bool>,
     #[prost(bool, optional, tag = "7")]
     pub autoplay_loading: Option<bool>,
 }
@@ -348,7 +348,7 @@ pub struct SetAutoplayModeMessage {
     #[prost(bool, optional, tag = "3")]
     pub autoplay_mode: Option<bool>,
     #[prost(bool, optional, tag = "4")]
-    pub autoplay_reset: Option<bool>,
+    pub(crate) autoplay_reset: Option<bool>,
     #[prost(bool, optional, tag = "5")]
     pub autoplay_loading: Option<bool>,
 }
@@ -360,9 +360,9 @@ pub struct AutoplayLoadTracksMessage {
     #[prost(bytes = "vec", optional, tag = "2")]
     pub action_uuid: Option<Vec<u8>>,
     #[prost(fixed32, repeated, tag = "3")]
-    pub track_ids: Vec<u32>,
+    pub(crate) track_ids: Vec<u32>,
     #[prost(bytes = "vec", optional, tag = "4")]
-    pub context_uuid: Option<Vec<u8>>,
+    pub(crate) context_uuid: Option<Vec<u8>>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -372,7 +372,7 @@ pub struct AutoplayRemoveTracksMessage {
     #[prost(bytes = "vec", optional, tag = "2")]
     pub action_uuid: Option<Vec<u8>>,
     #[prost(int32, repeated, packed = "false", tag = "3")]
-    pub queue_item_ids: Vec<i32>,
+    pub(crate) queue_item_ids: Vec<i32>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -386,13 +386,13 @@ pub struct SetQueueStateMessage {
     #[prost(bool, optional, tag = "4")]
     pub shuffle_mode: Option<bool>,
     #[prost(int32, repeated, packed = "false", tag = "5")]
-    pub shuffled_track_indexes: Vec<i32>,
+    pub(crate) shuffled_track_indexes: Vec<i32>,
     #[prost(bool, optional, tag = "6")]
     pub autoplay_mode: Option<bool>,
     #[prost(bool, optional, tag = "7")]
     pub autoplay_loading: Option<bool>,
     #[prost(message, repeated, tag = "8")]
-    pub autoplay_tracks: Vec<SetQueueTrackWithContext>,
+    pub(crate) autoplay_tracks: Vec<SetQueueTrackWithContext>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -432,15 +432,15 @@ pub struct QueueStateMessage {
     #[prost(bool, optional, tag = "4")]
     pub shuffle_mode: Option<bool>,
     #[prost(int32, repeated, packed = "false", tag = "5")]
-    pub shuffled_track_indexes: Vec<i32>,
+    pub(crate) shuffled_track_indexes: Vec<i32>,
     #[prost(bool, optional, tag = "6")]
     pub autoplay_mode: Option<bool>,
     #[prost(bool, optional, tag = "7")]
     pub autoplay_loading: Option<bool>,
     #[prost(message, repeated, tag = "8")]
-    pub autoplay_tracks: Vec<QueueTrackWithContext>,
+    pub(crate) autoplay_tracks: Vec<QueueTrackWithContext>,
     #[prost(bytes = "vec", optional, tag = "100")]
-    pub queue_hash: Option<Vec<u8>>,
+    pub(crate) queue_hash: Option<Vec<u8>>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -452,21 +452,21 @@ pub struct QueueTracksLoadedMessage {
     #[prost(message, repeated, tag = "3")]
     pub tracks: Vec<QueueTrack>,
     #[prost(int32, optional, tag = "4")]
-    pub queue_position: Option<i32>,
+    pub(crate) queue_position: Option<i32>,
     #[prost(fixed32, optional, tag = "5")]
-    pub shuffle_seed: Option<u32>,
+    pub(crate) shuffle_seed: Option<u32>,
     #[prost(int32, optional, tag = "6")]
-    pub shuffle_pivot_queue_item_id: Option<i32>,
+    pub(crate) shuffle_pivot_queue_item_id: Option<i32>,
     #[prost(bool, optional, tag = "7")]
     pub shuffle_mode: Option<bool>,
     #[prost(bytes = "vec", optional, tag = "8")]
-    pub context_uuid: Option<Vec<u8>>,
+    pub(crate) context_uuid: Option<Vec<u8>>,
     #[prost(bool, optional, tag = "9")]
-    pub autoplay_reset: Option<bool>,
+    pub(crate) autoplay_reset: Option<bool>,
     #[prost(bool, optional, tag = "10")]
     pub autoplay_loading: Option<bool>,
     #[prost(bytes = "vec", optional, tag = "100")]
-    pub queue_hash: Option<Vec<u8>>,
+    pub(crate) queue_hash: Option<Vec<u8>>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -478,17 +478,17 @@ pub struct QueueTracksInsertedMessage {
     #[prost(message, repeated, tag = "3")]
     pub tracks: Vec<QueueTrack>,
     #[prost(int32, optional, tag = "4")]
-    pub insert_after: Option<i32>,
+    pub(crate) insert_after: Option<i32>,
     #[prost(fixed32, optional, tag = "5")]
-    pub shuffle_seed: Option<u32>,
+    pub(crate) shuffle_seed: Option<u32>,
     #[prost(bytes = "vec", optional, tag = "6")]
-    pub context_uuid: Option<Vec<u8>>,
+    pub(crate) context_uuid: Option<Vec<u8>>,
     #[prost(bool, optional, tag = "7")]
-    pub autoplay_reset: Option<bool>,
+    pub(crate) autoplay_reset: Option<bool>,
     #[prost(bool, optional, tag = "8")]
     pub autoplay_loading: Option<bool>,
     #[prost(bytes = "vec", optional, tag = "100")]
-    pub queue_hash: Option<Vec<u8>>,
+    pub(crate) queue_hash: Option<Vec<u8>>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -500,15 +500,15 @@ pub struct QueueTracksAddedMessage {
     #[prost(message, repeated, tag = "3")]
     pub tracks: Vec<QueueTrack>,
     #[prost(fixed32, optional, tag = "4")]
-    pub shuffle_seed: Option<u32>,
+    pub(crate) shuffle_seed: Option<u32>,
     #[prost(bytes = "vec", optional, tag = "5")]
-    pub context_uuid: Option<Vec<u8>>,
+    pub(crate) context_uuid: Option<Vec<u8>>,
     #[prost(bool, optional, tag = "6")]
-    pub autoplay_reset: Option<bool>,
+    pub(crate) autoplay_reset: Option<bool>,
     #[prost(bool, optional, tag = "7")]
     pub autoplay_loading: Option<bool>,
     #[prost(bytes = "vec", optional, tag = "100")]
-    pub queue_hash: Option<Vec<u8>>,
+    pub(crate) queue_hash: Option<Vec<u8>>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -518,13 +518,13 @@ pub struct QueueTracksRemovedMessage {
     #[prost(bytes = "vec", optional, tag = "2")]
     pub action_uuid: Option<Vec<u8>>,
     #[prost(int32, repeated, packed = "false", tag = "3")]
-    pub queue_item_ids: Vec<i32>,
+    pub(crate) queue_item_ids: Vec<i32>,
     #[prost(bool, optional, tag = "4")]
-    pub autoplay_reset: Option<bool>,
+    pub(crate) autoplay_reset: Option<bool>,
     #[prost(bool, optional, tag = "5")]
     pub autoplay_loading: Option<bool>,
     #[prost(bytes = "vec", optional, tag = "100")]
-    pub queue_hash: Option<Vec<u8>>,
+    pub(crate) queue_hash: Option<Vec<u8>>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -534,15 +534,15 @@ pub struct QueueTracksReorderedMessage {
     #[prost(bytes = "vec", optional, tag = "2")]
     pub action_uuid: Option<Vec<u8>>,
     #[prost(int32, repeated, packed = "false", tag = "3")]
-    pub queue_item_ids: Vec<i32>,
+    pub(crate) queue_item_ids: Vec<i32>,
     #[prost(int32, optional, tag = "4")]
-    pub insert_after: Option<i32>,
+    pub(crate) insert_after: Option<i32>,
     #[prost(bool, optional, tag = "5")]
-    pub autoplay_reset: Option<bool>,
+    pub(crate) autoplay_reset: Option<bool>,
     #[prost(bool, optional, tag = "6")]
     pub autoplay_loading: Option<bool>,
     #[prost(bytes = "vec", optional, tag = "100")]
-    pub queue_hash: Option<Vec<u8>>,
+    pub(crate) queue_hash: Option<Vec<u8>>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -554,15 +554,15 @@ pub struct ShuffleModeSetMessage {
     #[prost(bool, optional, tag = "3")]
     pub shuffle_mode: Option<bool>,
     #[prost(fixed32, optional, tag = "4")]
-    pub shuffle_seed: Option<u32>,
+    pub(crate) shuffle_seed: Option<u32>,
     #[prost(int32, optional, tag = "5")]
-    pub shuffle_pivot_queue_item_id: Option<i32>,
+    pub(crate) shuffle_pivot_queue_item_id: Option<i32>,
     #[prost(bool, optional, tag = "6")]
-    pub autoplay_reset: Option<bool>,
+    pub(crate) autoplay_reset: Option<bool>,
     #[prost(bool, optional, tag = "7")]
     pub autoplay_loading: Option<bool>,
     #[prost(bytes = "vec", optional, tag = "100")]
-    pub queue_hash: Option<Vec<u8>>,
+    pub(crate) queue_hash: Option<Vec<u8>>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -574,7 +574,7 @@ pub struct AutoplayModeSetMessage {
     #[prost(bool, optional, tag = "3")]
     pub autoplay_mode: Option<bool>,
     #[prost(bool, optional, tag = "4")]
-    pub autoplay_reset: Option<bool>,
+    pub(crate) autoplay_reset: Option<bool>,
     #[prost(bool, optional, tag = "5")]
     pub autoplay_loading: Option<bool>,
 }
@@ -588,7 +588,7 @@ pub struct AutoplayTracksLoadedMessage {
     #[prost(message, repeated, tag = "3")]
     pub tracks: Vec<QueueTrack>,
     #[prost(bytes = "vec", optional, tag = "4")]
-    pub context_uuid: Option<Vec<u8>>,
+    pub(crate) context_uuid: Option<Vec<u8>>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -598,7 +598,7 @@ pub struct AutoplayTracksRemovedMessage {
     #[prost(bytes = "vec", optional, tag = "2")]
     pub action_uuid: Option<Vec<u8>>,
     #[prost(int32, repeated, packed = "false", tag = "3")]
-    pub queue_item_ids: Vec<i32>,
+    pub(crate) queue_item_ids: Vec<i32>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -606,9 +606,9 @@ pub struct QueueTracksAddedFromAutoplayMessage {
     #[prost(message, optional, tag = "1")]
     pub queue_version: Option<QueueVersionRef>,
     #[prost(int32, repeated, packed = "false", tag = "2")]
-    pub queue_item_ids: Vec<i32>,
+    pub(crate) queue_item_ids: Vec<i32>,
     #[prost(bytes = "vec", optional, tag = "100")]
-    pub queue_hash: Option<Vec<u8>>,
+    pub(crate) queue_hash: Option<Vec<u8>>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -660,15 +660,15 @@ pub struct RendererSetShuffleModeMessage {
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RendererMuteVolumeMessage {
     #[prost(bool, optional, tag = "1")]
-    pub value: Option<bool>,
+    pub(crate) value: Option<bool>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PlaybackPositionMessage {
     #[prost(fixed64, optional, tag = "1")]
-    pub timestamp: Option<u64>,
+    pub(crate) timestamp: Option<u64>,
     #[prost(int32, optional, tag = "2")]
-    pub value: Option<i32>,
+    pub(crate) value: Option<i32>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -676,7 +676,7 @@ pub struct RendererStateMessage {
     #[prost(int32, optional, tag = "1")]
     pub playing_state: Option<i32>,
     #[prost(int32, optional, tag = "2")]
-    pub buffer_state: Option<i32>,
+    pub(crate) buffer_state: Option<i32>,
     #[prost(message, optional, tag = "3")]
     pub current_position: Option<PlaybackPositionMessage>,
     #[prost(int32, optional, tag = "4")]
@@ -684,9 +684,9 @@ pub struct RendererStateMessage {
     #[prost(message, optional, tag = "5")]
     pub queue_version: Option<QueueVersionRef>,
     #[prost(int32, optional, tag = "6")]
-    pub current_queue_item_id: Option<i32>,
+    pub(crate) current_queue_item_id: Option<i32>,
     #[prost(int32, optional, tag = "7")]
-    pub next_queue_item_id: Option<i32>,
+    pub(crate) next_queue_item_id: Option<i32>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -704,7 +704,7 @@ pub struct RendererVolumeChangedMessage {
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RendererVolumeMutedMessage {
     #[prost(bool, optional, tag = "1")]
-    pub value: Option<bool>,
+    pub(crate) value: Option<bool>,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -734,7 +734,7 @@ pub struct RendererMaxAudioQualityChangedMessage {
     #[prost(int32, optional, tag = "1")]
     pub max_audio_quality: Option<i32>,
     #[prost(int32, optional, tag = "2")]
-    pub network_type: Option<i32>,
+    pub(crate) network_type: Option<i32>,
 }
 
 // --- SRVR_CTRL session management messages (server → controller) ---
@@ -743,7 +743,7 @@ pub struct RendererMaxAudioQualityChangedMessage {
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CtrlSessionStateMessage {
     #[prost(bytes = "vec", optional, tag = "1")]
-    pub session_uuid: Option<Vec<u8>>,
+    pub(crate) session_uuid: Option<Vec<u8>>,
     #[prost(int32, optional, tag = "2")]
     pub active_renderer_id: Option<i32>,
     #[prost(message, optional, tag = "3")]
@@ -756,53 +756,53 @@ pub struct CtrlSessionStateMessage {
 
 /// Nested player state for CtrlRendererStateUpdatedMessage
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct CtrlRendererPlayerState {
+pub(crate) struct CtrlRendererPlayerState {
     #[prost(int32, optional, tag = "1")]
     pub playing_state: Option<i32>,
     #[prost(int32, optional, tag = "2")]
-    pub buffer_state: Option<i32>,
+    pub(crate) buffer_state: Option<i32>,
     #[prost(message, optional, tag = "3")]
     pub current_position: Option<PlaybackPositionMessage>,
     #[prost(uint32, optional, tag = "4")]
     pub duration: Option<u32>,
     #[prost(int32, optional, tag = "5")]
-    pub current_queue_item_id: Option<i32>,
+    pub(crate) current_queue_item_id: Option<i32>,
 }
 
 /// Type 82: Renderer state updated (controller view)
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CtrlRendererStateUpdatedMessage {
     #[prost(int32, optional, tag = "1")]
-    pub renderer_id: Option<i32>,
+    pub(crate) renderer_id: Option<i32>,
     #[prost(int32, optional, tag = "2")]
-    pub status: Option<i32>,
+    pub(crate) status: Option<i32>,
     #[prost(message, optional, tag = "3")]
-    pub player_state: Option<CtrlRendererPlayerState>,
+    pub(crate) player_state: Option<CtrlRendererPlayerState>,
 }
 
 /// Type 83: New renderer added to session
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CtrlAddRendererMessage {
     #[prost(int32, optional, tag = "1")]
-    pub renderer_id: Option<i32>,
+    pub(crate) renderer_id: Option<i32>,
     #[prost(message, optional, tag = "2")]
-    pub device_info: Option<DeviceInfoMessage>,
+    pub(crate) device_info: Option<DeviceInfoMessage>,
 }
 
 /// Type 84: Renderer info updated
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CtrlUpdateRendererMessage {
     #[prost(int32, optional, tag = "1")]
-    pub renderer_id: Option<i32>,
+    pub(crate) renderer_id: Option<i32>,
     #[prost(message, optional, tag = "2")]
-    pub device_info: Option<DeviceInfoMessage>,
+    pub(crate) device_info: Option<DeviceInfoMessage>,
 }
 
 /// Type 85: Renderer removed from session
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CtrlRemoveRendererMessage {
     #[prost(int32, optional, tag = "1")]
-    pub renderer_id: Option<i32>,
+    pub(crate) renderer_id: Option<i32>,
 }
 
 /// Type 86: Active renderer changed
@@ -816,7 +816,7 @@ pub struct CtrlActiveRendererChangedMessage {
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CtrlVolumeChangedMessage {
     #[prost(int32, optional, tag = "1")]
-    pub renderer_id: Option<i32>,
+    pub(crate) renderer_id: Option<i32>,
     #[prost(uint32, optional, tag = "2")]
     pub volume: Option<u32>,
 }
@@ -832,27 +832,27 @@ pub struct CtrlLoopModeSetMessage {
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CtrlVolumeMutedMessage {
     #[prost(int32, optional, tag = "1")]
-    pub renderer_id: Option<i32>,
+    pub(crate) renderer_id: Option<i32>,
     #[prost(bool, optional, tag = "2")]
-    pub value: Option<bool>,
+    pub(crate) value: Option<bool>,
 }
 
 /// Type 99: Max audio quality changed (controller view)
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CtrlMaxAudioQualityChangedMessage {
     #[prost(int32, optional, tag = "1")]
-    pub renderer_id: Option<i32>,
+    pub(crate) renderer_id: Option<i32>,
     #[prost(int32, optional, tag = "2")]
     pub max_audio_quality: Option<i32>,
     #[prost(int32, optional, tag = "3")]
-    pub network_type: Option<i32>,
+    pub(crate) network_type: Option<i32>,
 }
 
 /// Type 100: File audio quality changed (controller view)
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CtrlFileAudioQualityChangedMessage {
     #[prost(int32, optional, tag = "1")]
-    pub renderer_id: Option<i32>,
+    pub(crate) renderer_id: Option<i32>,
     #[prost(uint32, optional, tag = "2")]
     pub sampling_rate: Option<u32>,
     #[prost(uint32, optional, tag = "3")]
@@ -867,7 +867,7 @@ pub struct CtrlFileAudioQualityChangedMessage {
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CtrlDeviceAudioQualityChangedMessage {
     #[prost(int32, optional, tag = "1")]
-    pub renderer_id: Option<i32>,
+    pub(crate) renderer_id: Option<i32>,
     #[prost(uint32, optional, tag = "2")]
     pub sampling_rate: Option<u32>,
     #[prost(uint32, optional, tag = "3")]

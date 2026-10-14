@@ -10,7 +10,7 @@ use tokio::sync::broadcast;
 
 /// Broadcast fan-out adapter handed to `AppRuntime`/`QbzCore`. Every event the
 /// core emits is re-published to all live subscribers.
-pub struct DaemonAdapter {
+pub(crate) struct DaemonAdapter {
     tx: broadcast::Sender<CoreEvent>,
 }
 
@@ -27,7 +27,7 @@ impl DaemonAdapter {
 
     /// A cloned producer handle to the same bus (used to hand the sender to
     /// other boot components while the adapter is moved into the runtime).
-    pub fn sender(&self) -> broadcast::Sender<CoreEvent> {
+    pub(crate) fn sender(&self) -> broadcast::Sender<CoreEvent> {
         self.tx.clone()
     }
 }

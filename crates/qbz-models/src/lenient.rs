@@ -18,7 +18,7 @@ use serde_json::Value;
 /// the ones that don't match `T` instead of nuking the whole list.
 ///
 /// `what` names the item kind for the logs (e.g. `"track"`, `"album"`).
-pub fn parse_items_lenient<T: DeserializeOwned>(items: Vec<Value>, what: &str) -> Vec<T> {
+pub(crate) fn parse_items_lenient<T: DeserializeOwned>(items: Vec<Value>, what: &str) -> Vec<T> {
     let total = items.len();
     let mut out = Vec::with_capacity(total);
     let mut dropped = 0usize;

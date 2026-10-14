@@ -116,11 +116,6 @@ fn parse_header(head: &[u8; SEAL_HEADER_LEN as usize]) -> io::Result<[u8; 16]> {
     Ok(nonce)
 }
 
-/// Does `head` begin a sealed file?
-pub fn looks_sealed(head: &[u8]) -> bool {
-    head.len() >= MAGIC.len() && head[..MAGIC.len()] == MAGIC
-}
-
 /// Seals a byte stream as it is written, header first.
 ///
 /// Sequential only — which is all three writers into the cache are. The counter
@@ -152,18 +147,8 @@ impl<W: Write> SealWriter<W> {
         })
     }
 
-    /// Plaintext bytes sealed so far — NOT the size of the file, which is this
-    /// plus [`SEAL_HEADER_LEN`].
-    pub fn plaintext_len(&self) -> u64 {
-        self.pos
-    }
-
     pub fn get_ref(&self) -> &W {
         &self.inner
-    }
-
-    pub fn get_mut(&mut self) -> &mut W {
-        &mut self.inner
     }
 
     pub fn into_inner(self) -> W {
@@ -334,7 +319,7 @@ mod tests {
         for part in data.chunks(chunk) {
             w.write_all(part).expect("write");
         }
-        assert_eq!(w.plaintext_len(), data.len() as u64);
+
         w.into_inner().into_inner()
     }
 
@@ -454,16 +439,11 @@ mod tests {
     #[test]
     fn a_plaintext_file_is_recognised_and_refused() {
         let data = plaintext(1_024);
-        assert!(!looks_sealed(&data));
         let err = match SealReader::new(SealKey::random(), Cursor::new(data.clone())) {
             Ok(_) => panic!("a plaintext file opened as sealed"),
             Err(e) => e,
         };
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-
-        let sealed = seal_to_vec(SealKey::random(), &data);
-        assert!(looks_sealed(&sealed));
-        assert!(!looks_sealed(&sealed[..4]), "a short read is not a verdict");
     }
 
     #[test]

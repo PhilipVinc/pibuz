@@ -103,7 +103,11 @@ pub enum RtOutcome {
 /// Kept separate from the syscall so the arithmetic is testable on any host.
 /// `min`/`max` are what `sched_get_priority_min`/`_max` report — 1 and 99 on
 /// Linux, but read rather than assumed.
-pub fn clamp_rt_priority(requested: i32, min: i32, max: i32) -> i32 {
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "only the Linux writer thread is promoted")
+)]
+pub(crate) fn clamp_rt_priority(requested: i32, min: i32, max: i32) -> i32 {
     requested.clamp(min, max)
 }
 
@@ -179,7 +183,7 @@ fn ensure_rtprio_rlimit(wanted: u32) -> Option<String> {
 ///
 /// Only ever call this from a thread that cannot block — see the module docs.
 #[cfg(target_os = "linux")]
-pub fn promote_current_thread(priority: u8) -> RtOutcome {
+pub(crate) fn promote_current_thread(priority: u8) -> RtOutcome {
     if priority == 0 {
         return RtOutcome::Disabled;
     }
@@ -231,7 +235,7 @@ pub fn promote_current_thread(priority: u8) -> RtOutcome {
 /// Stub for hosts that are not Linux. `pibuz` is a Linux daemon; this exists so
 /// the crate still compiles for a developer's `cargo check` on macOS.
 #[cfg(not(target_os = "linux"))]
-pub fn promote_current_thread(_priority: u8) -> RtOutcome {
+pub(crate) fn promote_current_thread(_priority: u8) -> RtOutcome {
     RtOutcome::Disabled
 }
 
