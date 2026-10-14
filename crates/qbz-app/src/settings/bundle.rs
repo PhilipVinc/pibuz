@@ -1,5 +1,5 @@
 // crates/qbz-app/src/settings/bundle.rs — the settings portability engine
-// (04-settings-portability.md), used by the `pibuz` CLI and setup TUI:
+// (04-settings-portability.md), used by the `pibuz` CLI:
 // `export(paths, opts) -> Bundle`,
 // `plan(bundle, target, opts, live) -> ImportPlan`, `apply(plan, target, uid)
 // -> ImportReport`.
@@ -107,7 +107,7 @@ pub struct DevicePick {
     pub options: Vec<(String, String)>,
 }
 
-/// The operator's answer to a [`DevicePick`] (from the CLI/TUI). Fed back into
+/// The operator's answer to a [`DevicePick`] (from the CLI). Fed back into
 /// [`replan_with_device`].
 #[derive(Debug, Clone)]
 pub enum DeviceChoice {
@@ -554,7 +554,7 @@ fn plan_prefs(value: &Value, plan: &mut ImportPlan) {
             }
             "language" => plan.skipped.push(skip_line(
                 "prefs.language",
-                "not imported (no TUI i18n in daemon v1)",
+                "not imported (pibuz has no UI language)",
             )),
             _ => plan
                 .skipped

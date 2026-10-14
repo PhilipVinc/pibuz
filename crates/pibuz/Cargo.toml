@@ -42,11 +42,6 @@ toml = "0.9"                 # in lock transitively
 libc = "0.2"                 # flock
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
-# T13 setup TUI. ratatui 0.30 (NEVER 0.29 — 0.29 pins unicode-width "=0.2.0",
-# unresolvable against Slint's annotate-snippets 0.12.16 which needs >=0.2.2;
-# ratatui-core 0.30 accepts >=0.2.0,<=0.2.2 → unifies on the lock's 0.2.2, IV5).
-# The `crossterm` backend is a DEFAULT feature; re-exported as ratatui::crossterm.
-ratatui = "0.30"
 
 [dev-dependencies]
 tempfile = "3"

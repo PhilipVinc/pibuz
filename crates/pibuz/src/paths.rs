@@ -194,7 +194,7 @@ mod tests {
     }
 
     /// The config file follows the same rule, and — because the resolved path
-    /// is what the TUI writes back to — a pre-rename `qbzd.toml` keeps being
+    /// is what `config path` reports and `run` reads — a pre-rename `qbzd.toml` keeps being
     /// the one file, instead of being shadowed by an empty `pibuz.toml`.
     #[test]
     fn config_file_prefers_the_new_name_then_the_legacy_one() {

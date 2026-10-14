@@ -6,7 +6,7 @@ official Qobuz apps like any other hardware streamer.
 It was developed for integration with the moode operating system, but will run pretty much anywhere.
 
 Features:
-- Daemon + control CLI + terminal setup wizard (TUI) in one binary
+- Daemon + control CLI in one binary
 - HiFi wizard with copyable audio-stack config blocks (clipboard works over SSH)
 - MPRIS out of the box, live JSON events (`pibuz watch`), service files for systemd/OpenRC/runit
 - Event hooks: `pibuz settings set hooks.script /path/to/script` runs your script on

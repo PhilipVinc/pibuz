@@ -9,8 +9,8 @@
 //! latch into `DaemonShared.qconnect` so `/api/status` stays diagnosable.
 //!
 //! `start()` mints the daemon's OWN device identity in the daemon-root KV, reads
-//! the effective startup mode (cli_override = None — never shadow the KV that
-//! T11/T13 write), and, when auto-connect is on, spawns a connect-on-Ready task
+//! the effective startup mode (cli_override = None — never shadow the settings
+//! that T11 writes), and, when auto-connect is on, spawns a connect-on-Ready task
 //! with the bounded [2s, 5s, 15s, 30s] retry schedule. QConnect reads NOTHING
 //! from pibuz.toml — only the `[qconnect]` section of the data root's
 //! settings.toml.
@@ -671,7 +671,7 @@ pub fn start(
     transport::init_data_root(settings_root.clone());
 
     // Effective startup decision (Ready-state only), from the KV store that
-    // `pibuz qconnect enable|disable` and the TUI write. `remember_last`
+    // `pibuz qconnect enable|disable` writes. `remember_last`
     // resolves to off.
     let mode = transport::load_startup_mode_at(&settings_root);
     let should_auto_connect = mode.auto_connects();

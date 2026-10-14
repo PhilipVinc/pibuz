@@ -7,8 +7,8 @@
 //! desktop copy (§1.4, §4): (1) the device uuid and Connect settings resolve
 //! against the DAEMON root's `settings.toml` — its OWN device_uuid, minted
 //! fresh; (2) the default device name is "Pibuz (hostname)" (OD6). The
-//! load/persist helpers take the data root (`*_at`), so T11 (settings) and T13
-//! (TUI) drive the same file the connect path reads.
+//! load/persist helpers take the data root (`*_at`), so T11 (settings) drives the
+//! same file the connect path reads.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -353,8 +353,8 @@ pub fn resolve_local_identity() -> qconnect_app::LocalIdentity {
 // ---------------------------------------------------------------------------
 // The `[qconnect]` section of settings.toml, read and written field by field
 // (`qbz_app::settings::qconnect` owns the struct and the file). The CLI
-// (`pibuz qconnect enable|disable`, `settings show/set`), the TUI QConnect
-// screen and the connect path all go through these, against the daemon root.
+// (`pibuz qconnect enable|disable`, `settings show/set`) and the connect path
+// both go through these, against the daemon root.
 // Every LOAD is fail-open (returns the default on any error); every SAVE
 // returns the error, so `pibuz settings set qconnect.*` can exit 1 instead of
 // reporting a write that never happened.

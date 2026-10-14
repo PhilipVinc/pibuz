@@ -205,8 +205,8 @@ fn parse_alsa_plugin(v: &str) -> Result<Option<AlsaPlugin>, String> {
         "hw" => Ok(Some(AlsaPlugin::Hw)),
         "plughw" => Ok(Some(AlsaPlugin::PlugHw)),
         "pcm" => Ok(Some(AlsaPlugin::Pcm)),
-        // Not a documented TUI option (03-setup-tui.md §3.2.1 lists only the 3
-        // concrete plugins, default Hw) — accepted here only so `settings
+        // Not a documented option (only the 3 concrete plugins are, default
+        // Hw) — accepted here only so `settings
         // show`'s value on a never-migrated-to-a-plugin row (the seed INSERT
         // leaves this column NULL, unlike `backend_type`) round-trips back
         // into `set` unchanged instead of erroring on its own read value.
@@ -228,8 +228,8 @@ fn render_alsa_plugin(v: Option<AlsaPlugin>) -> String {
 /// `audio.device`: empty / "system" / "default" clears to `None` (system
 /// default); anything else is the device id verbatim (`hw:CARD=D30,DEV=0`,
 /// a PipeWire node name, ...) — free text, not validated against a live
-/// enumeration here (that is the TUI's job, T13; a headless `settings set`
-/// must work with no device attached to check against).
+/// enumeration: a headless `settings set` must work with no device attached
+/// to check against.
 fn parse_output_device(v: &str) -> Option<String> {
     let trimmed = v.trim();
     if trimmed.is_empty()
@@ -609,7 +609,7 @@ fn read_all(roots: &ProfileRoots) -> Result<Vec<(&'static str, String)>, String>
 /// backing store then failed to open or write — a disk-full/permissions/
 /// corrupt-file problem — is not a usage mistake: that is `Io` (exit 1).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum SetError {
+enum SetError {
     Usage(String),
     Io(String),
 }
@@ -629,15 +629,9 @@ impl std::fmt::Display for SetError {
 }
 
 /// Validate + write ONE canonical key. Returns its [`ApplyClass`] on success
-/// (the CLI's own success-line hint — see module doc). `pub(crate)` so the T13
-/// setup TUI persists every screen through this SAME validated writer (03 §6 —
-/// the TUI adds no persistence of its own). Every arm parses (`Usage` on
+/// (the CLI's own success-line hint — see module doc). Every arm parses (`Usage` on
 /// failure) BEFORE it opens/writes a store (`Io` on failure) — see [`SetError`].
-pub(crate) fn write_one(
-    roots: &ProfileRoots,
-    key: &str,
-    raw: &str,
-) -> Result<ApplyClass, SetError> {
+fn write_one(roots: &ProfileRoots, key: &str, raw: &str) -> Result<ApplyClass, SetError> {
     let Some(class) = classify(key) else {
         return Err(SetError::Usage(unknown_key_error(key)));
     };

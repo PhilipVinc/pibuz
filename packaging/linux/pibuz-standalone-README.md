@@ -2,12 +2,12 @@
 
 This tarball is the independent daemon download (no dependency on the desktop
 `qbz` app, no deb/rpm needed). Install it on the box wired to your DAC — a
-Raspberry Pi, an LXC, a living-room NUC — run `pibuz setup` once, and it
-appears in the official Qobuz app as a Qobuz Connect device.
+Raspberry Pi, an LXC, a living-room NUC — point it at the DAC and switch Connect
+on, and it appears in the official Qobuz app as a Qobuz Connect device.
 
 ## Contents
 
-- `pibuz` — the daemon binary (also its own CLI client and setup TUI)
+- `pibuz` — the daemon binary (also its own CLI client)
 - `pibuz.service` — a systemd user unit (shipped, not enabled)
 - `completions/` — bash/zsh/fish shell completions
 
@@ -48,12 +48,15 @@ sudo loginctl enable-linger $USER
 ## First run
 
 ```bash
-pibuz setup
+pibuz settings set audio.backend alsa
+pibuz settings set audio.device hw:CARD=YourDac,DEV=0   # `aplay -L` lists them
+pibuz qconnect name "Living Room"
+pibuz qconnect enable
 ```
 
-`pibuz setup` is the six-screen configurator: log in to Qobuz, pick the audio
-device, name the Connect device. It edits the same stores `pibuz run` reads,
-so one pass is enough (revisit any time to change a setting).
+`pibuz settings show` lists every setting and its current value. There is no
+Qobuz login on the box: the Qobuz app hands the daemon a session when you pick
+it on your local network.
 
 Then enable and start the daemon:
 

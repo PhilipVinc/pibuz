@@ -206,15 +206,6 @@ cfg_port=$(pibuz config show --json | python3 -c "import json,sys; print(json.lo
 [ "$cfg_port" = "$PORT" ] || fail "config show --json port ($cfg_port) != expected test port ($PORT)"
 
 echo "== export/import roundtrip is a no-op (04 section 7) =="
-# The 04 section 7 roundtrip guarantee assumes a daemon "legitimately running"
-# its own settings -- concretely, one that has already moved past the fresh
-# store's quality_fallback_behavior=ask default (the TUI never writes "ask",
-# 03 section 3.3.2; "settings set" rejects it outright, cli/settings.rs). A
-# virgin store that never ran `pibuz setup`/`settings set` still holds "ask",
-# which the section 5.5 mapping unconditionally reports as `adapted` -- so
-# prime it first, exactly like a real first-run setup would, before proving
-# the no-op invariant.
-pibuz settings set audio.quality_fallback_behavior always_fallback >/dev/null
 BUNDLE="$SCRATCH/rt.qbzb"
 pibuz settings export "$BUNDLE" >/dev/null
 out=$(pibuz settings import "$BUNDLE" --dry-run)
@@ -248,13 +239,6 @@ rc_second=$?
 set -e
 [ "$rc_second" -eq 3 ] || fail "second 'pibuz run' on the same data root != 3 (got $rc_second)"
 pibuz ping >/dev/null || fail "the first daemon stopped answering after the double-start attempt"
-
-echo "== non-tty 'pibuz setup' exits 2, never hangs (03 section 2.4) =="
-set +e
-timeout 5 "$PIBUZ_BIN" setup </dev/null >/dev/null 2>&1
-rc_setup=$?
-set -e
-[ "$rc_setup" -eq 2 ] || fail "non-tty setup != 2 (got $rc_setup)"
 
 stop_daemon
 echo "ALL SCRIPTED CHECKS PASSED"
