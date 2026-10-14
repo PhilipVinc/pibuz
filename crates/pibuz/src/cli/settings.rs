@@ -66,14 +66,13 @@ pub enum ApplyClass {
 /// | `audio.quality_fallback_behavior` | no tier-retry path; quality comes straight from `playback.quality` |
 /// | `audio.allow_quality_fallback` | the gate for that same absent path |
 /// | `audio.limit_quality_to_device` | the desktop's request-time resolution, which pibuz does not have |
-/// | `audio.device_max_sample_rate` | only fed the limiter above (still compared by `daemon::audio_routing_changed`, never set here) |
+/// | `audio.device_max_sample_rate` | only fed the limiter above |
 /// | `audio.sync_audio_on_startup` | worked around a Flatpak stale-settings case with no daemon analogue |
 /// | `playback.show_context_icon` | a desktop UI preference; its own doc comment says so |
 ///
-/// Their `AudioSettings` fields, columns and migrations all STAY, and
-/// `settings::bundle` still imports and exports them, so a bundle exported by
-/// the desktop round-trips unchanged. What went is only this CLI's offer to set
-/// them. Do not re-add one without a consumer to point at.
+/// Their `AudioSettings` fields went later too, with `preferred_sample_rate`
+/// and `device_sample_rate_limits`; a settings bundle that carries any of them
+/// lists it as skipped. Do not re-add one without a consumer to point at.
 ///
 /// Three more went later, from a store the daemon never read at all: the
 /// desktop's playback preferences. They are in [`IGNORED_KEYS`] rather than

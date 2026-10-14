@@ -8,7 +8,6 @@
 use crate::{AlsaPlugin, AudioBackendType};
 use qbz_models::settings_file::{self, Sections};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,7 +16,6 @@ pub struct AudioSettings {
     pub output_device: Option<String>, // None = system default
     pub exclusive_mode: bool,
     pub dac_passthrough: bool,
-    pub preferred_sample_rate: Option<u32>,     // None = auto
     pub backend_type: Option<AudioBackendType>, // None = auto-detect
     pub alsa_plugin: Option<AlsaPlugin>,        // Only used when backend is ALSA
     pub alsa_hardware_volume: bool,             // Use ALSA mixer for volume (only with hw: devices)
@@ -175,19 +173,6 @@ pub struct AudioSettings {
     /// ~120 MB at Hi-Res.
     #[serde(default)]
     pub disk_cache_mb: u16,
-    /// When true, cap the REQUESTED streaming quality tier at the local output
-    /// device's detected ceiling (#638 fix 3; consumed by the desktop's
-    /// request-time resolution, never by the audio backends). Applies to local
-    /// playback only — never to casting, where the local DAC is not in the
-    /// signal path. Default: false (opt-in).
-    pub limit_quality_to_device: bool,
-    /// Cached max sample rate of the selected device (set when device is selected)
-    /// Used when limit_quality_to_device is true
-    pub device_max_sample_rate: Option<u32>,
-    /// Per-device sample rate limits: device_id -> max_sample_rate
-    /// Allows different DACs to have independent max sample rate configurations
-    #[serde(default)]
-    pub device_sample_rate_limits: HashMap<String, u32>,
     /// When true, apply volume normalization using ReplayGain metadata.
     /// When false (default), the audio pipeline is 100% bit-perfect — no sample modification.
     pub normalization_enabled: bool,
@@ -200,21 +185,10 @@ pub struct AudioSettings {
     /// When true, force PipeWire clock.force-quantum alongside clock.force-rate for bit-perfect.
     /// Reset both to 0 on stop. PipeWire-only, requires dac_passthrough.
     pub pw_force_bitperfect: bool,
-    /// When true, reload audio settings from DB into the player on app startup.
-    /// Useful when Player::new() may hold stale settings (e.g., after Flatpak updates).
-    /// Default: false (most users don't need this).
-    pub sync_audio_on_startup: bool,
-    /// User preference for what happens when all quality retries fail.
-    /// Values: "ask" (default), "always_fallback", "always_skip"
-    /// Protected by ADR-003: must survive reset_all() and migrations.
-    pub quality_fallback_behavior: String,
     /// When true, skip `pactl set-default-sink` on stream creation.
     /// Preserves external routing (JACK, qjackctl, Reaper).
     /// Mutually exclusive with dac_passthrough.
     pub skip_sink_switch: bool,
-    /// When true, automatically try lower quality tiers if the requested one fails.
-    /// When false (default), playback or download fails if the exact quality is unavailable.
-    pub allow_quality_fallback: bool,
     /// When true, hold a per-process ALSA device reservation (Lifetime B) for the
     /// configured output device while QBZ is running, so other PulseAudio/PipeWire
     /// clients won't grab the DAC and break exclusive playback. Off by default.
@@ -268,7 +242,6 @@ impl Default for AudioSettings {
             output_device: None,
             exclusive_mode: false,
             dac_passthrough: false,
-            preferred_sample_rate: None,
             // OOTB default is "System" (Some(SystemDefault)): play through the OS
             // default output, shared with other apps like any normal player — no
             // bit-perfect, no `pactl`. See AudioBackendType::default(). "Auto"
@@ -295,18 +268,12 @@ impl Default for AudioSettings {
             pcm_ring_ms: 0,      // 0 = take the host memory profile's figure
             writer_rt_priority: default_writer_rt_priority(),
             cache_to_disk: default_cache_to_disk(),
-            disk_cache_mb: 0,                          // 0 = DEFAULT_DISK_CACHE_MB
-            limit_quality_to_device: false, // Opt-in. Off since 1.1.9 (#45); wired to the read-only probe in #638 fix 3
-            device_max_sample_rate: None,   // Set when device is selected
-            device_sample_rate_limits: HashMap::new(), // Per-device limits (empty = no limit)
-            normalization_enabled: false,   // Off by default — preserves bit-perfect pipeline
+            disk_cache_mb: 0,                 // 0 = DEFAULT_DISK_CACHE_MB
+            normalization_enabled: false,     // Off by default — preserves bit-perfect pipeline
             normalization_target_lufs: -14.0, // Spotify/YouTube standard
             gapless_enabled: true, // On by default — works for same-format tracks on all backends
             pw_force_bitperfect: false, // Off by default — experimental PipeWire feature
-            sync_audio_on_startup: false, // Off by default — opt-in for stale-settings edge case
-            quality_fallback_behavior: "ask".to_string(),
             skip_sink_switch: false, // Off by default — only for JACK/DAW routing setups
-            allow_quality_fallback: false, // Off by default — fail rather than silently downgrade
             reserve_dac_while_running: false, // Off by default — opt-in DAC reservation (Lifetime B)
         }
     }
@@ -367,10 +334,6 @@ impl AudioSettingsStore {
 
     pub fn set_dac_passthrough(&self, enabled: bool) -> Result<(), String> {
         self.update(|s| s.dac_passthrough = enabled)
-    }
-
-    pub fn set_sample_rate(&self, rate: Option<u32>) -> Result<(), String> {
-        self.update(|s| s.preferred_sample_rate = rate)
     }
 
     /// Switching to ALSA with no plugin chosen picks `Hw`.
@@ -469,49 +432,12 @@ impl AudioSettingsStore {
         self.update(|s| s.streaming_only = enabled)
     }
 
-    pub fn set_limit_quality_to_device(&self, enabled: bool) -> Result<(), String> {
-        self.update(|s| s.limit_quality_to_device = enabled)
-    }
-
-    pub fn set_device_max_sample_rate(&self, rate: Option<u32>) -> Result<(), String> {
-        self.update(|s| s.device_max_sample_rate = rate)
-    }
-
-    /// The sample rate limit for one device; `None` removes it.
-    pub fn set_device_sample_rate_limit(
-        &self,
-        device_id: &str,
-        rate: Option<u32>,
-    ) -> Result<(), String> {
-        self.update(|s| match rate {
-            Some(r) => {
-                s.device_sample_rate_limits.insert(device_id.to_string(), r);
-            }
-            None => {
-                s.device_sample_rate_limits.remove(device_id);
-            }
-        })
-    }
-
-    /// The sample rate limit for one device, if it has one.
-    pub fn get_device_sample_rate_limit(&self, device_id: &str) -> Result<Option<u32>, String> {
-        Ok(self
-            .get_settings()?
-            .device_sample_rate_limits
-            .get(device_id)
-            .copied())
-    }
-
     pub fn set_normalization_enabled(&self, enabled: bool) -> Result<(), String> {
         self.update(|s| s.normalization_enabled = enabled)
     }
 
     pub fn set_gapless_enabled(&self, enabled: bool) -> Result<(), String> {
         self.update(|s| s.gapless_enabled = enabled)
-    }
-
-    pub fn set_allow_quality_fallback(&self, enabled: bool) -> Result<(), String> {
-        self.update(|s| s.allow_quality_fallback = enabled)
     }
 
     pub fn set_skip_sink_switch(&self, enabled: bool) -> Result<(), String> {
@@ -529,44 +455,14 @@ impl AudioSettingsStore {
         self.update(|s| s.pw_force_bitperfect = enabled)
     }
 
-    pub fn set_sync_audio_on_startup(&self, enabled: bool) -> Result<(), String> {
-        self.update(|s| s.sync_audio_on_startup = enabled)
-    }
-
-    pub fn get_quality_fallback_behavior(&self) -> Result<String, String> {
-        let settings = self.get_settings()?;
-        let value = &settings.quality_fallback_behavior;
-        match value.as_str() {
-            "ask" | "always_fallback" | "always_skip" => Ok(value.clone()),
-            _ => Ok("ask".to_string()),
-        }
-    }
-
-    pub fn set_quality_fallback_behavior(&self, behavior: &str) -> Result<(), String> {
-        match behavior {
-            "ask" | "always_fallback" | "always_skip" => {}
-            _ => return Err(format!("Invalid quality_fallback_behavior: {}", behavior)),
-        }
-        self.update(|s| s.quality_fallback_behavior = behavior.to_string())
-    }
-
     pub fn set_normalization_target_lufs(&self, target: f32) -> Result<(), String> {
         self.update(|s| s.normalization_target_lufs = target)
     }
 
     /// Reset all audio settings to their default values.
     pub fn reset_all(&self) -> Result<AudioSettings, String> {
-        // ADR-003: quality_fallback_behavior must survive reset_all()
-        let saved_fallback = self
-            .get_quality_fallback_behavior()
-            .unwrap_or_else(|_| "ask".to_string());
-        let result = AudioSettings {
-            quality_fallback_behavior: saved_fallback,
-            ..AudioSettings::default()
-        };
-        let stored = result.clone();
-        self.update(move |s| *s = stored)?;
-        Ok(result)
+        self.update(|s| *s = AudioSettings::default())?;
+        Ok(AudioSettings::default())
     }
 }
 
@@ -674,7 +570,6 @@ mod legacy {
             "output_device" => s.output_device = text(),
             "exclusive_mode" => flag(&mut s.exclusive_mode),
             "dac_passthrough" => flag(&mut s.dac_passthrough),
-            "preferred_sample_rate" => s.preferred_sample_rate = int().map(|r| r as u32),
             // NULL is "auto" for both, and stays None.
             "backend_type" => {
                 s.backend_type = text().and_then(|j| serde_json::from_str(&j).ok());
@@ -730,13 +625,6 @@ mod legacy {
                     s.disk_cache_mb = i as u16;
                 }
             }
-            "limit_quality_to_device" => flag(&mut s.limit_quality_to_device),
-            "device_max_sample_rate" => s.device_max_sample_rate = int().map(|r| r as u32),
-            "device_sample_rate_limits" => {
-                s.device_sample_rate_limits = text()
-                    .and_then(|j| serde_json::from_str(&j).ok())
-                    .unwrap_or_default();
-            }
             "normalization_enabled" => flag(&mut s.normalization_enabled),
             "normalization_target_lufs" => match value {
                 Value::Real(r) => s.normalization_target_lufs = r as f32,
@@ -745,14 +633,7 @@ mod legacy {
             },
             "gapless_enabled" => flag(&mut s.gapless_enabled),
             "pw_force_bitperfect" => flag(&mut s.pw_force_bitperfect),
-            "sync_audio_on_startup" => flag(&mut s.sync_audio_on_startup),
-            "quality_fallback_behavior" => {
-                if let Some(t) = text() {
-                    s.quality_fallback_behavior = t;
-                }
-            }
             "skip_sink_switch" => flag(&mut s.skip_sink_switch),
-            "allow_quality_fallback" => flag(&mut s.allow_quality_fallback),
             "reserve_dac_while_running" => flag(&mut s.reserve_dac_while_running),
             _ => {}
         }
@@ -804,10 +685,7 @@ mod tests {
         assert_eq!(settings.backend_type, Some(AudioBackendType::SystemDefault));
         assert_eq!(settings.alsa_plugin, Some(AlsaPlugin::Hw));
         assert!(settings.gapless_enabled);
-        assert!(!settings.sync_audio_on_startup);
-        assert_eq!(settings.quality_fallback_behavior, "ask");
         assert!(!settings.skip_sink_switch);
-        assert!(!settings.allow_quality_fallback);
         assert!(!settings.reserve_dac_while_running);
     }
 
@@ -823,7 +701,6 @@ mod tests {
         assert_eq!(settings.backend_type, Some(AudioBackendType::SystemDefault));
         assert_eq!(settings.alsa_plugin, Some(AlsaPlugin::Hw));
         assert!(settings.gapless_enabled);
-        assert_eq!(settings.quality_fallback_behavior, "ask");
         assert!(!settings.reserve_dac_while_running);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -897,38 +774,15 @@ mod tests {
     }
 
     #[test]
-    fn quality_fallback_invalid_value_reads_as_ask() {
-        let (dir, store) = fresh_store("quality-invalid");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            settings_file::path(&dir),
-            "[audio]\nquality_fallback_behavior = \"bad-value\"\n",
-        )
-        .expect("write invalid fallback behavior");
-
-        assert_eq!(
-            store
-                .get_quality_fallback_behavior()
-                .expect("get quality fallback"),
-            "ask"
-        );
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn reset_all_preserves_quality_fallback_behavior() {
-        let (dir, store) = fresh_store("reset-preserves-quality");
-        store
-            .set_quality_fallback_behavior("always_skip")
-            .expect("set quality fallback");
+    fn reset_all_restores_the_defaults() {
+        let (dir, store) = fresh_store("reset");
         store.set_output_device(Some("hw:4,0")).expect("set device");
         store.set_dac_passthrough(true).expect("set dac");
 
         let reset = store.reset_all().expect("reset settings");
         let settings = store.get_settings().expect("get settings");
 
-        assert_eq!(reset.quality_fallback_behavior, "always_skip");
-        assert_eq!(settings.quality_fallback_behavior, "always_skip");
+        assert_eq!(reset.output_device, None);
         assert_eq!(settings.output_device, None);
         assert!(!settings.dac_passthrough);
         let _ = std::fs::remove_dir_all(dir);
@@ -940,17 +794,8 @@ mod tests {
         {
             let store = AudioSettingsStore::new_at(&dir).expect("open store");
             store
-                .set_sync_audio_on_startup(true)
-                .expect("set sync flag");
-            store
-                .set_quality_fallback_behavior("always_fallback")
-                .expect("set quality fallback");
-            store
                 .set_reserve_dac_while_running(true)
                 .expect("set reserve flag");
-            store
-                .set_allow_quality_fallback(true)
-                .expect("set allow fallback");
             store
                 .set_skip_sink_switch(true)
                 .expect("set skip sink switch");
@@ -959,10 +804,7 @@ mod tests {
         let reopened = AudioSettingsStore::new_at(&dir).expect("reopen store");
         let settings = reopened.get_settings().expect("get settings");
 
-        assert!(settings.sync_audio_on_startup);
-        assert_eq!(settings.quality_fallback_behavior, "always_fallback");
         assert!(settings.reserve_dac_while_running);
-        assert!(settings.allow_quality_fallback);
         assert!(settings.skip_sink_switch);
         let _ = std::fs::remove_dir_all(dir);
     }

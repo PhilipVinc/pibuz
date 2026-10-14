@@ -571,11 +571,18 @@ const AUDIO_PORTABLE: &[&str] = &[
     "normalization_enabled",
     "normalization_target_lufs",
     "gapless_enabled",
+];
+/// Desktop settings pibuz has no use for: quality fallback (pibuz plays
+/// `playback.quality` or fails), the device quality limiter, a preferred rate,
+/// and a Flatpak stale-settings workaround. Listed, then skipped.
+const AUDIO_NO_EFFECT: &[&str] = &[
     "allow_quality_fallback",
+    "quality_fallback_behavior",
     "sync_audio_on_startup",
     "limit_quality_to_device",
     "preferred_sample_rate",
 ];
+const NO_EFFECT_WHY: &str = "no effect in pibuz (desktop audio setting)";
 const AUDIO_INTENT_FLAGS: &[&str] = &[
     "exclusive_mode",
     "dac_passthrough",
@@ -606,10 +613,11 @@ fn plan_audio(
         } else if AUDIO_NEVER_CACHES.contains(&k.as_str()) {
             plan.skipped
                 .push(skip_line(&format!("audio.{k}"), CACHE_SKIP_WHY));
+        } else if AUDIO_NO_EFFECT.contains(&k.as_str()) {
+            plan.skipped
+                .push(skip_line(&format!("audio.{k}"), NO_EFFECT_WHY));
         } else if AUDIO_PORTABLE.contains(&k.as_str()) {
             applied_line(plan, &format!("audio.{k}"), v, "");
-        } else if k == "quality_fallback_behavior" {
-            plan_quality_fallback(v, plan);
         }
     }
 
@@ -621,10 +629,10 @@ fn plan_audio(
         let known = AUDIO_PORTABLE.contains(&k.as_str())
             || AUDIO_INTENT_FLAGS.contains(&k.as_str())
             || AUDIO_NEVER_CACHES.contains(&k.as_str())
+            || AUDIO_NO_EFFECT.contains(&k.as_str())
             || matches!(
                 k.as_str(),
-                "quality_fallback_behavior"
-                    | "backend_type"
+                "backend_type"
                     | "output_device"
                     | "alsa_plugin"
                     | "alsa_hardware_volume"
@@ -644,21 +652,6 @@ fn plan_audio(
             plan.skipped
                 .push(skip_line(&format!("audio.{k}"), UNKNOWN_WHY));
         }
-    }
-}
-
-fn plan_quality_fallback(v: &Value, plan: &mut ImportPlan) {
-    if v.as_str() == Some("ask") {
-        // §5.5: never a silent skip on a daemon.
-        adapted_line(
-            plan,
-            "audio.quality_fallback_behavior",
-            v,
-            &Value::String("always_fallback".into()),
-            "no one to ask on a daemon",
-        );
-    } else {
-        applied_line(plan, "audio.quality_fallback_behavior", v, "");
     }
 }
 
@@ -1135,18 +1128,11 @@ fn apply_audio_writes(data_root: &Path, writes: &[(&str, &Value)]) -> Result<(),
                 store.set_stream_window_seconds(value.as_u64().unwrap_or(8) as u8)?
             }
             "streaming_only" => store.set_streaming_only(as_bool(value))?,
-            "limit_quality_to_device" => store.set_limit_quality_to_device(as_bool(value))?,
-            "preferred_sample_rate" => store.set_sample_rate(value.as_u64().map(|r| r as u32))?,
             "normalization_enabled" => store.set_normalization_enabled(as_bool(value))?,
             "normalization_target_lufs" => {
                 store.set_normalization_target_lufs(value.as_f64().unwrap_or(-14.0) as f32)?
             }
             "gapless_enabled" => store.set_gapless_enabled(as_bool(value))?,
-            "allow_quality_fallback" => store.set_allow_quality_fallback(as_bool(value))?,
-            "sync_audio_on_startup" => store.set_sync_audio_on_startup(as_bool(value))?,
-            "quality_fallback_behavior" => {
-                store.set_quality_fallback_behavior(value.as_str().unwrap_or("always_fallback"))?
-            }
             // The host/storage block. Every one of these was PLANNED — the
             // import printed it under "applied" — and then fell through to the
             // warn arm below and was never written, so `settings import`

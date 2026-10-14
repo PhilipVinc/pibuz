@@ -573,8 +573,8 @@ pub(crate) fn reload_audio(state: &crate::api::ApiState) {
 }
 
 /// The Reinit-class field set (03-setup-tui.md §4.3 / `qbz/src/settings.rs:
-/// 877-967,1134-1290`): backend, device, ALSA plugin, DSD mode, max sample
-/// rate, exclusive mode, DAC passthrough, hardware volume, lock-output
+/// 877-967,1134-1290`): backend, device, ALSA plugin, exclusive mode, DAC
+/// passthrough, hardware volume, lock-output
 /// (`skip_sink_switch`). Every other `AudioSettings` field is Reload-class —
 /// `player.reload_settings` above already covers it unconditionally.
 pub(crate) fn audio_routing_changed(
@@ -588,7 +588,6 @@ pub(crate) fn audio_routing_changed(
         || old.exclusive_mode != new.exclusive_mode
         || old.dac_passthrough != new.dac_passthrough
         || old.skip_sink_switch != new.skip_sink_switch
-        || old.device_max_sample_rate != new.device_max_sample_rate
 }
 
 /// Re-read `daemon_prefs.streaming_quality` into the live cell the driver's
@@ -735,13 +734,6 @@ mod tests {
         let mut lock_out = base.clone();
         lock_out.skip_sink_switch = !base.skip_sink_switch;
         assert!(audio_routing_changed(&base, &lock_out), "skip_sink_switch");
-
-        let mut rate = base.clone();
-        rate.device_max_sample_rate = Some(192_000);
-        assert!(
-            audio_routing_changed(&base, &rate),
-            "device_max_sample_rate"
-        );
     }
 
     #[test]
@@ -753,14 +745,10 @@ mod tests {
         reload_only.stream_first_track = !base.stream_first_track;
         reload_only.stream_buffer_seconds = 7;
         reload_only.streaming_only = !base.streaming_only;
-        reload_only.limit_quality_to_device = !base.limit_quality_to_device;
-        reload_only.allow_quality_fallback = !base.allow_quality_fallback;
-        reload_only.quality_fallback_behavior = "always_skip".to_string();
         reload_only.normalization_enabled = !base.normalization_enabled;
         reload_only.normalization_target_lufs = -18.0;
         reload_only.pw_force_bitperfect = !base.pw_force_bitperfect;
         reload_only.reserve_dac_while_running = !base.reserve_dac_while_running;
-        reload_only.sync_audio_on_startup = !base.sync_audio_on_startup;
         assert!(!audio_routing_changed(&base, &reload_only));
     }
 }

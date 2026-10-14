@@ -71,8 +71,7 @@ fn portable_fields_apply_verbatim() {
         "audio": {
             "gapless_enabled": true,
             "stream_buffer_seconds": 4,
-            "normalization_target_lufs": -18.0,
-            "sync_audio_on_startup": true
+            "normalization_target_lufs": -18.0
         },
         "prefs": { "streaming_quality": "hires_plus" }
     }));
@@ -176,18 +175,35 @@ fn device_uuid_never_imported() {
 }
 
 #[test]
-fn ask_maps_to_always_fallback_in_adapted() {
-    // §5.5: "ask" needs a UI the daemon lacks → always_fallback, in adapted,
-    // never a silent skip.
-    let p = scratch("ask");
-    let bundle = bundle_with(json!({ "audio": { "quality_fallback_behavior": "ask" } }));
+fn desktop_only_audio_settings_are_skipped_not_written() {
+    // Quality fallback, the device quality limiter, a preferred rate and a
+    // Flatpak workaround: settings pibuz has no field for. Every one is listed
+    // as skipped, with no write planned, whatever its value.
+    let p = scratch("audio-no-effect");
+    let bundle = bundle_with(json!({
+        "audio": {
+            "quality_fallback_behavior": "ask",
+            "allow_quality_fallback": true,
+            "limit_quality_to_device": true,
+            "preferred_sample_rate": 96000,
+            "sync_audio_on_startup": true
+        }
+    }));
 
     let plan = plan(&bundle, &p, &ImportOptions::default(), &live()).expect("plan");
 
-    let line = find(&plan.adapted, "audio.quality_fallback_behavior").expect("adapted");
-    assert_eq!(line.old.as_deref(), Some("ask"));
-    assert_eq!(line.new, "always_fallback");
-    assert!(find(&plan.skipped, "audio.quality_fallback_behavior").is_none());
+    for key in [
+        "audio.quality_fallback_behavior",
+        "audio.allow_quality_fallback",
+        "audio.limit_quality_to_device",
+        "audio.preferred_sample_rate",
+        "audio.sync_audio_on_startup",
+    ] {
+        let l = find(&plan.skipped, key).unwrap_or_else(|| panic!("{key} must skip"));
+        assert!(l.why.contains("no effect in pibuz"), "{key}: {}", l.why);
+    }
+    assert!(plan.applied.is_empty() && plan.adapted.is_empty());
+    assert!(plan.writes.is_empty());
     cleanup(&p);
 }
 
@@ -423,9 +439,6 @@ fn roundtrip_same_box_is_noop() {
             .unwrap();
         audio.set_output_device(Some("hw:1,0")).unwrap();
         audio.set_exclusive_mode(true).unwrap();
-        audio
-            .set_quality_fallback_behavior("always_fallback")
-            .unwrap();
         audio.set_gapless_enabled(true).unwrap();
 
         qconnect::update(&p.data_root, |qc| {
