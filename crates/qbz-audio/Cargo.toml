@@ -23,8 +23,9 @@ rodio = { version = "0.22", features = ["symphonia-all"] }
 symphonia = { workspace = true }
 ebur128 = "0.1"
 
-# Database for loudness cache
-rusqlite = { version = "0.31", features = ["bundled"] }
+# Only to read an audio_settings.db from before settings.toml, once. See
+# [features] below.
+rusqlite = { version = "0.31", features = ["bundled"], optional = true }
 
 # settings.toml: the [audio] section (qbz_models::settings_file)
 toml = "0.9"
@@ -83,6 +84,6 @@ workspace = true
 jack = ["dep:jack"]
 
 # Read an `audio_settings.db` from before settings.toml, once, into it. On by
-# default through pibuz; drop it, and this crate stops depending on SQLite for
-# settings, once no install is left that has one.
-sqlite-migrate = []
+# default through pibuz; the only reason this crate links SQLite. Drop it once
+# no install is left that has one.
+sqlite-migrate = ["dep:rusqlite"]
