@@ -87,9 +87,7 @@ pub struct BoundServer {
 }
 
 /// Everything the route handlers read. Owned by the single serving thread
-/// (moved into it by [`serve`]), so it only needs `Send`, never `Sync` — which
-/// is why a plain `AudioSettingsStore` (rusqlite `Connection`: Send, not Sync)
-/// can live here directly. `token` is the opt-in `[server] token`, read once at
+/// (moved into it by [`serve`]), so it only needs `Send`, never `Sync`. `token` is the opt-in `[server] token`, read once at
 /// boot (`None` = open).
 pub struct ApiState {
     pub runtime: Arc<AppRuntime<DaemonAdapter>>,
@@ -105,8 +103,8 @@ pub struct ApiState {
     /// `std::thread`, so async core calls (`get_queue_state`) run via
     /// `Handle::block_on` (never called from a runtime worker → no panic).
     pub rt: tokio::runtime::Handle,
-    /// Second read-only connection to the daemon-root audio settings DB (WAL
-    /// allows it alongside the Player's). Supplies `configured_device`/`backend`.
+    /// The daemon-root audio settings, read fresh on every status call.
+    /// Supplies `configured_device`/`backend`.
     pub audio: AudioSettingsStore,
     /// Cached device enumeration for `device_present` (refreshed on a TTL so a
     /// `status` poll never re-enumerates CPAL on every call).

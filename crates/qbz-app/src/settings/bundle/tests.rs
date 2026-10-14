@@ -428,17 +428,10 @@ fn roundtrip_same_box_is_noop() {
             .unwrap();
         audio.set_gapless_enabled(true).unwrap();
 
-        qconnect_kv_write(
-            &p.data_root.join("qconnect_settings.db"),
-            "device_name",
-            Some("Estudio"),
-        )
-        .unwrap();
-        qconnect_kv_write(
-            &p.data_root.join("qconnect_settings.db"),
-            "startup_mode",
-            Some("on"),
-        )
+        qconnect::update(&p.data_root, |qc| {
+            qc.device_name = Some("Estudio".into());
+            qc.startup_mode = "on".into();
+        })
         .unwrap();
     }
 
@@ -579,7 +572,7 @@ fn apply_writes_are_idempotent_and_persist() {
 
     assert_eq!(daemon_prefs::load_at(&p.data_root).streaming_quality, "cd");
     assert_eq!(
-        qconnect_kv_read(&p.data_root.join("qconnect_settings.db"), "device_name").as_deref(),
+        qconnect::load(&p.data_root).device_name.as_deref(),
         Some("Kitchen")
     );
     cleanup(&p);

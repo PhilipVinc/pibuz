@@ -2660,7 +2660,6 @@ dependencies = [
  "qconnect-transport-ws",
  "ratatui",
  "reqwest",
- "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
@@ -2846,7 +2845,6 @@ name = "qbz-app"
 version = "2.7.0"
 dependencies = [
  "chrono",
- "dirs 6.0.0",
  "log",
  "qbz-audio",
  "qbz-cache",
@@ -2870,7 +2868,6 @@ dependencies = [
  "alsa",
  "alsa-sys",
  "coreaudio-rs",
- "dirs 6.0.0",
  "ebur128",
  "jack",
  "libc",
@@ -2883,6 +2880,7 @@ dependencies = [
  "serde",
  "serde_json",
  "symphonia",
+ "toml",
  "zbus",
 ]
 

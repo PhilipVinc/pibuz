@@ -1,6 +1,6 @@
 // crates/pibuz/src/tui/screens/qconnect.rs — the Qobuz Connect screen (03 §3.4).
 //
-// Writes the daemon-root qconnect_settings.db KV via the App's write_one path
+// Writes the [qconnect] section of settings.toml via the App's write_one path
 // (qconnect.startup_mode / device_name / volume_mode). `device_uuid` is never
 // displayed. `remember_last` is not offered (desktop-ism). The device-name
 // preview resolves through the SAME `resolve_qconnect_friendly_name` the connect

@@ -4,17 +4,18 @@
 //! Ports the desktop `qconnect_transport.rs` config layer. The Qobuz client is
 //! reached via `runtime.core().client()` — an `Arc<RwLock<Option<QobuzClient>>>`
 //! (may be `None` before the API is initialized). Two daemon adaptations vs. the
-//! desktop copy (§1.4, §4): (1) the device-uuid + settings-DB path resolve
-//! against the DAEMON root's `qconnect_settings.db` — its OWN device_uuid, minted
-//! fresh, NEVER the desktop's global KV; (2) the default device name is
-//! "Pibuz (hostname)" (OD6). The KV load/persist helpers are path-parameterized
-//! `*_at` variants so T11 (settings) and T13 (TUI) drive the same daemon-root DB.
+//! desktop copy (§1.4, §4): (1) the device uuid and Connect settings resolve
+//! against the DAEMON root's `settings.toml` — its OWN device_uuid, minted
+//! fresh; (2) the default device name is "Pibuz (hostname)" (OD6). The
+//! load/persist helpers take the data root (`*_at`), so T11 (settings) and T13
+//! (TUI) drive the same file the connect path reads.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use qbz_app::playback_driver;
 use qbz_app::settings::daemon_prefs;
+use qbz_app::settings::qconnect as qconnect_settings;
 use qbz_app::shell::AppRuntime;
 use qbz_models::Quality;
 use qconnect_transport_ws::WsTransportConfig;
@@ -55,41 +56,20 @@ const QCONNECT_QWS_CREATE_TOKEN_PATH: &str = "/qws/createToken";
 
 type Runtime = Arc<AppRuntime<DaemonAdapter>>;
 
-/// The daemon-root `qconnect_settings.db` path, set once by `qconnect::start`
-/// before any connect. Daemon adaptation: the desktop delegates the path to the
-/// GLOBAL `qbz_app::qconnect_identity`; the daemon points every device-identity
-/// and KV read at its OWN root (§4 — the daemon never touches the desktop KV).
-static DAEMON_QCONNECT_SETTINGS_DB: OnceLock<PathBuf> = OnceLock::new();
-
-/// Point the QConnect settings/device-identity DB at the daemon root. Idempotent
-/// (a second call is ignored). Called from `qconnect::start(roots)` with
-/// `<roots.data>/qconnect_settings.db`.
-pub fn init_settings_db_path(path: PathBuf) {
-    let _ = DAEMON_QCONNECT_SETTINGS_DB.set(path);
-}
-
-/// The daemon-root QConnect settings DB path, if `init_settings_db_path` ran.
-fn qconnect_settings_db_path() -> Option<PathBuf> {
-    DAEMON_QCONNECT_SETTINGS_DB.get().cloned()
-}
-
-/// The daemon's data root, set once by `qconnect::start` alongside the settings
-/// DB. Separate from it because `daemon_prefs` lives in the root itself, not in
-/// the KV — deriving it from the DB path's parent would couple the two layouts.
+/// The daemon's data root, set once by `qconnect::start` before any connect.
+/// Every device-identity and settings read on the connect path goes to
+/// `settings.toml` under it, and the quality cap reads `daemon_prefs` there.
 static DAEMON_DATA_ROOT: OnceLock<PathBuf> = OnceLock::new();
 
-/// Point the QConnect quality cap at the daemon's data root. Idempotent (a
-/// second call is ignored). Called from `qconnect::start(roots)`.
+/// Point the connect path at the daemon's data root. Idempotent (a second call
+/// is ignored). Called from `qconnect::start(roots)`.
 pub fn init_data_root(path: PathBuf) {
     let _ = DAEMON_DATA_ROOT.set(path);
 }
 
-/// Persistent QConnect device identity for the DAEMON. Daemon adaptation vs. the
-/// desktop (which delegates to the shared global identity module): the uuid is
-/// minted + persisted in the daemon root's `qconnect_settings.db`, so the daemon
-/// keeps its OWN identity, distinct from the desktop install. An explicit
-/// `QBZ_QCONNECT_DEVICE_UUID` env value still wins. Fail-open: a fresh v4 when no
-/// daemon settings path is available yet.
+/// Persistent QConnect device identity: minted once and kept in the daemon
+/// root's `settings.toml`. An explicit `QBZ_QCONNECT_DEVICE_UUID` env value
+/// still wins. Fail-open: a fresh v4 when `init_data_root` has not run.
 pub fn resolve_qconnect_device_uuid() -> String {
     if let Some(explicit) = std::env::var("QBZ_QCONNECT_DEVICE_UUID")
         .ok()
@@ -98,8 +78,8 @@ pub fn resolve_qconnect_device_uuid() -> String {
     {
         return explicit;
     }
-    match qconnect_settings_db_path() {
-        Some(path) => qbz_app::qconnect_identity::device_uuid_from_db(&path),
+    match DAEMON_DATA_ROOT.get() {
+        Some(root) => qconnect_settings::device_uuid(root),
         None => uuid::Uuid::new_v4().to_string(),
     }
 }
@@ -254,10 +234,12 @@ pub struct QconnectJoinSessionRequest {
     pub device_info: Option<QconnectDeviceInfoPayload>,
 }
 
-/// Load the persisted custom device name from the daemon-root settings DB.
-/// Fail-open: None when `init_settings_db_path` never ran or on any read error.
+/// Load the persisted custom device name. Fail-open: None when
+/// `init_data_root` never ran or on any read error.
 fn load_persisted_device_name() -> Option<String> {
-    qconnect_settings_db_path().and_then(|path| load_device_name_at(&path))
+    DAEMON_DATA_ROOT
+        .get()
+        .and_then(|root| load_device_name_at(root))
 }
 
 /// Read from the KV like the name, rather than threaded from `connect()`, so
@@ -266,8 +248,9 @@ fn load_persisted_device_name() -> Option<String> {
 /// so the capability and the mode the engine enforces move together.
 fn load_persisted_volume_mode() -> VolumeMode {
     VolumeMode::from_kv(
-        qconnect_settings_db_path()
-            .and_then(|path| load_volume_mode_at(&path))
+        DAEMON_DATA_ROOT
+            .get()
+            .and_then(|root| load_volume_mode_at(root))
             .as_deref(),
     )
 }
@@ -368,181 +351,79 @@ pub fn resolve_local_identity() -> qconnect_app::LocalIdentity {
 }
 
 // ---------------------------------------------------------------------------
-// Daemon-root KV helpers (path-parameterized `*_at` copies of
-// qconnect_transport.rs:281-411). The desktop variants read the GLOBAL settings
-// DB; the daemon threads the DB path so T11 (`pibuz qconnect enable|disable`,
-// settings show/set) and T13 (TUI QConnect screen) drive the SAME daemon-root DB
-// the connect path reads. Every LOAD is fail-open (returns the default on any
-// error); every SAVE returns the error, so `pibuz settings set qconnect.*` can
-// exit 1 instead of reporting a write that never happened.
+// The `[qconnect]` section of settings.toml, read and written field by field
+// (`qbz_app::settings::qconnect` owns the struct and the file). The CLI
+// (`pibuz qconnect enable|disable`, `settings show/set`), the TUI QConnect
+// screen and the connect path all go through these, against the daemon root.
+// Every LOAD is fail-open (returns the default on any error); every SAVE
+// returns the error, so `pibuz settings set qconnect.*` can exit 1 instead of
+// reporting a write that never happened.
 // ---------------------------------------------------------------------------
 
-/// How long a connection waits on another one's lock before giving up. The
-/// daemon and a `settings set` from moOde open this file concurrently, and
-/// without a timeout SQLite fails the loser immediately with SQLITE_BUSY —
-/// which used to drop the write silently. Every holder keeps the lock for
-/// one statement, so this is never actually waited out.
-const QCONNECT_SETTINGS_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+pub use qconnect_settings::DEFAULT_PAIRING_PORT;
 
-/// Open the daemon-root QConnect settings DB (key/value table), creating it when
-/// missing. Mirrors the Tauri `startup.rs::open_settings_conn`.
-fn try_open_qconnect_settings_conn_at(path: &Path) -> Result<rusqlite::Connection, String> {
-    let fail = |err: rusqlite::Error| format!("qconnect settings {}: {err}", path.display());
-    // SQLite creates the file but not its directory. On a fresh profile the
-    // data root does not exist until the daemon or another store makes it, and
-    // a `settings set qconnect.*` that came first was dropped without a word.
-    // The other stores create theirs.
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)
-            .map_err(|err| format!("qconnect settings {}: {err}", dir.display()))?;
-    }
-    let conn = rusqlite::Connection::open(path).map_err(fail)?;
-    // Before the PRAGMA: switching to WAL takes a lock too.
-    conn.busy_timeout(QCONNECT_SETTINGS_BUSY_TIMEOUT)
-        .map_err(fail)?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
-        .map_err(fail)?;
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        )",
-    )
-    .map_err(fail)?;
-    Ok(conn)
-}
-
-/// The fail-open form the loaders use.
-fn open_qconnect_settings_conn_at(path: &Path) -> Option<rusqlite::Connection> {
-    try_open_qconnect_settings_conn_at(path).ok()
-}
-
-/// Store one `key = value` row.
-fn put_qconnect_setting_at(path: &Path, key: &str, value: &str) -> Result<(), String> {
-    try_open_qconnect_settings_conn_at(path)?
-        .execute(
-            "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
-            rusqlite::params![key, value],
-        )
-        .map(drop)
-        .map_err(|err| format!("qconnect settings {}: write {key}: {err}", path.display()))
-}
-
-/// Load the persisted custom device name (fail-open: None on any error).
-pub fn load_device_name_at(path: &Path) -> Option<String> {
-    let conn = open_qconnect_settings_conn_at(path)?;
-    conn.query_row(
-        "SELECT value FROM settings WHERE key = 'device_name'",
-        [],
-        |row| row.get::<_, String>(0),
-    )
-    .ok()
-    .filter(|v| !v.trim().is_empty())
+/// Load the persisted custom device name. None when unset or blank.
+pub fn load_device_name_at(root: &Path) -> Option<String> {
+    qconnect_settings::load(root)
+        .device_name
+        .filter(|v| !v.trim().is_empty())
 }
 
 /// Persist the custom device name (None clears it).
-pub fn persist_device_name_at(path: &Path, name: Option<&str>) -> Result<(), String> {
-    match name {
-        Some(n) => put_qconnect_setting_at(path, "device_name", n),
-        None => try_open_qconnect_settings_conn_at(path)?
-            .execute("DELETE FROM settings WHERE key = 'device_name'", [])
-            .map(drop)
-            .map_err(|err| {
-                format!(
-                    "qconnect settings {}: clear device_name: {err}",
-                    path.display()
-                )
-            }),
-    }
+pub fn persist_device_name_at(root: &Path, name: Option<&str>) -> Result<(), String> {
+    qconnect_settings::update(root, |s| s.device_name = name.map(str::to_string))
 }
 
-/// Load the persisted QConnect startup mode (`startup_mode` = "off" | "on" |
-/// "remember_last"). Fail-open: returns `Off` (the default) when missing/invalid.
-pub fn load_startup_mode_at(path: &Path) -> qconnect_app::QconnectStartupMode {
-    let Some(conn) = open_qconnect_settings_conn_at(path) else {
-        return qconnect_app::QconnectStartupMode::default();
-    };
-    conn.query_row(
-        "SELECT value FROM settings WHERE key = 'startup_mode'",
-        [],
-        |row| row.get::<_, String>(0),
-    )
-    .ok()
-    .as_deref()
-    .and_then(qconnect_app::QconnectStartupMode::from_str)
-    .unwrap_or_default()
+/// Load the QConnect startup mode (`startup_mode` = "off" | "on"). `Off` (the
+/// default) when unset or unknown.
+pub fn load_startup_mode_at(root: &Path) -> qconnect_app::QconnectStartupMode {
+    qconnect_app::QconnectStartupMode::from_str(&qconnect_settings::load(root).startup_mode)
+        .unwrap_or_default()
 }
 
 /// Persist the QConnect startup mode.
 pub fn save_startup_mode_at(
-    path: &Path,
+    root: &Path,
     mode: qconnect_app::QconnectStartupMode,
 ) -> Result<(), String> {
-    put_qconnect_setting_at(path, "startup_mode", mode.as_str())
+    qconnect_settings::update(root, |s| s.startup_mode = mode.as_str().to_string())
 }
 
-/// Load the daemon volume mode (`volume_mode` = "software" | "locked"; 01 §7.4).
-/// NEW daemon key (the desktop never reads it). Fail-open: None when unset.
-pub fn load_volume_mode_at(path: &Path) -> Option<String> {
-    let conn = open_qconnect_settings_conn_at(path)?;
-    conn.query_row(
-        "SELECT value FROM settings WHERE key = 'volume_mode'",
-        [],
-        |row| row.get::<_, String>(0),
-    )
-    .ok()
-    .filter(|v| !v.trim().is_empty())
+/// Load the daemon volume mode (`volume_mode` = "software" | "locked" |
+/// "external"; 01 §7.4). None when unset.
+pub fn load_volume_mode_at(root: &Path) -> Option<String> {
+    qconnect_settings::load(root)
+        .volume_mode
+        .filter(|v| !v.trim().is_empty())
 }
 
-/// Persist the daemon volume mode ("software" | "locked").
-pub fn save_volume_mode_at(path: &Path, mode: &str) -> Result<(), String> {
-    put_qconnect_setting_at(path, "volume_mode", mode)
+/// Persist the daemon volume mode.
+pub fn save_volume_mode_at(root: &Path, mode: &str) -> Result<(), String> {
+    qconnect_settings::update(root, |s| s.volume_mode = Some(mode.to_string()))
 }
 
-/// Load the pairing-surface switch (`pairing` = "on" | "off"; pairing.rs). NEW
-/// daemon key (the desktop never reads it). Fail-open: ON when unset/invalid —
-/// local pairing is the daemon's reason to exist on a shared-household box.
-pub fn load_pairing_enabled_at(path: &Path) -> bool {
-    let Some(conn) = open_qconnect_settings_conn_at(path) else {
-        return true;
-    };
-    let value: Option<String> = conn
-        .query_row(
-            "SELECT value FROM settings WHERE key = 'pairing'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .ok();
-    !matches!(value.as_deref(), Some("off"))
+/// Load the pairing-surface switch (pairing.rs). ON when unset — local pairing
+/// is the daemon's reason to exist on a shared-household box.
+pub fn load_pairing_enabled_at(root: &Path) -> bool {
+    qconnect_settings::load(root).pairing
 }
 
 /// Persist the pairing-surface switch.
-pub fn save_pairing_enabled_at(path: &Path, enabled: bool) -> Result<(), String> {
-    put_qconnect_setting_at(path, "pairing", if enabled { "on" } else { "off" })
+pub fn save_pairing_enabled_at(root: &Path, enabled: bool) -> Result<(), String> {
+    qconnect_settings::update(root, |s| s.pairing = enabled)
 }
 
-/// Default port for the pairing listener — one above the control plane's 8182.
-pub const DEFAULT_PAIRING_PORT: u16 = 8183;
-
-/// Load the pairing listener port (`pairing_port`). Fail-open to the default.
-pub fn load_pairing_port_at(path: &Path) -> u16 {
-    let Some(conn) = open_qconnect_settings_conn_at(path) else {
-        return DEFAULT_PAIRING_PORT;
-    };
-    conn.query_row(
-        "SELECT value FROM settings WHERE key = 'pairing_port'",
-        [],
-        |row| row.get::<_, String>(0),
-    )
-    .ok()
-    .and_then(|v| v.trim().parse::<u16>().ok())
-    .filter(|p| *p != 0)
-    .unwrap_or(DEFAULT_PAIRING_PORT)
+/// Load the pairing listener port. The default when unset or 0.
+pub fn load_pairing_port_at(root: &Path) -> u16 {
+    match qconnect_settings::load(root).pairing_port {
+        0 => DEFAULT_PAIRING_PORT,
+        port => port,
+    }
 }
 
 /// Persist the pairing listener port.
-pub fn save_pairing_port_at(path: &Path, port: u16) -> Result<(), String> {
-    put_qconnect_setting_at(path, "pairing_port", &port.to_string())
+pub fn save_pairing_port_at(root: &Path, port: u16) -> Result<(), String> {
+    qconnect_settings::update(root, |s| s.pairing_port = port)
 }
 
 /// The volume to set on ourselves when a Connect session picks this device,
@@ -555,21 +436,13 @@ pub fn save_pairing_port_at(path: &Path, port: u16) -> Result<(), String> {
 /// `--initial-volume`, and moOde exposes it for Spotify and Deezer), and it
 /// exists so a cast does not arrive at full scale on a system with no downstream
 /// volume control.
-pub fn load_initial_volume_at(path: &Path) -> Option<u8> {
-    let conn = open_qconnect_settings_conn_at(path)?;
-    conn.query_row(
-        "SELECT value FROM settings WHERE key = 'initial_volume'",
-        [],
-        |row| row.get::<_, String>(0),
-    )
-    .ok()
-    .and_then(|v| v.trim().parse::<u8>().ok())
-    .filter(|pct| *pct > 0 && *pct <= 100)
+pub fn load_initial_volume_at(root: &Path) -> Option<u8> {
+    Some(qconnect_settings::load(root).initial_volume).filter(|pct| *pct > 0 && *pct <= 100)
 }
 
 /// Persist the join-time volume percentage; `0` disables it.
-pub fn save_initial_volume_at(path: &Path, percent: u8) -> Result<(), String> {
-    put_qconnect_setting_at(path, "initial_volume", &percent.to_string())
+pub fn save_initial_volume_at(root: &Path, percent: u8) -> Result<(), String> {
+    qconnect_settings::update(root, |s| s.initial_volume = percent)
 }
 
 /// Build the WS transport config: env overrides first, then auto-discovery via
@@ -837,9 +710,8 @@ mod tests {
         std::fs::create_dir_all(&root).expect("scratch data root");
 
         let set = |key: &str| {
-            let mut prefs = daemon_prefs::load_at(&root);
-            prefs.streaming_quality = key.to_string();
-            daemon_prefs::save_at(&prefs, &root).expect("save prefs");
+            daemon_prefs::update_at(&root, |p| p.streaming_quality = key.to_string())
+                .expect("save prefs");
         };
 
         // Every key `settings set playback.quality` accepts maps to the wire
@@ -872,80 +744,93 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    fn scratch_root(name: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "pibuz_qconnect_kv_{name}_{}_{nonce}",
+            std::process::id()
+        ))
+    }
+
     #[test]
-    fn kv_helpers_round_trip_against_a_temp_daemon_db() {
-        let tmp =
-            std::env::temp_dir().join(format!("pibuz_qconnect_kv_test_{}.db", std::process::id()));
-        let _ = std::fs::remove_file(&tmp);
+    fn kv_helpers_round_trip_against_a_temp_daemon_root() {
+        let root = scratch_root("roundtrip");
 
         // Unset -> defaults / None.
         assert_eq!(
-            load_startup_mode_at(&tmp),
+            load_startup_mode_at(&root),
             qconnect_app::QconnectStartupMode::Off
         );
-        assert_eq!(load_device_name_at(&tmp), None);
-        assert_eq!(load_volume_mode_at(&tmp), None);
-        assert!(load_pairing_enabled_at(&tmp), "pairing defaults ON");
-        assert_eq!(load_pairing_port_at(&tmp), DEFAULT_PAIRING_PORT);
+        assert_eq!(load_device_name_at(&root), None);
+        assert_eq!(load_volume_mode_at(&root), None);
+        assert!(load_pairing_enabled_at(&root), "pairing defaults ON");
+        assert_eq!(load_pairing_port_at(&root), DEFAULT_PAIRING_PORT);
+        assert_eq!(load_initial_volume_at(&root), None);
 
         // Persist + read back.
-        save_startup_mode_at(&tmp, qconnect_app::QconnectStartupMode::On).unwrap();
-        persist_device_name_at(&tmp, Some("Living Room")).unwrap();
-        save_volume_mode_at(&tmp, "locked").unwrap();
+        save_startup_mode_at(&root, qconnect_app::QconnectStartupMode::On).unwrap();
+        persist_device_name_at(&root, Some("Living Room")).unwrap();
+        save_volume_mode_at(&root, "locked").unwrap();
+        save_initial_volume_at(&root, 30).unwrap();
 
         assert_eq!(
-            load_startup_mode_at(&tmp),
+            load_startup_mode_at(&root),
             qconnect_app::QconnectStartupMode::On
         );
-        assert_eq!(load_device_name_at(&tmp).as_deref(), Some("Living Room"));
-        assert_eq!(load_volume_mode_at(&tmp).as_deref(), Some("locked"));
+        assert_eq!(load_device_name_at(&root).as_deref(), Some("Living Room"));
+        assert_eq!(load_volume_mode_at(&root).as_deref(), Some("locked"));
+        assert_eq!(load_initial_volume_at(&root), Some(30));
 
-        // Clearing the device name removes it.
-        persist_device_name_at(&tmp, None).unwrap();
-        assert_eq!(load_device_name_at(&tmp), None);
+        // Clearing the device name removes it; 0 turns the join volume off.
+        persist_device_name_at(&root, None).unwrap();
+        assert_eq!(load_device_name_at(&root), None);
+        save_initial_volume_at(&root, 0).unwrap();
+        assert_eq!(load_initial_volume_at(&root), None);
 
-        // Pairing switch + port round-trip; port 0 / garbage fall back.
-        save_pairing_enabled_at(&tmp, false).unwrap();
-        assert!(!load_pairing_enabled_at(&tmp));
-        save_pairing_enabled_at(&tmp, true).unwrap();
-        assert!(load_pairing_enabled_at(&tmp));
-        save_pairing_port_at(&tmp, 9000).unwrap();
-        assert_eq!(load_pairing_port_at(&tmp), 9000);
-        save_pairing_port_at(&tmp, 0).unwrap();
-        assert_eq!(load_pairing_port_at(&tmp), DEFAULT_PAIRING_PORT);
+        // Pairing switch + port round-trip; port 0 falls back.
+        save_pairing_enabled_at(&root, false).unwrap();
+        assert!(!load_pairing_enabled_at(&root));
+        save_pairing_enabled_at(&root, true).unwrap();
+        assert!(load_pairing_enabled_at(&root));
+        save_pairing_port_at(&root, 9000).unwrap();
+        assert_eq!(load_pairing_port_at(&root), 9000);
+        save_pairing_port_at(&root, 0).unwrap();
+        assert_eq!(load_pairing_port_at(&root), DEFAULT_PAIRING_PORT);
 
-        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Every save used to swallow its error, so `pibuz settings set
-    /// qconnect.volume_mode locked` exited 0 against a database it could not
-    /// open. A plain file where the directory should be fails the open even
+    /// qconnect.volume_mode locked` exited 0 against a store it could not
+    /// open. A plain file where the directory should be fails the write even
     /// as root, which a read-only file would not.
     #[test]
-    fn every_save_reports_a_database_it_cannot_open() {
-        let blocker =
-            std::env::temp_dir().join(format!("pibuz_qconnect_kv_blocked_{}", std::process::id()));
+    fn every_save_reports_a_root_it_cannot_write() {
+        let blocker = scratch_root("blocked");
         std::fs::write(&blocker, b"not a directory").unwrap();
-        let db = blocker.join("qconnect_settings.db");
+        let root = blocker.join("data");
 
         let results = [
             (
                 "startup_mode",
-                save_startup_mode_at(&db, qconnect_app::QconnectStartupMode::On),
+                save_startup_mode_at(&root, qconnect_app::QconnectStartupMode::On),
             ),
             (
                 "device_name",
-                persist_device_name_at(&db, Some("Living Room")),
+                persist_device_name_at(&root, Some("Living Room")),
             ),
-            ("device_name cleared", persist_device_name_at(&db, None)),
-            ("volume_mode", save_volume_mode_at(&db, "locked")),
-            ("pairing", save_pairing_enabled_at(&db, false)),
-            ("pairing_port", save_pairing_port_at(&db, 9000)),
-            ("initial_volume", save_initial_volume_at(&db, 30)),
+            ("device_name cleared", persist_device_name_at(&root, None)),
+            ("volume_mode", save_volume_mode_at(&root, "locked")),
+            ("pairing", save_pairing_enabled_at(&root, false)),
+            ("pairing_port", save_pairing_port_at(&root, 9000)),
+            ("initial_volume", save_initial_volume_at(&root, 30)),
         ];
         for (key, result) in results {
             let err = result.expect_err(key);
-            assert!(err.contains("qconnect settings"), "{key}: {err}");
+            assert!(err.contains(&root.display().to_string()), "{key}: {err}");
         }
         let _ = std::fs::remove_file(&blocker);
     }
@@ -955,42 +840,38 @@ mod tests {
     /// directory, silently.
     #[test]
     fn a_save_on_a_fresh_profile_creates_the_data_root() {
-        let root =
-            std::env::temp_dir().join(format!("pibuz_qconnect_kv_fresh_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let db = root.join("data").join("qconnect_settings.db");
+        let base = scratch_root("fresh");
+        let root = base.join("data");
 
-        save_volume_mode_at(&db, "locked").expect("creates the directory, then writes");
-        assert_eq!(load_volume_mode_at(&db).as_deref(), Some("locked"));
+        save_volume_mode_at(&root, "locked").expect("creates the directory, then writes");
+        assert_eq!(load_volume_mode_at(&root).as_deref(), Some("locked"));
 
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// The daemon and a `settings set` from moOde open this file at the same
-    /// time. Without a busy timeout the loser of a lock race failed at once,
-    /// and the write was dropped without a word.
+    /// The daemon and a `settings set` from moOde write this file at the same
+    /// time. Each save rewrites the whole `[qconnect]` section, so without the
+    /// file lock the slower one would put back the value the faster one had
+    /// just changed.
     #[test]
-    fn a_save_waits_out_a_brief_lock_instead_of_dropping_the_write() {
-        let db = std::env::temp_dir().join(format!(
-            "pibuz_qconnect_kv_locked_{}.db",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&db);
-        save_volume_mode_at(&db, "software").unwrap();
-
-        let holder = try_open_qconnect_settings_conn_at(&db).unwrap();
-        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
-        let release = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            holder.execute_batch("COMMIT").unwrap();
-        });
-
-        save_volume_mode_at(&db, "locked").expect("waits for the lock, then writes");
-        release.join().unwrap();
-        assert_eq!(load_volume_mode_at(&db).as_deref(), Some("locked"));
-
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
+    fn concurrent_saves_of_different_keys_both_land() {
+        let root = scratch_root("concurrent");
+        for _ in 0..5 {
+            let a = {
+                let root = root.clone();
+                std::thread::spawn(move || save_volume_mode_at(&root, "locked").unwrap())
+            };
+            let b = {
+                let root = root.clone();
+                std::thread::spawn(move || persist_device_name_at(&root, Some("Kitchen")).unwrap())
+            };
+            a.join().unwrap();
+            b.join().unwrap();
+            assert_eq!(load_volume_mode_at(&root).as_deref(), Some("locked"));
+            assert_eq!(load_device_name_at(&root).as_deref(), Some("Kitchen"));
+            save_volume_mode_at(&root, "software").unwrap();
+            persist_device_name_at(&root, None).unwrap();
         }
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -12,7 +12,8 @@
 //! the effective startup mode (cli_override = None — never shadow the KV that
 //! T11/T13 write), and, when auto-connect is on, spawns a connect-on-Ready task
 //! with the bounded [2s, 5s, 15s, 30s] retry schedule. QConnect reads NOTHING
-//! from pibuz.toml — only the daemon-root `qconnect_settings.db`.
+//! from pibuz.toml — only the `[qconnect]` section of the data root's
+//! settings.toml.
 
 pub mod engine;
 pub mod pairing;
@@ -77,8 +78,8 @@ pub(crate) struct DaemonQconnectInner {
 }
 
 /// The configured `qconnect.volume_mode` (unset or unknown -> `Software`).
-fn volume_mode_at(settings_db: &std::path::Path) -> engine::VolumeMode {
-    engine::VolumeMode::from_kv(transport::load_volume_mode_at(settings_db).as_deref())
+fn volume_mode_at(root: &std::path::Path) -> engine::VolumeMode {
+    engine::VolumeMode::from_kv(transport::load_volume_mode_at(root).as_deref())
 }
 
 /// Map a lifecycle state to the `/api/status` `qconnect.state` label + the
@@ -146,7 +147,7 @@ pub struct DaemonQconnectService {
     inner: Arc<Mutex<DaemonQconnectInner>>,
     runtime: Runtime,
     shared: SharedState,
-    settings_db: PathBuf,
+    data_root: PathBuf,
     custom_device_name: Arc<tokio::sync::RwLock<Option<String>>>,
     /// Tokens handed over by a Qobuz app via the local pairing surface
     /// (pairing.rs). `connect()` prefers a live entry over `/qws/createToken`.
@@ -236,7 +237,7 @@ impl DaemonQconnectService {
         // T10 (OD4, §7.4): resolve the volume policy from the daemon-root KV at
         // connect, so a later `pibuz settings reload` (T11) is picked up on the
         // next connect. Unset/unknown -> Software (the OD4 default).
-        let volume_mode = volume_mode_at(&self.settings_db);
+        let volume_mode = volume_mode_at(&self.data_root);
         let engine = DaemonRendererEngine::new(
             Arc::clone(&self.runtime),
             volume_mode,
@@ -313,7 +314,7 @@ impl DaemonQconnectService {
             volume_mode, // T10 (OD4): join-time volume report honors the mode
             // Resolved at connect like the mode above, so a `settings set` is
             // picked up on the next connect.
-            initial_volume: transport::load_initial_volume_at(&self.settings_db),
+            initial_volume: transport::load_initial_volume_at(&self.data_root),
             pairing_store: Arc::clone(&self.pairing_store),
             handoff_join_pending: Arc::clone(&self.handoff_join_pending),
         });
@@ -401,8 +402,8 @@ impl DaemonQconnectService {
     /// recently wrote — 03-setup-tui.md §3.4's "applies on the next connection"
     /// rule. Does NOT force a reconnect by itself (a rename alone must not
     /// bounce an active session).
-    async fn refresh_device_name(&self, settings_db: &std::path::Path) {
-        let name = transport::load_device_name_at(settings_db);
+    async fn refresh_device_name(&self, root: &std::path::Path) {
+        let name = transport::load_device_name_at(root);
         *self.custom_device_name.write().await = name;
     }
 
@@ -594,8 +595,8 @@ impl QconnectControl {
     /// Re-cache the device-name override from the daemon-root KV (§ see
     /// [`DaemonQconnectService::refresh_device_name`] — applies on the NEXT
     /// connect, never forces a reconnect for a rename alone).
-    pub async fn refresh_device_name(&self, settings_db: &std::path::Path) {
-        self.0.refresh_device_name(settings_db).await;
+    pub async fn refresh_device_name(&self, root: &std::path::Path) {
+        self.0.refresh_device_name(root).await;
     }
 }
 
@@ -664,19 +665,17 @@ pub fn start(
     report_notify: Arc<tokio::sync::Notify>,
     core_events: broadcast::Receiver<CoreEvent>,
 ) -> QconnectHandle {
-    let settings_db = roots.data.join("qconnect_settings.db");
-    // Re-point device identity + KV at the daemon root (NEVER the desktop global).
-    transport::init_settings_db_path(settings_db.clone());
-    // And the quality cap at the root itself, where `daemon_prefs` lives: the
-    // cast path reads `playback.quality` from here (upstream#693).
-    transport::init_data_root(roots.data.clone());
+    // Point device identity, the Connect settings and the quality cap (the cast
+    // path reads `playback.quality`, upstream#693) at the daemon root.
+    let settings_root = roots.data.clone();
+    transport::init_data_root(settings_root.clone());
 
     // Effective startup decision (Ready-state only), from the KV store that
     // `pibuz qconnect enable|disable` and the TUI write. `remember_last`
     // resolves to off.
-    let mode = transport::load_startup_mode_at(&settings_db);
+    let mode = transport::load_startup_mode_at(&settings_root);
     let should_auto_connect = mode.auto_connects();
-    let custom_name = transport::load_device_name_at(&settings_db);
+    let custom_name = transport::load_device_name_at(&settings_root);
     let effective_name = transport::resolve_qconnect_friendly_name(custom_name.as_deref());
 
     // Latch the initial status so `/api/status` reflects the config before Ready.
@@ -692,7 +691,7 @@ pub fn start(
     // default level (0.75) would reach the samples, and the jump to unity when
     // the connect lands would be heard mid-track. `connect_locked` sets it
     // again per connect, which is what picks up a changed setting.
-    let boot_volume_mode = volume_mode_at(&settings_db);
+    let boot_volume_mode = volume_mode_at(&settings_root);
     if let Err(err) = runtime
         .core()
         .player()
@@ -705,7 +704,7 @@ pub fn start(
         inner: Arc::new(Mutex::new(DaemonQconnectInner::default())),
         runtime,
         shared,
-        settings_db: settings_db.clone(),
+        data_root: settings_root.clone(),
         custom_device_name: Arc::new(tokio::sync::RwLock::new(custom_name)),
         pairing_store: Arc::new(std::sync::Mutex::new(None)),
         ops: Mutex::new(()),
@@ -718,31 +717,31 @@ pub fn start(
     // Local pairing surface (KV `pairing` = on|off, default on; port from KV
     // `pairing_port`). Fail-open on error: the account-bound cloud path above
     // is independent of it, so a bind conflict must not take the daemon down.
-    let (pairing, refresh_task, pairing_port) = if transport::load_pairing_enabled_at(&settings_db)
-    {
-        let port = transport::load_pairing_port_at(&settings_db);
-        match pairing::spawn(
-            port,
-            &effective_name,
-            Arc::clone(&service),
-            tokio::runtime::Handle::current(),
-        ) {
-            Ok(handle) => {
-                let refresh = pairing::spawn_token_refresh(
-                    service.pairing_store(),
-                    Arc::clone(&service.runtime),
-                );
-                (Some(handle), Some(refresh), Some(port))
+    let (pairing, refresh_task, pairing_port) =
+        if transport::load_pairing_enabled_at(&settings_root) {
+            let port = transport::load_pairing_port_at(&settings_root);
+            match pairing::spawn(
+                port,
+                &effective_name,
+                Arc::clone(&service),
+                tokio::runtime::Handle::current(),
+            ) {
+                Ok(handle) => {
+                    let refresh = pairing::spawn_token_refresh(
+                        service.pairing_store(),
+                        Arc::clone(&service.runtime),
+                    );
+                    (Some(handle), Some(refresh), Some(port))
+                }
+                Err(err) => {
+                    log::warn!("[QConnect/Pairing] disabled for this run: {err}");
+                    (None, None, None)
+                }
             }
-            Err(err) => {
-                log::warn!("[QConnect/Pairing] disabled for this run: {err}");
-                (None, None, None)
-            }
-        }
-    } else {
-        log::info!("[QConnect/Pairing] disabled by settings (pairing = off)");
-        (None, None, None)
-    };
+        } else {
+            log::info!("[QConnect/Pairing] disabled by settings (pairing = off)");
+            (None, None, None)
+        };
     // Reflect the pairing surface in `/api/status` (static for the process
     // lifetime — the listener is boot-time-only). `pairing_port` is the port
     // the listener actually BOUND, never a re-read of the KV (a settings set
@@ -821,14 +820,14 @@ mod volume_mode_tests {
     /// from: the value `pibuz settings set qconnect.volume_mode` stored.
     #[test]
     fn the_stored_mode_is_what_boot_and_connect_resolve() {
-        let db =
-            std::env::temp_dir().join(format!("pibuz_volume_mode_at_{}.db", std::process::id()));
-        let _ = std::fs::remove_file(&db);
-        assert_eq!(volume_mode_at(&db), VolumeMode::Software, "unset");
-        transport::save_volume_mode_at(&db, "external").unwrap();
-        assert_eq!(volume_mode_at(&db), VolumeMode::External);
-        transport::save_volume_mode_at(&db, "locked").unwrap();
-        assert_eq!(volume_mode_at(&db), VolumeMode::Locked);
-        let _ = std::fs::remove_file(&db);
+        let root =
+            std::env::temp_dir().join(format!("pibuz_volume_mode_at_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(volume_mode_at(&root), VolumeMode::Software, "unset");
+        transport::save_volume_mode_at(&root, "external").unwrap();
+        assert_eq!(volume_mode_at(&root), VolumeMode::External);
+        transport::save_volume_mode_at(&root, "locked").unwrap();
+        assert_eq!(volume_mode_at(&root), VolumeMode::Locked);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

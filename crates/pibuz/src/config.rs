@@ -1,7 +1,7 @@
 // crates/pibuz/src/config.rs — pibuz.toml: PROCESS concerns only (D14 single-source rule).
 // Engine settings (audio/playback/qconnect content) live in the stores — never here.
-// QConnect startup_mode/device_name/volume_mode live SOLELY in the daemon-root
-// qconnect_settings.db KV (03 §3.4/§6; helpers land in T9) — no [qconnect] table.
+// QConnect startup_mode/device_name/volume_mode live SOLELY in the [qconnect]
+// section of the data root's settings.toml (03 §3.4/§6), not in this file.
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize, Serialize)] // Serialize: `pibuz config show --json` (T11)

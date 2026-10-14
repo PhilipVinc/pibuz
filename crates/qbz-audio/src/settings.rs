@@ -6,12 +6,13 @@
 //! the core types and persistence logic.
 
 use crate::{AlsaPlugin, AudioBackendType};
-use rusqlite::{params, Connection};
+use qbz_models::settings_file::{self, Sections};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AudioSettings {
     pub output_device: Option<String>, // None = system default
     pub exclusive_mode: bool,
@@ -311,675 +312,225 @@ impl Default for AudioSettings {
     }
 }
 
+/// The `[audio]` section of `settings.toml` (see `qbz_models::settings_file`).
+///
+/// Holds a path, not a handle: every read goes to the file, so the next read
+/// after a `pibuz settings set` from another process sees what it wrote.
 pub struct AudioSettingsStore {
-    conn: Connection,
+    root: PathBuf,
 }
 
+const SECTION: &str = "audio";
+
+/// `backend_type` and `alsa_plugin` default to `Some`, and `None` means
+/// "auto". TOML has no null and a key left out takes its default, so `None`
+/// is written as this word instead of being left out.
+const AUTO: &str = "auto";
+
 impl AudioSettingsStore {
-    fn open_at(dir: &Path, db_name: &str) -> Result<Self, String> {
-        std::fs::create_dir_all(dir)
-            .map_err(|e| format!("Failed to create data directory: {}", e))?;
-
-        let db_path = dir.join(db_name);
-        let conn = Connection::open(&db_path)
-            .map_err(|e| format!("Failed to open audio settings database: {}", e))?;
-
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
-            .map_err(|e| format!("Failed to enable WAL for audio settings database: {}", e))?;
-
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS audio_settings (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                output_device TEXT,
-                exclusive_mode INTEGER NOT NULL DEFAULT 0,
-                dac_passthrough INTEGER NOT NULL DEFAULT 0,
-                preferred_sample_rate INTEGER,
-                backend_type TEXT,
-                alsa_plugin TEXT,
-                alsa_hardware_volume INTEGER NOT NULL DEFAULT 0,
-                stream_first_track INTEGER NOT NULL DEFAULT 1,
-                stream_buffer_seconds INTEGER NOT NULL DEFAULT 2
-            );",
-        )
-        .map_err(|e| format!("Failed to create audio settings table: {}", e))?;
-
-        // Migration: Add new columns if they don't exist (for existing databases)
-        let _ = conn.execute(
-            "ALTER TABLE audio_settings ADD COLUMN backend_type TEXT",
-            [],
-        );
-        let _ = conn.execute("ALTER TABLE audio_settings ADD COLUMN alsa_plugin TEXT", []);
-        let _ = conn.execute(
-            "ALTER TABLE audio_settings ADD COLUMN alsa_hardware_volume INTEGER DEFAULT 0",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE audio_settings ADD COLUMN stream_first_track INTEGER DEFAULT 1",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE audio_settings ADD COLUMN stream_buffer_seconds INTEGER DEFAULT 2",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE audio_settings ADD COLUMN streaming_only INTEGER DEFAULT 0",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE audio_settings ADD COLUMN limit_quality_to_device INTEGER DEFAULT 0",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE audio_settings ADD COLUMN device_max_sample_rate INTEGER",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE audio_settings ADD COLUMN normalization_enabled INTEGER DEFAULT 0",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE audio_settings ADD COLUMN normalization_target_lufs REAL DEFAULT -14.0",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE audio_settings ADD COLUMN gapless_enabled INTEGER DEFAULT 1",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE audio_settings ADD COLUMN device_sample_rate_limits TEXT",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE audio_settings ADD COLUMN pw_force_bitperfect INTEGER DEFAULT 0",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE audio_settings ADD COLUMN sync_audio_on_startup INTEGER DEFAULT 0",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE audio_settings ADD COLUMN quality_fallback_behavior TEXT DEFAULT 'ask'",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE audio_settings ADD COLUMN skip_sink_switch INTEGER DEFAULT 0",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE audio_settings ADD COLUMN allow_quality_fallback INTEGER DEFAULT 0",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE audio_settings ADD COLUMN reserve_dac_while_running INTEGER DEFAULT 0",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE audio_settings ADD COLUMN memory_cache_mb INTEGER DEFAULT 0",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE audio_settings ADD COLUMN alsa_mixer_device TEXT DEFAULT ''",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE audio_settings ADD COLUMN volume_curve TEXT DEFAULT 'perceptual'",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE audio_settings ADD COLUMN alsa_buffer_ms INTEGER DEFAULT 0",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE audio_settings ADD COLUMN cache_to_disk INTEGER DEFAULT 1",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE audio_settings ADD COLUMN dac_keepalive_ms INTEGER DEFAULT 0",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE audio_settings ADD COLUMN pcm_ring_ms INTEGER DEFAULT 0",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE audio_settings ADD COLUMN stream_window_seconds INTEGER DEFAULT 8",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE audio_settings ADD COLUMN writer_rt_priority INTEGER DEFAULT 5",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE audio_settings ADD COLUMN disk_cache_mb INTEGER DEFAULT 0",
-            [],
-        );
-
-        // Seed the single settings row on first run with the OOTB default backend
-        // ("System"). INSERT OR IGNORE is a one-time seed: it only fires when the
-        // row does not exist yet, so existing installs are never rewritten on
-        // later launches (settings are only reset by the explicit Reset action,
-        // never just by restarting).
-        //
-        // There is deliberately NO backfill of existing NULL backend_type rows: a
-        // NULL backend_type means "Auto" and is preserved as-is. (An earlier #375
-        // workaround backfilled NULL -> PipeWire on every open, which hard-required
-        // `pactl` and froze OOTB playback without it, #470.)
-        let default_backend_json = serde_json::to_string(&AudioBackendType::default())
-            .map_err(|e| format!("Failed to serialize default backend: {}", e))?;
-        conn.execute(
-            "INSERT OR IGNORE INTO audio_settings (id, exclusive_mode, dac_passthrough, backend_type) VALUES (1, 0, 0, ?1)",
-            params![default_backend_json],
-        )
-        .map_err(|e| format!("Failed to seed audio settings row: {}", e))?;
-
-        // One-time backfill (#638 Phase C / F10): installs that first ran a
-        // pre-#45 build had `limit_quality_to_device` backfilled to 1 by the
-        // original DEFAULT-1 migration and still read `true` today. That was
-        // inert while nothing consumed the flag; now that the local device cap
-        // (fix 3) consumes it, those installs would silently gain a cap nobody
-        // asked for on upgrade — a silently-appearing cap is the exact bug
-        // class this work removes. Reset the flag to the modern default ONCE,
-        // gated on `user_version`, so a user who deliberately re-enables it
-        // afterwards is never clobbered again. The stamp is only written after
-        // a successful UPDATE so a failed backfill retries on the next open.
-        let user_version: i64 = conn
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .unwrap_or(0);
-        if user_version < 1 {
-            match conn.execute(
-                "UPDATE audio_settings SET limit_quality_to_device = 0 WHERE id = 1",
-                [],
-            ) {
-                Ok(_) => {
-                    if let Err(e) = conn.pragma_update(None, "user_version", 1) {
-                        log::warn!("audio settings: user_version stamp failed: {e}");
-                    }
-                }
-                Err(e) => {
-                    log::warn!("audio settings: limit_quality_to_device backfill failed: {e}")
-                }
-            }
-        }
-
-        Ok(Self { conn })
-    }
-
+    /// The audio settings under `base_dir`. Creates nothing; the file appears
+    /// on the first write. Folds in an `audio_settings.db` from before
+    /// `settings.toml`, when there is one.
     pub fn new_at(base_dir: &Path) -> Result<Self, String> {
-        Self::open_at(base_dir, "audio_settings.db")
+        legacy::migrate(base_dir);
+        Ok(Self {
+            root: base_dir.to_path_buf(),
+        })
     }
 
+    /// Whether anything has ever written audio settings here.
+    pub fn has_settings(&self) -> bool {
+        settings_file::has_section(&self.root, SECTION)
+    }
+
+    /// The current settings, or the defaults when none were ever written. An
+    /// error when `settings.toml` is there but does not parse.
     pub fn get_settings(&self) -> Result<AudioSettings, String> {
-        self.conn
-            .query_row(
-                "SELECT output_device, exclusive_mode, dac_passthrough, preferred_sample_rate, backend_type, alsa_plugin, alsa_hardware_volume, stream_first_track, stream_buffer_seconds, streaming_only, limit_quality_to_device, device_max_sample_rate, normalization_enabled, normalization_target_lufs, gapless_enabled, device_sample_rate_limits, pw_force_bitperfect, sync_audio_on_startup, quality_fallback_behavior, skip_sink_switch, allow_quality_fallback, reserve_dac_while_running, memory_cache_mb, alsa_mixer_device, volume_curve, alsa_buffer_ms, cache_to_disk, dac_keepalive_ms, pcm_ring_ms, writer_rt_priority, stream_window_seconds, disk_cache_mb FROM audio_settings WHERE id = 1",
-                [],
-                |row| {
-                    // Parse backend_type from JSON string
-                    let backend_type: Option<AudioBackendType> = row
-                        .get::<_, Option<String>>(4)?
-                        .and_then(|s| serde_json::from_str(&s).ok());
+        from_section(&settings_file::load(&self.root)?)
+    }
 
-                    // Parse alsa_plugin from JSON string
-                    let alsa_plugin: Option<AlsaPlugin> = row
-                        .get::<_, Option<String>>(5)?
-                        .and_then(|s| serde_json::from_str(&s).ok());
-
-                    // Parse device_sample_rate_limits from JSON string
-                    let device_sample_rate_limits: HashMap<String, u32> = row
-                        .get::<_, Option<String>>(15)?
-                        .and_then(|s| serde_json::from_str(&s).ok())
-                        .unwrap_or_default();
-
-                    Ok(AudioSettings {
-                        output_device: row.get(0)?,
-                        exclusive_mode: row.get::<_, i64>(1)? != 0,
-                        dac_passthrough: row.get::<_, i64>(2)? != 0,
-                        preferred_sample_rate: row.get(3)?,
-                        backend_type,
-                        alsa_plugin,
-                        alsa_hardware_volume: row.get::<_, Option<i64>>(6)?.unwrap_or(0) != 0,
-                        stream_first_track: row.get::<_, Option<i64>>(7)?.unwrap_or(0) != 0,
-                        stream_buffer_seconds: row.get::<_, Option<i64>>(8)?.unwrap_or(3) as u8,
-                        streaming_only: row.get::<_, Option<i64>>(9)?.unwrap_or(0) != 0,
-                        limit_quality_to_device: row.get::<_, Option<i64>>(10)?.unwrap_or(0) != 0,
-                        device_max_sample_rate: row.get::<_, Option<i64>>(11)?.map(|r| r as u32),
-                        device_sample_rate_limits,
-                        normalization_enabled: row.get::<_, Option<i64>>(12)?.unwrap_or(0) != 0,
-                        normalization_target_lufs: row.get::<_, Option<f64>>(13)?.unwrap_or(-14.0) as f32,
-                        gapless_enabled: row.get::<_, Option<i64>>(14)?.unwrap_or(1) != 0,
-                        pw_force_bitperfect: row.get::<_, Option<i64>>(16)?.unwrap_or(0) != 0,
-                        sync_audio_on_startup: row.get::<_, Option<i64>>(17)?.unwrap_or(0) != 0,
-                        quality_fallback_behavior: row
-                            .get::<_, Option<String>>(18)?
-                            .unwrap_or_else(|| "ask".to_string()),
-                        skip_sink_switch: row.get::<_, Option<i64>>(19)?.unwrap_or(0) != 0,
-                        allow_quality_fallback: row.get::<_, Option<i64>>(20)?.unwrap_or(0) != 0,
-                        reserve_dac_while_running: row
-                            .get::<_, Option<i64>>(21)?
-                            .unwrap_or(0)
-                            != 0,
-                        memory_cache_mb: row.get::<_, Option<i64>>(22)?.unwrap_or(0) as u16,
-                        alsa_mixer_device: row.get::<_, Option<String>>(23)?.unwrap_or_default(),
-                        volume_curve: row
-                            .get::<_, Option<String>>(24)?
-                            .filter(|v| !v.is_empty())
-                            .unwrap_or_else(default_volume_curve),
-                        alsa_buffer_ms: row.get::<_, Option<i64>>(25)?.unwrap_or(0) as u16,
-                        cache_to_disk: row.get::<_, Option<i64>>(26)?.unwrap_or(1) != 0,
-                        dac_keepalive_ms: row.get::<_, Option<i64>>(27)?.unwrap_or(0) as u16,
-                        pcm_ring_ms: row.get::<_, Option<i64>>(28)?.unwrap_or(0) as u32,
-                        stream_window_seconds: row.get::<_, Option<i64>>(30)?.unwrap_or(8) as u8,
-                        disk_cache_mb: row.get::<_, Option<i64>>(31)?.unwrap_or(0) as u16,
-                        writer_rt_priority: row.get::<_, Option<i64>>(29)?.unwrap_or_else(
-                            || i64::from(default_writer_rt_priority()),
-                        ) as u8,
-                    })
-                },
-            )
-            .map_err(|e| format!("Failed to get audio settings: {}", e))
+    fn update(&self, f: impl FnOnce(&mut AudioSettings)) -> Result<(), String> {
+        settings_file::update(&self.root, |sections| {
+            let mut settings = from_section(sections)?;
+            f(&mut settings);
+            to_section(sections, &settings)
+        })
     }
 
     pub fn set_output_device(&self, device: Option<&str>) -> Result<(), String> {
-        self.conn
-            .execute(
-                "UPDATE audio_settings SET output_device = ?1 WHERE id = 1",
-                params![device],
-            )
-            .map_err(|e| format!("Failed to set output device: {}", e))?;
-        Ok(())
+        self.update(|s| s.output_device = device.map(str::to_string))
     }
 
     pub fn set_exclusive_mode(&self, enabled: bool) -> Result<(), String> {
-        self.conn
-            .execute(
-                "UPDATE audio_settings SET exclusive_mode = ?1 WHERE id = 1",
-                params![enabled as i64],
-            )
-            .map_err(|e| format!("Failed to set exclusive mode: {}", e))?;
-        Ok(())
+        self.update(|s| s.exclusive_mode = enabled)
     }
 
     pub fn set_dac_passthrough(&self, enabled: bool) -> Result<(), String> {
-        self.conn
-            .execute(
-                "UPDATE audio_settings SET dac_passthrough = ?1 WHERE id = 1",
-                params![enabled as i64],
-            )
-            .map_err(|e| format!("Failed to set DAC passthrough: {}", e))?;
-        Ok(())
+        self.update(|s| s.dac_passthrough = enabled)
     }
 
     pub fn set_sample_rate(&self, rate: Option<u32>) -> Result<(), String> {
-        self.conn
-            .execute(
-                "UPDATE audio_settings SET preferred_sample_rate = ?1 WHERE id = 1",
-                params![rate.map(|r| r as i64)],
-            )
-            .map_err(|e| format!("Failed to set sample rate: {}", e))?;
-        Ok(())
+        self.update(|s| s.preferred_sample_rate = rate)
     }
 
+    /// Switching to ALSA with no plugin chosen picks `Hw`.
     pub fn set_backend_type(&self, backend: Option<AudioBackendType>) -> Result<(), String> {
-        let backend_json = backend
-            .map(|b| serde_json::to_string(&b))
-            .transpose()
-            .map_err(|e| format!("Failed to serialize backend type: {}", e))?;
-
-        self.conn
-            .execute(
-                "UPDATE audio_settings SET backend_type = ?1 WHERE id = 1",
-                params![backend_json],
-            )
-            .map_err(|e| format!("Failed to set backend type: {}", e))?;
-
-        // When switching to ALSA, ensure alsa_plugin has a value (default to Hw)
-        if backend == Some(AudioBackendType::Alsa) {
-            let current_plugin: Option<String> = self
-                .conn
-                .query_row(
-                    "SELECT alsa_plugin FROM audio_settings WHERE id = 1",
-                    [],
-                    |row| row.get(0),
-                )
-                .map_err(|e| format!("Failed to check alsa_plugin: {}", e))?;
-
-            if current_plugin.is_none() {
+        self.update(|s| {
+            s.backend_type = backend;
+            if backend == Some(AudioBackendType::Alsa) && s.alsa_plugin.is_none() {
                 log::info!(
                     "[AudioSettings] ALSA backend selected with no plugin set, defaulting to Hw"
                 );
-                self.set_alsa_plugin(Some(AlsaPlugin::Hw))?;
+                s.alsa_plugin = Some(AlsaPlugin::Hw);
             }
-        }
-        Ok(())
+        })
     }
 
     pub fn set_alsa_plugin(&self, plugin: Option<AlsaPlugin>) -> Result<(), String> {
-        let plugin_json = plugin
-            .map(|p| serde_json::to_string(&p))
-            .transpose()
-            .map_err(|e| format!("Failed to serialize ALSA plugin: {}", e))?;
-
-        self.conn
-            .execute(
-                "UPDATE audio_settings SET alsa_plugin = ?1 WHERE id = 1",
-                params![plugin_json],
-            )
-            .map_err(|e| format!("Failed to set ALSA plugin: {}", e))?;
-        Ok(())
+        self.update(|s| s.alsa_plugin = plugin)
     }
 
     pub fn set_alsa_hardware_volume(&self, enabled: bool) -> Result<(), String> {
-        self.conn
-            .execute(
-                "UPDATE audio_settings SET alsa_hardware_volume = ?1 WHERE id = 1",
-                params![enabled as i64],
-            )
-            .map_err(|e| format!("Failed to set ALSA hardware volume: {}", e))?;
-        Ok(())
+        self.update(|s| s.alsa_hardware_volume = enabled)
     }
 
     pub fn set_stream_first_track(&self, enabled: bool) -> Result<(), String> {
-        self.conn
-            .execute(
-                "UPDATE audio_settings SET stream_first_track = ?1 WHERE id = 1",
-                params![enabled as i64],
-            )
-            .map_err(|e| format!("Failed to set stream first track: {}", e))?;
-        Ok(())
+        self.update(|s| s.stream_first_track = enabled)
     }
 
+    /// Clamped to 1-10.
     pub fn set_stream_buffer_seconds(&self, seconds: u8) -> Result<(), String> {
-        // Clamp to valid range 1-10
-        let clamped = seconds.clamp(1, 10);
-        self.conn
-            .execute(
-                "UPDATE audio_settings SET stream_buffer_seconds = ?1 WHERE id = 1",
-                params![clamped as i64],
-            )
-            .map_err(|e| format!("Failed to set stream buffer seconds: {}", e))?;
-        Ok(())
+        self.update(|s| s.stream_buffer_seconds = seconds.clamp(1, 10))
     }
 
-    /// Set the ALSA control device holding the DAC's mixer. Empty restores
-    /// deriving it from the output device.
-    /// Set the software volume curve (`perceptual` or `linear`). Read once when
-    /// the player starts, so it takes effect on the next daemon start.
-    /// Set the ALSA direct-path buffer length in ms; `0` restores the
-    /// rate-derived default. Read when a stream opens, so it applies to the
-    /// next track (or the next renderer start).
-    /// Enable or disable L2 disk caching. Read when the player builds its cache,
-    /// so it takes effect on the next daemon start.
+    /// Read when the player builds its cache, so it takes effect on the next
+    /// daemon start.
     pub fn set_disk_cache_mb(&self, mb: u16) -> Result<(), String> {
-        self.conn
-            .execute(
-                "UPDATE audio_settings SET disk_cache_mb = ?1 WHERE id = 1",
-                params![mb as i64],
-            )
-            .map_err(|e| format!("Failed to set disk_cache_mb: {}", e))?;
-        Ok(())
+        self.update(|s| s.disk_cache_mb = mb)
     }
 
+    /// Read when the player builds its cache, so it takes effect on the next
+    /// daemon start.
     pub fn set_cache_to_disk(&self, enabled: bool) -> Result<(), String> {
-        self.conn
-            .execute(
-                "UPDATE audio_settings SET cache_to_disk = ?1 WHERE id = 1",
-                params![enabled as i64],
-            )
-            .map_err(|e| format!("Failed to set cache_to_disk: {}", e))?;
-        Ok(())
+        self.update(|s| s.cache_to_disk = enabled)
     }
 
+    /// The ALSA direct-path buffer length in ms; `0` restores the rate-derived
+    /// default. Read when a stream opens, so it applies to the next track.
     pub fn set_alsa_buffer_ms(&self, ms: u16) -> Result<(), String> {
-        self.conn
-            .execute(
-                "UPDATE audio_settings SET alsa_buffer_ms = ?1 WHERE id = 1",
-                params![ms],
-            )
-            .map_err(|e| format!("Failed to set ALSA buffer ms: {}", e))?;
-        Ok(())
+        self.update(|s| s.alsa_buffer_ms = ms)
     }
 
-    /// Set the decoded-audio ring depth in ms; `0` restores the host memory
-    /// profile's figure. Read when a stream opens, so it applies to the next
-    /// track.
     /// Clamped 2..=60. Below two seconds a single WiFi hiccup empties the
     /// window; above a minute it stops being a window.
     pub fn set_stream_window_seconds(&self, seconds: u8) -> Result<(), String> {
-        let seconds = seconds.clamp(2, 60);
-        self.conn
-            .execute(
-                "UPDATE audio_settings SET stream_window_seconds = ?1 WHERE id = 1",
-                params![seconds as i64],
-            )
-            .map_err(|e| format!("Failed to set stream window seconds: {}", e))?;
-        Ok(())
+        self.update(|s| s.stream_window_seconds = seconds.clamp(2, 60))
     }
 
+    /// The decoded-audio ring depth in ms; `0` restores the host memory
+    /// profile's figure. Read when a stream opens, so it applies to the next
+    /// track.
     pub fn set_pcm_ring_ms(&self, ms: u32) -> Result<(), String> {
-        self.conn
-            .execute(
-                "UPDATE audio_settings SET pcm_ring_ms = ?1 WHERE id = 1",
-                params![ms as i64],
-            )
-            .map_err(|e| format!("Failed to set PCM ring ms: {}", e))?;
-        Ok(())
+        self.update(|s| s.pcm_ring_ms = ms)
     }
 
-    /// Set the ALSA writer thread's `SCHED_FIFO` priority; `0` turns the
-    /// promotion off. Read once when the player starts, so it takes effect on
-    /// the next daemon start.
+    /// The ALSA writer thread's `SCHED_FIFO` priority; `0` turns the promotion
+    /// off. Read once when the player starts, so it takes effect on the next
+    /// daemon start.
     pub fn set_writer_rt_priority(&self, priority: u8) -> Result<(), String> {
-        self.conn
-            .execute(
-                "UPDATE audio_settings SET writer_rt_priority = ?1 WHERE id = 1",
-                params![priority as i64],
-            )
-            .map_err(|e| format!("Failed to set writer RT priority: {}", e))?;
-        Ok(())
+        self.update(|s| s.writer_rt_priority = priority)
     }
 
     pub fn set_dac_keepalive_ms(&self, ms: u16) -> Result<(), String> {
-        self.conn
-            .execute(
-                "UPDATE audio_settings SET dac_keepalive_ms = ?1 WHERE id = 1",
-                params![ms],
-            )
-            .map_err(|e| format!("Failed to set DAC keep-alive ms: {}", e))?;
-        Ok(())
+        self.update(|s| s.dac_keepalive_ms = ms)
     }
 
+    /// `perceptual` or `linear`. Read once when the player starts, so it
+    /// takes effect on the next daemon start.
     pub fn set_volume_curve(&self, curve: &str) -> Result<(), String> {
-        self.conn
-            .execute(
-                "UPDATE audio_settings SET volume_curve = ?1 WHERE id = 1",
-                params![curve],
-            )
-            .map_err(|e| format!("Failed to set volume curve: {}", e))?;
-        Ok(())
+        self.update(|s| s.volume_curve = curve.to_string())
     }
 
+    /// The ALSA control device holding the DAC's mixer. Empty restores
+    /// deriving it from the output device.
     pub fn set_alsa_mixer_device(&self, device: &str) -> Result<(), String> {
-        self.conn
-            .execute(
-                "UPDATE audio_settings SET alsa_mixer_device = ?1 WHERE id = 1",
-                params![device],
-            )
-            .map_err(|e| format!("Failed to set ALSA mixer device: {}", e))?;
-        Ok(())
+        self.update(|s| s.alsa_mixer_device = device.to_string())
     }
 
-    /// Set the L1 audio-cache budget in MB. `0` restores auto-sizing.
+    /// The L1 audio-cache budget in MB. `0` restores auto-sizing.
     ///
     /// Clamped to 1024 MB: anything larger is a typo, and the L1 cache is not
     /// where a gigabyte of RAM belongs.
     pub fn set_memory_cache_mb(&self, megabytes: u16) -> Result<(), String> {
-        let clamped = megabytes.min(1024);
-        self.conn
-            .execute(
-                "UPDATE audio_settings SET memory_cache_mb = ?1 WHERE id = 1",
-                params![clamped as i64],
-            )
-            .map_err(|e| format!("Failed to set memory cache size: {}", e))?;
-        Ok(())
+        self.update(|s| s.memory_cache_mb = megabytes.min(1024))
     }
 
     pub fn set_streaming_only(&self, enabled: bool) -> Result<(), String> {
-        self.conn
-            .execute(
-                "UPDATE audio_settings SET streaming_only = ?1 WHERE id = 1",
-                params![enabled as i64],
-            )
-            .map_err(|e| format!("Failed to set streaming only: {}", e))?;
-        Ok(())
+        self.update(|s| s.streaming_only = enabled)
     }
 
     pub fn set_limit_quality_to_device(&self, enabled: bool) -> Result<(), String> {
-        self.conn
-            .execute(
-                "UPDATE audio_settings SET limit_quality_to_device = ?1 WHERE id = 1",
-                params![enabled as i64],
-            )
-            .map_err(|e| format!("Failed to set limit quality to device: {}", e))?;
-        Ok(())
+        self.update(|s| s.limit_quality_to_device = enabled)
     }
 
     pub fn set_device_max_sample_rate(&self, rate: Option<u32>) -> Result<(), String> {
-        self.conn
-            .execute(
-                "UPDATE audio_settings SET device_max_sample_rate = ?1 WHERE id = 1",
-                params![rate.map(|r| r as i64)],
-            )
-            .map_err(|e| format!("Failed to set device max sample rate: {}", e))?;
-        Ok(())
+        self.update(|s| s.device_max_sample_rate = rate)
     }
 
-    /// Set the sample rate limit for a specific device
-    /// If rate is None, removes the limit for that device
+    /// The sample rate limit for one device; `None` removes it.
     pub fn set_device_sample_rate_limit(
         &self,
         device_id: &str,
         rate: Option<u32>,
     ) -> Result<(), String> {
-        // Get current limits
-        let mut limits = self.get_device_sample_rate_limits()?;
-
-        // Update or remove the limit for this device
-        if let Some(r) = rate {
-            limits.insert(device_id.to_string(), r);
-        } else {
-            limits.remove(device_id);
-        }
-
-        // Serialize and save
-        let json = serde_json::to_string(&limits)
-            .map_err(|e| format!("Failed to serialize device sample rate limits: {}", e))?;
-
-        self.conn
-            .execute(
-                "UPDATE audio_settings SET device_sample_rate_limits = ?1 WHERE id = 1",
-                params![json],
-            )
-            .map_err(|e| format!("Failed to set device sample rate limits: {}", e))?;
-        Ok(())
+        self.update(|s| match rate {
+            Some(r) => {
+                s.device_sample_rate_limits.insert(device_id.to_string(), r);
+            }
+            None => {
+                s.device_sample_rate_limits.remove(device_id);
+            }
+        })
     }
 
-    /// Get the sample rate limit for a specific device
-    /// Returns None if no limit is set for this device
+    /// The sample rate limit for one device, if it has one.
     pub fn get_device_sample_rate_limit(&self, device_id: &str) -> Result<Option<u32>, String> {
-        let limits = self.get_device_sample_rate_limits()?;
-        Ok(limits.get(device_id).copied())
-    }
-
-    /// Get all device sample rate limits
-    fn get_device_sample_rate_limits(&self) -> Result<HashMap<String, u32>, String> {
-        let json: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT device_sample_rate_limits FROM audio_settings WHERE id = 1",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|e| format!("Failed to get device sample rate limits: {}", e))?;
-
-        match json {
-            Some(s) if !s.is_empty() => serde_json::from_str(&s)
-                .map_err(|e| format!("Failed to parse device sample rate limits: {}", e)),
-            _ => Ok(HashMap::new()),
-        }
+        Ok(self
+            .get_settings()?
+            .device_sample_rate_limits
+            .get(device_id)
+            .copied())
     }
 
     pub fn set_normalization_enabled(&self, enabled: bool) -> Result<(), String> {
-        self.conn
-            .execute(
-                "UPDATE audio_settings SET normalization_enabled = ?1 WHERE id = 1",
-                params![enabled as i64],
-            )
-            .map_err(|e| format!("Failed to set normalization enabled: {}", e))?;
-        Ok(())
+        self.update(|s| s.normalization_enabled = enabled)
     }
 
     pub fn set_gapless_enabled(&self, enabled: bool) -> Result<(), String> {
-        self.conn
-            .execute(
-                "UPDATE audio_settings SET gapless_enabled = ?1 WHERE id = 1",
-                params![enabled as i64],
-            )
-            .map_err(|e| format!("Failed to set gapless enabled: {}", e))?;
-        Ok(())
+        self.update(|s| s.gapless_enabled = enabled)
     }
 
     pub fn set_allow_quality_fallback(&self, enabled: bool) -> Result<(), String> {
-        self.conn
-            .execute(
-                "UPDATE audio_settings SET allow_quality_fallback = ?1 WHERE id = 1",
-                params![enabled as i64],
-            )
-            .map_err(|e| format!("Failed to set allow_quality_fallback: {}", e))?;
-        Ok(())
+        self.update(|s| s.allow_quality_fallback = enabled)
     }
 
     pub fn set_skip_sink_switch(&self, enabled: bool) -> Result<(), String> {
-        self.conn
-            .execute(
-                "UPDATE audio_settings SET skip_sink_switch = ?1 WHERE id = 1",
-                params![enabled as i64],
-            )
-            .map_err(|e| format!("Failed to set skip_sink_switch: {}", e))?;
-        Ok(())
+        self.update(|s| s.skip_sink_switch = enabled)
     }
 
     /// Persist the `reserve_dac_while_running` flag (Lifetime B from the
-    /// ALSA exclusive-hardening design spec). Toggling this only updates
-    /// the DB row; applying the change to the live `DeviceReservation`
-    /// guard is the caller's responsibility.
+    /// ALSA exclusive-hardening design spec). Applying the change to the live
+    /// `DeviceReservation` guard is the caller's responsibility.
     pub fn set_reserve_dac_while_running(&self, enabled: bool) -> Result<(), String> {
-        self.conn
-            .execute(
-                "UPDATE audio_settings SET reserve_dac_while_running = ?1 WHERE id = 1",
-                params![enabled as i64],
-            )
-            .map_err(|e| format!("Failed to set reserve_dac_while_running: {}", e))?;
-        Ok(())
+        self.update(|s| s.reserve_dac_while_running = enabled)
     }
 
     pub fn set_pw_force_bitperfect(&self, enabled: bool) -> Result<(), String> {
-        self.conn
-            .execute(
-                "UPDATE audio_settings SET pw_force_bitperfect = ?1 WHERE id = 1",
-                params![enabled as i64],
-            )
-            .map_err(|e| format!("Failed to set pw_force_bitperfect: {}", e))?;
-        Ok(())
+        self.update(|s| s.pw_force_bitperfect = enabled)
     }
 
     pub fn set_sync_audio_on_startup(&self, enabled: bool) -> Result<(), String> {
-        self.conn
-            .execute(
-                "UPDATE audio_settings SET sync_audio_on_startup = ?1 WHERE id = 1",
-                params![enabled as i64],
-            )
-            .map_err(|e| format!("Failed to set sync_audio_on_startup: {}", e))?;
-        Ok(())
+        self.update(|s| s.sync_audio_on_startup = enabled)
     }
 
     pub fn get_quality_fallback_behavior(&self) -> Result<String, String> {
@@ -996,135 +547,234 @@ impl AudioSettingsStore {
             "ask" | "always_fallback" | "always_skip" => {}
             _ => return Err(format!("Invalid quality_fallback_behavior: {}", behavior)),
         }
-        self.conn
-            .execute(
-                "UPDATE audio_settings SET quality_fallback_behavior = ?1 WHERE id = 1",
-                params![behavior],
-            )
-            .map_err(|e| format!("Failed to set quality_fallback_behavior: {}", e))?;
-        Ok(())
+        self.update(|s| s.quality_fallback_behavior = behavior.to_string())
     }
 
     pub fn set_normalization_target_lufs(&self, target: f32) -> Result<(), String> {
-        self.conn
-            .execute(
-                "UPDATE audio_settings SET normalization_target_lufs = ?1 WHERE id = 1",
-                params![target as f64],
-            )
-            .map_err(|e| format!("Failed to set normalization target LUFS: {}", e))?;
-        Ok(())
+        self.update(|s| s.normalization_target_lufs = target)
     }
 
-    /// Reset all audio settings to their default values
+    /// Reset all audio settings to their default values.
     pub fn reset_all(&self) -> Result<AudioSettings, String> {
         // ADR-003: quality_fallback_behavior must survive reset_all()
         let saved_fallback = self
             .get_quality_fallback_behavior()
             .unwrap_or_else(|_| "ask".to_string());
-
-        let defaults = AudioSettings::default();
-        let backend_json: Option<String> = defaults
-            .backend_type
-            .map(|b| serde_json::to_string(&b))
-            .transpose()
-            .map_err(|e| format!("Failed to serialize backend type: {}", e))?;
-        let plugin_json: Option<String> = defaults
-            .alsa_plugin
-            .map(|p| serde_json::to_string(&p))
-            .transpose()
-            .map_err(|e| format!("Failed to serialize ALSA plugin: {}", e))?;
-
-        // Serialize per-device limits (empty on reset)
-        let limits_json = serde_json::to_string(&defaults.device_sample_rate_limits)
-            .map_err(|e| format!("Failed to serialize device sample rate limits: {}", e))?;
-
-        self.conn
-            .execute(
-                "UPDATE audio_settings SET
-                    output_device = ?1,
-                    exclusive_mode = ?2,
-                    dac_passthrough = ?3,
-                    preferred_sample_rate = ?4,
-                    backend_type = ?5,
-                    alsa_plugin = ?6,
-                    alsa_hardware_volume = ?7,
-                    stream_first_track = ?8,
-                    stream_buffer_seconds = ?9,
-                    streaming_only = ?10,
-                    limit_quality_to_device = ?11,
-                    device_max_sample_rate = ?12,
-                    normalization_enabled = ?13,
-                    normalization_target_lufs = ?14,
-                    gapless_enabled = ?15,
-                    device_sample_rate_limits = ?16,
-                    pw_force_bitperfect = ?17,
-                    sync_audio_on_startup = ?18,
-                    skip_sink_switch = ?19,
-                    allow_quality_fallback = ?20,
-                    reserve_dac_while_running = ?21,
-                    memory_cache_mb = ?22,
-                    alsa_mixer_device = ?23,
-                    volume_curve = ?24,
-                    alsa_buffer_ms = ?25,
-                    cache_to_disk = ?26,
-                    dac_keepalive_ms = ?27,
-                    pcm_ring_ms = ?28,
-                    writer_rt_priority = ?29,
-                    stream_window_seconds = ?30,
-                    disk_cache_mb = ?31
-                WHERE id = 1",
-                params![
-                    defaults.output_device,
-                    defaults.exclusive_mode as i64,
-                    defaults.dac_passthrough as i64,
-                    defaults.preferred_sample_rate.map(|r| r as i64),
-                    backend_json,
-                    plugin_json,
-                    defaults.alsa_hardware_volume as i64,
-                    defaults.stream_first_track as i64,
-                    defaults.stream_buffer_seconds as i64,
-                    defaults.streaming_only as i64,
-                    defaults.limit_quality_to_device as i64,
-                    defaults.device_max_sample_rate.map(|r| r as i64),
-                    defaults.normalization_enabled as i64,
-                    defaults.normalization_target_lufs as f64,
-                    defaults.gapless_enabled as i64,
-                    limits_json,
-                    defaults.pw_force_bitperfect as i64,
-                    defaults.sync_audio_on_startup as i64,
-                    defaults.skip_sink_switch as i64,
-                    defaults.allow_quality_fallback as i64,
-                    defaults.reserve_dac_while_running as i64,
-                    defaults.memory_cache_mb as i64,
-                    defaults.alsa_mixer_device.clone(),
-                    defaults.volume_curve.clone(),
-                    defaults.alsa_buffer_ms as i64,
-                    defaults.cache_to_disk as i64,
-                    defaults.dac_keepalive_ms as i64,
-                    defaults.pcm_ring_ms as i64,
-                    defaults.writer_rt_priority as i64,
-                    defaults.stream_window_seconds as i64,
-                    defaults.disk_cache_mb as i64,
-                ],
-            )
-            .map_err(|e| format!("Failed to reset audio settings: {}", e))?;
-
-        // ADR-003: restore quality_fallback_behavior after reset (it is not an audio config)
-        self.conn
-            .execute(
-                "UPDATE audio_settings SET quality_fallback_behavior = ?1 WHERE id = 1",
-                params![saved_fallback],
-            )
-            .map_err(|e| {
-                format!(
-                    "Failed to restore quality_fallback_behavior after reset: {}",
-                    e
-                )
-            })?;
-
-        let mut result = defaults;
-        result.quality_fallback_behavior = saved_fallback;
+        let result = AudioSettings {
+            quality_fallback_behavior: saved_fallback,
+            ..AudioSettings::default()
+        };
+        let stored = result.clone();
+        self.update(move |s| *s = stored)?;
         Ok(result)
+    }
+}
+
+/// `[audio]` as an [`AudioSettings`], with `auto` read back as `None`.
+fn from_section(sections: &Sections) -> Result<AudioSettings, String> {
+    let mut table: toml::Table = sections.get(SECTION)?;
+    let backend_auto = take_auto(&mut table, "backend_type");
+    let plugin_auto = take_auto(&mut table, "alsa_plugin");
+    let mut settings: AudioSettings = toml::Value::Table(table)
+        .try_into()
+        .map_err(|e| format!("{} [{SECTION}]: {e}", sections.file().display()))?;
+    if backend_auto {
+        settings.backend_type = None;
+    }
+    if plugin_auto {
+        settings.alsa_plugin = None;
+    }
+    Ok(settings)
+}
+
+fn take_auto(table: &mut toml::Table, key: &str) -> bool {
+    let auto = table.get(key).and_then(toml::Value::as_str) == Some(AUTO);
+    if auto {
+        table.remove(key);
+    }
+    auto
+}
+
+/// Write `settings` as `[audio]`, with `None` spelled `auto`.
+fn to_section(sections: &mut Sections, settings: &AudioSettings) -> Result<(), String> {
+    let mut table = match toml::Value::try_from(settings) {
+        Ok(toml::Value::Table(t)) => t,
+        Ok(_) => unreachable!("a struct serializes to a table"),
+        Err(e) => return Err(format!("[{SECTION}]: {e}")),
+    };
+    for (key, is_auto) in [
+        ("backend_type", settings.backend_type.is_none()),
+        ("alsa_plugin", settings.alsa_plugin.is_none()),
+    ] {
+        if is_auto {
+            table.insert(key.to_string(), toml::Value::String(AUTO.to_string()));
+        }
+    }
+    sections.set(SECTION, &table)
+}
+
+/// `audio_settings.db`, the store before `settings.toml`. Read once, by
+/// [`AudioSettingsStore::new_at`], then deleted.
+#[cfg(feature = "sqlite-migrate")]
+mod legacy {
+    use super::*;
+    use rusqlite::types::Value;
+
+    const DB_NAME: &str = "audio_settings.db";
+
+    pub(super) fn migrate(root: &Path) {
+        settings_file::migrate_legacy(root, &root.join(DB_NAME), SECTION, |db, sections| {
+            to_section(sections, &read(db)?)
+        });
+    }
+
+    /// The one row, column by column by NAME, over the defaults: a database
+    /// last opened by an older version lacks the newer columns, and those
+    /// keep their defaults.
+    pub(super) fn read(db: &Path) -> Result<AudioSettings, String> {
+        // Read-write, not read-only: a read-only open cannot replay a WAL that a
+        // crashed writer left behind, and the file is deleted right after.
+        let conn = rusqlite::Connection::open(db).map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare("SELECT * FROM audio_settings WHERE id = 1")
+            .map_err(|e| e.to_string())?;
+        let names: Vec<String> = stmt.column_names().iter().map(|n| n.to_string()).collect();
+        let row: Vec<(String, Value)> = stmt
+            .query_row([], |row| {
+                names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, n)| Ok((n.clone(), row.get::<_, Value>(i)?)))
+                    .collect()
+            })
+            .map_err(|e| e.to_string())?;
+
+        let mut s = AudioSettings::default();
+        for (name, value) in row {
+            apply(&mut s, &name, value);
+        }
+        Ok(s)
+    }
+
+    fn apply(s: &mut AudioSettings, name: &str, value: Value) {
+        let int = || match &value {
+            Value::Integer(i) => Some(*i),
+            _ => None,
+        };
+        let text = || match &value {
+            Value::Text(t) => Some(t.clone()),
+            _ => None,
+        };
+        let flag = |field: &mut bool| {
+            if let Some(i) = int() {
+                *field = i != 0;
+            }
+        };
+        match name {
+            "output_device" => s.output_device = text(),
+            "exclusive_mode" => flag(&mut s.exclusive_mode),
+            "dac_passthrough" => flag(&mut s.dac_passthrough),
+            "preferred_sample_rate" => s.preferred_sample_rate = int().map(|r| r as u32),
+            // NULL is "auto" for both, and stays None.
+            "backend_type" => {
+                s.backend_type = text().and_then(|j| serde_json::from_str(&j).ok());
+            }
+            "alsa_plugin" => s.alsa_plugin = text().and_then(|j| serde_json::from_str(&j).ok()),
+            "alsa_hardware_volume" => flag(&mut s.alsa_hardware_volume),
+            "alsa_mixer_device" => s.alsa_mixer_device = text().unwrap_or_default(),
+            "stream_first_track" => flag(&mut s.stream_first_track),
+            "stream_buffer_seconds" => {
+                if let Some(i) = int() {
+                    s.stream_buffer_seconds = i as u8;
+                }
+            }
+            "stream_window_seconds" => {
+                if let Some(i) = int() {
+                    s.stream_window_seconds = i as u8;
+                }
+            }
+            "streaming_only" => flag(&mut s.streaming_only),
+            "memory_cache_mb" => {
+                if let Some(i) = int() {
+                    s.memory_cache_mb = i as u16;
+                }
+            }
+            "volume_curve" => {
+                if let Some(t) = text().filter(|t| !t.is_empty()) {
+                    s.volume_curve = t;
+                }
+            }
+            "alsa_buffer_ms" => {
+                if let Some(i) = int() {
+                    s.alsa_buffer_ms = i as u16;
+                }
+            }
+            "dac_keepalive_ms" => {
+                if let Some(i) = int() {
+                    s.dac_keepalive_ms = i as u16;
+                }
+            }
+            "pcm_ring_ms" => {
+                if let Some(i) = int() {
+                    s.pcm_ring_ms = i as u32;
+                }
+            }
+            "writer_rt_priority" => {
+                if let Some(i) = int() {
+                    s.writer_rt_priority = i as u8;
+                }
+            }
+            "cache_to_disk" => flag(&mut s.cache_to_disk),
+            "disk_cache_mb" => {
+                if let Some(i) = int() {
+                    s.disk_cache_mb = i as u16;
+                }
+            }
+            "limit_quality_to_device" => flag(&mut s.limit_quality_to_device),
+            "device_max_sample_rate" => s.device_max_sample_rate = int().map(|r| r as u32),
+            "device_sample_rate_limits" => {
+                s.device_sample_rate_limits = text()
+                    .and_then(|j| serde_json::from_str(&j).ok())
+                    .unwrap_or_default();
+            }
+            "normalization_enabled" => flag(&mut s.normalization_enabled),
+            "normalization_target_lufs" => match value {
+                Value::Real(r) => s.normalization_target_lufs = r as f32,
+                Value::Integer(i) => s.normalization_target_lufs = i as f32,
+                _ => {}
+            },
+            "gapless_enabled" => flag(&mut s.gapless_enabled),
+            "pw_force_bitperfect" => flag(&mut s.pw_force_bitperfect),
+            "sync_audio_on_startup" => flag(&mut s.sync_audio_on_startup),
+            "quality_fallback_behavior" => {
+                if let Some(t) = text() {
+                    s.quality_fallback_behavior = t;
+                }
+            }
+            "skip_sink_switch" => flag(&mut s.skip_sink_switch),
+            "allow_quality_fallback" => flag(&mut s.allow_quality_fallback),
+            "reserve_dac_while_running" => flag(&mut s.reserve_dac_while_running),
+            _ => {}
+        }
+    }
+}
+
+/// Without the `sqlite-migrate` feature an old `audio_settings.db` cannot be
+/// read. Say so rather than silently starting from defaults, and leave the
+/// file for a build that can.
+#[cfg(not(feature = "sqlite-migrate"))]
+mod legacy {
+    use std::path::Path;
+
+    pub(super) fn migrate(root: &Path) {
+        let db = root.join("audio_settings.db");
+        if db.exists() && !qbz_models::settings_file::has_section(root, super::SECTION) {
+            log::warn!(
+                "[settings] {} is from an older pibuz and this build cannot read it \
+                 (built without sqlite-migrate); audio settings are at their defaults",
+                db.display()
+            );
+        }
     }
 }
 
@@ -1167,12 +817,11 @@ mod tests {
 
         let settings = store.get_settings().expect("get settings");
 
-        // Fresh store is seeded with the OOTB default backend "System" (#470).
+        // A store nothing has written to IS the defaults: the OOTB backend
+        // "System" (#470), and the struct's own answer for every field. The
+        // SQLite store used to disagree with the struct on two of them.
         assert_eq!(settings.backend_type, Some(AudioBackendType::SystemDefault));
-        assert_eq!(settings.alsa_plugin, None);
-        // The store and the struct must answer the same question the same way.
-        // They did not: `AudioSettings::default()` said true and a fresh store
-        // said false, and the two assertions sat in adjacent tests.
+        assert_eq!(settings.alsa_plugin, Some(AlsaPlugin::Hw));
         assert!(settings.gapless_enabled);
         assert_eq!(settings.quality_fallback_behavior, "ask");
         assert!(!settings.reserve_dac_while_running);
@@ -1189,19 +838,20 @@ mod tests {
         let dir = unique_test_dir("backend-null-auto");
         {
             let store = AudioSettingsStore::new_at(&dir).expect("open store");
-            store
-                .conn
-                .execute(
-                    "UPDATE audio_settings SET backend_type = NULL WHERE id = 1",
-                    [],
-                )
-                .expect("force null (Auto) backend");
+            store.set_backend_type(None).expect("Auto backend");
+            store.set_alsa_plugin(None).expect("Auto plugin");
         }
+        // Spelled out, because a key left out of the file takes its default,
+        // and the default is not None.
+        let text = std::fs::read_to_string(settings_file::path(&dir)).unwrap();
+        assert!(text.contains("backend_type = \"auto\""), "{text}");
+        assert!(text.contains("alsa_plugin = \"auto\""), "{text}");
 
         let reopened = AudioSettingsStore::new_at(&dir).expect("reopen store");
         let settings = reopened.get_settings().expect("get settings");
 
         assert_eq!(settings.backend_type, None);
+        assert_eq!(settings.alsa_plugin, None);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1249,13 +899,12 @@ mod tests {
     #[test]
     fn quality_fallback_invalid_value_reads_as_ask() {
         let (dir, store) = fresh_store("quality-invalid");
-        store
-            .conn
-            .execute(
-                "UPDATE audio_settings SET quality_fallback_behavior = 'bad-value' WHERE id = 1",
-                [],
-            )
-            .expect("write invalid fallback behavior");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            settings_file::path(&dir),
+            "[audio]\nquality_fallback_behavior = \"bad-value\"\n",
+        )
+        .expect("write invalid fallback behavior");
 
         assert_eq!(
             store
@@ -1347,5 +996,99 @@ mod tests {
             serde_json::from_str(legacy).expect("legacy JSON should deserialize");
 
         assert!(!settings.reserve_dac_while_running);
+    }
+    /// An `audio_settings.db` as an older pibuz left it: only some of the
+    /// columns later versions added, in WAL mode.
+    #[cfg(feature = "sqlite-migrate")]
+    fn plant_legacy_db(dir: &Path, insert: &str) -> std::path::PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let db = dir.join("audio_settings.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(&format!(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE audio_settings (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                output_device TEXT,
+                exclusive_mode INTEGER NOT NULL DEFAULT 0,
+                dac_passthrough INTEGER NOT NULL DEFAULT 0,
+                preferred_sample_rate INTEGER,
+                backend_type TEXT,
+                alsa_plugin TEXT,
+                alsa_hardware_volume INTEGER NOT NULL DEFAULT 0,
+                stream_first_track INTEGER NOT NULL DEFAULT 1,
+                stream_buffer_seconds INTEGER NOT NULL DEFAULT 2,
+                alsa_mixer_device TEXT DEFAULT '',
+                gapless_enabled INTEGER DEFAULT 1,
+                normalization_target_lufs REAL DEFAULT -14.0,
+                disk_cache_mb INTEGER DEFAULT 0
+             );
+             {insert}"
+        ))
+        .unwrap();
+        db
+    }
+
+    #[cfg(feature = "sqlite-migrate")]
+    #[test]
+    fn a_legacy_database_is_migrated_into_settings_toml_and_deleted() {
+        let dir = unique_test_dir("legacy-migrate");
+        let db = plant_legacy_db(
+            &dir,
+            "INSERT INTO audio_settings (id, output_device, backend_type, alsa_plugin,
+                alsa_hardware_volume, stream_buffer_seconds, alsa_mixer_device,
+                gapless_enabled, normalization_target_lufs, disk_cache_mb)
+             VALUES (1, '_audioout', '\"Alsa\"', '\"Hw\"', 1, 5, 'hw:0', 0, -18.0, 2000);",
+        );
+
+        let settings = AudioSettingsStore::new_at(&dir)
+            .unwrap()
+            .get_settings()
+            .unwrap();
+        assert_eq!(settings.output_device.as_deref(), Some("_audioout"));
+        assert_eq!(settings.backend_type, Some(AudioBackendType::Alsa));
+        assert_eq!(settings.alsa_plugin, Some(AlsaPlugin::Hw));
+        assert!(settings.alsa_hardware_volume);
+        assert_eq!(settings.stream_buffer_seconds, 5);
+        assert_eq!(settings.alsa_mixer_device, "hw:0");
+        assert!(!settings.gapless_enabled);
+        assert_eq!(settings.normalization_target_lufs, -18.0);
+        assert_eq!(settings.disk_cache_mb, 2000);
+        // Columns this database never had keep their defaults.
+        let defaults = AudioSettings::default();
+        assert_eq!(
+            settings.stream_window_seconds,
+            defaults.stream_window_seconds
+        );
+        assert_eq!(settings.writer_rt_priority, defaults.writer_rt_priority);
+        assert_eq!(settings.cache_to_disk, defaults.cache_to_disk);
+
+        for suffix in ["", "-wal", "-shm"] {
+            assert!(
+                !dir.join(format!("audio_settings.db{suffix}")).exists(),
+                "audio_settings.db{suffix} must be gone"
+            );
+        }
+        assert!(!db.exists());
+        // And it is now the file that answers.
+        let reopened = AudioSettingsStore::new_at(&dir).unwrap();
+        assert_eq!(reopened.get_settings().unwrap().disk_cache_mb, 2000);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(feature = "sqlite-migrate")]
+    #[test]
+    fn a_legacy_null_backend_and_plugin_stay_auto() {
+        // A NULL backend_type meant "Auto", and a fresh SQLite store left
+        // alsa_plugin NULL. Migrating must not turn either into the default.
+        let dir = unique_test_dir("legacy-auto");
+        plant_legacy_db(&dir, "INSERT INTO audio_settings (id) VALUES (1);");
+
+        let settings = AudioSettingsStore::new_at(&dir)
+            .unwrap()
+            .get_settings()
+            .unwrap();
+        assert_eq!(settings.backend_type, None);
+        assert_eq!(settings.alsa_plugin, None);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

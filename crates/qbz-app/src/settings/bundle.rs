@@ -23,7 +23,7 @@ use serde_json::{Map, Value};
 use qbz_audio::settings::{AudioSettings, AudioSettingsStore};
 use qbz_audio::AudioBackendType;
 
-use crate::settings::daemon_prefs;
+use crate::settings::{daemon_prefs, qconnect};
 
 /// The bundle schema version this importer implements and this exporter writes
 /// (04 §1). Hard-gated on import (`plan` step 2, §5.6). v1 is the floor.
@@ -1176,103 +1176,62 @@ fn apply_audio_writes(data_root: &Path, writes: &[(&str, &Value)]) -> Result<(),
 }
 
 fn apply_prefs_quality(data_root: &Path, value: &Value) -> Result<(), String> {
-    let mut prefs = daemon_prefs::load_at(data_root);
-    if let Some(q) = value.as_str() {
-        prefs.streaming_quality = q.to_string();
-    }
-    daemon_prefs::save_at(&prefs, data_root)
+    daemon_prefs::update_at(data_root, |prefs| {
+        if let Some(q) = value.as_str() {
+            prefs.streaming_quality = q.to_string();
+        }
+    })
 }
 
 fn apply_qconnect_writes(data_root: &Path, writes: &[(&str, &Value)]) -> Result<(), String> {
-    let db = data_root.join("qconnect_settings.db");
-    for (key, value) in writes {
-        match *key {
-            "device_name" => {
-                let name = value.as_str().filter(|s| !s.is_empty());
-                qconnect_kv_write(&db, "device_name", name)?;
+    qconnect::update(data_root, |qc| {
+        for (key, value) in writes {
+            match *key {
+                "device_name" => {
+                    qc.device_name = value.as_str().filter(|s| !s.is_empty()).map(str::to_string);
+                }
+                "startup_mode" => {
+                    if let Some(mode) = value.as_str() {
+                        qc.startup_mode = mode.to_string();
+                    }
+                }
+                other => log::warn!("[bundle] apply: unhandled qconnect key {other}"),
             }
-            "startup_mode" => {
-                qconnect_kv_write(&db, "startup_mode", value.as_str())?;
-            }
-            other => log::warn!("[bundle] apply: unhandled qconnect key {other}"),
         }
-    }
-    Ok(())
+    })
 }
 
 fn as_bool(v: &Value) -> bool {
     v.as_bool().unwrap_or(false)
 }
 
-// ============================ store readers (side-effect free) ============================
+// ============================ store readers ============================
+//
+// These create no settings (so `plan` and a dry run write nothing), with one
+// exception: opening a store folds in its pre-settings.toml file, if one is
+// still there. That changes where the values live, never what they are.
 
-/// Read the current audio settings WITHOUT creating the DB (so `plan`/dry-run
-/// never write). Returns `None` when the store file is absent (caller uses
-/// `AudioSettings::default()`).
+/// The current audio settings, or `None` when nothing ever wrote any (the
+/// caller uses `AudioSettings::default()`).
 fn read_audio_settings(data_root: &Path) -> Option<AudioSettings> {
-    if !data_root.join("audio_settings.db").exists() {
+    let store = AudioSettingsStore::new_at(data_root).ok()?;
+    if !store.has_settings() {
         return None;
     }
-    AudioSettingsStore::new_at(data_root)
-        .and_then(|s| s.get_settings())
-        .ok()
+    store.get_settings().ok()
 }
 
 fn read_qconnect_domain(data_root: &Path) -> Option<Value> {
-    let db = data_root.join("qconnect_settings.db");
-    if !db.exists() {
+    if !qconnect::exists(data_root) {
         return None;
     }
+    let qc = qconnect::load(data_root);
     let mut obj = Map::new();
-    if let Some(name) = qconnect_kv_read(&db, "device_name") {
+    if let Some(name) = qc.device_name.filter(|n| !n.trim().is_empty()) {
         obj.insert("device_name".into(), Value::String(name));
     }
-    if let Some(mode) = qconnect_kv_read(&db, "startup_mode") {
-        obj.insert("startup_mode".into(), Value::String(mode));
-    }
-    if obj.is_empty() {
-        None
-    } else {
-        Some(Value::Object(obj))
-    }
-}
-
-// ---- qconnect KV (self-contained rusqlite — the engine must be desktop-callable) ----
-fn qconnect_kv_read(db: &Path, key: &str) -> Option<String> {
-    let conn = rusqlite::Connection::open(db).ok()?;
-    conn.query_row(
-        "SELECT value FROM settings WHERE key = ?1",
-        rusqlite::params![key],
-        |row| row.get::<_, String>(0),
-    )
-    .ok()
-    .filter(|v| !v.trim().is_empty())
-}
-
-fn qconnect_kv_write(db: &Path, key: &str, value: Option<&str>) -> Result<(), String> {
-    let conn = rusqlite::Connection::open(db).map_err(|e| e.to_string())?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
-        .map_err(|e| e.to_string())?;
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
-    )
-    .map_err(|e| e.to_string())?;
-    match value {
-        Some(v) => conn
-            .execute(
-                "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
-                rusqlite::params![key, v],
-            )
-            .map(|_| ())
-            .map_err(|e| e.to_string()),
-        None => conn
-            .execute(
-                "DELETE FROM settings WHERE key = ?1",
-                rusqlite::params![key],
-            )
-            .map(|_| ())
-            .map_err(|e| e.to_string()),
-    }
+    obj.insert("startup_mode".into(), Value::String(qc.startup_mode));
+    Some(Value::Object(obj))
 }
 
 // ---- last_user_id under an arbitrary root (daemon-safe) ----

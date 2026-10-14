@@ -177,8 +177,8 @@ pub async fn run(roots: ProfileRoots, cfg: PibuzConfig, warns: Vec<String>) -> R
     );
 
     // 11. HTTP serve (02 §3) on the already-bound socket. `ApiState` carries a
-    //     second read-only audio-store connection (WAL) for the status audio
-    //     block, the tokio handle for the async queue read, and the opt-in
+    //     second audio store (a path; every read goes to the file) for the status
+    //     audio block, the tokio handle for the async queue read, and the opt-in
     //     [server] token (None = open). 12. QConnect (T9/T10) splices after this.
     let api_audio = qbz_audio::settings::AudioSettingsStore::new_at(&roots.data)
         .map_err(|e| format!("error: could not open the audio settings store for the API: {e}"))?;
@@ -536,7 +536,7 @@ pub(crate) async fn reload(state: &crate::api::ApiState) {
     reload_qconnect(state).await;
 }
 
-/// Re-read `audio_settings.db` and apply it to the live `Player`. A struct
+/// Re-read the audio settings and apply it to the live `Player`. A struct
 /// refresh (`reload_settings`) always happens; the output device is ADDITIONALLY
 /// reinitialized only when a routing-critical field actually changed since the
 /// last reload (mirrors the desktop's `Apply::Reinit` — `qbz/src/settings.rs:
@@ -615,9 +615,9 @@ pub(crate) async fn reload_qconnect(state: &crate::api::ApiState) {
     let Some(qc) = state.qconnect_control.get() else {
         return;
     };
-    let db = state.roots.data.join("qconnect_settings.db");
-    qc.refresh_device_name(&db).await;
-    let mode = crate::qconnect::transport::load_startup_mode_at(&db);
+    let root = state.roots.data.as_path();
+    qc.refresh_device_name(root).await;
+    let mode = crate::qconnect::transport::load_startup_mode_at(root);
     let should_connect = mode.auto_connects();
     if should_connect {
         if let Err(e) = qc.connect().await {

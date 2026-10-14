@@ -34,7 +34,6 @@ log = { workspace = true }
 async-trait = { workspace = true }
 # QConnect glue copies (T9) — mirror the desktop copies' direct imports
 uuid = { version = "1", features = ["v4"] }                    # renderer-report action uuids
-rusqlite = { version = "0.31", features = ["bundled"] }        # daemon-root qconnect_settings.db KV
 futures-util = { workspace = true }                            # remote_stream.rs feeder (byte-exact)
 # new direct deps (versions already in lock where noted)
 tiny_http = "0.12"           # pairing.rs / api HTTP listener
@@ -54,6 +53,16 @@ tempfile = "3"
 
 [lints]
 workspace = true
+
+[features]
+default = ["sqlite-migrate"]
+# Read the SQLite settings stores an older pibuz left in the data root
+# (audio_settings.db, qconnect_settings.db) once, into settings.toml, then
+# delete them. Without it those files are ignored with a warning, and the
+# renderer starts from default settings as a new Connect device. This is the
+# only thing that still compiles SQLite into pibuz for settings; drop it once
+# no install is left that has one.
+sqlite-migrate = ["qbz-app/sqlite-migrate", "qbz-audio/sqlite-migrate"]
 
 # Debian packaging, read by `cargo deb -p pibuz`.
 #

@@ -30,7 +30,7 @@ use crate::adapter::DaemonAdapter;
 
 // T10 (OD4, §7.4): daemon-only volume policy. The desktop has no equivalent —
 // it always applies remote volume. The mode is read from the daemon-root
-// `qconnect_settings.db` `volume_mode` KV key (transport::load_volume_mode_at)
+// `[qconnect] volume_mode` (transport::load_volume_mode_at)
 // at connect time and injected into the engine + session host.
 /// How the daemon treats a controller's remote volume command (01 §7.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

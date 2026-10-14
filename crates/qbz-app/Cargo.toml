@@ -16,8 +16,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 log = { workspace = true }
-rusqlite = { version = "0.31", features = ["bundled"] }
-dirs = "6"
+# Only to read the SQLite stores from before settings.toml, once. See
+# [features] below.
+rusqlite = { version = "0.31", features = ["bundled"], optional = true }
 uuid = { version = "1", features = ["v4"] }
 chrono = { workspace = true }
 
@@ -26,6 +27,12 @@ rustls = { version = "0.23", features = ["aws_lc_rs"] }
 
 [lints]
 workspace = true
+
+[features]
+# Read the SQLite stores from before settings.toml (qconnect_settings.db, and
+# audio_settings.db through qbz-audio) once, into it. On by default through
+# pibuz; drop it once no install is left that has one.
+sqlite-migrate = ["dep:rusqlite", "qbz-audio/sqlite-migrate"]
 
 [dev-dependencies]
 # The residency tests drive a real AudioCache.

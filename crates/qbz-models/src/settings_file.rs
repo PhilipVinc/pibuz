@@ -59,22 +59,25 @@ pub fn path(root: &Path) -> PathBuf {
 /// A file or section that does not parse also yields the defaults, with an
 /// error in the log: a daemon that cannot read its settings still starts.
 pub fn read_section<T: DeserializeOwned + Default>(root: &Path, name: &str) -> T {
-    let sections = match read(root) {
-        Ok(s) => s,
-        Err(e) => {
-            log::error!("[settings] {e}; using defaults for [{name}]");
-            return T::default();
-        }
-    };
-    sections.get(name).unwrap_or_else(|e| {
+    try_read_section(root, name).unwrap_or_else(|e| {
         log::error!("[settings] {e}; using defaults for [{name}]");
         T::default()
     })
 }
 
+/// One section, or its defaults when the file or the section is absent; an
+/// error when either is there but does not parse. For a caller that should
+/// report a broken file rather than paper over it, such as `settings show`.
+pub fn try_read_section<T: DeserializeOwned + Default>(
+    root: &Path,
+    name: &str,
+) -> Result<T, String> {
+    load(root)?.get(name)
+}
+
 /// Whether the file exists, parses, and has a `[name]` table.
 pub fn has_section(root: &Path, name: &str) -> bool {
-    read(root).map(|s| s.has(name)).unwrap_or(false)
+    load(root).map(|s| s.has(name)).unwrap_or(false)
 }
 
 /// Run `f` on one section under the lock and save the result.
@@ -106,7 +109,7 @@ pub fn update<R>(
 ) -> Result<R, String> {
     std::fs::create_dir_all(root).map_err(|e| format!("{}: {e}", root.display()))?;
     let _lock = Lock::acquire(root)?;
-    let mut sections = read(root)?;
+    let mut sections = load(root)?;
     let out = f(&mut sections)?;
     if sections.changed {
         write(root, &sections.table)?;
@@ -122,6 +125,11 @@ pub struct Sections {
 }
 
 impl Sections {
+    /// The file these sections came from, for error messages.
+    pub fn file(&self) -> &Path {
+        &self.file
+    }
+
     /// Whether the file has a `[name]` table.
     pub fn has(&self, name: &str) -> bool {
         self.table.get(name).is_some_and(toml::Value::is_table)
@@ -151,7 +159,8 @@ impl Sections {
     }
 }
 
-fn read(root: &Path) -> Result<Sections, String> {
+/// The whole file, parsed. Absent is empty; unparseable is an error.
+pub fn load(root: &Path) -> Result<Sections, String> {
     let file = path(root);
     let table = match std::fs::read_to_string(&file) {
         Ok(text) => text
@@ -184,6 +193,83 @@ fn write(root: &Path, table: &toml::Table) -> Result<(), String> {
     File::open(root)
         .and_then(|dir| dir.sync_all())
         .map_err(fail)
+}
+
+/// Fold a store from before `settings.toml` into it, once, then delete it.
+///
+/// Runs only when `legacy` exists. If `section` is already in the file, the
+/// store was migrated before and only the deletion is left to do (a crash
+/// between the two). Otherwise `import` reads `legacy` and writes what it
+/// holds through [`Sections::set`]; it should set nothing until it has read
+/// everything.
+///
+/// Every failure keeps the settings, never the error:
+/// - `settings.toml` itself does not parse: nothing happens, and the next
+///   open tries again once it is fixed.
+/// - `import` fails: the old store is renamed to `<name>.unreadable` for a
+///   human to look at, so it is not retried, and logged, on every open.
+pub fn migrate_legacy(
+    root: &Path,
+    legacy: &Path,
+    section: &str,
+    import: impl FnOnce(&Path, &mut Sections) -> Result<(), String>,
+) {
+    if !legacy.exists() {
+        return;
+    }
+    let mut unreadable = None;
+    let migrated = update(root, |sections| {
+        if sections.has(section) {
+            return Ok(false);
+        }
+        if let Err(e) = import(legacy, sections) {
+            unreadable = Some(e);
+            return Ok(false);
+        }
+        Ok(true)
+    });
+    match (migrated, unreadable) {
+        (Err(e), _) => log::error!(
+            "[settings] {} not migrated yet, settings.toml cannot be written: {e}",
+            legacy.display()
+        ),
+        (Ok(_), Some(e)) => {
+            log::error!(
+                "[settings] could not read {}: {e}; moved aside, its settings are lost",
+                legacy.display()
+            );
+            set_aside_legacy(legacy);
+        }
+        (Ok(migrated), None) => {
+            if migrated {
+                log::info!("[settings] migrated {} into {FILE_NAME}", legacy.display());
+            }
+            remove_legacy(legacy);
+        }
+    }
+}
+
+/// Delete a store from before `settings.toml`, with the `-wal` and `-shm`
+/// files SQLite keeps beside one. Missing files are fine.
+pub fn remove_legacy(legacy: &Path) {
+    for suffix in ["", "-wal", "-shm"] {
+        let mut name = legacy.as_os_str().to_owned();
+        name.push(suffix);
+        let _ = std::fs::remove_file(PathBuf::from(name));
+    }
+}
+
+fn set_aside_legacy(legacy: &Path) {
+    let mut name = legacy.as_os_str().to_owned();
+    name.push(".unreadable");
+    if let Err(e) = std::fs::rename(legacy, PathBuf::from(name)) {
+        log::error!("[settings] could not move {} aside: {e}", legacy.display());
+    }
+    for suffix in ["-wal", "-shm"] {
+        let mut name = legacy.as_os_str().to_owned();
+        name.push(suffix);
+        let _ = std::fs::remove_file(PathBuf::from(name));
+    }
 }
 
 /// An exclusive `flock` on the lock file, released when dropped (the
@@ -385,11 +471,94 @@ mod tests {
             })
         };
         while !writer.is_finished() {
-            let sections = read(&root).expect("a reader saw a file that does not parse");
+            let sections = load(&root).expect("a reader saw a file that does not parse");
             let demo: Demo = sections.get("demo").unwrap();
             assert_eq!(demo.name.len(), 4096, "a reader saw a truncated section");
         }
         writer.join().unwrap();
         let _ = std::fs::remove_dir_all(&root);
+    }
+    fn plant_legacy(root: &Path) -> PathBuf {
+        std::fs::create_dir_all(root).unwrap();
+        let legacy = root.join("old_store.db");
+        std::fs::write(&legacy, b"old").unwrap();
+        std::fs::write(root.join("old_store.db-wal"), b"wal").unwrap();
+        std::fs::write(root.join("old_store.db-shm"), b"shm").unwrap();
+        legacy
+    }
+
+    fn import_demo(count: u32) -> impl FnOnce(&Path, &mut Sections) -> Result<(), String> {
+        move |legacy, sections| {
+            assert_eq!(std::fs::read(legacy).unwrap(), b"old");
+            sections.set(
+                "demo",
+                &Demo {
+                    count,
+                    ..Demo::default()
+                },
+            )
+        }
+    }
+
+    #[test]
+    fn a_legacy_store_is_migrated_once_and_then_deleted_with_its_siblings() {
+        let root = scratch("migrate");
+        let legacy = plant_legacy(&root);
+        migrate_legacy(&root, &legacy, "demo", import_demo(42));
+
+        assert_eq!(read_section::<Demo>(&root, "demo").count, 42);
+        for name in ["old_store.db", "old_store.db-wal", "old_store.db-shm"] {
+            assert!(!root.join(name).exists(), "{name} must be deleted");
+        }
+        // Nothing left to migrate: the importer must not run again.
+        migrate_legacy(&root, &legacy, "demo", |_, _| panic!("migrated twice"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_section_already_in_the_file_wins_over_a_leftover_legacy_store() {
+        // A crash between writing settings.toml and deleting the old store.
+        let root = scratch("migrate-leftover");
+        update_section(&root, "demo", |d: &mut Demo| d.count = 7).unwrap();
+        let legacy = plant_legacy(&root);
+        migrate_legacy(&root, &legacy, "demo", |_, _| panic!("must not import"));
+        assert_eq!(read_section::<Demo>(&root, "demo").count, 7);
+        assert!(!legacy.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_unreadable_legacy_store_is_set_aside_not_retried() {
+        let root = scratch("migrate-unreadable");
+        let legacy = plant_legacy(&root);
+        migrate_legacy(&root, &legacy, "demo", |_, _| Err("not a database".into()));
+        assert!(!legacy.exists());
+        assert!(root.join("old_store.db.unreadable").exists());
+        assert!(!has_section(&root, "demo"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_legacy_store_waits_while_settings_toml_does_not_parse() {
+        let root = scratch("migrate-blocked");
+        let legacy = plant_legacy(&root);
+        std::fs::write(path(&root), "[demo\n").unwrap();
+        migrate_legacy(&root, &legacy, "demo", |_, _| panic!("must not import"));
+        assert!(legacy.exists(), "kept for when the file is fixed");
+
+        std::fs::write(path(&root), "").unwrap();
+        migrate_legacy(&root, &legacy, "demo", import_demo(3));
+        assert_eq!(read_section::<Demo>(&root, "demo").count, 3);
+        assert!(!legacy.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn no_legacy_store_means_no_file_is_created() {
+        let root = scratch("migrate-none");
+        migrate_legacy(&root, &root.join("old_store.db"), "demo", |_, _| {
+            panic!("nothing to import")
+        });
+        assert!(!root.exists());
     }
 }

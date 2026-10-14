@@ -53,7 +53,7 @@ pub enum ApplyClass {
 /// lists exactly these, in this order; `settings set` accepts exactly these
 /// keys and nothing else. Domains: `audio.*` (`AudioSettingsStore`),
 /// `playback.*` (daemon_prefs),
-/// `qconnect.*` (the daemon-root `qconnect_settings.db` KV, T9),
+/// `qconnect.*` (`qbz_app::settings::qconnect`, T9),
 /// `hooks.*` (daemon_prefs, CONSOLE ext).
 ///
 /// **A key belongs here only if the daemon READS it.** Six were dropped in 2.4
@@ -122,7 +122,7 @@ const KEY_TABLE: &[(&str, ApplyClass)] = &[
     // --- playback (daemon_prefs) --------------------------------------------
     ("playback.quality", ApplyClass::None),
     ("playback.mpris", ApplyClass::None),
-    // --- qconnect (daemon-root qconnect_settings.db KV, T9) ----------------
+    // --- qconnect (the [qconnect] section, T9) ------------------------------
     ("qconnect.device_name", ApplyClass::None),
     ("qconnect.startup_mode", ApplyClass::None),
     ("qconnect.volume_mode", ApplyClass::None),
@@ -163,10 +163,6 @@ fn unknown_key_error(key: &str) -> String {
         out.push_str(&format!("      {k}\n"));
     }
     out
-}
-
-fn qconnect_db(roots: &ProfileRoots) -> PathBuf {
-    roots.data.join("qconnect_settings.db")
 }
 
 // ============================ value parsing ============================
@@ -510,7 +506,7 @@ fn open_audio(roots: &ProfileRoots) -> Result<AudioSettingsStore, String> {
 fn read_all(roots: &ProfileRoots) -> Result<Vec<(&'static str, String)>, String> {
     let audio = open_audio(roots)?.get_settings()?;
     let prefs = daemon_prefs::load_at(&roots.data);
-    let db = qconnect_db(roots);
+    let root = roots.data.as_path();
 
     let mut out = Vec::with_capacity(KEY_TABLE.len());
     for (key, _) in KEY_TABLE {
@@ -584,21 +580,21 @@ fn read_all(roots: &ProfileRoots) -> Result<Vec<(&'static str, String)>, String>
             "audio.reserve_dac_while_running" => render_bool(audio.reserve_dac_while_running),
             "playback.quality" => prefs.streaming_quality.clone(),
             "playback.mpris" => render_bool(prefs.mpris_enabled),
-            "qconnect.device_name" => render_opt_string(&qconnect_kv::load_device_name_at(&db)),
-            "qconnect.startup_mode" => qconnect_kv::load_startup_mode_at(&db).as_str().to_string(),
+            "qconnect.device_name" => render_opt_string(&qconnect_kv::load_device_name_at(root)),
+            "qconnect.startup_mode" => qconnect_kv::load_startup_mode_at(root).as_str().to_string(),
             "qconnect.volume_mode" => {
-                qconnect_kv::load_volume_mode_at(&db).unwrap_or_else(|| "software".to_string())
+                qconnect_kv::load_volume_mode_at(root).unwrap_or_else(|| "software".to_string())
             }
-            "qconnect.initial_volume" => qconnect_kv::load_initial_volume_at(&db)
+            "qconnect.initial_volume" => qconnect_kv::load_initial_volume_at(root)
                 .map(|pct| pct.to_string())
                 .unwrap_or_else(|| "off".to_string()),
-            "qconnect.pairing" => if qconnect_kv::load_pairing_enabled_at(&db) {
+            "qconnect.pairing" => if qconnect_kv::load_pairing_enabled_at(root) {
                 "on"
             } else {
                 "off"
             }
             .to_string(),
-            "qconnect.pairing_port" => qconnect_kv::load_pairing_port_at(&db).to_string(),
+            "qconnect.pairing_port" => qconnect_kv::load_pairing_port_at(root).to_string(),
             "hooks.script" => prefs.hook_script.clone(),
             other => unreachable!("KEY_TABLE/read_all drifted apart on key: {other}"),
         };
@@ -824,21 +820,17 @@ pub(crate) fn write_one(
         }
         "playback.quality" => {
             let v = parse_streaming_quality(raw).map_err(SetError::Usage)?;
-            let mut prefs = daemon_prefs::load_at(&roots.data);
-            prefs.streaming_quality = v;
-            daemon_prefs::save_at(&prefs, &roots.data).map_err(SetError::Io)?;
+            daemon_prefs::update_at(&roots.data, |p| p.streaming_quality = v)
+                .map_err(SetError::Io)?;
         }
         "playback.mpris" => {
             let v = parse_bool(raw).map_err(SetError::Usage)?;
-            let mut prefs = daemon_prefs::load_at(&roots.data);
-            prefs.mpris_enabled = v;
-            daemon_prefs::save_at(&prefs, &roots.data).map_err(SetError::Io)?;
+            daemon_prefs::update_at(&roots.data, |p| p.mpris_enabled = v).map_err(SetError::Io)?;
         }
-        "qconnect.device_name" => qconnect_kv::persist_device_name_at(
-            &qconnect_db(roots),
-            parse_output_device(raw).as_deref(),
-        )
-        .map_err(SetError::Io)?,
+        "qconnect.device_name" => {
+            qconnect_kv::persist_device_name_at(&roots.data, parse_output_device(raw).as_deref())
+                .map_err(SetError::Io)?
+        }
         "qconnect.startup_mode" => {
             let mode = match raw.to_ascii_lowercase().as_str() {
                 "on" => qconnect_app::QconnectStartupMode::On,
@@ -849,19 +841,19 @@ pub(crate) fn write_one(
                     )))
                 }
             };
-            qconnect_kv::save_startup_mode_at(&qconnect_db(roots), mode).map_err(SetError::Io)?
+            qconnect_kv::save_startup_mode_at(&roots.data, mode).map_err(SetError::Io)?
         }
         "qconnect.volume_mode" => {
             let v = parse_volume_mode(raw).map_err(SetError::Usage)?;
-            qconnect_kv::save_volume_mode_at(&qconnect_db(roots), &v).map_err(SetError::Io)?
+            qconnect_kv::save_volume_mode_at(&roots.data, &v).map_err(SetError::Io)?
         }
         "qconnect.initial_volume" => {
             let v = parse_initial_volume(raw).map_err(SetError::Usage)?;
-            qconnect_kv::save_initial_volume_at(&qconnect_db(roots), v).map_err(SetError::Io)?
+            qconnect_kv::save_initial_volume_at(&roots.data, v).map_err(SetError::Io)?
         }
         "qconnect.pairing" => {
             let v = parse_bool(raw).map_err(SetError::Usage)?;
-            qconnect_kv::save_pairing_enabled_at(&qconnect_db(roots), v).map_err(SetError::Io)?
+            qconnect_kv::save_pairing_enabled_at(&roots.data, v).map_err(SetError::Io)?
         }
         "qconnect.pairing_port" => {
             let port = raw
@@ -872,13 +864,11 @@ pub(crate) fn write_one(
                 .ok_or_else(|| {
                     SetError::Usage(format!("invalid port '{raw}' — expected 1-65535"))
                 })?;
-            qconnect_kv::save_pairing_port_at(&qconnect_db(roots), port).map_err(SetError::Io)?
+            qconnect_kv::save_pairing_port_at(&roots.data, port).map_err(SetError::Io)?
         }
         "hooks.script" => {
             let v = parse_hook_script(raw).map_err(SetError::Usage)?;
-            let mut prefs = daemon_prefs::load_at(&roots.data);
-            prefs.hook_script = v;
-            daemon_prefs::save_at(&prefs, &roots.data).map_err(SetError::Io)?;
+            daemon_prefs::update_at(&roots.data, |p| p.hook_script = v).map_err(SetError::Io)?;
         }
         other => unreachable!("KEY_TABLE/write_one drifted apart on key: {other}"),
     }
@@ -989,14 +979,14 @@ pub fn set(roots: &ProfileRoots, key: &str, value: &str) -> i32 {
 /// `pibuz qconnect enable` (⬇). Writes `startup_mode = on`, nudges reload.
 /// Human line verbatim per 02 §2.2 (device name interpolated).
 pub fn qconnect_enable(roots: &ProfileRoots) -> i32 {
-    let db = qconnect_db(roots);
-    if let Err(e) = qconnect_kv::save_startup_mode_at(&db, qconnect_app::QconnectStartupMode::On) {
+    let root = roots.data.as_path();
+    if let Err(e) = qconnect_kv::save_startup_mode_at(root, qconnect_app::QconnectStartupMode::On) {
         eprintln!("error: {e}");
         return 1;
     }
     nudge(roots);
     let name = qconnect_kv::resolve_qconnect_friendly_name(
-        qconnect_kv::load_device_name_at(&db).as_deref(),
+        qconnect_kv::load_device_name_at(root).as_deref(),
     );
     println!("qconnect enabled — device \"{name}\" will appear in the Qobuz app once logged in");
     0
@@ -1005,8 +995,9 @@ pub fn qconnect_enable(roots: &ProfileRoots) -> i32 {
 /// `pibuz qconnect disable` (⬇). Writes `startup_mode = off`, nudges reload
 /// (disconnects the live session, per `daemon::reload_qconnect`).
 pub fn qconnect_disable(roots: &ProfileRoots) -> i32 {
-    let db = qconnect_db(roots);
-    if let Err(e) = qconnect_kv::save_startup_mode_at(&db, qconnect_app::QconnectStartupMode::Off) {
+    let root = roots.data.as_path();
+    if let Err(e) = qconnect_kv::save_startup_mode_at(root, qconnect_app::QconnectStartupMode::Off)
+    {
         eprintln!("error: {e}");
         return 1;
     }
@@ -1020,8 +1011,9 @@ pub fn qconnect_disable(roots: &ProfileRoots) -> i32 {
 /// §3.4). Applies on the NEXT connection, never forces a reconnect
 /// (`daemon::reload_qconnect` / `QconnectControl::refresh_device_name`).
 pub fn qconnect_name(roots: &ProfileRoots, name: &str) -> i32 {
-    let db = qconnect_db(roots);
-    if let Err(e) = qconnect_kv::persist_device_name_at(&db, parse_output_device(name).as_deref()) {
+    let root = roots.data.as_path();
+    if let Err(e) = qconnect_kv::persist_device_name_at(root, parse_output_device(name).as_deref())
+    {
         eprintln!("error: {e}");
         return 1;
     }

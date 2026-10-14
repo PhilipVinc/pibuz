@@ -1,7 +1,7 @@
 // crates/pibuz/src/tui/screens/audio.rs — the Audio screen (03-setup-tui.md §3.2).
 //
-// The J1-critical screen. Writes audio_settings.db in the daemon data root via
-// AudioSettingsStore::new_at (reused through the App's write_one path — no new
+// The J1-critical screen. Writes the [audio] section of the data root's
+// settings.toml via AudioSettingsStore::new_at (reused through the App's write_one path — no new
 // persistence). The three load-bearing PURE pieces (unit-tested at the bottom):
 //   1. the constraint matrix (§3.2.3 shown/enabled) — `row_state`;
 //   2. the cross-setting cascades (§3.2.3 items 1-7) — `cascade_*`;

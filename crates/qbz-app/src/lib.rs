@@ -1,5 +1,4 @@
 pub mod playback_driver;
-pub mod qconnect_identity;
 pub mod settings;
 pub mod shell;
 

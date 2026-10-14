@@ -26,8 +26,8 @@ ebur128 = "0.1"
 # Database for loudness cache
 rusqlite = { version = "0.31", features = ["bundled"] }
 
-# System directories
-dirs = "6"
+# settings.toml: the [audio] section (qbz_models::settings_file)
+toml = "0.9"
 
 # Lock-free SPSC ring buffer (f32-native) for the JACK feeder -> RT callback
 # handoff (#263 Tier 3). f32 elements avoid any byte/alignment handling.
@@ -81,3 +81,8 @@ workspace = true
 # a box without libjack that is a panic, not the `Err` the player's dispatch is
 # written to handle. Compiling the backend out removes the panic path entirely.
 jack = ["dep:jack"]
+
+# Read an `audio_settings.db` from before settings.toml, once, into it. On by
+# default through pibuz; drop it, and this crate stops depending on SQLite for
+# settings, once no install is left that has one.
+sqlite-migrate = []

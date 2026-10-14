@@ -389,13 +389,13 @@ impl App {
                 ))
             }
             Screen::QConnect => {
-                let db = self.roots.data.join("qconnect_settings.db");
+                let root = self.roots.data.as_path();
                 let on = matches!(
-                    qconnect_kv::load_startup_mode_at(&db),
+                    qconnect_kv::load_startup_mode_at(root),
                     qconnect_app::QconnectStartupMode::On
                 );
-                let name = qconnect_kv::load_device_name_at(&db);
-                let vol = qconnect_kv::load_volume_mode_at(&db);
+                let name = qconnect_kv::load_device_name_at(root);
+                let vol = qconnect_kv::load_volume_mode_at(root);
                 Active::QConnect(QConnectState::new(on, name, vol))
             }
             Screen::Network => {
