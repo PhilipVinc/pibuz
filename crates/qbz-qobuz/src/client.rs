@@ -86,7 +86,7 @@ pub struct QobuzClient {
     cmaf_seed_probe_done: Arc<RwLock<bool>>,
     locale: Arc<RwLock<String>>,
     cmaf_session: Arc<RwLock<Option<CmafSession>>>,
-    /// Backs off the hot streaming/favorites paths after repeated 403s so a
+    /// Backs off the hot streaming paths after repeated 403s so a
     /// post-outage account hiccup can't be escalated into a per-IP edge block
     /// by the no-backoff prefetch scheduler (issue #637).
     forbidden_breaker: Arc<ForbiddenBreaker>,
@@ -140,12 +140,12 @@ impl QobuzClient {
     /// Short-circuit an authenticated request when the 403 breaker is open.
     /// Returns `Err(ForbiddenCircuitOpen)` — no network is touched — so a
     /// post-outage 403 storm cannot get the user's IP edge-blocked. Callers put
-    /// this at the top of the hot streaming/favorites paths.
+    /// this at the top of the hot streaming paths.
     fn forbidden_guard(&self) -> Result<()> {
         // Test hook: `QBZ_FORCE_403=1` forces the breaker open so the whole 403
-        // back-off path (no-network short-circuit + abort-fallback + the audible
-        // "backing off" toast) can be smoke-tested on a HEALTHY account, which
-        // otherwise can't reproduce the incident. Off by default; issue #637.
+        // back-off path (no-network short-circuit + abort-fallback) can be
+        // smoke-tested on a HEALTHY account, which otherwise can't reproduce
+        // the incident. Off by default; issue #637.
         if std::env::var_os("QBZ_FORCE_403").is_some() {
             return Err(ApiError::ForbiddenCircuitOpen(30));
         }
@@ -174,7 +174,7 @@ impl QobuzClient {
 
     /// Initialize client by extracting bundle tokens.
     ///
-    /// Warm start: if cached tokens exist, use them immediately so the UI never
+    /// Warm start: if cached tokens exist, use them immediately so startup never
     /// blocks on Qobuz's (sometimes very slow) ~7 MB bundle download, then
     /// refresh in the background — re-downloading only if Qobuz rotated the
     /// bundle version. Cold start (first run or after a cache wipe): fetch now,
@@ -182,18 +182,13 @@ impl QobuzClient {
     /// hang forever.
     ///
     /// Returns `true` if it served cached tokens (warm), `false` if it had to do
-    /// a live extraction (cold) — callers can use this to drive a "connecting"
-    /// UI only when it actually matters.
+    /// a live extraction (cold).
     pub async fn init(&self) -> Result<bool> {
         if let Some(cached) = bundle::load_cached_bundle() {
             let version = cached.bundle_version.clone();
             log::info!("[Bundle] Using cached tokens (version {})", version);
             *self.tokens.write().await = Some(cached.into());
 
-            // Cache reads are never gated, but the background refresh is a
-            // network request — gate it once before cloning the client into
-            // the spawned task, skipping the refresh instead of failing the
-            // warm start.
             match self.http() {
                 Ok(client) => {
                     let client = client.clone();
@@ -215,9 +210,7 @@ impl QobuzClient {
         }
 
         log::info!("[Bundle] No cached tokens, extracting from Qobuz...");
-        // Cold start: a live bundle fetch is a network request — gated on
-        // purpose so an offline cold start fails fast instead of waiting out
-        // the network timeouts.
+        // Cold start: nothing cached, so the bundle has to be fetched now.
         let tokens = bundle::extract_and_cache_bundle_tokens(self.http()?).await?;
         *self.tokens.write().await = Some(tokens);
         Ok(false)
@@ -228,7 +221,7 @@ impl QobuzClient {
         self.locale.read().await.clone()
     }
 
-    /// Get app ID (public for catalog search)
+    /// Get app ID
     pub async fn app_id(&self) -> Result<String> {
         self.tokens
             .read()
@@ -238,15 +231,12 @@ impl QobuzClient {
             .ok_or_else(|| ApiError::BundleExtractionError("Client not initialized".to_string()))
     }
 
-    /// Get HTTP client reference (public for catalog search)
+    /// Get HTTP client reference
     pub fn get_http(&self) -> &Client {
         &self.http
     }
 
-    /// The single offline choke point (D3): every Qobuz SERVICE request flows
-    /// through here. While offline mode is active, fail fast with a typed,
-    /// non-transient error instead of timing out against the network.
-    ///
+    /// The client every Qobuz SERVICE request takes. Never fails.
     pub(crate) fn http(&self) -> Result<&Client> {
         Ok(&self.http)
     }
@@ -408,8 +398,6 @@ impl QobuzClient {
     /// Login with email and password
     pub async fn login(&self, email: &str, password: &str) -> Result<UserSession> {
         let url = endpoints::build_url(paths::USER_LOGIN);
-        // Auth exemption: raw client, bypasses the offline gate (sign-in is
-        // explicit user intent to reach Qobuz; the gate governs services).
         let response = self
             .http
             .get(&url)
@@ -441,7 +429,7 @@ impl QobuzClient {
         self.session.read().await.is_some()
     }
 
-    /// Get user auth token header value (public for catalog search)
+    /// Get user auth token header value
     pub async fn auth_token(&self) -> Result<String> {
         self.session
             .read()
@@ -636,10 +624,8 @@ impl QobuzClient {
         Ok(serde_json::from_value(response)?)
     }
 
-    /// Like [`get_dynamic_suggest`] but carrying the `track_to_analysed`
-    /// payload — the PRIMARY DailyQ/WeeklyQ path. Tauri seeds this with up to 9
-    /// resolved `{track_id, artist_id, genre_id, label_id}` tuples and only
-    /// falls back to an empty analysis when a call returns zero items.
+    /// `/dynamic/suggest` carrying the `track_to_analysed` payload — the
+    /// PRIMARY DailyQ/WeeklyQ path.
     pub async fn get_dynamic_suggest_full(
         &self,
         listened_track_ids: &[u64],
@@ -700,8 +686,6 @@ impl QobuzClient {
         let response: Value = http_response.json().await?;
         Ok(serde_json::from_value(response)?)
     }
-
-    // === Lyrics (v9.9.0.0-beta delta) ===
 
     /// Fetch full Track objects for a batch of track IDs.
     /// Uses the `track/getList` endpoint, which caps at 50 IDs per call,
@@ -839,9 +823,6 @@ impl QobuzClient {
                 let headers = self.api_headers().await?;
                 let secret = self.secret().await.unwrap_or_default();
 
-                // Offline gate checked ONCE for the whole page batch (the
-                // first page above already passed through it) — not inside
-                // the per-page loop.
                 let gated_http = self.http()?;
 
                 // Launch all page requests concurrently
@@ -1104,8 +1085,6 @@ impl QobuzClient {
         Err(ApiError::NoQualityAvailable)
     }
 
-    // ============ Artist Page Endpoints ============
-
     // === CMAF streaming endpoints ===
 
     /// Ensure we have a valid CMAF session, renewing if expired.
@@ -1118,8 +1097,7 @@ impl QobuzClient {
     /// the first in the cache. Any `get_file_url` response whose wrapped
     /// key was tied to the first session then unwrapped with the second
     /// session's key and blew up with AES-CBC "Unpad Error" — which
-    /// manifested as prefetch CMAF failures + downloaded-but-gappy
-    /// transitions between offline tracks.
+    /// manifested as prefetch CMAF failures.
     ///
     /// Fix: a double-checked lock pattern on the write guard. Fast path
     /// uses a read guard; slow path acquires the write guard, re-checks

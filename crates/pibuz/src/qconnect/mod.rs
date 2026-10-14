@@ -1,19 +1,17 @@
 //! Daemon QConnect service facade + boot-step-12 entry point.
 //!
-//! Composes the copied glue (engine / sink / session / report / transport /
-//! remote_stream) into a headless connect flow that reproduces the desktop
-//! `SlintQconnectService::connect` recipe (build transport -> one shared
+//! Composes the glue (engine / sink / session / report / transport /
+//! remote_stream) into a headless connect flow (build transport -> one shared
 //! sync-state Mutex -> sink -> `QconnectApp::new` -> `set_app` -> `connect` ->
 //! subscribe transport events BEFORE the spawn -> spawn `run_session_loop` ->
-//! `bootstrap_remote_presence`), minus every UI surface. Lifecycle transitions
+//! `bootstrap_remote_presence`). Lifecycle transitions
 //! latch into `DaemonShared.qconnect` so `/api/status` stays diagnosable.
 //!
-//! `start()` mints the daemon's OWN device identity in the daemon-root KV, reads
-//! the effective startup mode (cli_override = None — never shadow the settings
-//! that T11 writes), and, when auto-connect is on, spawns a connect-on-Ready task
-//! with the bounded [2s, 5s, 15s, 30s] retry schedule. QConnect reads NOTHING
-//! from pibuz.toml — only the `[qconnect]` section of the data root's
-//! settings.toml.
+//! `start()` mints the daemon's OWN device identity in the data root's
+//! settings.toml, reads the persisted startup mode, and, when auto-connect is
+//! on, spawns a connect-on-Ready task with the bounded [2s, 5s, 15s, 30s]
+//! retry schedule. QConnect reads NOTHING from pibuz.toml — only the
+//! `[qconnect]` section of the data root's settings.toml.
 
 pub mod engine;
 pub mod pairing;
@@ -54,7 +52,7 @@ type SharedState = Arc<std::sync::Mutex<DaemonShared>>;
 pub(crate) struct DaemonQconnectRuntime {
     pub app: Arc<DaemonQconnectApp>,
     /// Re-latched by `bootstrap_after_reconnect` on a credential re-resolve;
-    /// consumed by the full-reconnect path (T10) + status/endpoint reporting.
+    /// consumed by the full-reconnect path + status/endpoint reporting.
     pub config: WsTransportConfig,
     pub event_loop: JoinHandle<()>,
     pub sync_state: Arc<Mutex<QconnectRemoteSyncState>>,
@@ -62,18 +60,17 @@ pub(crate) struct DaemonQconnectRuntime {
     pub volume_mode: engine::VolumeMode,
 }
 
-/// Connect-flow state, mirrored on the desktop `SlintQconnectInner`. `pub(crate)`
-/// fields so `session::DaemonSessionLoopHost` can gate lifecycle + re-latch the
-/// config + drop the runtime on reconnect-exhausted.
+/// Connect-flow state. `pub(crate)` fields so `session::DaemonSessionLoopHost`
+/// can gate lifecycle + re-latch the config + drop the runtime on
+/// reconnect-exhausted.
 #[derive(Default)]
 pub(crate) struct DaemonQconnectInner {
     pub runtime: Option<DaemonQconnectRuntime>,
-    /// Latched connect/loop error; surfaced by `pibuz status` QConnect block (T11).
+    /// Latched connect/loop error; surfaced by `pibuz status` QConnect block.
     pub last_error: Option<String>,
     pub lifecycle_state: QconnectLifecycleState,
     /// Last local queue ids this session pushed to the cloud (the publish.rs
-    /// echo latch). Cleared on every connect (parity with the desktop
-    /// `qconnect_service.rs` connect reset).
+    /// echo latch). Cleared on every connect.
     pub last_pushed_queue_ids: Option<Vec<u64>>,
 }
 
@@ -98,7 +95,7 @@ fn latch_lifecycle_into_shared(shared: &SharedState, state: QconnectLifecycleSta
         if matches!(state, QconnectLifecycleState::Reconnecting) {
             s.qconnect.last_transport_reconnect = Some(unix_seconds_string());
         }
-        // 01 §9.3: a live QConnect session (fresh connect OR post-reconnect
+        // A live QConnect session (fresh connect OR post-reconnect
         // recovery) is a real network-reachable outcome — latch it true. The
         // reconnect-EXHAUSTED failure side latches false in
         // `session::DaemonSessionLoopHost::on_reconnect_exhausted` (it does
@@ -120,8 +117,7 @@ fn unix_seconds_string() -> String {
 }
 
 /// Dedup + gate a lifecycle transition: only emit while a runtime is alive and
-/// the state actually changes. Mirrors the desktop
-/// `update_lifecycle_state_if_running`, plus the `DaemonShared` latch.
+/// the state actually changes; also latches it into `DaemonShared`.
 pub(crate) async fn update_lifecycle_state_if_running(
     inner: &Arc<Mutex<DaemonQconnectInner>>,
     sink: &DaemonEventSink,
@@ -156,7 +152,7 @@ pub struct DaemonQconnectService {
     /// takeover's `disconnect()` against an in-flight `connect()` (e.g. the
     /// auto-connect watcher mid-handshake) lets the slower connect install its
     /// runtime LAST — leaking the newer session's event loop + WS connection
-    /// and stranding the handed-over token on the account session.
+    /// and stranding the handed-over token.
     ops: Mutex<()>,
     /// The latest pairing-takeover task (pairing.rs POST handler). Tracked so
     /// a newer handoff aborts the previous takeover and `shutdown()` can abort
@@ -167,7 +163,8 @@ pub struct DaemonQconnectService {
     /// (is_active=true). Armed by a handoff takeover — the handoff IS the
     /// user's output selection and no SET_ACTIVE_RENDERER follows it (official
     /// receivers join active after a handoff; qobuz-proxy parity). Never armed
-    /// on the account path, which keeps the desktop anti-steal join.
+    /// otherwise: an ordinary join stays available and does not steal the
+    /// render.
     handoff_join_pending: Arc<std::sync::atomic::AtomicBool>,
     /// Which track is still filling its buffer — written by the renderer
     /// engine, read by the report scheduler so the controller is told
@@ -234,9 +231,9 @@ impl DaemonQconnectService {
 
         let transport = Arc::new(NativeWsTransport::new());
         let sync_state = Arc::new(Mutex::new(QconnectRemoteSyncState::default()));
-        // T10 (OD4, §7.4): resolve the volume policy from the daemon-root KV at
-        // connect, so a later `pibuz settings reload` (T11) is picked up on the
-        // next connect. Unset/unknown -> Software (the OD4 default).
+        // Resolve the volume policy from settings.toml at connect, so a later
+        // `settings set` is picked up on the next connect. Unset/unknown ->
+        // Software.
         let volume_mode = volume_mode_at(&self.data_root);
         let engine = DaemonRendererEngine::new(
             Arc::clone(&self.runtime),
@@ -269,7 +266,7 @@ impl DaemonQconnectService {
             return Err(msg);
         }
 
-        // T10 (OD4, §7.4): if locked volume mode, pin the player to 100% (1.0)
+        // If locked volume mode, pin the player to 100% (1.0)
         // at connect time. Corrects Rodio backends (PipeWire/Pulse), where the
         // Player default is 0.75 rather than 1.0.
         //
@@ -311,7 +308,7 @@ impl DaemonQconnectService {
             sink: Arc::clone(&sink),
             runtime: Arc::clone(&self.runtime),
             shared: Arc::clone(&self.shared),
-            volume_mode, // T10 (OD4): join-time volume report honors the mode
+            volume_mode, // join-time volume report honors the mode
             // Resolved at connect like the mode above, so a `settings set` is
             // picked up on the next connect.
             initial_volume: transport::load_initial_volume_at(&self.data_root),
@@ -358,7 +355,7 @@ impl DaemonQconnectService {
 
     /// Tear the QConnect session down. Always forces Off. Aborts AND joins the
     /// event loop so its `Arc<AppRuntime>` clone drops before the daemon's
-    /// shutdown releases the audio device (§8.2 / #521 ordering).
+    /// shutdown releases the audio device (#521 ordering).
     pub async fn disconnect(&self) -> Result<(), String> {
         let _ops = self.ops.lock().await;
         self.disconnect_locked().await
@@ -396,12 +393,12 @@ impl DaemonQconnectService {
         Ok(())
     }
 
-    /// T11 (`POST /api/settings/reload`): re-cache the device-name override from
-    /// the daemon-root KV so the NEXT `connect()` (whenever that happens) uses
+    /// `POST /api/settings/reload`: re-cache the device-name override from
+    /// settings.toml so the NEXT `connect()` (whenever that happens) uses
     /// whatever `pibuz qconnect name` / `settings set qconnect.device_name` most
-    /// recently wrote — 03-setup-tui.md §3.4's "applies on the next connection"
-    /// rule. Does NOT force a reconnect by itself (a rename alone must not
-    /// bounce an active session).
+    /// recently wrote — a rename applies on the next connection. Does NOT force
+    /// a reconnect by itself (a rename alone must not bounce an active
+    /// session).
     async fn refresh_device_name(&self, root: &std::path::Path) {
         let name = transport::load_device_name_at(root);
         *self.custom_device_name.write().await = name;
@@ -426,11 +423,9 @@ impl DaemonQconnectService {
     /// interleave between our disconnect and connect.
     pub(crate) async fn reconnect_for_pairing(&self) -> Result<(), String> {
         let _ops = self.ops.lock().await;
-        // Login-free path: the API client may still be missing after an
-        // offline-tolerant boot (no-op when initialized), and the handed-over
-        // jwt_api is the client's credential when no account is logged in
-        // (stream URLs via `Authorization: Bearer` — the user session, when
-        // present, still outranks it inside the client).
+        // The API client may still be missing after an offline-tolerant boot
+        // (no-op when initialized), and the handed-over jwt_api is the
+        // client's credential (stream URLs via `Authorization: Bearer`).
         let _ = self.runtime.core().try_init_api().await;
         if let Some(tokens) = pairing::valid_ws_tokens(&self.pairing_store) {
             if let Some(client) = self.runtime.core().client().read().await.clone() {
@@ -532,7 +527,7 @@ impl DaemonQconnectService {
 }
 
 /// Owner handle held by the daemon boot for the process lifetime. Drives runtime
-/// enable/disable (T11) and the ordered shutdown (§8.2-1).
+/// enable/disable and the ordered shutdown.
 pub struct QconnectHandle {
     service: Arc<DaemonQconnectService>,
     watcher: Option<JoinHandle<()>>,
@@ -540,7 +535,7 @@ pub struct QconnectHandle {
     /// so no handoff can land while the session is being torn down, and joined
     /// so its `Arc<DaemonQconnectService>` clone drops before `drop(booted)`.
     pairing: Option<pairing::PairingHandle>,
-    /// T10: the report-tick scheduler task. Held so shutdown can abort+join it
+    /// The report-tick scheduler task. Held so shutdown can abort+join it
     /// (it clones `Arc<AppRuntime>`, so it must drop before `drop(booted)` per the
     /// #521 clock-release ordering, exactly like the watcher).
     report_task: Option<JoinHandle<()>>,
@@ -553,7 +548,7 @@ pub struct QconnectHandle {
     refresh_task: Option<JoinHandle<()>>,
 }
 
-/// T11: a `Clone`-able, `Send + Sync` handle onto the running
+/// A `Clone`-able, `Send + Sync` handle onto the running
 /// [`DaemonQconnectService`] — what the reload route reaches through
 /// `ApiState.qconnect_control` (`Arc<std::sync::OnceLock<QconnectControl>>`,
 /// populated by `QconnectHandle::control()` right after `start()` returns).
@@ -570,11 +565,11 @@ impl QconnectControl {
 
     pub async fn disconnect(&self) -> Result<(), String> {
         // Operator intent (`pibuz qconnect disable`): drop any handed-over
-        // pairing credentials, so a later enable reconnects with the daemon
-        // account instead of silently re-joining the last LAN caster's
-        // session. Abort any in-flight takeover FIRST and do the clearing
-        // under the ops lock — otherwise a takeover that already read the
-        // tokens re-installs the caster's Bearer right after we cleared it.
+        // pairing credentials, so a later enable does not silently re-join
+        // the last LAN caster's session. Abort any in-flight takeover FIRST
+        // and do the clearing under the ops lock — otherwise a takeover that
+        // already read the tokens re-installs the caster's Bearer right after
+        // we cleared it.
         // The internal disconnect() must NOT clear anything —
         // reconnect_for_pairing depends on the token surviving its own
         // disconnect step.
@@ -592,7 +587,7 @@ impl QconnectControl {
         self.0.disconnect_locked().await
     }
 
-    /// Re-cache the device-name override from the daemon-root KV (§ see
+    /// Re-cache the device-name override from settings.toml (see
     /// [`DaemonQconnectService::refresh_device_name`] — applies on the NEXT
     /// connect, never forces a reconnect for a rename alone).
     pub async fn refresh_device_name(&self, root: &std::path::Path) {
@@ -604,17 +599,17 @@ impl QconnectHandle {
     /// A cheap, `Clone`-able handle onto the running service — what
     /// `daemon.rs`'s `POST /api/settings/reload` route holds (via an
     /// `Arc<OnceLock<QconnectControl>>` populated right after `start()`
-    /// returns, since QConnect boots AFTER the HTTP server per the normative
-    /// order, 01-architecture.md §8.1 steps 11/12). Carries none of the
-    /// `JoinHandle`s `QconnectHandle` owns — those stay daemon-shutdown-only.
+    /// returns, since QConnect boots AFTER the HTTP server: boot steps 11/12).
+    /// Carries none of the `JoinHandle`s `QconnectHandle` owns — those stay
+    /// daemon-shutdown-only.
     pub fn control(&self) -> QconnectControl {
         QconnectControl(Arc::clone(&self.service))
     }
 
-    /// §8.2-1: stop the auto-connect watcher and disconnect the session BEFORE
-    /// the daemon stops playback. Aborts + joins the watcher and the event loop so
-    /// every `Arc<AppRuntime>` clone this handle owns drops ahead of
-    /// `drop(booted)` (the #521 clock-release ordering).
+    /// Shutdown step 1: stop the auto-connect watcher and disconnect the
+    /// session BEFORE the daemon stops playback. Aborts + joins the watcher and
+    /// the event loop so every `Arc<AppRuntime>` clone this handle owns drops
+    /// ahead of `drop(booted)` (the #521 clock-release ordering).
     pub async fn shutdown(&mut self) {
         // Stop the pairing surface FIRST (no new handoffs), then kill any
         // in-flight takeover, so nothing can resurrect a session after the
@@ -629,7 +624,7 @@ impl QconnectHandle {
             watcher.abort();
             let _ = watcher.await;
         }
-        // T10: stop the report scheduler too, so its `Arc<AppRuntime>` clone drops
+        // Stop the report scheduler too, so its `Arc<AppRuntime>` clone drops
         // ahead of `drop(booted)`.
         if let Some(report_task) = self.report_task.take() {
             report_task.abort();
@@ -655,8 +650,8 @@ impl QconnectHandle {
 }
 
 /// Boot step 12: wire QConnect. Mints the daemon's OWN device identity in the
-/// daemon-root KV, decides auto-connect from the persisted startup mode
-/// (`QconnectStartupMode::auto_connects`), latches the initial status,
+/// data root's settings.toml, decides auto-connect from the persisted startup
+/// mode (`QconnectStartupMode::auto_connects`), latches the initial status,
 /// and, when enabled, spawns the connect-on-Ready retry task.
 pub fn start(
     runtime: Runtime,
@@ -666,11 +661,11 @@ pub fn start(
     core_events: broadcast::Receiver<CoreEvent>,
 ) -> QconnectHandle {
     // Point device identity, the Connect settings and the quality cap (the cast
-    // path reads `playback.quality`, upstream#693) at the daemon root.
+    // path reads `playback.quality`) at the daemon root.
     let settings_root = roots.data.clone();
     transport::init_data_root(settings_root.clone());
 
-    // Effective startup decision (Ready-state only), from the KV store that
+    // Effective startup decision (Ready-state only), from the setting that
     // `pibuz qconnect enable|disable` writes. `remember_last`
     // resolves to off.
     let mode = transport::load_startup_mode_at(&settings_root);
@@ -714,9 +709,10 @@ pub fn start(
         report_notify: Arc::clone(&report_notify),
     });
 
-    // Local pairing surface (KV `pairing` = on|off, default on; port from KV
-    // `pairing_port`). Fail-open on error: the account-bound cloud path above
-    // is independent of it, so a bind conflict must not take the daemon down.
+    // Local pairing surface (`qconnect.pairing` = on|off, default on; port
+    // from `qconnect.pairing_port`). Fail-open on error: the account-bound
+    // cloud path above is independent of it, so a bind conflict must not
+    // take the daemon down.
     let (pairing, refresh_task, pairing_port) =
         if transport::load_pairing_enabled_at(&settings_root) {
             let port = transport::load_pairing_port_at(&settings_root);
@@ -744,8 +740,8 @@ pub fn start(
         };
     // Reflect the pairing surface in `/api/status` (static for the process
     // lifetime — the listener is boot-time-only). `pairing_port` is the port
-    // the listener actually BOUND, never a re-read of the KV (a settings set
-    // racing the boot window must not make status report a port nothing
+    // the listener actually BOUND, never a re-read of the setting (a settings
+    // set racing the boot window must not make status report a port nothing
     // listens on).
     if let Ok(mut s) = service.shared.lock() {
         s.qconnect.pairing = pairing.is_some();
@@ -767,7 +763,7 @@ pub fn start(
         None
     };
 
-    // T10 (§7.2): spawn the report-tick scheduler. It runs for the daemon
+    // Spawn the report-tick scheduler. It runs for the daemon
     // lifetime, waking on the driver's ReportEdge signal (via `report_notify`)
     // and its own ~2 s floor, and reports on the LIVE session (a no-op until a
     // connect installs a runtime).

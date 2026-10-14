@@ -742,7 +742,7 @@ fn build_cdn_client() -> std::result::Result<&'static reqwest::Client, String> {
 /// Fetch a CDN URL into bytes, retrying transient failures (network blips,
 /// 5xx, 429) with exponential backoff. A terminal status (404/403) fails
 /// immediately. Without this a single transient segment failure aborted the
-/// whole track download and the frontend skipped it — issue #467.
+/// whole track download and the track was skipped — issue #467.
 async fn fetch_bytes_with_retry(
     http: &reqwest::Client,
     url: &str,

@@ -372,9 +372,8 @@ fn decode_renderer_server_command(
             // takeover sends message 43 TWICE — first with no value (a pending
             // notification), then with `true` — so reading the absent one as
             // `false` turns the announcement of an incoming activation into a
-            // deactivation. Upstream gets away with `unwrap_or(false)` because
-            // it ignores SetActive(false) entirely; this fork STOPS on it
-            // (`renderer.rs`), so the same mistake stops playback.
+            // deactivation. The renderer STOPS on SetActive(false) (in
+            // qconnect-app's `renderer.rs`), so the mistake stops playback.
             if payload.active.is_none() {
                 log::debug!("[QConnect] SetActive with no value (pending) — ignored");
                 return Ok(None);
@@ -1188,8 +1187,8 @@ mod tests {
 
     /// `active` is an optional bool and absent is NOT false. A takeover sends
     /// message 43 twice — pending (no value), then `true` — and reading the
-    /// pending one as a deactivation stops playback in a fork that acts on
-    /// SetActive(false), which this one does.
+    /// pending one as a deactivation stops playback, because the renderer acts
+    /// on SetActive(false).
     #[test]
     fn set_active_without_a_value_is_not_a_deactivation() {
         let message = QConnectMessage {

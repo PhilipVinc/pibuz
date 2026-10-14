@@ -8,11 +8,9 @@
 //! `QconnectApp::apply_session_management_event`; only the post-lock work the
 //! returned `SessionApplyOutcome` asks for runs here.
 //!
-//! Daemon adaptation vs. the Slint copy (§1.4): the FOUR renderer-critical arms
-//! (QueueUpdated / RendererCommandApplied / SessionManagementEvent /
-//! RendererUpdated) are wired so the daemon functions AS a renderer; every UI arm
-//! (device picker, now-playing card, DEV modal, toasts) is dropped, and the three
-//! desktop `toast::error_weak` surfaces become `log::warn!`.
+//! The FOUR renderer-critical arms (QueueUpdated / RendererCommandApplied /
+//! SessionManagementEvent / RendererUpdated) are what make the daemon a
+//! renderer; the remaining events are only logged.
 
 use std::sync::{Arc, OnceLock, Weak};
 
@@ -205,13 +203,7 @@ impl DaemonEventSink {
         self.report_volume("join-time volume, re-asserted").await;
     }
 
-    /// Apply a server session-management event by delegating the locked critical
-    /// section to qconnect-app, then running the post-lock renderer-engine work
-    /// the returned `SessionApplyOutcome` asks for. Mirrors the Tauri
-    /// `apply_session_management_event`; the post-lock ordering (loop mode ->
-    /// local-playback handoff -> projection -> freeze -> watchdog) is identical.
-    /// latch whether the session still renders HERE, for
-    /// `/api/status`.
+    /// Latch whether the session still renders HERE, for `/api/status`.
     ///
     /// `session_active` only says we hold a cloud connection, which stays true
     /// when the controller moves playback to its own speakers — so moOde kept
@@ -245,6 +237,10 @@ impl DaemonEventSink {
         }
     }
 
+    /// Apply a server session-management event by delegating the locked critical
+    /// section to qconnect-app, then running the post-lock renderer-engine work
+    /// the returned `SessionApplyOutcome` asks for, in this order: loop mode ->
+    /// local-playback handoff -> projection -> freeze -> watchdog.
     async fn apply_session_management_event(&self, message_type: &str, payload: &Value) {
         let Some(app) = self.app.get().and_then(Weak::upgrade) else {
             return;
@@ -307,8 +303,7 @@ impl DaemonEventSink {
     }
 
     /// When an active PEER renderer now owns playback, stop our local playback so
-    /// the two don't double-play. Mirrors the Tauri helper, with the engine seam
-    /// in place of `CoreBridge`.
+    /// the two don't double-play.
     async fn sync_local_playback_for_renderer_ownership(&self) {
         let peer_renderer_active = {
             let state = self.sync_state.lock().await;
@@ -334,7 +329,7 @@ impl DaemonEventSink {
 
     /// Refresh the cached projection for the active renderer and, when a peer owns
     /// playback, align the local queue cursor to the peer's current track (so a
-    /// later takeover lands on the right track). Mirrors the Tauri helper.
+    /// later takeover lands on the right track).
     async fn sync_active_renderer_projection(&self, renderer_id: i32) {
         let (queue_state, renderer_state, session_loop_mode, should_align_engine) = {
             let state = self.sync_state.lock().await;
@@ -485,11 +480,9 @@ impl QconnectEventSink for DaemonEventSink {
                 }
             }
             QconnectAppEvent::RendererUnreachable { renderer_id } => {
-                // Slint copy surfaced a toast here — daemon logs it (§1.4).
                 log::warn!("[QConnect] Renderer {renderer_id} unreachable");
             }
             QconnectAppEvent::RendererDisconnected { renderer_id } => {
-                // Slint copy surfaced a toast here — daemon logs it (§1.4).
                 log::warn!("[QConnect] Renderer {renderer_id} disconnected");
             }
             QconnectAppEvent::PlaybackError {
@@ -497,7 +490,6 @@ impl QconnectEventSink for DaemonEventSink {
                 error_type,
                 ..
             } => {
-                // Slint copy surfaced a toast here — daemon logs it (§1.4).
                 log::warn!(
                     "[QConnect] Playback error on queue_item {queue_item_id}: {error_type:?}"
                 );

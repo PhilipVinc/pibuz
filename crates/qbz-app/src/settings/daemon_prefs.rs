@@ -1,6 +1,6 @@
 // crates/qbz-app/src/settings/daemon_prefs.rs
-//! The daemon's player prefs (01-architecture.md §10.3). Lives in qbz-app so
-//! pibuz AND settings::bundle share one struct (D2).
+//! The daemon's player prefs. Lives in qbz-app so pibuz AND settings::bundle
+//! share one struct.
 //!
 //! Stored as two sections of `settings.toml`, named after the CLI keys that
 //! set them: `[playback]` holds `quality`, `[hooks]` holds
@@ -16,7 +16,7 @@ pub struct DaemonPrefs {
     /// "mp3" | "cd" | "hires" | "hires_plus".
     pub streaming_quality: String,
     /// Absolute path of an executable the daemon runs on playback/session
-    /// events (CONSOLE ext), with the event in `QBZ_*` environment variables.
+    /// events, with the event in `QBZ_*` environment variables.
     /// Empty = hooks off (the default). The `QBZD_HOOK` env var overrides it
     /// when set. Changing it needs a daemon restart (the dispatcher spawns at
     /// boot). Machine-local by design — NEVER part of the settings bundle.

@@ -1,26 +1,22 @@
-// crates/pibuz/src/cli/settings.rs — `pibuz settings show|set`,
-// `pibuz qconnect enable|disable|name`, `pibuz config path|show`
-// (02-cli-and-api.md §2.2). ALL ⬇ daemon-down capable (§2.4): every verb here
-// reads/writes the daemon's REAL stores directly at the daemon roots
-// (`AudioSettingsStore::new_at`, `daemon_prefs`, the qconnect KV `_at` helpers
-// — T9) and best-effort nudges a running daemon via `POST /api/settings/reload` afterwards
-// (`login::nudge_reload` — the same ping-then-reload pattern `login`/`logout`
-// already use), never the other way around (§1.1: the CLI holds no daemon
-// state of its own). Export/import land in T12.
+// crates/pibuz/src/cli/settings.rs — `pibuz settings show|set|export|import`,
+// `pibuz qconnect enable|disable|name`, `pibuz config path|show`. Every verb
+// here works with the daemon down: it reads/writes the daemon's REAL stores
+// directly at the daemon roots (`AudioSettingsStore::new_at`, `daemon_prefs`,
+// the qconnect `_at` helpers) and best-effort nudges a running daemon via
+// `POST /api/settings/reload` afterwards (`crate::daemon_nudge`), never the
+// other way around (the CLI holds no daemon state of its own).
 //
-// The canonical dotted-key table below is this CLI's own copy of the desktop
-// Apply ladder (`qbz/src/settings.rs:87-94`, per-key classification
-// `:877-967,1134-1290`; 03-setup-tui.md §4.3's 9-field Reinit list). Per
-// 03-setup-tui.md §4.3 (normative): the server's reload response carries NO
+// The canonical dotted-key table below is this CLI's own copy of the Apply
+// ladder (Reinit / Reload / None). The server's reload response carries NO
 // reinit/reload narrative of its own — that classification is composed
 // CLIENT-side, which is exactly what [`ApplyClass`] is for.
 //
-// Value encoding (deliberate, P0 scope): every value round-trips as a plain
-// string — `settings show --json`'s values are exactly what `settings set`
-// accepts back, key for key. No per-type JSON (bool/number) encoding; that
-// would need a second parser on top of the one `set` already has, for a
-// convenience no shipped P0/P1 script needs (the CLI is the machine
-// interface here, not `/api/settings/reload`'s response body).
+// Value encoding (deliberate): every value round-trips as a plain string —
+// `settings show --json`'s values are exactly what `settings set` accepts
+// back, key for key. No per-type JSON (bool/number) encoding; that would need
+// a second parser on top of the one `set` already has, for a convenience no
+// shipped script needs (the CLI is the machine interface here, not
+// `/api/settings/reload`'s response body).
 
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -38,10 +34,10 @@ use crate::qconnect::transport as qconnect_kv;
 /// Whether a key's write is Reinit-class (closes/reopens the output device),
 /// Reload-class (struct refresh only, no audible gap), or affects nothing the
 /// live `Player`/QConnect service reads immediately (playback prefs, qconnect
-/// KV — applies next play / next connect respectively). Purely this CLI's own
-/// bookkeeping for the success-line hint; the daemon decides for itself via
-/// `daemon::audio_routing_changed` — the two are independent copies of the
-/// same table, per 03-setup-tui.md §4.3.
+/// settings — applies next play / next connect respectively). Purely this
+/// CLI's own bookkeeping for the success-line hint; the daemon decides for
+/// itself via `daemon::audio_routing_changed` — the two are independent copies
+/// of the same table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplyClass {
     Reinit,
@@ -53,8 +49,8 @@ pub enum ApplyClass {
 /// lists exactly these, in this order; `settings set` accepts exactly these
 /// keys and nothing else. Domains: `audio.*` (`AudioSettingsStore`),
 /// `playback.*` (daemon_prefs),
-/// `qconnect.*` (`qbz_app::settings::qconnect`, T9),
-/// `hooks.*` (daemon_prefs, CONSOLE ext).
+/// `qconnect.*` (`qbz_app::settings::qconnect`),
+/// `hooks.*` (daemon_prefs).
 ///
 /// **A key belongs here only if the daemon READS it.** Six were dropped in 2.4
 /// because nothing outside the settings plumbing itself consumed them — they
@@ -78,7 +74,7 @@ pub enum ApplyClass {
 /// desktop's playback preferences. They are in [`IGNORED_KEYS`] rather than
 /// simply gone, because moOde sends two of them on every renderer start.
 const KEY_TABLE: &[(&str, ApplyClass)] = &[
-    // --- audio (Reinit — 03-setup-tui.md §4.3's 9-field list) -------------
+    // --- audio (Reinit) ----------------------------------------------------
     ("audio.backend", ApplyClass::Reinit),
     ("audio.device", ApplyClass::Reinit),
     ("audio.alsa_plugin", ApplyClass::Reinit),
@@ -119,7 +115,7 @@ const KEY_TABLE: &[(&str, ApplyClass)] = &[
     ("audio.pw_force_bitperfect", ApplyClass::Reload),
     // --- playback (daemon_prefs) --------------------------------------------
     ("playback.quality", ApplyClass::None),
-    // --- qconnect (the [qconnect] section, T9) ------------------------------
+    // --- qconnect (the [qconnect] section) ----------------------------------
     ("qconnect.device_name", ApplyClass::None),
     ("qconnect.startup_mode", ApplyClass::None),
     ("qconnect.volume_mode", ApplyClass::None),
@@ -131,16 +127,17 @@ const KEY_TABLE: &[(&str, ApplyClass)] = &[
     // start/stop them).
     ("qconnect.pairing", ApplyClass::None),
     ("qconnect.pairing_port", ApplyClass::None),
-    // --- hooks (daemon_prefs, CONSOLE ext) ----------------------------------
+    // --- hooks (daemon_prefs) ----------------------------------------------
     ("hooks.script", ApplyClass::None),
 ];
 
-/// Keys `settings set` accepts, warns about and otherwise ignores. They set
-/// the desktop's playback preferences (autoplay, restore the last session,
-/// resume its position), which nothing in pibuz ever read. moOde's
-/// `renderer.php` still sends `persist_session` and `resume_playback_position`
-/// on every renderer start, so refusing them would turn two harmless lines
-/// into two errors in its log. Delete this once moOde stops sending them.
+/// Keys `settings set` accepts, warns about and otherwise ignores: the
+/// desktop's playback preferences (autoplay, restore the last session, resume
+/// its position), which nothing in pibuz ever read, and `playback.mpris`,
+/// which went with MPRIS. moOde's `renderer.php` still sends
+/// `persist_session`, `resume_playback_position` and `mpris` on every renderer
+/// start, so refusing them would turn harmless lines into errors in its log.
+/// Delete this once moOde stops sending them.
 const IGNORED_KEYS: &[&str] = &[
     "playback.autoplay",
     "playback.persist_session",
@@ -152,8 +149,8 @@ fn classify(key: &str) -> Option<ApplyClass> {
     KEY_TABLE.iter().find(|(k, _)| *k == key).map(|(_, c)| *c)
 }
 
-/// The fault + fix for an unknown key (02 §1.4 error voice: name the fault,
-/// then the fix). No "error:" prefix — `set()` adds it uniformly at the print
+/// The fault + fix for an unknown key (the error voice: name the fault, then
+/// the fix). No "error:" prefix — `set()` adds it uniformly at the print
 /// site, matching every other value-parse error in this file.
 fn unknown_key_error(key: &str) -> String {
     let mut out = format!("unknown setting key '{key}'\n  → valid keys:\n");
@@ -205,10 +202,9 @@ fn parse_alsa_plugin(v: &str) -> Result<Option<AlsaPlugin>, String> {
         "plughw" => Ok(Some(AlsaPlugin::PlugHw)),
         "pcm" => Ok(Some(AlsaPlugin::Pcm)),
         // Not a documented option (only the 3 concrete plugins are, default
-        // Hw) — accepted here only so `settings
-        // show`'s value on a never-migrated-to-a-plugin row (the seed INSERT
-        // leaves this column NULL, unlike `backend_type`) round-trips back
-        // into `set` unchanged instead of erroring on its own read value.
+        // Hw) — accepted here only so `settings show`'s value for an unset
+        // plugin (`None`, stored as `auto`) round-trips back into `set`
+        // unchanged instead of erroring on its own read value.
         "auto" => Ok(None),
         other => Err(format!(
             "invalid ALSA plugin '{other}' — expected one of: hw, plughw, pcm"
@@ -599,8 +595,8 @@ fn read_all(roots: &ProfileRoots) -> Result<Vec<(&'static str, String)>, String>
     Ok(out)
 }
 
-/// The two exit-code classes a [`write_one`] failure can fall into (02 §1.3,
-/// the frozen exit-code table: 2 is reserved for USAGE mistakes only). An
+/// The two exit-code classes a [`write_one`] failure can fall into (the frozen
+/// exit-code table: 2 is reserved for USAGE mistakes only). An
 /// unknown key or an invalid value for a known key never touches a store —
 /// that is `Usage` (exit 2). A key that classified and parsed fine but whose
 /// backing store then failed to open or write — a disk-full/permissions/
@@ -854,11 +850,10 @@ fn write_one(roots: &ProfileRoots, key: &str, raw: &str) -> Result<ApplyClass, S
     Ok(class)
 }
 
-/// Best-effort nudge of a LOCAL running daemon (§1.1/§1.5: these verbs always
-/// target the daemon whose stores they just wrote, never `--host`/
-/// `QBZD_HOST` — same reasoning as `login`/`logout`). Reads the opt-in
-/// `[server] token` the same way `cli/client.rs::resolve_token` does for the
-/// local target, so a token-protected daemon still gets nudged.
+/// Best-effort nudge of a LOCAL running daemon (these verbs always target the
+/// daemon whose stores they just wrote, never `--host`/`QBZD_HOST`). Reads the
+/// opt-in `[server] token` the same way `cli/client.rs::resolve_token` does
+/// for the local target, so a token-protected daemon still gets nudged.
 fn nudge(roots: &ProfileRoots) -> bool {
     let host = crate::daemon_nudge::nudge_host(roots);
     let token = local_token(roots);
@@ -866,7 +861,7 @@ fn nudge(roots: &ProfileRoots) -> bool {
 }
 
 /// Three-state variant of [`nudge`] for `settings import`, which must
-/// distinguish daemon-down from reload-refused (04 §5.3 step 7).
+/// distinguish daemon-down from reload-refused.
 fn nudge_outcome(roots: &ProfileRoots) -> crate::daemon_nudge::NudgeOutcome {
     let host = crate::daemon_nudge::nudge_host(roots);
     let token = local_token(roots);
@@ -887,7 +882,7 @@ fn local_token(roots: &ProfileRoots) -> Option<String> {
 
 // ============================ CLI entry points ============================
 
-/// `pibuz settings show [--json]` (⬇). `--json`: `{"audio.backend": "alsa", ...}`
+/// `pibuz settings show [--json]`. `--json`: `{"audio.backend": "alsa", ...}`
 /// — every value the plain string `settings set` would accept back (module
 /// doc). Exit: 0 · 1 (a store failed to open/read).
 pub fn show(json: bool, roots: &ProfileRoots) -> i32 {
@@ -916,13 +911,12 @@ pub fn show(json: bool, roots: &ProfileRoots) -> i32 {
     0
 }
 
-/// `pibuz settings set <KEY> <VALUE>` (⬇). Unknown key → exit 2 listing valid
+/// `pibuz settings set <KEY> <VALUE>`. Unknown key → exit 2 listing valid
 /// keys; invalid value for a known key → exit 2 naming the valid values;
 /// the key/value classified and parsed fine but the backing store failed to
-/// open or write (disk/permissions) → exit 1 (02 §1.3: 2 is USAGE-only —
-/// see [`SetError`]). Writes always succeed locally before any daemon
-/// contact is attempted (§2.4 daemon-down capable); daemon-down prints
-/// `changes apply when the daemon starts` (this task's brief, verbatim)
+/// open or write (disk/permissions) → exit 1 (2 is USAGE-only — see
+/// [`SetError`]). Writes always succeed locally before any daemon contact is
+/// attempted; daemon-down prints `changes apply when the daemon starts`
 /// instead of failing.
 pub fn set(roots: &ProfileRoots, key: &str, value: &str) -> i32 {
     if IGNORED_KEYS.contains(&key) {
@@ -955,8 +949,8 @@ pub fn set(roots: &ProfileRoots, key: &str, value: &str) -> i32 {
     0
 }
 
-/// `pibuz qconnect enable` (⬇). Writes `startup_mode = on`, nudges reload.
-/// Human line verbatim per 02 §2.2 (device name interpolated).
+/// `pibuz qconnect enable`. Writes `startup_mode = on`, nudges reload. The
+/// human line interpolates the device name.
 pub fn qconnect_enable(roots: &ProfileRoots) -> i32 {
     let root = roots.data.as_path();
     if let Err(e) = qconnect_kv::save_startup_mode_at(root, qconnect_app::QconnectStartupMode::On) {
@@ -971,7 +965,7 @@ pub fn qconnect_enable(roots: &ProfileRoots) -> i32 {
     0
 }
 
-/// `pibuz qconnect disable` (⬇). Writes `startup_mode = off`, nudges reload
+/// `pibuz qconnect disable`. Writes `startup_mode = off`, nudges reload
 /// (disconnects the live session, per `daemon::reload_qconnect`).
 pub fn qconnect_disable(roots: &ProfileRoots) -> i32 {
     let root = roots.data.as_path();
@@ -985,9 +979,8 @@ pub fn qconnect_disable(roots: &ProfileRoots) -> i32 {
     0
 }
 
-/// `pibuz qconnect name "Living Room"` (⬇). Empty clears the override back to
-/// the hostname default (desktop write semantics preserved, 03-setup-tui.md
-/// §3.4). Applies on the NEXT connection, never forces a reconnect
+/// `pibuz qconnect name "Living Room"`. Empty clears the override back to the
+/// hostname default. Applies on the NEXT connection, never forces a reconnect
 /// (`daemon::reload_qconnect` / `QconnectControl::refresh_device_name`).
 pub fn qconnect_name(roots: &ProfileRoots, name: &str) -> i32 {
     let root = roots.data.as_path();
@@ -1003,9 +996,9 @@ pub fn qconnect_name(roots: &ProfileRoots, name: &str) -> i32 {
     0
 }
 
-/// `pibuz config path` (⬇). Process roots + the credential file + the
-/// (conventional, not necessarily yet installed — T14) systemd user unit
-/// path. No `--json` (02 §2.2 gives none for this subverb).
+/// `pibuz config path`. Process roots + the credential file + the
+/// (conventional, not necessarily installed) systemd user unit path. No
+/// `--json`.
 pub fn config_path(roots: &ProfileRoots) -> i32 {
     println!("config : {}", roots.config.display());
     println!("data   : {}", roots.data.display());
@@ -1024,8 +1017,8 @@ fn unit_path() -> PathBuf {
         .join("systemd/user/pibuz.service")
 }
 
-/// `pibuz config show [--json]` (⬇) — effective `pibuz.toml`, process concerns
-/// only (01-architecture.md §10.1; engine settings live in `settings show`).
+/// `pibuz config show [--json]` — effective `pibuz.toml`, process concerns
+/// only (engine settings live in `settings show`).
 /// Keys the file doesn't set are annotated `(default)` in human mode.
 pub fn config_show(json: bool, roots: &ProfileRoots) -> i32 {
     let path = roots.config_file();
@@ -1099,11 +1092,10 @@ fn present_keys(path: &Path) -> std::collections::HashSet<String> {
     out
 }
 
-// ============================ settings export / import (T12) ============================
+// ======================== settings export / import ========================
 
-/// `pibuz settings export [FILE] [--include-auth]` (⬇, 04-settings-portability.md
-/// §4.1). Reads the daemon profile and writes ONE versioned JSON bundle at 0600.
-/// Exit: 0 · 1.
+/// `pibuz settings export [FILE] [--include-auth]`. Reads the daemon profile
+/// and writes ONE versioned JSON bundle at 0600. Exit: 0 · 1.
 pub fn export(roots: &ProfileRoots, file: Option<String>, include_auth: bool) -> i32 {
     let paths = ProfilePaths {
         config_root: roots.config.clone(),
@@ -1123,9 +1115,9 @@ pub fn export(roots: &ProfileRoots, file: Option<String>, include_auth: bool) ->
         return 1;
     }
 
-    // The §3 warning prints whenever ANY secret actually made it into the file:
-    // the auth token OR a non-blank scrobbler secret (--include-auth exports
-    // scrobbler tokens even when the Qobuz token itself is absent).
+    // The secret warning prints whenever ANY secret actually made it into the
+    // file: the auth token OR a non-blank scrobbler secret (--include-auth
+    // exports scrobbler tokens even when the Qobuz token itself is absent).
     if bundle.contains_secrets() {
         println!("{}", crate::cli::copy::bundle_secret_warning(&path));
     } else {
@@ -1135,9 +1127,9 @@ pub fn export(roots: &ProfileRoots, file: Option<String>, include_auth: bool) ->
 }
 
 /// `pibuz settings import FILE [--include-auth] [--remap OLD=NEW]...
-/// [--dry-run]` (⬇, 04 §5.3). read → version-gate → plan → (TTY device re-pick /
-/// non-tty safe defaults) → validate secrets BEFORE any write → apply →
-/// reload-nudge → three-bucket summary. Exit: 0 · 1 · 2 · 4.
+/// [--dry-run]`. read → version-gate → plan → (TTY device re-pick / non-tty
+/// safe defaults) → apply → reload-nudge → three-bucket summary. Exit:
+/// 0 · 1 · 2.
 pub async fn import(
     roots: &ProfileRoots,
     file: &str,
@@ -1165,8 +1157,8 @@ pub async fn import(
         }
     };
 
-    // --remap OLD=NEW (parsed + validated even though the P0 daemon skips
-    // library_folders, so scripts written for P1 do not break — 04 §5.2).
+    // --remap OLD=NEW (parsed + validated even though library_folders is
+    // always skipped, so scripts that pass it do not break).
     let mut remap = Vec::new();
     for r in remap_raw {
         match r.split_once('=') {
@@ -1227,7 +1219,7 @@ pub async fn import(
     let validated_uid: Option<u64> = None;
     let auth_note: Option<String> = None;
 
-    // Dry-run stops after step 5 (04 §5.1): same summary, writes nothing.
+    // Dry-run stops here: same summary, writes nothing.
     if dry_run {
         print_buckets(&plan, &bundle, auth_note.as_deref(), None);
         println!("\ndry-run: no changes written");
@@ -1243,7 +1235,7 @@ pub async fn import(
         return 1;
     }
 
-    // Step 7: reload-nudge a running daemon. Three states (04 §5.3 step 7):
+    // Step 7: reload-nudge a running daemon. Three states:
     // reloaded / not running (fine) / up-but-refused (exit 1, restart hint).
     let outcome = nudge_outcome(roots);
     let (done_line, stderr_msg, exit) = reload_disposition(outcome, plan.routing_critical_changed);
@@ -1257,7 +1249,7 @@ pub async fn import(
 
 /// Pure mapping of the nudge outcome (+ whether a routing-critical field
 /// changed) to the `done:` reload phrase, an optional stderr error, and the
-/// exit code. Split from IO so the §5.3-step-7 contract is unit-testable.
+/// exit code. Split from IO so it is unit-testable.
 fn reload_disposition(
     outcome: crate::daemon_nudge::NudgeOutcome,
     routing_critical: bool,
@@ -1265,7 +1257,7 @@ fn reload_disposition(
     use crate::daemon_nudge::NudgeOutcome::*;
     match outcome {
         Reloaded => {
-            // §5.3 step 7 honesty rule: a routing-critical change re-inits the
+            // Honesty rule: a routing-critical change re-inits the
             // output device on the spot — say so instead of hiding it.
             let line = if routing_critical {
                 "daemon reloaded (was running; output device reinitialized — an in-flight track may gap)"
@@ -1316,7 +1308,7 @@ fn build_live_system(bundle: &Bundle) -> LiveSystem {
     LiveSystem { backends, devices }
 }
 
-/// Interactive device picker (04 §5.4). Numbered device list; the last entry is
+/// Interactive device picker. Numbered device list; the last entry is
 /// always "system default"; an unparseable answer falls to system default.
 fn prompt_device(pick: &bundle::DevicePick) -> DeviceChoice {
     println!(
@@ -1362,7 +1354,7 @@ fn print_summary_header(bundle: &Bundle) {
     println!();
 }
 
-/// The three-bucket summary EXACTLY in the 04 §5.4 format: applied (`= value`),
+/// The three-bucket summary: applied (`= value`),
 /// adapted (`old -> new (why)`), skipped (`+why`), the desktop shared-name
 /// advisory, the auth footer, and the `done:` line.
 fn print_buckets(
@@ -1407,7 +1399,7 @@ fn print_buckets(
         println!("  {:width$} {}", l.key, l.why);
     }
 
-    // Shared-device-name advisory: only for a desktop-sourced bundle (§2.4/§5.4).
+    // Shared-device-name advisory: only for a desktop-sourced bundle.
     if bundle.source.profile == "desktop" {
         if let Some(dn) = plan
             .applied
@@ -1485,7 +1477,7 @@ mod tests {
     fn unknown_key_is_rejected_and_lists_every_valid_key() {
         let roots = scratch_roots("unknown-key");
         let err = write_one(&roots, "audio.bogus", "x").unwrap_err();
-        // 02 §1.3: an unknown key is a USAGE mistake (exit 2), never Io.
+        // An unknown key is a USAGE mistake (exit 2), never Io.
         assert!(matches!(err, SetError::Usage(_)), "{err:?}");
         assert!(
             err.message().contains("unknown setting key 'audio.bogus'"),
@@ -1502,7 +1494,7 @@ mod tests {
 
     #[test]
     fn invalid_value_for_a_known_key_is_a_usage_error_not_io() {
-        // 02 §1.3: a bad value for a KNOWN key is still exit 2 (usage), same
+        // A bad value for a KNOWN key is still exit 2 (usage), same
         // class as an unknown key — never Io, which is reserved for a store
         // that failed to open/write after the value parsed fine.
         let roots = scratch_roots("bad-value");
@@ -1513,7 +1505,7 @@ mod tests {
 
     #[test]
     fn store_open_failure_is_an_io_error_not_usage() {
-        // 02 §1.3: the key classifies and the value parses fine (exclusive_mode
+        // The key classifies and the value parses fine (exclusive_mode
         // is a plain bool) — a store that then fails to even OPEN (here: the
         // data root is blocked by a plain file, so `create_dir_all` fails) is
         // exit 1 (Io), never the usage exit 2.
@@ -1593,7 +1585,7 @@ mod tests {
 
     #[test]
     fn show_json_round_trips_into_set_for_every_canonical_key() {
-        // The brief's Step 1 property: `settings show --json` includes every
+        // The round-trip property: `settings show --json` includes every
         // key `settings set` accepts, AND the value it reports for a key is
         // itself a valid `set` input for that same key (a real functional
         // round-trip against temp on-disk stores, not just "same key names").
@@ -1824,7 +1816,7 @@ mod tests {
         assert!(err.is_none());
         assert_eq!(code, 0);
 
-        // §5.3 step 7 honesty rule: routing-critical + reloaded names the gap.
+        // Honesty rule: routing-critical + reloaded names the gap.
         let (line, err, code) = reload_disposition(Reloaded, true);
         assert!(line.contains("output device reinitialized"), "{line}");
         assert!(line.contains("gap"), "{line}");

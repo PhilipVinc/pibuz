@@ -1,28 +1,25 @@
-// crates/pibuz/src/api/queue.rs — routes 13-16 (02-cli-and-api.md §3.3.13-16):
-// GET /api/queue, POST /api/queue/{add,remove,clear}.
+// crates/pibuz/src/api/queue.rs — GET /api/queue and the POST /api/queue/*
+// routes.
 //
-// INDEX CONVENTION (normative, §3.3.13/§3.3.15, cross-doc-fixed): every index
-// on the wire is 0-based, the SAME space as `current_index` in the
-// `GET /api/queue` response. The CLI is the only place a 1-based position
-// exists (§2.2's `queue list` table, `queue remove <INDEX>`) — the translation
-// happens ONLY at the CLI boundary (`cli/queue.rs`), never here. This file
-// speaks 0-based exclusively, straight from `QueueState.current_index`
-// (`crates/qbz-models/src/playback.rs:94-103`) with no shift.
+// INDEX CONVENTION: every index on the wire is 0-based, the SAME space as
+// `current_index` in the `GET /api/queue` response. The CLI is the only place
+// a 1-based position exists (the `queue list` table, the position arguments
+// of `queue remove`/`move`/`jump`) — the translation happens ONLY at the CLI
+// boundary (`cli/queue.rs`), never here. This file speaks 0-based
+// exclusively, straight from `qbz_models::QueueState.current_index` with no
+// shift.
 //
-// Server-side materialization (brief, non-negotiable): `add` NEVER accepts a
+// Server-side materialization (non-negotiable): `add` NEVER accepts a
 // client-built `QueueTrack`. It resolves each `track_id` via `core.get_track`
 // (the Qobuz catalog `Track`) and maps it to a `QueueTrack` with
 // `track_to_queue_track` below, derived from `qbz_models::Track`.
 //
-// Response shape note on `add`: 02 §3.3.14's sketch is `{"added","total_tracks"}`.
+// Response shape note on `add`: the base shape is `{"added","total_tracks"}`.
 // This handler additively includes `"tracks"`: the materialized `QueueTrack`
-// objects, in request order — the same reasoning T7 used for `next`/`previous`
-// returning the full landing `QueueTrack` (02 §3.3.9-10) rather than a bare id:
-// the CLI's documented human line (`added: Spain – Chick Corea (next)`, §2.2)
-// needs title/artist, and §1.1's one-request-per-verb rule forbids a second
-// GET to fetch them. §3.1.4 explicitly allows additive fields within
-// api_version 1; `total_tracks`/`added` are unchanged and still exactly what
-// §3.3.14 documents.
+// objects, in request order — the CLI's human line (`added: Spain – Chick
+// Corea (next)`) needs title/artist, and the one-request-per-verb rule forbids
+// a second GET to fetch them. Additive fields are allowed within api_version
+// 1; `total_tracks`/`added` are unchanged.
 use std::io::Cursor;
 
 use serde_json::Value;
@@ -32,18 +29,18 @@ use qbz_models::{QueueTrack, RepeatMode, Track};
 
 use super::{err_json, json, ApiState};
 
-/// `GET /api/queue` (02 §3.3.13). `query` is the raw query string (no leading
+/// `GET /api/queue`. `query` is the raw query string (no leading
 /// `?`) — `route()` strips it off the path before dispatch, so it is threaded
 /// through separately. Reads the FULL queue state (`get_queue_state_full`,
 /// not the UI-capped `get_queue_state`) so `offset`/`limit` paginate over the
 /// complete `upcoming` list rather than an already-truncated 20-entry window.
 ///
-/// ADDITIVE `history` field (§3.1.4 allows additive within api_version 1):
-/// the full played-track list, recent-first (`QueueManager::get_state_full`'s
-/// convention, qbz-player/src/queue.rs:1064-1070). Without it the §2.2
-/// `queue list` example — a played row rendered ABOVE the current track — is
-/// unreproducible from the response. `history_len` stays exactly as
-/// documented (§3.3.13); nothing existing is renamed or removed.
+/// ADDITIVE `history` field (additive fields are allowed within api_version
+/// 1): the full played-track list, recent-first
+/// (`QueueManager::get_state_full`'s convention). Without it the `queue list`
+/// table — a played row rendered ABOVE the current track — is unreproducible
+/// from the response. `history_len` is unchanged; nothing existing is renamed
+/// or removed.
 pub fn list(state: &ApiState, query: &str) -> Response<Cursor<Vec<u8>>> {
     let (offset, limit) = parse_offset_limit(query);
     let queue = state
@@ -83,7 +80,7 @@ pub fn list(state: &ApiState, query: &str) -> Response<Cursor<Vec<u8>>> {
     )
 }
 
-/// `POST /api/queue/add` (02 §3.3.14). Body `{"track_ids": [...], "position":
+/// `POST /api/queue/add`. Body `{"track_ids": [...], "position":
 /// "end"|"next"}` (`position` default `"end"`). Errors:
 /// 404 `not_found` (any unresolvable id — resolution stops at the first
 /// failure, nothing partially added), 400 `bad_request` (malformed
@@ -124,7 +121,7 @@ pub fn add(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
     if position == AddPosition::Next {
         // `add_track_next` always inserts immediately after the current
         // track, so reverse iteration is what lands multiple tracks in
-        // request order (matches the desktop's multi-add-next convention).
+        // request order.
         for track in resolved.into_iter().rev() {
             state
                 .rt
@@ -144,10 +141,10 @@ pub fn add(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
     )
 }
 
-/// `POST /api/queue/remove` (02 §3.3.15). Body `{"index": N}`, 0-based —
+/// `POST /api/queue/remove`. Body `{"index": N}`, 0-based —
 /// SAME space as `current_index` (no CLI-boundary shift here). Errors:
 /// 404 `not_found` (index out of range), 400 `bad_request` (index is the
-/// playing track — the verbatim hint below is quoted §3.3.15; also a
+/// playing track, with the fixed hint below; also a
 /// missing or non-integer `index` field, with distinct messages).
 pub fn remove(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
     let index = match parse_remove_index(body) {
@@ -196,10 +193,10 @@ pub fn remove(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
         // command) landing between the two calls can shrink the queue or
         // shift `current_index`, so this branch IS reachable, and a remove
         // can land on what just BECAME the playing row. Both degradations
-        // are benign (a 404 here; a queue edit the §3.3.15 gate was one tick
+        // are benign (a 404 here; a queue edit the playing-row gate was one tick
         // too late to refuse) — never a panic, never corruption
         // (`QueueManager::remove_track` re-checks bounds under its own lock).
-        // TODO(converge): atomic remove-guard primitive in qbz-core (P1).
+        // TODO: an atomic remove-guard primitive in qbz-core.
         None => err_json(
             404,
             "not_found",
@@ -209,9 +206,9 @@ pub fn remove(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
     }
 }
 
-/// `POST /api/queue/clear` (02 §3.3.16). Body `{"keep_current": bool}`
-/// (default `true` when the field is absent — the CLI always sends it
-/// explicitly, §"queue clear" in cli/queue.rs).
+/// `POST /api/queue/clear`. Body `{"keep_current": bool}` (default `true`
+/// when the field is absent — the CLI always sends it explicitly, see
+/// `cli/queue.rs::clear`).
 pub fn clear(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
     let keep_current = body
         .get("keep_current")
@@ -227,8 +224,8 @@ pub fn clear(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
     json(200, serde_json::json!({"total_tracks": total_tracks}))
 }
 
-/// `POST /api/queue/move` (CONSOLE). Body `{"from": N, "to": N}` (0-based).
-/// GUI drag-reorder (core `move_track`). 404 when either index is out of range.
+/// `POST /api/queue/move`. Body `{"from": N, "to": N}` (0-based). Reorders
+/// via core `move_track`. 404 when either index is out of range.
 pub fn reorder(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
     let from = match body.get("from").and_then(|v| v.as_u64()) {
         Some(n) => n as usize,
@@ -264,10 +261,9 @@ pub fn reorder(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
     }
 }
 
-/// `POST /api/queue/jump` (CONSOLE). Body `{"index": N}` (0-based). A
+/// `POST /api/queue/jump`. Body `{"index": N}` (0-based). A
 /// click-to-play-row: moves the cursor (`play_index`) AND starts audio through
-/// the shipped ritual — never a bare cursor move (control-surface §2.2).
-/// Auth-gated (needs a session to resolve the stream). The cursor move is
+/// the shipped ritual — never a bare cursor move. The cursor move is
 /// synchronous (the 404 contract is immediate); the resolve+play leg is
 /// spawn-and-ack (see `playback::advance`) so a slow fetch can't starve the
 /// single-threaded API — failures latch into `last_errors.stream`.
@@ -316,7 +312,7 @@ pub fn jump(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
     )
 }
 
-/// `POST /api/queue/stop-after` (CONSOLE). Body `{"track_id": N}` |
+/// `POST /api/queue/stop-after`. Body `{"track_id": N}` |
 /// `{"current": true}` | `{"off": true}`. Sets/clears the stop-after gate
 /// (core `set_stop_after`/`clear_stop_after`).
 pub fn stop_after(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
@@ -391,7 +387,7 @@ fn parse_track_ids(body: &Value) -> Result<Vec<u64>, (String, String)> {
     Ok(ids)
 }
 
-/// `position` for `add` — strict literal match (§3.3.14: `"end"|"next"`,
+/// `position` for `add` — strict literal match (`"end"|"next"`,
 /// default `"end"` when the field is absent). Anything else — an unknown
 /// literal, or a non-string — is a 400, never a silent fall-through to
 /// "end" (a typo'd `"nxet"` appending to the queue tail instead of playing
@@ -419,7 +415,7 @@ fn parse_position(body: &Value) -> Result<AddPosition, (String, String)> {
 
 /// `index` for `remove` — distinct messages for a MISSING field vs a
 /// present-but-wrong-type one (a string or negative `index` is not "you
-/// forgot the field"; §1.4 error voice wants the message to name the actual
+/// forgot the field"; the error voice wants the message to name the actual
 /// fault).
 fn parse_remove_index(body: &Value) -> Result<usize, (String, String)> {
     let hint = "body: {\"index\": 3}".to_string();
@@ -464,7 +460,7 @@ fn paginate(items: &[QueueTrack], offset: usize, limit: usize) -> Vec<QueueTrack
     items.iter().skip(offset).take(limit).cloned().collect()
 }
 
-/// `?offset=0&limit=100` (02 §3.3.13). Malformed/missing values fall back to
+/// `?offset=0&limit=100`. Malformed/missing values fall back to
 /// the documented defaults; there is no 400 for a bad query param (a read
 /// route degrades gracefully rather than failing the request).
 fn parse_offset_limit(query: &str) -> (usize, usize) {
@@ -708,7 +704,7 @@ mod tests {
 
     #[test]
     fn check_remove_index_rejects_the_playing_index() {
-        // 02 §3.3.15's own example state: current_index=1, removing index 1.
+        // current_index=1, removing index 1.
         assert_eq!(
             check_remove_index(1, 14, Some(1)),
             RemoveCheck::PlayingIndex
@@ -717,7 +713,7 @@ mod tests {
 
     #[test]
     fn remove_playing_index_error_body_matches_the_documented_hint() {
-        // 02 §3.3.15 verbatim: {"error":{"code":"bad_request",
+        // Verbatim: {"error":{"code":"bad_request",
         // "message":"index 1 is the playing track","hint":"use: pibuz next, or pibuz queue clear"}}
         let body = super::super::error_body(
             "bad_request",

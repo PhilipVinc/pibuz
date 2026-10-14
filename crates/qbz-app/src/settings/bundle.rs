@@ -1,19 +1,20 @@
-// crates/qbz-app/src/settings/bundle.rs — the settings portability engine
-// (04-settings-portability.md), used by the `pibuz` CLI:
-// `export(paths, opts) -> Bundle`,
+// crates/qbz-app/src/settings/bundle.rs — the settings portability engine,
+// used by the `pibuz` CLI: `export(paths, opts) -> Bundle`,
 // `plan(bundle, target, opts, live) -> ImportPlan`, `apply(plan, target, uid)
 // -> ImportReport`.
 //
-// The load-bearing invariant (04 §1): CLASSIFICATION LIVES IN THE IMPORTER,
+// The `§` numbers name the rules of the portability design this implements.
+//
+// The load-bearing invariant (§1): CLASSIFICATION LIVES IN THE IMPORTER,
 // NEVER IN THE BUNDLE. A bundle is data with zero authority over how it is
-// applied — the §3 table (below, `classify_audio_key` + the domain loops) is
+// applied — the §3 table (below, `plan_audio` + the domain loops) is
 // versioned with THIS code and applied to whatever is present in the file,
 // including fields a well-behaved exporter never writes (a hand-added
 // `volume` is skipped no matter how it got there — §1 corollary).
 //
-// TDD: the inline `#[cfg(test)]` module IS the normative test suite — one test
-// per §3/§5 rule. The engine takes a `LiveSystem` by injection so those tests
-// never need real audio hardware.
+// TDD: the `tests` module (`bundle/tests.rs`) IS the normative test suite —
+// one test per §3/§5 rule. The engine takes a `LiveSystem` by injection so
+// those tests never need real audio hardware.
 
 use std::path::{Path, PathBuf};
 
@@ -26,12 +27,12 @@ use qbz_audio::AudioBackendType;
 use crate::settings::{daemon_prefs, qconnect};
 
 /// The bundle schema version this importer implements and this exporter writes
-/// (04 §1). Hard-gated on import (`plan` step 2, §5.6). v1 is the floor.
+/// (§1). Hard-gated on import (`plan` step 2, §5.6). v1 is the floor.
 pub const SCHEMA_VERSION: i64 = 1;
 
 // ============================ public types ============================
 
-/// One versioned JSON document (04 §1). The header fields are typed; every
+/// One versioned JSON document (§1). The header fields are typed; every
 /// settings domain rides in `domains` as raw JSON so the importer can classify
 /// whatever is present (§1 corollary). Serializes FLAT — the domains sit at the
 /// top level alongside the header, exactly like the §2.9 example.
@@ -70,6 +71,7 @@ pub struct ExportOptions {
 pub struct ImportOptions {
     pub include_auth: bool,
     /// Repeatable `--remap OLD=NEW` prefix rewrites for `library_folders`.
+    /// Accepted and ignored: `library_folders` is always skipped.
     pub remap: Vec<(String, String)>,
     /// True when there is no interactive terminal — machine fields that would
     /// need a prompt fall to safe defaults instead of hanging (§5.3 step 4).
@@ -149,8 +151,8 @@ pub struct ImportReport {
 }
 
 /// Everything that can go wrong in the engine. `Display` renders a plain
-/// message; the CLI maps the daemon-facing variants to the verbatim 04 copies
-/// in `cli::copy`.
+/// message; the CLI maps the daemon-facing variants to the verbatim copies in
+/// `cli::copy`.
 #[derive(Debug)]
 pub enum BundleError {
     /// Step 1: unreadable file / invalid JSON.
@@ -159,8 +161,8 @@ pub enum BundleError {
     VersionMalformed,
     /// Step 2: bundle newer than this importer (§5.6).
     VersionTooNew { bundle: i64, supported: i64 },
-    /// Export: `--include-auth` but the desktop token would not decrypt (IV1,
-    /// §4.1 — portal-secret bound to the desktop session).
+    /// Export: `--include-auth` but the desktop token would not decrypt (§4.1).
+    /// Nothing constructs it: the desktop export is gone.
     TokenDecryptFailed,
     /// Any store/file I/O failure (export write or apply write).
     Io(String),
@@ -384,10 +386,6 @@ fn build_plan(
 
 // ============================ apply (§5.3 step 6) ============================
 
-/// Execute a plan against the daemon-root stores. Reached only after every
-/// check passed (validate-all-then-apply). Pure setter writes — re-running is
-/// safe and idempotent (§5.3 step 6). `validated_uid` is the authoritative uid
-/// from the validated login (§5.7); when absent, the daemon's own
 /// Test-only since the account path went: nothing in the import writes a
 /// `last_user_id` any more, but the fixtures still need to plant one.
 #[cfg(test)]
@@ -396,7 +394,11 @@ fn write_last_user_id(data_root: &Path, uid: u64) -> Result<(), String> {
     std::fs::write(data_root.join("last_user_id"), uid.to_string()).map_err(|e| e.to_string())
 }
 
-/// `last_user_id` is consulted for per-user writes.
+/// Execute a plan against the daemon-root stores. Reached only after every
+/// check passed (validate-all-then-apply). Pure setter writes — re-running is
+/// safe and idempotent (§5.3 step 6). `validated_uid`, the authoritative uid
+/// from the validated login (§5.7), is not used: nothing written here is
+/// per-user.
 pub fn apply(
     plan: &ImportPlan,
     target: &ProfilePaths,
@@ -1054,7 +1056,7 @@ fn plan_integrations(
     }
 }
 
-// ---- library_folders — P0 daemon always skips (§2.6) ----
+// ---- library_folders — always skipped: no local library (§2.6) ----
 fn plan_library_folders(value: &Value, plan: &mut ImportPlan) {
     let count = value.as_array().map(|a| a.len()).unwrap_or(0);
     plan.skipped.push(PlanLine {
@@ -1245,13 +1247,13 @@ fn now_rfc3339() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
-/// The suggested export filename `qbz-settings-YYYYMMDD.qbzb` (04 §1).
+/// The suggested export filename `qbz-settings-YYYYMMDD.qbzb` (§1).
 pub fn default_filename() -> String {
     format!("qbz-settings-{}.qbzb", chrono::Utc::now().format("%Y%m%d"))
 }
 
 /// Serialize a bundle to `path`, ALWAYS mode 0600 — fail rather than fall back
-/// to a wider mode (04 §6). Shared by the CLI and the P1 desktop modal.
+/// to a wider mode (§6).
 pub fn write_bundle_file(path: &Path, bundle: &Bundle) -> Result<(), BundleError> {
     let json = bundle.to_json_string()?;
     #[cfg(unix)]

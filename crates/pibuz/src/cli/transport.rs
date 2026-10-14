@@ -1,6 +1,6 @@
-// crates/pibuz/src/cli/transport.rs — the 10 transport verbs (02-cli-and-api.md
-// §2.2): `now play pause toggle stop next prev seek volume mute`. Each
-// networked verb is exactly one HTTP request (§1.1); the pure argument
+// crates/pibuz/src/cli/transport.rs — the 10 transport verbs: `now play pause
+// toggle stop next prev seek volume mute`. Each networked verb is exactly one
+// HTTP request; the pure argument
 // parsers/renderers below are unit-tested without a running daemon.
 use serde_json::Value;
 
@@ -9,8 +9,8 @@ use crate::paths::ProfileRoots;
 
 // ============================ `now` ============================
 
-/// `pibuz now [--json]` — renders `GET /api/now-playing` (§2.2/§3.3.4).
-/// Exit: 0 · 3 · 4 (via `ApiClient`/`error_from_envelope`, unchanged here).
+/// `pibuz now [--json]` — renders `GET /api/now-playing`.
+/// Exit: 0 · 1 · 3 (via `ApiClient`/`error_from_envelope`, unchanged here).
 pub async fn now(host: Option<String>, json: bool, roots: &ProfileRoots) -> i32 {
     let client = ApiClient::new(host, roots);
     match client.get("/api/now-playing").await {
@@ -30,7 +30,7 @@ pub async fn now(host: Option<String>, json: bool, roots: &ProfileRoots) -> i32 
 }
 
 /// `playing · Chick Corea – Spain · 3:12/9:41 · 96kHz/24bit · vol 80%` /
-/// `stopped · queue 14 tracks` (02 §2.2, verbatim shape).
+/// `stopped · queue 14 tracks`.
 fn render_now(v: &Value) -> String {
     let track = v.get("track").filter(|t| !t.is_null());
     let Some(track) = track else {
@@ -78,7 +78,7 @@ fn render_now(v: &Value) -> String {
 // ============================ play/pause/toggle/stop ============================
 
 /// `POST` to `path` with no body, printing the response's `state` field
-/// (`play`/`pause`/`toggle`/`stop` share this exact shape — 02 §3.3.5-8).
+/// (`play`/`pause`/`toggle`/`stop` share this exact shape).
 async fn transport_state(host: Option<String>, roots: &ProfileRoots, path: &str) -> i32 {
     let client = ApiClient::new(host, roots);
     match client.post(path, serde_json::json!({})).await {
@@ -113,7 +113,7 @@ pub async fn stop(host: Option<String>, roots: &ProfileRoots) -> i32 {
 // ============================ next/prev ============================
 
 /// `POST` to `path` with no body; the response is the landing `QueueTrack` or
-/// `null` at queue end (02 §3.3.9-10, legacy shape).
+/// `null` at queue end.
 async fn transport_advance(host: Option<String>, roots: &ProfileRoots, path: &str) -> i32 {
     let client = ApiClient::new(host, roots);
     match client.post(path, serde_json::json!({})).await {
@@ -128,7 +128,7 @@ async fn transport_advance(host: Option<String>, roots: &ProfileRoots, path: &st
     }
 }
 
-/// `-> Chick Corea – 500 Miles High` / `queue finished` (02 §2.2, verbatim) —
+/// `-> Chick Corea – 500 Miles High` / `queue finished` —
 /// or `-> queued (next)` for the spawn-and-ack advance response (the ritual
 /// runs async; follow the landing track via `pibuz now`).
 fn render_advance(v: &Value) -> String {
@@ -157,8 +157,8 @@ pub async fn prev(host: Option<String>, roots: &ProfileRoots) -> i32 {
 
 // ============================ seek ============================
 
-/// A parsed `pibuz seek` argument (02 §2.2: absolute seconds, `+N`/`-N`
-/// relative, or `mm:ss`).
+/// A parsed `pibuz seek` argument (absolute seconds, `+N`/`-N` relative, or
+/// `mm:ss`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SeekArg {
     Absolute(u64),
@@ -200,7 +200,7 @@ pub fn parse_seek_arg(s: &str) -> Result<SeekArg, String> {
         .map_err(|_| format!("invalid seek position '{s}' — expected seconds, +N, -N, or mm:ss"))
 }
 
-/// `SeekArg` -> the `POST /api/playback/seek` body (02 §3.3.11): `{"position"}`
+/// `SeekArg` -> the `POST /api/playback/seek` body: `{"position"}`
 /// (absolute, legacy field name) or `{"delta"}` (additive).
 pub fn seek_body(arg: SeekArg) -> Value {
     match arg {
@@ -209,8 +209,8 @@ pub fn seek_body(arg: SeekArg) -> Value {
     }
 }
 
-/// `pibuz seek <POS|+N|-N|mm:ss>` — human `at 1:30 / 9:41` (02 §2.2, verbatim
-/// — note the spaced slash, unlike `now`'s unspaced `3:12/9:41`). Exit:
+/// `pibuz seek <POS|+N|-N|mm:ss>` — human `at 1:30 / 9:41` (note the
+/// spaced slash, unlike `now`'s unspaced `3:12/9:41`). Exit:
 /// 0 · 1 · 2 (local parse failure) · 3 · 5.
 pub async fn seek(host: Option<String>, roots: &ProfileRoots, arg: String) -> i32 {
     let parsed = match parse_seek_arg(&arg) {
@@ -237,8 +237,8 @@ pub async fn seek(host: Option<String>, roots: &ProfileRoots, arg: String) -> i3
 
 // ============================ volume ============================
 
-/// A parsed `pibuz volume` argument (02 §2.2: 0-100 absolute, or `+N`/`-N`
-/// relative — both in CLI percent-space).
+/// A parsed `pibuz volume` argument (0-100 absolute, or `+N`/`-N` relative —
+/// both in CLI percent-space).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VolumeArg {
     Absolute(u8),
@@ -269,8 +269,8 @@ pub fn parse_volume_arg(s: &str) -> Result<VolumeArg, String> {
     Ok(VolumeArg::Absolute(n))
 }
 
-/// CLI 0-100 <-> API 0.0-1.0 (02 §2.2: "CLI speaks 0-100; the API speaks
-/// 0.0-1.0 — legacy contract"). `f64` throughout — JSON numbers ARE f64
+/// CLI 0-100 <-> API 0.0-1.0 (the CLI speaks 0-100; the API speaks 0.0-1.0).
+/// `f64` throughout — JSON numbers ARE f64
 /// (`serde_json::Number`), and computing in f32 then widening to build the
 /// request body round-trips imprecisely (`0.8f32 as f64` != the `0.8` JSON
 /// literal); the eventual `as f32` narrowing happens once, server-side,
@@ -294,8 +294,8 @@ pub fn volume_body(arg: VolumeArg) -> Value {
 }
 
 /// `pibuz volume [<0-100>|+N|-N] [--json]`. Bare = read via `GET
-/// /api/now-playing`, extracting `{volume, muted}` (no dedicated read route,
-/// 02 §2.2). With an argument: `POST /api/playback/volume`. Exit:
+/// /api/now-playing`, extracting `{volume, muted}` (no dedicated read route).
+/// With an argument: `POST /api/playback/volume`. Exit:
 /// 0 · 1 · 2 (local parse failure) · 3 · 5.
 pub async fn volume(
     host: Option<String>,
@@ -362,8 +362,8 @@ pub async fn volume(
 // ============================ mute ============================
 
 /// `None` (bare = toggle) / `Some("on")` / `Some("off")` -> the
-/// `{"mute": "on"|"off"|"toggle"}` body form (02 §2.2/§3.3.12 — "same route
-/// as volume, costs no extra route").
+/// `{"mute": "on"|"off"|"toggle"}` body form (the same route as volume, so it
+/// costs no extra route).
 pub fn mute_body(arg: Option<&str>) -> Result<Value, String> {
     match arg {
         None => Ok(serde_json::json!({"mute": "toggle"})),
@@ -373,8 +373,8 @@ pub fn mute_body(arg: Option<&str>) -> Result<Value, String> {
     }
 }
 
-/// `pibuz mute [on|off]` — human `muted (was 80%)` / `unmuted · vol 80%`
-/// (02 §2.2, verbatim). Exit: 0 · 1 · 2 (local parse failure) · 3 · 5.
+/// `pibuz mute [on|off]` — human `muted (was 80%)` / `unmuted · vol 80%`.
+/// Exit: 0 · 1 · 2 (local parse failure) · 3 · 5.
 pub async fn mute(host: Option<String>, roots: &ProfileRoots, state_arg: Option<String>) -> i32 {
     let body = match mute_body(state_arg.as_deref()) {
         Ok(b) => b,
@@ -410,9 +410,9 @@ fn fmt_mmss(secs: u64) -> String {
 }
 
 /// `96000` Hz -> `"96kHz"`; `44100` Hz -> `"44.1kHz"` — the `now` human line's
-/// own Hz->kHz rendering choice (independent of the documented Hz-vs-kHz JSON
-/// quirk between `playback.sample_rate` and `track.sample_rate`, which is
-/// left as-is on the wire, 02 §2.2).
+/// own Hz->kHz rendering choice (independent of the Hz-vs-kHz JSON quirk
+/// between `playback.sample_rate` and `track.sample_rate`, which is left as-is
+/// on the wire).
 fn fmt_khz(hz: u64) -> String {
     if hz.is_multiple_of(1000) {
         format!("{}kHz", hz / 1000)
@@ -458,7 +458,7 @@ mod tests {
 
     #[test]
     fn cli_percent_and_api_fraction_convert_both_ways() {
-        // 02 §2.2 — "CLI speaks 0-100; the API speaks 0.0-1.0".
+        // The CLI speaks 0-100; the API speaks 0.0-1.0.
         assert_eq!(pct_to_fraction(80), 0.8);
         assert_eq!(fraction_to_pct(0.8), 80);
         assert_eq!(fraction_to_pct(0.75), 75);
@@ -501,7 +501,7 @@ mod tests {
 
     #[test]
     fn render_now_matches_the_documented_playing_example() {
-        // 02 §2.2 `now --json` example, human line: "playing · Chick Corea –
+        // The `now` human line: "playing · Chick Corea –
         // Spain · 3:12/9:41 · 96kHz/24bit · vol 80%".
         let v = serde_json::json!({
             "playback": {

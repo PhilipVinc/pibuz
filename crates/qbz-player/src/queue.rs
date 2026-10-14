@@ -388,9 +388,9 @@ impl QueueManager {
     /// positions through `shuffle_order`. Peels positions off the tail inward so
     /// the surviving positions never shift under it. Returns the count removed.
     ///
-    /// This is the "Remove all after" queue action. A second, absolute-index
-    /// version used to sit below it, not play-order-aware under shuffle and
-    /// kept (its own comment said so) only for its unit coverage. It is gone.
+    /// A second, absolute-index version used to sit below it, not
+    /// play-order-aware under shuffle and kept (its own comment said so) only
+    /// for its unit coverage. It is gone.
     pub fn remove_upcoming_after(&self, upcoming_index: usize) -> usize {
         let mut upcoming_len = {
             let state = self.state.lock().unwrap();
@@ -415,7 +415,7 @@ impl QueueManager {
         let mut state = self.state.lock().unwrap();
 
         if state.shuffle {
-            // In shuffle mode, DnD indices come from the visible upcoming list,
+            // In shuffle mode the indices are positions in the upcoming list,
             // so they must be applied to shuffle_order positions (not absolute
             // track indices in state.tracks).
             let base_pos = state
@@ -652,8 +652,8 @@ impl QueueManager {
     /// Move the current pointer to the track whose id matches `id`, WITHOUT
     /// starting playback. Used to reconcile the queue pointer to a track the
     /// audio engine already advanced to on its own (a gapless hand-off
-    /// happens inside the player, not through `next`), so the now-playing
-    /// card never goes stale while the seek bar keeps moving.
+    /// happens inside the player, not through `next`), so the queue's current
+    /// track never goes stale while the audio moves on.
     ///
     /// Returns the matched track plus whether the pointer actually moved
     /// (`false` = it was already current). Returns `None` when no queue track
@@ -682,14 +682,12 @@ impl QueueManager {
     }
 
     /// Jump to a track by its position in the `upcoming` list as returned by
-    /// `get_state`. This is the position the user sees in the Queue sidebar;
-    /// the method resolves it to the correct canonical index even when
-    /// shuffle is active (where the display order differs from the canonical
+    /// `get_state`. The method resolves it to the correct canonical index even
+    /// when shuffle is active (where the play order differs from the canonical
     /// `tracks` order).
     ///
-    /// Used by the "click a track in the queue panel" path — fixes issue
-    /// #327 where shuffle mode caused a different track than the one
-    /// clicked to be played.
+    /// Fixes issue #327, where shuffle mode caused a different track than the
+    /// one chosen to be played.
     pub fn play_upcoming_at(&self, upcoming_index: usize) -> Option<QueueTrack> {
         let canonical_index = {
             let state = self.state.lock().unwrap();
@@ -717,7 +715,7 @@ impl QueueManager {
         // controller's `materialize_remote_queue` re-aligning the cursor to the
         // same index via `play_index`, since the stopped local player makes the
         // alignment fire unconditionally) must NOT record a spurious "previous"
-        // entry, or the current track shows up duplicated in the History tab.
+        // entry, or the current track shows up duplicated in the history.
         // Matches `sync_current_to_id`'s `moved` guard.
         if let Some(curr_idx) = state.current_index {
             if curr_idx != index {
@@ -808,7 +806,7 @@ impl QueueManager {
 
     /// Set the "stop after" marker on a specific track ID. Replaces any
     /// previous marker. Silent no-op if the track ID is not currently in
-    /// the queue (defensive check — frontend should only ever pass IDs
+    /// the queue (defensive check — callers should only ever pass IDs
     /// from the current queue).
     pub fn set_stop_after(&self, track_id: u64) {
         let mut state = self.state.lock().unwrap();
@@ -817,7 +815,7 @@ impl QueueManager {
         }
     }
 
-    /// Clear the marker (user cancellation from UI).
+    /// Clear the marker.
     pub fn clear_stop_after(&self) {
         let mut state = self.state.lock().unwrap();
         state.stop_after_track_id = None;
@@ -843,7 +841,7 @@ impl QueueManager {
         }
     }
 
-    /// Get queue state for frontend
+    /// Get queue state, with upcoming and history capped
     pub fn get_state(&self) -> QueueState {
         let state = self.state.lock().unwrap();
 
@@ -895,7 +893,8 @@ impl QueueManager {
         }
     }
 
-    /// Get all tracks in the queue plus the current index (for session persistence).
+    /// Get all tracks in the queue plus the current index (for QConnect, which
+    /// publishes and aligns against the whole queue).
     /// Unlike get_state() which caps upcoming/history, this returns the full track list.
     pub fn get_all_tracks(&self) -> (Vec<QueueTrack>, Option<usize>) {
         let state = self.state.lock().unwrap();
@@ -903,8 +902,8 @@ impl QueueManager {
     }
 
     /// Get the full queue state without the upcoming/history caps applied by
-    /// `get_state()`. Used by clients that paginate the upcoming list (e.g.
-    /// the Queue sidebar's "UP NEXT" paginator) and need the complete history.
+    /// `get_state()`. Used by clients that paginate the upcoming list (the
+    /// HTTP API's queue listing) and need the complete history.
     /// The `upcoming` ordering is shuffle-aware, matching `get_state()`.
     pub fn get_state_full(&self) -> QueueState {
         let state = self.state.lock().unwrap();
@@ -1205,19 +1204,18 @@ mod tests {
     }
 
     // ===================================================================
-    // LANE C DIAGNOSTIC TESTS (B1 — sync_current_to_id pointer robustness)
+    // DIAGNOSTIC TESTS: sync_current_to_id pointer robustness
     // These reproduce concrete states where the QueueManager pointer ends
     // up at a DIFFERENT track than the audio engine is actually playing.
     // ===================================================================
 
-    /// B1 ROOT-CAUSE (a): live track id NOT present in `state.tracks`.
+    /// ROOT-CAUSE (a): live track id NOT present in `state.tracks`.
     /// When the audio engine has gaplessly advanced into a track that is no
     /// longer in the queue (e.g. the queue was replaced by a brand-new list
     /// while the OLD track was still draining, or an infinite-radio / single-
     /// track-replace), `sync_current_to_id` returns None and the pointer is
-    /// left untouched — pointing at the STALE old track. Both NPB and sidebar
-    /// then read the wrong `current_track`, and the poll loop never retries
-    /// (it updates `last_track_id` and `continue`s). This is the "cleared the
+    /// left untouched — pointing at the STALE old track, and everything that
+    /// reads `current_track` reports the wrong one. This is the "cleared the
     /// queue and it did NOT fix it" symptom.
     #[test]
     fn test_sync_current_to_id_unknown_id_leaves_pointer_stale() {
@@ -1243,7 +1241,7 @@ mod tests {
         );
     }
 
-    /// B1 ROOT-CAUSE (a'): clear(keep_current) when the kept track is NOT the
+    /// ROOT-CAUSE (a'): clear(keep_current) when the kept track is NOT the
     /// audible one. The user clears the queue to "fix" the stale now-playing,
     /// but clear keeps the track at the (already stale) `current_index`, so the
     /// wrong track is now the SOLE entry — and because its id != the live audio
@@ -1267,7 +1265,7 @@ mod tests {
         assert_eq!(queue.get_state_full().current_track.unwrap().id, 100);
     }
 
-    /// B1 ROOT-CAUSE (b): DUPLICATE track ids in the queue.
+    /// ROOT-CAUSE (b): DUPLICATE track ids in the queue.
     /// `sync_current_to_id` uses `position(|t| t.id == id)`, which returns the
     /// FIRST match. If the same track id appears twice (very common: a track
     /// added to a playlist twice, an album with a repeated bonus track, or a
@@ -1299,7 +1297,7 @@ mod tests {
         );
         // Consequence: the UP-NEXT list is computed from the wrong slot. From
         // idx 0 the upcoming is [200, 100, 300]; from the real idx 2 it should
-        // be [300]. The sidebar shows a wrong upcoming list.
+        // be [300].
         let upcoming_ids: Vec<u64> = state.upcoming.iter().map(|t| t.id).collect();
         assert_eq!(
             upcoming_ids,

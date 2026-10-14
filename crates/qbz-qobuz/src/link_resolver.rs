@@ -1,22 +1,23 @@
 //! Qobuz link resolver
 //!
 //! Parses Qobuz URLs (both `qobuzapp://` scheme and `https://play.qobuz.com/`)
-//! into typed navigation actions. Pure function, no I/O, no Tauri dependency.
+//! into the album, track, artist or playlist they point at. Pure function, no
+//! I/O.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// A resolved Qobuz link — tells the frontend which view to navigate to.
+/// A resolved Qobuz link — the item it points at.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "id")]
 pub enum ResolvedLink {
-    /// Navigate to album view. ID is a string (matches qbz-models Album.id).
+    /// An album. ID is a string (matches qbz-models Album.id).
     OpenAlbum(String),
-    /// Navigate to track's album. ID is numeric.
+    /// A track. ID is numeric.
     OpenTrack(u64),
-    /// Navigate to artist view. ID is numeric.
+    /// An artist. ID is numeric.
     OpenArtist(u64),
-    /// Navigate to playlist view. ID is numeric.
+    /// A playlist. ID is numeric.
     OpenPlaylist(u64),
 }
 
@@ -35,7 +36,7 @@ pub enum LinkResolverError {
     InvalidId(String),
 }
 
-/// Resolve a Qobuz URL into a navigation action.
+/// Resolve a Qobuz URL into the item it links to.
 ///
 /// Accepted formats:
 /// - `qobuzapp://album/<id>`

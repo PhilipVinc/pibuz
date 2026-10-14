@@ -964,7 +964,7 @@ async fn the_controllers_repeat_mode_reaches_the_player_with_its_meaning_intact(
 /// shuffled order is and sends it separately. A renderer that reaches for the
 /// order-generating call here invents its own random order, and the phone and
 /// the speakers then disagree about what plays next for the rest of the
-/// session — the documented "es un infierno" failure.
+/// session.
 #[tokio::test]
 async fn tapping_shuffle_flips_the_flag_without_inventing_an_order() {
     let harness = ControllerHarness::new().await;
@@ -1127,7 +1127,7 @@ async fn the_same_intent_lands_the_same_way_whichever_route_it_arrives_by() {
 /// later item. So a single release reported its catalog id as the queue item id,
 /// the controller could not match that against any row of the queue it holds,
 /// and the play button spun forever with the renderer sitting paused
-/// (vicrodh/qbz#794, "Blister Sunrise" by M83).
+/// ("Blister Sunrise" by M83).
 #[tokio::test]
 async fn a_one_track_release_plays_and_names_its_item_the_way_the_cloud_does() {
     let harness = ControllerHarness::new().await;

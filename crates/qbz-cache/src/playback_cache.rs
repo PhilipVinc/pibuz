@@ -43,7 +43,7 @@ struct PlaybackCacheState {
     /// Tracks the player is HOLDING — the one playing and the one queued for
     /// the gapless hand-off. Never evicted, however old they look.
     ///
-    /// The player takes a `TrackAudio::File(path)` from this cache and opens
+    /// The player takes a `TrackAudio::File` from this cache and opens
     /// that path later, on resume and on every seek. An LRU that cannot see
     /// that deletes the file from under it: the transport reports `paused`
     /// without anyone pausing, and each retry fails with `cannot resume -
@@ -448,7 +448,7 @@ impl PlaybackCache {
         // a complete entry — so that track decoded as garbage on every later
         // play until something evicted it. A rename is atomic, so the cache only
         // ever contains whole files; a crash leaves a `.part` that
-        // `rebuild_index` sweeps.
+        // `sweep_previous_run` clears at the next start.
         let temp_path = path.with_extension("part");
         match fs::File::create(&temp_path) {
             Ok(file) => {
@@ -509,7 +509,6 @@ impl PlaybackCache {
         }
     }
 
-    /// Evict oldest entries to make room for new data
     /// Make room for `needed_bytes`, and say whether it worked.
     ///
     /// `false` means the only entries left are pinned — the caller must NOT

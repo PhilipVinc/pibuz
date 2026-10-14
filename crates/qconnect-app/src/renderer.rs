@@ -1,9 +1,9 @@
-//! Frontend-agnostic renderer-side pure helpers (slice 6).
+//! Renderer-side helpers and orchestration.
 //!
-//! Pure protocol/format math used by the renderer orchestration (queue
-//! materialize / cursor-align). No engine, no I/O. The load-dedup predicates
-//! and the audio-quality report helpers live here alongside their
-//! orchestration / report consumers.
+//! The top of the file is pure protocol/format math (no engine, no I/O); below
+//! it is the renderer orchestration (queue materialize / cursor-align / echo
+//! filtering), written against [`QconnectRendererEngine`]. The load-dedup
+//! predicates live here alongside the orchestration that consumes them.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -22,7 +22,7 @@ use crate::session::{cap_quality, quality_from_max_audio_quality};
 use crate::{QConnectQueueState, QConnectRendererState, QconnectRemoteSyncState, RendererCommand};
 
 /// QConnect protocol `playing_state` wire values. Single source of truth for the
-/// renderer orchestration; the Tauri adapter re-exports these from here.
+/// renderer orchestration and the host's reports.
 pub const PLAYING_STATE_UNKNOWN: i32 = 0;
 pub const PLAYING_STATE_STOPPED: i32 = 1;
 pub const PLAYING_STATE_PLAYING: i32 = 2;
@@ -41,7 +41,7 @@ const LOAD_ATTEMPT_DEDUP_WINDOW: Duration = Duration::from_secs(5);
 const HANDOFF_ECHO_WINDOW: Duration = Duration::from_millis(1_500);
 
 /// Source tag stamped on remote queue tracks materialized from a QConnect cloud
-/// queue. Matches the Tauri adapter's prior `QCONNECT_REMOTE_QUEUE_SOURCE`.
+/// queue.
 pub const QCONNECT_REMOTE_QUEUE_SOURCE: &str = "qobuz_connect_remote";
 
 pub fn qconnect_repeat_mode_from_loop_mode(loop_mode: i32) -> Option<RepeatMode> {
@@ -117,15 +117,12 @@ pub fn model_track_to_core_queue_track(track: &Track) -> QueueTrack {
     }
 }
 
-// ===================== Renderer orchestration (slice 6, step 6) =====================
+// ===================== Renderer orchestration =====================
 //
 // Engine-agnostic: written ONLY against `QconnectRendererEngine` + the shared
-// `QconnectRemoteSyncState`. The Tauri/Slint adapters obtain a concrete engine
-// (`&CoreBridge` / `&SlintEngine`) — including any "not initialized yet" guard —
-// and dispatch here, so the hard-won echo/cursor/materialize/shuffle logic is
-// never re-derived per frontend. Ported byte-for-byte from the prior Tauri
-// `corebridge.rs` / `track_loading.rs`; only `bridge` -> `engine` and the
-// guard-unwrap (which stays adapter-side) changed.
+// `QconnectRemoteSyncState`. The host obtains a concrete engine — including any
+// "not initialized yet" guard — and dispatches here, so the hard-won
+// echo/cursor/materialize/shuffle logic is never re-derived per host.
 
 pub fn queue_state_needs_materialization(
     previous: Option<&QConnectQueueState>,
@@ -147,8 +144,8 @@ pub fn queue_state_needs_materialization(
 pub fn should_reload_remote_track(playback_state: &PlaybackState, track_id: u64) -> bool {
     // Only reload when the track ID actually changed. The previous
     // !has_loaded_audio gate fired during the buffering window of an
-    // initial load (qbz already started fetching but the audio engine
-    // hasn't reported the track as loaded yet) — when the cloud echo
+    // initial load (fetching had started but the audio engine hasn't
+    // reported the track as loaded yet) — when the cloud echo
     // SetState arrived for the same track, this caused a redundant
     // load that interrupted the in-progress one. That was the residual
     // first-track hiccup.
@@ -250,8 +247,8 @@ pub async fn ensure_remote_track_loaded(
 
 /// Force a (re)stream of `track_id` at `start_position_secs` when BECOMING the
 /// active renderer (takeback). Unlike [`ensure_remote_track_loaded`], this does
-/// NOT short-circuit on a matching `playback_state.track_id`: a prior
-/// controller->renderer handoff tore the local stream down via `engine.stop()`
+/// NOT short-circuit on a matching `playback_state.track_id`: handing the render
+/// to a peer earlier tore the local stream down via `engine.stop()`
 /// (audio buffer cleared, `has_loaded_audio` false) while `current_track_id`
 /// still reports the old track, so the plain track-id guard would skip the load
 /// and the following `resume()` would fail with "no audio data available".
@@ -368,16 +365,16 @@ pub async fn apply_renderer_command(
                     false
                 };
 
-                // Track-manipulation operations (cursor align, force-restart,
+                // Track-manipulation operations (cursor align,
                 // ensure_remote_track_loaded) only run when the COMMAND
                 // explicitly specifies a current_track. The projection's
                 // resolved_current_track can be stale: when the cloud sends
                 // a state-only update (pause/resume) with command.current_track=null,
                 // the projection falls back to renderer_state.current_track,
-                // which is the cloud's last-known view of qbz's playback —
-                // potentially behind qbz's actual local advance. Using that
+                // which is the cloud's last-known view of our playback —
+                // potentially behind our actual local advance. Using that
                 // stale value to align/load causes spurious track switches
-                // (e.g., pause from iOS made qbz jump back to a previous
+                // (e.g., pause from iOS made the renderer jump back to a previous
                 // track). The outer renderer_state-based projection is still
                 // used for shuffle sync above and downstream playing_state /
                 // seek operations, which remain safe because they don't
@@ -533,12 +530,12 @@ pub async fn apply_renderer_command(
                 let current_pos_secs = playback_state.position;
                 let target_secs = position_ms / 1000;
                 // Reject echo seeks: when the command targets the same track
-                // qbz is already playing AND target<=1s while local is well
+                // we are already playing AND target<=1s while local is well
                 // ahead, this is the cloud re-emitting a stale SetState
                 // (frequently fires on next_track corrections and queue_
                 // item_id refreshes). A real peer "go to start" intent
                 // would target the same track as the local one but the
-                // round-trip to qbz is already a few seconds, making this
+                // round-trip to us is already a few seconds, making this
                 // case indistinguishable from echo — favor stability.
                 let is_echo_reset = current_track
                     .as_ref()
@@ -550,7 +547,7 @@ pub async fn apply_renderer_command(
                 // active renderer. The previous gate (`peer_renderer_active`)
                 // skipped seeks entirely when local was the active renderer,
                 // breaking the case where a peer controller (e.g. official
-                // Qobuz mobile app) sends a real seek to qbz acting as the
+                // Qobuz mobile app) sends a real seek to us acting as the
                 // renderer — the audio thread never moved while the cloud
                 // state advanced, so the controller's progress bar locked.
                 // The is_echo_reset + abs_diff > 2 gates already filter the
@@ -723,7 +720,7 @@ pub async fn apply_renderer_command(
             // shuffle order — the cloud owns queue order, which arrives separately
             // via `sync_remote_shuffle_projection` / `materialize_remote_queue`.
             // Calling the order-generating `set_shuffle` would produce a divergent
-            // local random order ("es un infierno" — the documented failure mode).
+            // local random order.
             engine.set_shuffle_flag(enabled).await;
         }
     }
@@ -969,7 +966,7 @@ pub async fn materialize_remote_queue(
     // broadcasts immediately), then ~400ms later with the computed
     // shuffle_order. If we mark shuffle_enabled=true on the first event
     // with an absent order, set_queue_with_order falls into its identity
-    // path (0,1,2,...) — that is qbz inventing a sequence that diverges
+    // path (0,1,2,...) — that is us inventing a sequence that diverges
     // from the order the cloud is about to authorize. Defer the engine
     // shuffle activation until the authoritative order is present.
     let effective_shuffle_enabled = queue_state.shuffle_mode && core_shuffle_order.is_some();
@@ -1038,11 +1035,6 @@ pub async fn materialize_remote_queue(
     // above only re-points the queue, so without this the tap plays nothing and
     // the outgoing track keeps going.
     //
-    // Gated on the cloud reporting the session PLAYING: a selection made while
-    // paused or stopped is the controller staging a track, not asking for audio.
-    // `ensure_remote_track_loaded` keeps the shared dedup window, so a SetState
-    // that DOES name this track right after cannot load it twice, and it
-    // short-circuits when the engine already plays it.
     // A queue REPLACEMENT that names nothing at all. Picking an album the
     // renderer is not playing from pushes a whole new queue with
     // `autoplay_reset` and `queue_position: null`, and every SetState that
@@ -1147,13 +1139,10 @@ pub async fn align_queue_cursor(
     Ok(())
 }
 
-// ===================== Mock-engine trait tests (slice 6, step 8) =====================
+// ===================== Mock-engine trait tests =====================
 //
 // These exercise the renderer orchestration end-to-end against a recording mock
-// engine — the hard-won behavior that previously could only be tested through the
-// Tauri adapter. A passing test here proves the logic is engine-independent: any
-// future Slint regression is a wiring bug in its trait impl, not a re-derivation
-// bug in the shared logic.
+// engine, so the shared logic is tested independently of any real engine.
 
 #[cfg(test)]
 mod tests {
@@ -1210,8 +1199,7 @@ mod tests {
         queue_tracks: Vec<QueueTrack>,
         queue_index: Option<usize>,
         loaded_audio: bool,
-        /// This renderer's configured ceiling; `None` = uncapped, as the
-        /// desktop is.
+        /// This renderer's configured ceiling; `None` = uncapped.
         local_max_quality: Option<Quality>,
     }
 
@@ -1455,8 +1443,8 @@ mod tests {
         assert_eq!(engine.calls().start_qualities, vec![Quality::Mp3]);
     }
 
-    /// An UNCAPPED renderer (the desktop, which has no `playback.quality`)
-    /// keeps honoring the controller exactly as before this fix.
+    /// An UNCAPPED renderer (the trait default) keeps honoring the controller
+    /// exactly as before this fix.
     #[tokio::test]
     async fn an_uncapped_renderer_still_honors_the_controller() {
         let engine = MockEngine::new();
@@ -2377,7 +2365,7 @@ mod tests {
         assert!(engine.calls().start_track_streams.is_empty());
     }
 
-    /// #1 (takeback) — the prior controller->renderer stop() cleared the audio
+    /// #1 (takeback) — the stop() that handed the render away cleared the audio
     /// buffer but left a stale track id, so a plain track-id guard would skip
     /// the reload and a later resume() would die with "no audio data
     /// available". That reload still happens, but on the STATE-ONLY resume

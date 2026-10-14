@@ -13,7 +13,7 @@ mod paths;
 mod qconnect;
 mod state;
 
-pub const API_VERSION: u32 = 1; // 02-cli-and-api.md §1.6
+pub const API_VERSION: u32 = 1;
 
 /// The version this build reports everywhere (`pibuz version`, `--version`,
 /// `/api/status`, the Connect device's softwareVersion). Normally the Cargo
@@ -133,7 +133,7 @@ enum Cmd {
         #[arg(long)]
         system: bool,
     },
-    /// Shell completions (hidden; packaged by T14)
+    /// Shell completions (hidden; for packagers)
     #[command(hide = true)]
     Completions {
         shell: clap_complete::Shell,
@@ -294,8 +294,8 @@ enum QconnectCmd {
     Name { name: String },
 }
 
-// The tokenless default has no rotation verb (02 §3.1.2): `config` is just
-// path|show. Rotating the opt-in [server] token = edit pibuz.toml + restart.
+// The tokenless default has no rotation verb: `config` is just path|show.
+// Rotating the opt-in [server] token = edit pibuz.toml + restart.
 #[derive(Subcommand)]
 enum ConfigCmd {
     Path,
@@ -474,10 +474,10 @@ async fn main() {
     std::process::exit(code);
 }
 
-/// Resolve the daemon profile roots for a local CLI auth operation. `login` and
-/// `logout` write the credential file into the config root and nudge the LOCAL
-/// daemon, so — like `run` — they honor a `pibuz.toml` `data_root` override while
-/// keeping the config root at its XDG default.
+/// Resolve the daemon profile roots for a local CLI settings operation.
+/// `settings` and `qconnect` write into the data root and nudge the LOCAL
+/// daemon, so — like `run` — they (and `config`) honor a `pibuz.toml`
+/// `data_root` override while keeping the config root at its XDG default.
 fn login_roots() -> paths::ProfileRoots {
     let bootstrap = paths::ProfileRoots::resolve(None, None);
     let cfg_path = bootstrap.config_file();

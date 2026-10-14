@@ -1,14 +1,14 @@
-//! Core events for frontend communication
+//! Core events
 //!
-//! This module defines all events that flow from the core to frontends.
-//! Frontends implement FrontendAdapter to receive these events.
+//! This module defines all events that flow from the core to the host.
+//! The host implements FrontendAdapter to receive these events.
 
 use serde::Serialize;
 
 use crate::playback::{PlaybackState, QueueState, QueueTrack};
 use crate::types::UserSession;
 
-/// All events emitted by QBZ core to frontends
+/// All events emitted by QBZ core to the host's adapter
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", content = "data")]
 pub enum CoreEvent {

@@ -197,10 +197,8 @@ pub fn resolve_remote_start_index(
             // STALE relative to THIS queue — e.g. a fresh album was just pushed (new
             // track_context_uuid, autoplay_reset) while the projection still names
             // the PREVIOUS queue's item. Trusting the stale qid lands the cursor on
-            // the wrong track (the "NowPlayingBar shows track 4 on a freshly-pushed
-            // album" bug, controlling a peer that was already rendering). Fall
-            // through to the track_id lookup; it won't find the old track in the new
-            // queue, so the caller defaults to the queue head.
+            // the wrong track. Fall through to the track_id lookup; it won't find the
+            // old track in the new queue, so the caller defaults to the queue head.
             let track_matches = renderer_track_id
                 .map(|track_id| queue_state.queue_items[index].track_id == track_id)
                 .unwrap_or(true);
@@ -300,10 +298,10 @@ pub fn resolve_core_shuffle_order(
 /// A release of exactly one track has no later item to corroborate with, and
 /// demanding one anyway is what left a single release reporting its catalog id
 /// where the controller expected 0. The controller cannot find that id in the
-/// queue it holds, so the play button spun forever while the renderer sat paused
-/// (vicrodh/qbz#794). Corroborate when there is something to corroborate with; a
-/// queue of one rests on the head alone, which is safe because a catalog id is
-/// never also a queue position.
+/// queue it holds, so the play button spun forever while the renderer sat
+/// paused. Corroborate when there is something to corroborate with; a queue of
+/// one rests on the head alone, which is safe because a catalog id is never
+/// also a queue position.
 fn is_cloud_placeholder_current_queue_item(
     queue: &QConnectQueueState,
     current_index: usize,
@@ -355,12 +353,11 @@ mod tests {
         }
     }
 
-    /// Regression (controller of a peer that was already rendering): a fresh album
-    /// is pushed, but the cached renderer projection still names the PREVIOUS
-    /// queue's item (qid=3 + the old track_id). The old track is absent from the
-    /// new queue, so the stale qid must NOT resolve the cursor to the new queue's
-    /// item 3 ("NowPlayingBar shows track 4 on a freshly-pushed album"). It falls
-    /// through to the track_id lookup (miss) → None → caller defaults to the head.
+    /// Regression: a fresh album is pushed, but the cached renderer projection
+    /// still names the PREVIOUS queue's item (qid=3 + the old track_id). The old
+    /// track is absent from the new queue, so the stale qid must NOT resolve the
+    /// cursor to the new queue's item 3. It falls through to the track_id lookup
+    /// (miss) → None → caller defaults to the head.
     #[test]
     fn stale_qid_with_mismatched_track_does_not_land_on_wrong_track() {
         let q = queue(vec![
@@ -398,7 +395,7 @@ mod tests {
         assert_eq!(resolve_remote_start_index(&q, Some(99), Some(200)), Some(1));
     }
 
-    /// Regression (vicrodh/qbz#794, "Blister Sunrise" by M83): a release of ONE
+    /// Regression ("Blister Sunrise" by M83): a release of ONE
     /// track. Its head is the cloud's placeholder exactly as a longer release's
     /// is, and must normalize to 0 — there is simply no second item to prove it
     /// with. Reporting the catalog id instead left the controller's play button

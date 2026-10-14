@@ -41,14 +41,13 @@ where
     transport: Arc<TTransport>,
     sink: Arc<TSink>,
     state: Arc<Mutex<QconnectRuntimeState>>,
-    /// Cross-frontend remote-sync accumulator (session topology, renderer-state
-    /// cache, materialization cache, load-attempt dedup, watchdog epoch). Held
-    /// behind its OWN Mutex, disjoint from `state`: the two are never co-locked,
-    /// so the renderer-report hot path never serializes against session/watchdog
-    /// work and there is no deadlock edge against `clear_pending_if_matches`
-    /// (which locks `state`). The session loop (slice 5) and the renderer engine
-    /// (slice 6) both lock THIS one, exactly as they share it today via the Tauri
-    /// adapter. See `MASTER-qconnect-to-slint-plan.md` §0 (one Mutex, not two).
+    /// Remote-sync accumulator (session topology, renderer-state cache,
+    /// materialization cache, load-attempt dedup, watchdog epoch). Held behind
+    /// its OWN Mutex, disjoint from `state`: the two are never co-locked, so the
+    /// renderer-report hot path never serializes against session/watchdog work
+    /// and there is no deadlock edge against `clear_pending_if_matches` (which
+    /// locks `state`). The session loop and the renderer orchestration both lock
+    /// THIS one — one Mutex, not two.
     sync: Arc<Mutex<QconnectRemoteSyncState>>,
 }
 
@@ -75,9 +74,9 @@ where
     const PENDING_ACTION_TIMEOUT_MS: u64 = 10_000;
 
     /// Construct the app. `sync` is the shared remote-sync accumulator handle:
-    /// the Tauri adapter builds it, hands a clone to its event sink / service
-    /// loop, and passes the SAME `Arc` here so there is exactly one lock backing
-    /// the session/liveness/renderer paths. The Slint adapter will do the same.
+    /// the host builds it, hands a clone to its event sink / service loop, and
+    /// passes the SAME `Arc` here so there is exactly one lock backing the
+    /// session/liveness/renderer paths.
     pub fn new(
         transport: Arc<TTransport>,
         sink: Arc<TSink>,
@@ -96,8 +95,8 @@ where
         Arc::clone(&self.state)
     }
 
-    /// Shared handle to the remote-sync accumulator. The adapter uses this so its
-    /// event sink, service loop, and CoreBridge helpers lock the very same Mutex
+    /// Shared handle to the remote-sync accumulator. The host uses this so its
+    /// event sink, service loop, and renderer engine lock the very same Mutex
     /// the app's own session/watchdog methods lock.
     pub fn sync_handle(&self) -> Arc<Mutex<QconnectRemoteSyncState>> {
         Arc::clone(&self.sync)
@@ -218,9 +217,8 @@ where
 
     /// Emit a RndrSrvrFileAudioQualityChanged report describing the decoded file
     /// format, deduped against the last reported value. Returns Ok(true) when a
-    /// report was sent. Frontend-agnostic (slice 6, step 7): both the Tauri and
-    /// Slint report loops feed this; the snapshot is produced from the engine's
-    /// `current_output_format()`.
+    /// report was sent. The host's report loop feeds this; the snapshot is
+    /// produced from the engine's `current_output_format()`.
     pub async fn report_file_audio_quality_if_changed(
         &self,
         queue_version: QueueVersion,
@@ -294,7 +292,7 @@ where
         Ok(true)
     }
 
-    /// Update the renderer state's position from the frontend's playback position.
+    /// Update the renderer state's position from the engine's playback position.
     /// This keeps the internal state in sync with the actual audio playback, so that
     /// renderer reports triggered by server commands (pause/resume) include the real position.
     pub async fn update_renderer_position(&self, position_ms: u64) {
@@ -537,15 +535,16 @@ where
         // Detect echo SET_STATE commands: the server echoes every state report
         // as a SET_STATE with only next_track (playing_state=None,
         // current_track=None, current_position_ms=None). These echoes must
-        // NOT trigger CoreBridge actions (align cursor, load track,
+        // NOT trigger engine actions (align cursor, load track,
         // resume/pause) or state reports, otherwise they destroy the local
         // queue and cause feedback loops.
         //
         // Issue #387: a peer controller (e.g. official Qobuz mobile app)
         // sends a SEEK as SET_STATE with only current_position_ms set
         // (playing_state=None, current_track=None). The previous filter
-        // matched that shape and silently swallowed the command, so qbz
-        // never moved its audio thread when an external controller seeked.
+        // matched that shape and silently swallowed the command, so the
+        // renderer never moved its audio thread when an external controller
+        // seeked.
         // Treat current_position_ms.is_some() as the signal that the
         // command carries real intent and must be propagated.
         let is_echo = matches!(
@@ -1163,19 +1162,17 @@ fn session_management_event_completes_pending_action(
 }
 
 /// Post-lock work returned by [`QconnectApp::apply_session_management_event`].
-/// The adapter runs the CoreBridge side-effects (remote loop mode,
-/// local-playback handoff, projection alignment) from these flags in order,
-/// then drives the freeze + watchdog via
-/// [`QconnectApp::freeze_active_renderer_projection`] /
-/// [`QconnectApp::arm_renderer_watchdog`] — preserving the exact post-lock
-/// ordering of the prior inline Tauri implementation.
+/// The host runs the engine side-effects (remote loop mode, local-playback
+/// handoff, projection alignment) from these flags in order, then drives the
+/// freeze + watchdog via [`QconnectApp::freeze_active_renderer_projection`] /
+/// [`QconnectApp::arm_renderer_watchdog`].
 #[derive(Debug, Default, Clone)]
 pub struct SessionApplyOutcome {
-    /// Active renderer whose remote projection should be re-aligned into CoreBridge.
+    /// Active renderer whose remote projection should be re-aligned into the engine.
     pub remote_projection_renderer_id: Option<i32>,
     /// Stop local playback because an active peer renderer now owns playback.
     pub sync_local_playback: bool,
-    /// Apply this remote loop mode to CoreBridge.
+    /// Apply this remote loop mode to the engine.
     pub apply_loop_mode: Option<i32>,
     /// Active peer renderer left gracefully (ACTIVE_DISCONNECTED) — freeze it.
     pub disconnected_renderer_id: Option<i32>,
@@ -1185,7 +1182,7 @@ pub struct SessionApplyOutcome {
 
 /// Bump the watchdog epoch, invalidating any in-flight 12s liveness task.
 /// Returns the new generation (captured when arming so the spawned task knows
-/// which epoch it belongs to). Relocated from the Tauri sink (slice 2+4).
+/// which epoch it belongs to).
 fn bump_watchdog_generation(state: &mut QconnectRemoteSyncState) -> u64 {
     state.watchdog_generation = state.watchdog_generation.wrapping_add(1);
     state.watchdog_generation
@@ -1198,18 +1195,14 @@ where
 {
     /// Apply a server session-management event (types 81-87, 97-101) to the
     /// shared remote-sync accumulator under ONE lock, returning the post-lock
-    /// work the adapter must drive.
+    /// work the host must drive.
     ///
-    /// Relocated from the Tauri event sink (slice 2+4): the locked critical
-    /// section is byte-identical. The only differences are (a) the lock handle
-    /// is `self.sync`, (b) local identity is injected as `identity` so the crate
-    /// stays frontend-agnostic (`refresh_local_renderer_id` takes it instead of
-    /// resolving device-info itself), and (c) the post-lock dispatch is RETURNED
-    /// via [`SessionApplyOutcome`] rather than run inline — the CoreBridge
-    /// materialization stays adapter-side because it is the renderer-engine seam
-    /// (slice 6). The early `return`s (missing required fields) yield a default
-    /// outcome so the adapter's post-lock block does nothing, exactly as the
-    /// prior `return;` skipped it.
+    /// Local identity is injected as `identity` (`refresh_local_renderer_id`
+    /// takes it instead of resolving device-info itself), and the post-lock
+    /// dispatch is RETURNED via [`SessionApplyOutcome`] rather than run inline —
+    /// the engine materialization stays host-side because it is the
+    /// renderer-engine seam. The early `return`s (missing required fields) yield
+    /// a default outcome so the host's post-lock block does nothing.
     pub async fn apply_session_management_event(
         &self,
         message_type: &str,
@@ -1375,7 +1368,7 @@ where
                 sync_session_renderer_active_flags(&mut state);
                 remote_projection_renderer_id = state.session.active_renderer_id;
                 sync_local_playback = true;
-                // P0-1: active-renderer change disarms any pending liveness task.
+                // An active-renderer change disarms any pending liveness task.
                 bump_watchdog_generation(&mut state);
             }
             "MESSAGE_TYPE_SRVR_CTRL_RENDERER_STATE_UPDATED" => {
@@ -1420,16 +1413,16 @@ where
                     && is_peer_renderer_active(&state.session)
                     && renderer_id != -1;
 
-                // P0-2: graceful disconnect. status==ACTIVE_DISCONNECTED(2) for
-                // the active remote renderer (id != -1) means the renderer left
-                // cleanly — freeze the projection so the UI stops lying.
+                // Graceful disconnect. status==ACTIVE_DISCONNECTED(2) for the
+                // active remote renderer (id != -1) means the renderer left
+                // cleanly — freeze the projection so it stops lying.
                 let status =
                     RendererStatus::from_wire(payload.get("status").and_then(Value::as_i64));
                 if status == RendererStatus::ActiveDisconnected && is_active_peer {
                     disconnected_renderer_id = Some(renderer_id as i32);
                 }
 
-                // P0-1 liveness watchdog. Any RENDERER_STATE_UPDATED for the
+                // Liveness watchdog. Any RENDERER_STATE_UPDATED for the
                 // active peer resets the timer (bump generation); arm a fresh 12s
                 // task only while PLAYING. A non-playing update disarms (bump
                 // only, no spawn).
@@ -1511,12 +1504,12 @@ where
         }
     }
 
-    /// Arm the generation-guarded 12s renderer-liveness watchdog (P0-1). Spawns
+    /// Arm the generation-guarded 12s renderer-liveness watchdog. Spawns
     /// a task holding a cheap clone of self. On wake it re-locks the sync
     /// accumulator and no-ops unless its captured epoch is still current AND the
     /// renderer is still the active peer AND still nominally PLAYING; only then
     /// does it freeze the projection and emit `RendererUnreachable`. Modeled on
-    /// `watch_pending_action_timeout`; relocated from the Tauri sink (slice 2+4).
+    /// `watch_pending_action_timeout`.
     pub fn arm_renderer_watchdog(&self, renderer_id: i32, generation: u64) {
         let app = self.clone();
         tokio::spawn(async move {
@@ -1551,13 +1544,11 @@ where
     }
 
     /// Force the active renderer's cached projection to UNKNOWN/stopped and emit
-    /// the freeze event through the sink. Shared by ACTIVE_DISCONNECTED (P0-2)
-    /// and the silence watchdog (P0-1). Relocated from the Tauri sink (slice
-    /// 2+4): the state mutation + `self.sink.on_event(freeze_event)` is
-    /// byte-identical. The sink's mapper arm for `RendererUnreachable` /
-    /// `RendererDisconnected` ONLY emits the dedicated channel (+ the blanket
-    /// event); it does NOT route back into apply or call this helper again, so it
-    /// cannot re-arm the watchdog or recurse.
+    /// the freeze event through the sink. Shared by ACTIVE_DISCONNECTED and the
+    /// silence watchdog. The sink must handle `RendererUnreachable` /
+    /// `RendererDisconnected` without routing back into apply or calling this
+    /// helper again (pibuz's only logs them), so it cannot re-arm the watchdog
+    /// or recurse.
     pub async fn freeze_active_renderer_projection(
         &self,
         renderer_id: i32,
@@ -1575,8 +1566,7 @@ where
 
 /// Prior-state snapshot captured from the sync accumulator BEFORE a SESSION_STATE
 /// frame is applied, plus the server's classified active state derived from the
-/// incoming payload. Drives P1-3 takeover arbitration after the apply. Relocated
-/// from the Tauri adapter (slice 5) so the shared session loop owns it.
+/// incoming payload. Drives takeover arbitration after the apply.
 #[derive(Debug, Clone, Copy)]
 pub struct SessionStateTakeoverInput {
     pub was_active: bool,
@@ -1585,7 +1575,7 @@ pub struct SessionStateTakeoverInput {
 }
 
 /// Preview the first 8 `track_id`s under `payload[key]` for diagnostic emits.
-/// Pure; relocated from the Tauri adapter (slice 5).
+/// Pure.
 pub fn queue_payload_track_preview(payload: &Value, key: &str) -> Vec<i64> {
     payload
         .get(key)
@@ -1607,8 +1597,8 @@ where
 {
     /// Capture `was_active` from the current (pre-apply) sync state and whether
     /// the incoming SESSION_STATE names no active renderer. Pure-ish read;
-    /// takes no decision. Relocated from the Tauri adapter (slice 5); locks
-    /// `self.sync` (the same accumulator the apply path mutates).
+    /// takes no decision. Locks `self.sync` (the same accumulator the apply
+    /// path mutates).
     pub async fn capture_session_state_takeover_input(
         &self,
         payload: &Value,
@@ -1630,8 +1620,7 @@ where
 
     /// Clear the pending action slot iff it still matches `action_uuid`. Used for
     /// replies that are not reducer-correlated (set-active, ask-for-state). Locks
-    /// `self.state` (NEVER co-locked with `self.sync`). Relocated from the Tauri
-    /// adapter (slice 5).
+    /// `self.state` (NEVER co-locked with `self.sync`).
     pub async fn clear_pending_if_matches(&self, action_uuid: &str) {
         let mut state = self.state.lock().await;
         let pending_matches = state
@@ -1646,10 +1635,8 @@ where
 
     /// Guarded `CtrlSrvrSetActiveRenderer` sender. No-ops when the target equals
     /// the current active renderer or the id is invalid. Never resets reconnect
-    /// counters (#358 latch untouched). Relocated from the Tauri adapter's
-    /// `send_set_active_renderer_via_app` (slice 5); the request payload
-    /// `{ "renderer_id": <i32> }` is byte-identical to the prior
-    /// `QconnectSetActiveRendererRequest` serialization.
+    /// counters (#358 latch untouched). The request payload is
+    /// `{ "renderer_id": <i32> }`.
     pub async fn send_set_active_renderer(&self, target_renderer_id: i32) -> Result<bool, String> {
         if target_renderer_id < 0 {
             return Ok(false);
@@ -1672,11 +1659,9 @@ where
         Ok(true)
     }
 
-    /// Ask the currently-active renderer for its full state (P1-8). No-op when no
+    /// Ask the currently-active renderer for its full state. No-op when no
     /// active renderer is known. The reply is not reducer-correlated, so its
-    /// pending slot is cleared immediately. Relocated from the Tauri adapter
-    /// (slice 5); payload byte-identical to the prior
-    /// `QconnectAskForRendererStateRequest` serialization.
+    /// pending slot is cleared immediately.
     pub async fn ask_for_active_renderer_state(&self) -> Result<bool, String> {
         let active_id = {
             let st = self.sync.lock().await;
@@ -1697,9 +1682,9 @@ where
         Ok(true)
     }
 
-    /// Ask the server for the current queue state (P1-8 Lagged-recovery / generic
+    /// Ask the server for the current queue state (Lagged-recovery / generic
     /// re-sync). The reply is not reducer-correlated, so its pending slot is
-    /// cleared. Relocated from the Tauri adapter (slice 5).
+    /// cleared.
     pub async fn ask_for_queue_state(&self) -> Result<(), String> {
         let cmd = self
             .build_queue_command(
@@ -1716,31 +1701,29 @@ where
     }
 }
 
-/// Attempt budget for the Lagged-recovery re-AskForQueueState loop (P1-8).
+/// Attempt budget for the Lagged-recovery re-AskForQueueState loop.
 const QCONNECT_REASK_QUEUE_STATE_MAX_ATTEMPTS: u32 = 5;
 
-/// Adapter-provided seams for the shared session loop. `run_session_loop` is
-/// frontend-agnostic; it calls these for the bits that must stay adapter-side:
-/// the lifecycle gating (depends on the adapter's runtime ownership), the
-/// reconnect-exhausted teardown (R3), controller bootstrap, the renderer-join
-/// reports (which read the engine's track duration — R2), and the raw error
-/// surface. Both the Tauri adapter and a future Slint adapter implement this.
+/// Host-provided seams for the session loop. `run_session_loop` calls these
+/// for the bits that must stay host-side: the lifecycle gating (depends on the
+/// host's runtime ownership), the reconnect-exhausted teardown, controller
+/// bootstrap, the renderer-join reports (which read the engine's track
+/// duration), and the raw error surface.
 // clippy 1.99 `double_must_use` fires on `#[async_trait]`'s output, not on
 // this code; see `qbz_models::FrontendAdapter`.
 #[allow(unknown_lints, clippy::double_must_use)]
 #[async_trait]
 pub trait SessionLoopHost: Send + Sync {
-    /// Surface a lifecycle transition. The Tauri adapter gates + dedups this
-    /// (emits `qconnect:status_changed` via the sink only while a runtime is
-    /// still alive); a Slint adapter does its own.
+    /// Surface a lifecycle transition. The host gates + dedups this (publishes
+    /// it only while a runtime is still alive).
     async fn update_lifecycle(&self, state: QconnectLifecycleState);
     /// Re-bootstrap controller presence after a reconnect (JoinSession + ask
     /// queue state). Logs its own errors.
     async fn bootstrap_after_reconnect(&self);
-    /// Renderer JoinSession + initial reports for `session_uuid` (R2: reads the
-    /// current track duration from the adapter's engine). Idempotent per uuid.
+    /// Renderer JoinSession + initial reports for `session_uuid` (reads the
+    /// current track duration from the host's engine). Idempotent per uuid.
     async fn deferred_renderer_join(&self, session_uuid: String, reason: i32);
-    /// Handle MaxReconnectAttemptsExceeded (R3): set Exhausted + last_error, drop
+    /// Handle MaxReconnectAttemptsExceeded: set Exhausted + last_error, drop
     /// the runtime unless idle-retry is active, surface the terminal status.
     /// Returns true if the loop should break (terminate), false to keep idling.
     async fn on_reconnect_exhausted(
@@ -1749,12 +1732,11 @@ pub trait SessionLoopHost: Send + Sync {
         last_reason: String,
         idle_retry_active: bool,
     ) -> bool;
-    /// Surface a transport-handling error (the raw `qconnect:error` channel on Tauri).
+    /// Surface a transport-handling error.
     async fn on_loop_error(&self, message: String);
 }
 
-/// Hex preview of up to `max_bytes` bytes for diagnostic logging. Mirrors the
-/// Tauri adapter's `hex_preview` (relocated with the loop, slice 5).
+/// Hex preview of up to `max_bytes` bytes for diagnostic logging.
 fn hex_preview(data: &[u8], max_bytes: usize) -> String {
     let take = data.len().min(max_bytes);
     let hex: String = data[..take]
@@ -1774,20 +1756,18 @@ where
     TTransport: WsTransport + 'static,
     TSink: QconnectEventSink + 'static,
 {
-    /// The shared transport event loop. Relocated from the Tauri adapter (slice
-    /// 5): consumes transport events and drives takeover arbitration / deferred
-    /// renderer join / reconnect resync / Lagged re-ask, routing diagnostics +
-    /// lifecycle through `self.sink` + the injected `host`. Byte-identical to the
-    /// prior inline Tauri loop; the adapter-coupled seams (lifecycle gating,
-    /// teardown, bootstrap, renderer-join, raw error) go through `host` so both
-    /// frontends share this control flow.
+    /// The transport event loop: consumes transport events and drives takeover
+    /// arbitration / deferred renderer join / reconnect resync / Lagged re-ask,
+    /// routing diagnostics + lifecycle through `self.sink` + the injected
+    /// `host`. The host-coupled seams (lifecycle gating, teardown, bootstrap,
+    /// renderer-join, raw error) go through `host`.
     pub async fn run_session_loop(
         &self,
         host: Arc<dyn SessionLoopHost>,
         mut transport_rx: tokio::sync::broadcast::Receiver<TransportEvent>,
         idle_retry_active: bool,
     ) {
-        // NOTE: `transport_rx` is subscribed by the adapter SYNCHRONOUSLY before
+        // NOTE: `transport_rx` is subscribed by the host SYNCHRONOUSLY before
         // this task is spawned (and before any further await), so the receiver is
         // live before the WS handshake can emit its initial events. tokio
         // broadcast has no replay — subscribing here, inside the spawned task,
@@ -1795,13 +1775,13 @@ where
         log::info!("[QConnect/EventLoop] Started listening for transport events");
         let mut renderer_joined = false;
         let mut has_disconnected = false;
-        // P1-8: budget for re-AskForQueueState after Lagged broadcast drops,
+        // Budget for re-AskForQueueState after Lagged broadcast drops,
         // until the session_uuid is confirmed. Reset on disconnect.
         let mut lagged_reask_attempts: u32 = 0;
         loop {
             match transport_rx.recv().await {
                 Ok(event) => {
-                    // P1-3: on every SESSION_STATE, capture our prior active/playing
+                    // On every SESSION_STATE, capture our prior active/playing
                     // state + classify the server's active renderer BEFORE the sink
                     // applies the new state, so takeover arbitration runs on the
                     // prior snapshot once the apply lands below.
@@ -1837,7 +1817,7 @@ where
                             renderer_joined = false;
                             has_disconnected = true;
                             lagged_reask_attempts = 0;
-                            // Surface "Reconnecting" to the UI, but only if we're
+                            // Surface "Reconnecting", but only if we're
                             // not in a teardown path (Off/Exhausted). The host gates
                             // this on a live runtime.
                             host.update_lifecycle(QconnectLifecycleState::Reconnecting)
@@ -1853,12 +1833,12 @@ where
                             if has_disconnected {
                                 log::info!("[QConnect] Re-bootstrapping after reconnect...");
                                 host.bootstrap_after_reconnect().await;
-                                // P1-8: resync renderer state too, not just the queue.
+                                // Resync renderer state too, not just the queue.
                                 if let Err(err) = self.ask_for_active_renderer_state().await {
                                     log::warn!("[QConnect] AskForRendererState after reconnect failed: {err}");
                                 }
-                                // P1-11: signal the frontend that the post-reconnect
-                                // resync has been issued.
+                                // Signal the host that the post-reconnect resync
+                                // has been issued.
                                 self.sink.on_event(QconnectAppEvent::ResyncComplete).await;
                             }
                         }
@@ -1989,7 +1969,7 @@ where
                                     }),
                                 })
                                 .await;
-                            // R3: the adapter owns the runtime/teardown. It sets
+                            // The host owns the runtime/teardown. It sets
                             // Exhausted + last_error, drops the runtime unless idle-
                             // retry is active, surfaces the terminal status, and tells
                             // us whether to break (terminate) or keep idling.
@@ -2003,7 +1983,7 @@ where
                             if should_break {
                                 break;
                             }
-                            // gap #7 (idle_retry_active): keep the loop alive for the
+                            // idle_retry_active: keep the loop alive for the
                             // re-armed transport; skip the reducer for this terminal
                             // diagnostic and wait for the next event.
                             continue;
@@ -2040,7 +2020,7 @@ where
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                     log::warn!("[QConnect] Transport event lagged by {skipped} messages");
-                    // P1-8: a Lagged drop may have eaten the SESSION_STATE carrying
+                    // A Lagged drop may have eaten the SESSION_STATE carrying
                     // the session_uuid. Re-ask for queue state until the uuid is
                     // confirmed or the attempt budget is spent.
                     let session_uuid_known = {

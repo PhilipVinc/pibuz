@@ -4,8 +4,8 @@
 //! device enumeration, probing PCMs that wrap `dmix` or `route` plugins
 //! emits benign errors (e.g. "unable to open slave" when PipeWire holds
 //! the hardware exclusively, "Found no matching channel map" when a
-//! surround route rejects the probe layout). These appear in the app
-//! log as noise even though enumeration tolerates them.
+//! surround route rejects the probe layout). These appear in the
+//! daemon's log as noise even though enumeration tolerates them.
 //!
 //! This module installs a Rust-side handler that routes those errors
 //! through the `log` crate at `debug!` level. They stay visible when

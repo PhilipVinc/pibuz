@@ -479,9 +479,10 @@ mod tests {
     }
 
     /// The case that made this reachable from the status API: a moOde Pi with
-    /// `alsa_buffer_ms = 1000` at 96 kHz. The LowMemory profile asks for 2 s and
-    /// gets 3 s, because three times a 1000 ms hardware ring is 3000 ms. The
-    /// daemon logged 288000 frames while `/api/status` reported 2000 ms.
+    /// `alsa_buffer_ms = 1000` at 96 kHz. The LowMemory profile asked for 2 s
+    /// then and got 3 s, because three times a 1000 ms hardware ring is
+    /// 3000 ms. The daemon logged 288000 frames while `/api/status` reported
+    /// 2000 ms.
     #[test]
     fn the_alsa_floor_beats_the_profile_on_a_big_hardware_buffer() {
         let rate = 96_000;

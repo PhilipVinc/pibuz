@@ -56,7 +56,7 @@ pub enum ApiError {
     /// `reqwest::Error`'s own `Display` embeds the signed request URL, and this
     /// variant is printed by `retry.rs`'s warn, by `?` conversions, and by
     /// anything that formats an `ApiError`. Fixing it here is what makes those
-    /// safe at once (upstream#780 item 10).
+    /// safe at once.
     #[error("Network error: {}", crate::redact::describe_reqwest(.0))]
     NetworkError(#[from] reqwest::Error),
 

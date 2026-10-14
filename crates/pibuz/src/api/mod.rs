@@ -1,9 +1,9 @@
-// crates/pibuz/src/api/mod.rs — the HTTP control plane (02-cli-and-api.md §3).
+// crates/pibuz/src/api/mod.rs — the HTTP control plane.
 //
 // tiny_http 0.12, single listener, thread-per-connection collapsed to ONE
 // serving thread (requests are handled inline, serialized — a control plane
 // sees a handful of clients, never a load). Two mechanisms qualify the
-// otherwise-open surface (§3.1.2):
+// otherwise-open surface:
 //   - Origin shield (ALWAYS on): any request carrying an `Origin` header is
 //     refused `403 origin_forbidden` before routing — CLI/curl/scripts send no
 //     `Origin`, browsers do (CSRF / DNS-rebinding guard at zero UX cost).
@@ -13,7 +13,7 @@
 //
 // The two-call split — `bind` at boot step 5 (stateless, so the foreign-occupant
 // diagnosis runs BEFORE the stores/runtime exist), `serve` at boot step 11 — is
-// what keeps the 01-architecture.md §8.1 boot order honest.
+// what keeps the boot order honest.
 pub mod play;
 pub mod playback;
 pub mod queue;
@@ -36,13 +36,10 @@ use qbz_app::shell::AppRuntime;
 use qbz_audio::settings::AudioSettingsStore;
 use qbz_models::CoreEvent;
 
-/// The counted P0 route table (02 §3.2) — 17, FINAL, this test now guards the
-/// budget forever. A route exists only iff a shipped client calls it (§3.1.4).
-/// T1-T6 landed the first 3; T7 added the 9 playback + now-playing routes
-/// (rows 4-12); T8 added the 4 queue routes (rows 13-16); T11 (this task)
-/// adds `/api/settings/reload` (row 17) — the inline
-/// `route_table_matches_spec_count` test pins the number so the 68-routes
-/// failure shape (a route with no caller) cannot creep back in.
+/// The counted P0 route table — the core control surface. A route exists only
+/// iff a shipped client calls it: the inline `route_table_matches_spec_count`
+/// test pins the number so the 68-routes failure shape (a route with no
+/// caller) cannot creep back in.
 pub const P0_ROUTES: &[(&str, &str)] = &[
     ("GET", "/api/ping"),
     ("GET", "/api/info"),
@@ -109,16 +106,16 @@ pub struct ApiState {
     /// Cached device enumeration for `device_present` (refreshed on a TTL so a
     /// `status` poll never re-enumerates CPAL on every call).
     pub devices: Mutex<DeviceCache>,
-    /// T11: the `AudioSettings` last applied to the `Player`, so
+    /// The `AudioSettings` last applied to the `Player`, so
     /// `POST /api/settings/reload` can tell whether a routing-critical field
     /// changed since the previous reload (`daemon::audio_routing_changed`) —
     /// reinit only when it did, never on every unrelated nudge.
     pub audio_snapshot: Mutex<qbz_audio::settings::AudioSettings>,
-    /// T11: the live cell the playback driver's background auto-advance reads
+    /// The live cell the playback driver's background auto-advance reads
     /// for streaming quality (`daemon.rs::run`'s `quality_cell`) — reload
     /// writes a fresh value here after re-reading `daemon_prefs`.
     pub quality: Arc<Mutex<qbz_models::Quality>>,
-    /// T11: reaches the running QConnect service (`connect`/`disconnect`/
+    /// Reaches the running QConnect service (`connect`/`disconnect`/
     /// device-name refresh) once `qconnect::start` (boot step 12, AFTER the
     /// API starts serving at step 11) publishes it — empty only in the brief
     /// window between the two, which the reload handler no-ops through.
@@ -139,7 +136,7 @@ pub struct DeviceCache {
 
 /// Live serving handle. [`ApiHandle::shutdown`] unblocks the serving thread and
 /// joins it — dropping the thread's `ApiState` (and with it the `Arc<AppRuntime>`
-/// clone) BEFORE the daemon drops the runtime, preserving the §8.2 audio
+/// clone) BEFORE the daemon drops the runtime, preserving the #521 audio
 /// clock-release ordering (the API thread is one more `Arc<AppRuntime>` holder,
 /// exactly like the driver and auth-retry tasks).
 pub struct ApiHandle {
@@ -164,7 +161,7 @@ pub enum BindError {
     Other(String),
 }
 
-/// Boot step 5 (01 §8.1): bind only — stateless, so the foreign-occupant
+/// Boot step 5: bind only — stateless, so the foreign-occupant
 /// diagnosis (in `daemon.rs`) runs BEFORE stores (6) and runtime composition (7).
 pub fn bind(addr: SocketAddr) -> Result<BoundServer, BindError> {
     match tiny_http::Server::http(addr) {
@@ -211,7 +208,7 @@ pub fn probe_is_pibuz(addr: SocketAddr) -> bool {
     text.contains("\"app\":\"pibuz\"")
 }
 
-/// Boot step 11 (01 §8.1): start serving on the already-bound socket. Requests
+/// Boot step 11: start serving on the already-bound socket. Requests
 /// are handled inline on one thread (serialized). `unblock` (from the handle)
 /// ends `incoming_requests` for graceful shutdown.
 pub fn serve(server: BoundServer, state: ApiState) -> ApiHandle {
@@ -284,7 +281,7 @@ fn route(state: &ApiState, req: &mut Request) -> Response<Cursor<Vec<u8>>> {
         .map(|h| h.value.as_str());
 
     // Origin shield (ALWAYS on) + opt-in [server] token — one pre-routing gate,
-    // /api/ping exempt from the token only (§3.1.2).
+    // /api/ping exempt from the token only.
     if let Some(reject) = access_gate(
         has_origin,
         &method,
@@ -359,7 +356,7 @@ fn route(state: &ApiState, req: &mut Request) -> Response<Cursor<Vec<u8>>> {
     }
 }
 
-/// Read and parse a request body as JSON (T7's seek/volume POST bodies).
+/// Read and parse a request body as JSON (the POST routes' bodies).
 /// An unreadable or absent body parses to `Value::Null` — the route handlers
 /// treat a missing expected field as `400 bad_request`, never a panic.
 fn read_json_body(req: &mut Request) -> serde_json::Value {
@@ -395,7 +392,7 @@ impl GateReject {
     }
 }
 
-/// The pre-routing access decision (02 §3.1.2): Origin shield always on; the
+/// The pre-routing access decision: Origin shield always on; the
 /// opt-in Bearer required on every route except `GET /api/ping` when `token`
 /// is `Some`. `None` = open (no auth machinery). Returns `Some(_)` to reject.
 fn access_gate(
@@ -435,10 +432,10 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// Canonical JSON number for a volume level (0.0-1.0). `serde_json::Value`
 /// backs f32 via `Number::from_f32`, which stores the value as `f as f64` —
 /// the f32→f64 widening turns `0.8f32` into `0.800000011920929` on the wire.
-/// 02-cli-and-api.md §2.2/§3.3.4 document plain `0.8`, and `--json` is the
-/// frozen machine contract ("scripts parse this"), so every volume-bearing
-/// response routes through this instead of a bare `json!(v)`. 3 decimals is
-/// plenty of precision for a 0.0-1.0 level.
+/// The wire carries plain `0.8`, and `--json` is the frozen machine contract
+/// ("scripts parse this"), so every volume-bearing response routes through
+/// this instead of a bare `json!(v)`. 3 decimals is plenty of precision for a
+/// 0.0-1.0 level.
 pub(crate) fn canon_volume(v: f32) -> serde_json::Value {
     canon_f32(v)
 }
@@ -463,11 +460,11 @@ pub(crate) fn json(status: u16, body: serde_json::Value) -> Response<Cursor<Vec<
         .with_header(header)
 }
 
-/// The normative error envelope (02 §3.1.3): `{"error":{"code","message","hint"}}`.
-/// The CLI keys its exit code off `code` (never raw HTTP status), and every hint
-/// names the fix (§1.4 error voice). The G0 addendum's shorthand
-/// `{"error":"origin_forbidden"}` is this same nested envelope — the uniform
-/// §3.1.3 shape the CLI's `error_from_envelope` reads via `error.code`.
+/// The error envelope: `{"error":{"code","message","hint"}}`. The CLI keys
+/// its exit code off `code` (never raw HTTP status), and every hint names the
+/// fix. Every error, `origin_forbidden` included, uses this same nested
+/// envelope — the uniform shape the CLI's `error_from_envelope` reads via
+/// `error.code`.
 pub(crate) fn err_json(
     status: u16,
     code: &str,
@@ -487,9 +484,7 @@ mod tests {
 
     #[test]
     fn route_table_matches_spec_count() {
-        // 02-cli-and-api.md §3.2 — P0 = exactly 17 routes, FINAL; grows ONLY
-        // with a shipped client. T1-T6 landed 3; T7 +9 = 12; T8 +4 = 16; T11
-        // (this task) +1 = 17.
+        // P0 = exactly 17 routes; grows ONLY with a shipped client.
         assert_eq!(P0_ROUTES.len(), 17);
         assert!(P0_ROUTES.contains(&("GET", "/api/ping")));
         assert!(P0_ROUTES.contains(&("GET", "/api/info")));
@@ -620,7 +615,7 @@ mod tests {
 
     #[test]
     fn error_envelope_is_the_nested_shape_with_code() {
-        // 02 §3.1.3 — the on-the-wire shape the CLI reads via `error.code`.
+        // The on-the-wire shape the CLI reads via `error.code`.
         let body = error_body("origin_forbidden", "refused", "not a browser API");
         assert_eq!(body["error"]["code"], "origin_forbidden");
         assert_eq!(body["error"]["message"], "refused");

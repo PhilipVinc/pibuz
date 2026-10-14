@@ -1,10 +1,8 @@
 // crates/pibuz/src/state.rs — shared in-memory daemon state (one
 // `Arc<Mutex<DaemonShared>>` shared by the playback driver + the HTTP API).
-// Fields land now; real sources wire in as each producing task lands
-// (T3 driver/audio, T6 HTTP server, T7 transport, T9/T10 QConnect).
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct LatchedErrors {
-    // 01 §9.4 — drain-once channels become latches
+    // drain-once channels become latches
     pub stream: Option<String>,
     pub auth: Option<String>,
     pub transport: Option<String>,
@@ -19,13 +17,11 @@ pub struct DaemonShared {
     pub started_at: std::time::Instant,
     pub startup_warnings: u32,
     pub qconnect: QconnectStatus,
-    /// Coarse network-reachability signal for `/api/status`'s `network.online`
-    /// (01 §9.3). Latched ONLY from real network-class outcomes — never active
-    /// probing: false on an auth-retry/credential-reload network-class failure
-    /// or a QConnect reconnect-exhausted, true on a successful login/restore
-    /// (`restore_activate`, which reload's own credential validation also
-    /// funnels through) or a successful QConnect (re)connect. Defaults true
-    /// (optimistic) until the first outcome latches it.
+    /// Coarse network-reachability signal for `/api/status`'s `network.online`.
+    /// Latched ONLY from real network-class outcomes — never active probing:
+    /// false on a QConnect reconnect-exhausted, true on a successful QConnect
+    /// (re)connect. Defaults true (optimistic) until the first outcome latches
+    /// it.
     pub network_online: std::sync::atomic::AtomicBool,
     /// CoreEvent bus handle so state mutations here can publish matching bus
     /// events (`emit_qconnect_session_changed`). None until `daemon::run`
@@ -34,7 +30,7 @@ pub struct DaemonShared {
 }
 
 impl DaemonShared {
-    /// Read the latched network-reachability signal (§9.3). `Relaxed` is
+    /// Read the latched network-reachability signal. `Relaxed` is
     /// sufficient — this is a coarse status flag read under the same
     /// `Mutex<DaemonShared>` guard as every other field here, not a
     /// synchronization primitive of its own.
@@ -50,10 +46,6 @@ impl DaemonShared {
             .store(online, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Publish the CURRENT `qconnect` block as a `QconnectSessionChanged` bus
-    /// event (SSE `/api/events`, `pibuz watch`, the event hook). Call AFTER
-    /// mutating `self.qconnect`; a best-effort no-op before the bus attaches
-    /// or when no receiver is subscribed.
     /// Publish an event on the daemon bus (SSE subscribers and the event hook).
     /// A no-op before the bus exists, which is the case during early startup.
     pub fn emit(&self, event: qbz_models::CoreEvent) {
@@ -74,6 +66,10 @@ impl DaemonShared {
         self.qconnect.is_active = false;
     }
 
+    /// Publish the CURRENT `qconnect` block as a `QconnectSessionChanged` bus
+    /// event (SSE `/api/events`, `pibuz watch`, the event hook). Call AFTER
+    /// mutating `self.qconnect`; a best-effort no-op before the bus attaches
+    /// or when no receiver is subscribed.
     pub fn emit_qconnect_session_changed(&self) {
         if let Some(bus) = &self.bus {
             let _ = bus.send(qbz_models::CoreEvent::QconnectSessionChanged {
@@ -181,7 +177,7 @@ mod tests {
 
     #[test]
     fn network_online_latches_false_then_true() {
-        // Pure latch semantics (01 §9.3): a real network-class failure flips
+        // Pure latch semantics: a real network-class failure flips
         // it false, a real success flips it back true — the exact two
         // transitions every call site above drives. Defaults true.
         let shared = DaemonShared {

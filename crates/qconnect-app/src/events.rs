@@ -33,9 +33,8 @@ pub enum QconnectAppEvent {
         action_uuid: String,
     },
     QueueResyncTriggered,
-    /// Renderer per-track playback failure (PlaybackErrorMessage). The frontend
-    /// maps streamable/network/not-found failures on the current item to an
-    /// auto-skip; other types surface a toast only.
+    /// Renderer per-track playback failure (PlaybackErrorMessage) received
+    /// from the server.
     PlaybackError {
         queue_item_id: u64,
         error_type: qconnect_protocol::ErrorType,
@@ -67,7 +66,7 @@ pub enum QconnectAppEvent {
         state: QconnectLifecycleState,
     },
     /// Pass-through diagnostic (inbound-event preview, cloud error, max-reconnect, ...).
-    /// `channel` is the legacy Tauri channel suffix so the mapper is mechanical.
+    /// `channel` names the source, e.g. `qconnect:cloud_error`.
     Diagnostic {
         channel: String,
         level: String,
@@ -103,8 +102,8 @@ mod tests {
         }
     }
 
-    /// Slice 3: the five new liveness/lifecycle/diagnostic variants flow through
-    /// the `QconnectEventSink` trait. A sink receives each one verbatim.
+    /// The liveness/lifecycle/diagnostic variants flow through the
+    /// `QconnectEventSink` trait. A sink receives each one verbatim.
     #[tokio::test]
     async fn new_variants_flow_through_sink() {
         let sink = TestSink::default();
@@ -148,9 +147,7 @@ mod tests {
         ));
     }
 
-    /// The lifecycle state must serialize snake_case so the Tauri mapper's
-    /// `{"state": <serialized>}` payload is byte-identical to the prior raw
-    /// `qconnect:status_changed` emit.
+    /// The lifecycle state must serialize snake_case.
     #[test]
     fn lifecycle_state_serializes_snake_case() {
         assert_eq!(

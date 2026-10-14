@@ -16,8 +16,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum AudioBackendType {
     /// PipeWire backend (modern, recommended)
-    /// - Supports device selection without changing system default
-    /// - Uses PULSE_SINK environment variable
+    /// - Selects the device by making it the system default, or, with
+    ///   `skip_sink_switch`, by targeting it without changing the default
     /// - Compatible with PulseAudio apps
     PipeWire,
 
@@ -33,7 +33,7 @@ pub enum AudioBackendType {
     /// - Fallback for systems without PipeWire
     Pulse,
 
-    /// JACK backend (#263 Tier 3 — pro-audio routing). Linux-only in practice.
+    /// JACK backend (#263 — pro-audio routing). Linux-only in practice.
     /// - QBZ appears as a first-class JACK client with stable ports
     ///   (`qbz:out_FL` / `qbz:out_FR`), patchable in qjackctl/qpwgraph/Reaper
     /// - Routing survives track changes (the client + ports live once)
@@ -42,8 +42,9 @@ pub enum AudioBackendType {
     ///   bit-perfect ALSA-exclusive / DAC-passthrough paths.
     Jack,
 
-    /// System default backend (non-Linux platforms)
-    /// - Uses CPAL default host (CoreAudio on macOS, WASAPI on Windows)
+    /// System default backend (every platform; the default)
+    /// - Uses CPAL default host (CoreAudio on macOS, WASAPI on Windows, the
+    ///   ALSA "default" PCM on Linux)
     /// - Automatic device selection via OS audio system
     #[default]
     SystemDefault,
@@ -274,7 +275,7 @@ pub trait AudioBackend: Send + Sync {
     /// Check if this backend is available on the current system
     fn is_available(&self) -> bool;
 
-    /// Get a description of this backend for UI display
+    /// Get a human-readable description of this backend
     fn description(&self) -> &'static str;
 
     /// Downcast to concrete type (for ALSA Direct stream creation)
@@ -308,7 +309,7 @@ impl BackendManager {
                 backends.push(AudioBackendType::Pulse);
             }
 
-            // JACK (#263 Tier 3): offered now that the player wiring is in place
+            // JACK (#263): offered now that the player wiring is in place
             // (StreamType::Jack + dispatch + PlaybackEngine::Jack feeder/resampler).
             // Only when compiled in -- the old note here claimed "the binary links
             // libjack, so reaching here means it is present", which was never true:
@@ -512,7 +513,7 @@ impl AudioBackend for CpalDefaultBackend {
         // CPAL's raw enumeration repeats one output across many ALSA PCM
         // plugins (all sharing a display name) and includes the `null` discard
         // sink. Collapse the duplicates and push `null` to the end so the
-        // System/JACK picker shows one entry per real output. See device_filter.
+        // System/JACK list has one entry per real output. See device_filter.
         let devices = crate::device_filter::retain_real_outputs(
             devices,
             |d| d.id.as_str(),

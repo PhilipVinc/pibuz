@@ -1,8 +1,8 @@
 // crates/pibuz/src/cli/client.rs — the stateless HTTP client behind every
-// networked CLI verb (02-cli-and-api.md §1.1). One verb = one request; the
-// client holds no daemon state beyond target discovery (§1.5).
+// networked CLI verb. One verb = one request; the client holds no daemon
+// state beyond target discovery.
 //
-// Target discovery precedence (§1.5): `--host` > `QBZD_HOST` > local default
+// Target discovery precedence: `--host` > `QBZD_HOST` > local default
 // `127.0.0.1:8182`. The Bearer is sent ONLY in opt-in mode: when `QBZD_TOKEN`
 // is set (remote or local) or, when targeting the LOCAL daemon, the local
 // `pibuz.toml` carries `[server] token`. Default: no token anywhere.
@@ -13,18 +13,18 @@ use serde_json::Value;
 use crate::config::PibuzConfig;
 use crate::paths::ProfileRoots;
 
-/// The frozen exit-code taxonomy (02 §1.3). `exit_code()` is the ONLY source of
+/// The frozen exit-code taxonomy. `exit_code()` is the ONLY source of
 /// a networked verb's process exit code; scripts encode these numbers forever.
 #[derive(Debug)]
 pub enum CliError {
     /// exit 3 — connect refused / timeout on the target (carries `host` for the
-    /// §1.4 daemon-down copy).
+    /// daemon-down copy).
     Unreachable(String),
-    /// exit 5 — audio/device error (device unopenable, volume/seek fixed in DSD).
+    /// exit 5 — audio/device error (device unopenable, nothing to play).
     Device(String),
     /// exit 6 — unknown id / index out of range.
     NotFound(String),
-    /// exit 1 — breaking `api_version` skew: the verb refuses politely (§1.6).
+    /// exit 1 — breaking `api_version` skew: the verb refuses politely.
     ApiSkew { daemon: u32, cli: u32 },
     /// exit 1 — any other runtime error (daemon said no / local failure).
     Runtime(String),
@@ -47,7 +47,7 @@ impl std::fmt::Display for CliError {
         match self {
             CliError::Unreachable(host) => write!(f, "{}", copy::daemon_down(host)),
             // `error_from_envelope` pre-builds the two DSD-specific codes into
-            // the full verbatim §1.4 copy (already "error: ..." prefixed); a
+            // the full verbatim copy (already "error: ..." prefixed); a
             // plain device message from the server gets the generic prefix.
             CliError::Device(m) => {
                 if m.starts_with("error:") {
@@ -73,7 +73,7 @@ pub struct Target {
     pub is_local: bool,
 }
 
-/// §1.5 target discovery: `--host` > `QBZD_HOST` > local `127.0.0.1:8182`. An
+/// Target discovery: `--host` > `QBZD_HOST` > local `127.0.0.1:8182`. An
 /// explicit override (flag or env) is treated as remote — only the local
 /// default reads the local token / runs the linger check.
 pub fn resolve_host(flag: Option<String>) -> Target {
@@ -106,7 +106,7 @@ fn normalize_hostport(h: &str) -> String {
     }
 }
 
-/// §1.5 token discovery: `QBZD_TOKEN` (remote or local), else — only when
+/// Token discovery: `QBZD_TOKEN` (remote or local), else — only when
 /// targeting the local daemon — the local `pibuz.toml` `[server] token`.
 pub(crate) fn resolve_token(target: &Target, roots: &ProfileRoots) -> Option<String> {
     if let Ok(t) = std::env::var("QBZD_TOKEN") {
@@ -132,7 +132,7 @@ pub struct ApiClient {
 }
 
 impl ApiClient {
-    /// Discover the target + token per §1.5 and build the client.
+    /// Discover the target + token and build the client.
     pub fn new(host: Option<String>, roots: &ProfileRoots) -> Self {
         let target = resolve_host(host);
         let token = resolve_token(&target, roots);
@@ -165,7 +165,7 @@ impl ApiClient {
         self.send(req).await
     }
 
-    /// P0 mutation transport — consumed by the T7 transport verbs
+    /// Mutation transport — consumed by the transport verbs
     /// (play/pause/toggle/stop/next/prev/seek/volume/mute).
     pub async fn post(&self, path: &str, body: Value) -> Result<Value, CliError> {
         let req = self.bearer(
@@ -190,7 +190,7 @@ impl ApiClient {
         if status.is_success() {
             match serde_json::from_str::<Value>(&text) {
                 Ok(v) => Ok(v),
-                // Unparseable 2xx body → the §1.6 sanctioned second request.
+                // Unparseable 2xx body → the one sanctioned second request.
                 Err(_) => Err(self.diagnose_skew().await),
             }
         } else {
@@ -209,7 +209,7 @@ impl ApiClient {
         }
     }
 
-    /// §1.6: an unreadable body / unknown envelope is the only trigger for the
+    /// An unreadable body / unknown envelope is the only trigger for the
     /// single sanctioned second request, `GET /api/info` — the stable identity
     /// route. `api_version` mismatch → refuse politely; otherwise a plain error.
     async fn diagnose_skew(&self) -> CliError {
@@ -234,7 +234,7 @@ impl ApiClient {
     }
 }
 
-/// Map an error envelope's `code` (02 §3.1.3) to the frozen exit taxonomy. The
+/// Map an error envelope's `code` to the frozen exit taxonomy. The
 /// CLI keys off `code`, never raw HTTP status. `origin_forbidden`/`invalid_token`
 /// and anything unrecognized → exit 1.
 fn error_from_envelope(v: &Value) -> CliError {
@@ -250,7 +250,7 @@ fn error_from_envelope(v: &Value) -> CliError {
         .to_string();
     match code {
         "not_found" => CliError::NotFound(message),
-        // §1.4's verbatim DSD blocks are frozen client-side copy, not the
+        // The verbatim DSD blocks are frozen client-side copy, not the
         // server's short envelope message — swap them in so `pibuz seek`/
         // `volume`/`mute` print the exact documented multi-line text.
         "volume_fixed_dsd" => CliError::Device(crate::cli::copy::volume_fixed_dsd()),
@@ -266,7 +266,6 @@ mod tests {
 
     #[test]
     fn exit_codes_match_the_frozen_table() {
-        // 02-cli-and-api.md §1.3.
         assert_eq!(CliError::Unreachable("x".into()).exit_code(), 3);
         assert_eq!(CliError::Device("x".into()).exit_code(), 5);
         assert_eq!(CliError::NotFound("x".into()).exit_code(), 6);

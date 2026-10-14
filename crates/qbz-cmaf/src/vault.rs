@@ -42,8 +42,7 @@ use rand::Rng;
 type Aes128Ctr = ctr::Ctr128BE<aes::Aes128>;
 
 /// `b"PIBUZSL1"` — present on every sealed file, checked on every open. A file
-/// without it is from a build that wrote plaintext, and is swept rather than
-/// read.
+/// without it is refused rather than read.
 const MAGIC: [u8; 8] = *b"PIBUZSL1";
 
 const VERSION: u16 = 1;
@@ -118,16 +117,13 @@ fn parse_header(head: &[u8; SEAL_HEADER_LEN as usize]) -> io::Result<[u8; 16]> {
 }
 
 /// Does `head` begin a sealed file?
-///
-/// For the startup sweep, which has to tell a file this build wrote from a
-/// plaintext one an older build left behind.
 pub fn looks_sealed(head: &[u8]) -> bool {
     head.len() >= MAGIC.len() && head[..MAGIC.len()] == MAGIC
 }
 
 /// Seals a byte stream as it is written, header first.
 ///
-/// Sequential only — which is all four writers into the cache are. The counter
+/// Sequential only — which is all three writers into the cache are. The counter
 /// advances with the bytes handed over, so a caller that skipped or rewound
 /// would seal at the wrong offsets; there is no API here to do that with.
 pub struct SealWriter<W: Write> {
@@ -285,8 +281,9 @@ impl<R: Read + Seek> Seek for SealReader<R> {
     }
 }
 
-/// Seal `plaintext` into a whole buffer, for the caller that has the bytes in
-/// hand already (`PlaybackCache::insert`, spilling an L1 track).
+/// Seal `plaintext` into a whole buffer. Every writer into the cache streams
+/// through [`SealWriter`]; this one-call form is what tests use to plant a
+/// sealed file.
 pub fn seal_to_vec(key: SealKey, plaintext: &[u8]) -> Vec<u8> {
     let mut nonce = [0u8; 16];
     rand::rng().fill_bytes(&mut nonce);
@@ -365,9 +362,9 @@ mod tests {
         let back = unseal_in_place(key, sealed.clone()).expect("unseal");
         assert_eq!(back, data);
 
-        // And the two writers are interchangeable at the READER, which is what
-        // matters: `insert` and the disk tee both produce files the same open
-        // path has to read.
+        // And the two sealers are interchangeable at the READER, which is what
+        // matters: tests plant files with `seal_to_vec`, the cache writes them
+        // through `SealWriter`, and the same open path has to read both.
         let mut r = SealReader::new(key, Cursor::new(sealed)).expect("open");
         let mut back = Vec::new();
         r.read_to_end(&mut back).expect("read");
@@ -453,7 +450,7 @@ mod tests {
     }
 
     /// A plaintext file from a build before this one must not be handed to the
-    /// decoder as if it were sealed. The startup sweep uses the same check.
+    /// decoder as if it were sealed.
     #[test]
     fn a_plaintext_file_is_recognised_and_refused() {
         let data = plaintext(1_024);

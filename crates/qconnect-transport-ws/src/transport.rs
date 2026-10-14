@@ -452,7 +452,7 @@ async fn run_native_transport_loop(
             }
             emit(&events_tx, TransportEvent::Authenticated);
         } else if config.require_jwt {
-            // gap #12: the real Qobuz endpoint requires AUTHENTICATE. Silently
+            // The real Qobuz endpoint requires AUTHENTICATE. Silently
             // skipping it leaves the session un-joinable; surface it as a hard
             // credential error and route it through the existing bounded
             // reconnect path (increment-only — issue #358 latch unaffected).
@@ -563,7 +563,7 @@ async fn run_native_transport_loop(
         // keep paying the lock cost.
         let mut session_established = false;
 
-        // Per-connection keepalive half-open tracking (gap #6). The deadline is
+        // Per-connection keepalive half-open tracking. The deadline is
         // ~2.5× the ping interval: a healthy peer answers within one interval,
         // so two unanswered pings plus 2.5× silence is a confident half-open
         // signal without being trigger-happy.
@@ -770,7 +770,7 @@ async fn handle_reconnect_delay(
 }
 
 /// Long-backoff idle retry after the reconnect loop has Exhausted its bounded
-/// attempts (gap #7). When `idle_retry_ms == 0` this is a no-op returning
+/// attempts. When `idle_retry_ms == 0` this is a no-op returning
 /// `false` (legacy terminate behavior). Otherwise it sleeps `idle_retry_ms`
 /// (cancellable by shutdown); on a real shutdown it returns `false` without
 /// re-arming. On a clean wake it resets the attempt counter / backoff to base
@@ -1068,7 +1068,7 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// Pure half-open TCP detector (gap #6). Returns `true` only when at least two
+/// Pure half-open TCP detector. Returns `true` only when at least two
 /// keepalive pings have gone unanswered AND the last pong is older than
 /// `max_silence_ms`. Requiring two outstanding pings avoids tearing down a
 /// healthy connection that simply missed a single pong window.
@@ -1138,7 +1138,7 @@ struct CloudPayload {
 mod tests {
     use super::*;
 
-    /// gap #12: `require_jwt` must default to `false` so the InMemory / test
+    /// `require_jwt` must default to `false` so the InMemory / test
     /// transport path keeps working without a JWT. Only the real Qobuz endpoint
     /// (set in `resolve_transport_config`) flips it on.
     #[test]
@@ -1147,7 +1147,7 @@ mod tests {
         assert!(!cfg.require_jwt);
     }
 
-    /// gap #6: half-open detection only fires after BOTH at least two
+    /// Half-open detection only fires after BOTH at least two
     /// unanswered pings AND silence past the deadline. A single missed pong, or
     /// recent silence with fewer than two outstanding pings, must NOT tear the
     /// connection down.
@@ -1162,7 +1162,7 @@ mod tests {
         assert!(keepalive_is_stale(now, now - deadline - 1, 2, deadline));
     }
 
-    /// gap #7: with `idle_retry_ms == 0` the helper is a no-op — it returns
+    /// With `idle_retry_ms == 0` the helper is a no-op — it returns
     /// `false` (terminate) and leaves the counters untouched.
     #[tokio::test]
     async fn idle_retry_disabled_when_interval_zero() {
@@ -1173,7 +1173,7 @@ mod tests {
         assert_eq!(attempt, 5);
     }
 
-    /// gap #7: a shutdown signalled during the idle wait must cancel the retry
+    /// A shutdown signalled during the idle wait must cancel the retry
     /// and NOT re-arm (returns `false`, counters untouched).
     #[tokio::test]
     async fn idle_retry_cancelled_by_shutdown_does_not_rearm() {

@@ -6,13 +6,10 @@
 //! `qconnect_app::renderer` instead of re-deriving it.
 //!
 //! The protected bit-perfect seams (`play_streaming_dynamic` / `play_data`) and
-//! the HTTP feeder live here, impl-side, exactly as the Tauri `CoreBridge` impl
-//! does; the probe-derived sample_rate/channels/bit_depth flow STRAIGHT into
-//! `play_streaming_dynamic` (never defaulted, or hi-res remote playback silently
-//! resamples). The feeder body is a near-verbatim port of the Tauri
-//! `track_loading.rs` feeder, with `bridge.player()` -> `self.core().player()`;
-//! the only deviation is the TLS backend — the crates workspace `reqwest` ships
-//! `rustls-tls` (not `native-tls`), so the `.use_native_tls()` calls are dropped.
+//! the HTTP feeder live here, impl-side; the probe-derived
+//! sample_rate/channels/bit_depth flow STRAIGHT into `play_streaming_dynamic`
+//! (never defaulted, or hi-res remote playback silently resamples). The
+//! workspace `reqwest` ships `rustls-tls`, not `native-tls`.
 //! TLS is transport encryption only; the decoded audio bytes are identical, so
 //! bit-perfect is unaffected. (If the Qobuz streaming CDN ever presents a cert
 //! rustls rejects, add `native-tls` to pibuz's reqwest features.)
@@ -28,14 +25,13 @@ use qconnect_app::QconnectRendererEngine;
 
 use crate::adapter::DaemonAdapter;
 
-// T10 (OD4, §7.4): daemon-only volume policy. The desktop has no equivalent —
-// it always applies remote volume. The mode is read from the daemon-root
-// `[qconnect] volume_mode` (transport::load_volume_mode_at)
-// at connect time and injected into the engine + session host.
-/// How the daemon treats a controller's remote volume command (01 §7.4).
+// The daemon's volume policy. The mode is read from the daemon-root
+// `[qconnect] volume_mode` (transport::load_volume_mode_at) at connect time
+// and injected into the engine + session host.
+/// How the daemon treats a controller's remote volume command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VolumeMode {
-    /// OD4 DEFAULT. Remote `SetVolume` is applied to the player via the core,
+    /// The DEFAULT. Remote `SetVolume` is applied to the player via the core,
     /// and the player's real volume is reported back to the controller.
     #[default]
     Software,
@@ -53,9 +49,9 @@ pub enum VolumeMode {
 }
 
 impl VolumeMode {
-    /// Parse the `volume_mode` KV value. Anything but the literals `"locked"`
-    /// and `"external"` (unset, empty, unknown) falls back to `Software` — the
-    /// OD4 default.
+    /// Parse the stored `volume_mode` value. Anything but the literals
+    /// `"locked"` and `"external"` (unset, empty, unknown) falls back to
+    /// `Software` — the default.
     pub fn from_kv(value: Option<&str>) -> Self {
         match value.map(str::trim) {
             Some("locked") => VolumeMode::Locked,
@@ -97,7 +93,7 @@ impl VolumeMode {
 /// awaited from a runtime task).
 pub struct DaemonRendererEngine {
     runtime: Arc<AppRuntime<DaemonAdapter>>,
-    /// T10 (OD4): resolved volume policy for this session (from the KV at connect).
+    /// Resolved volume policy for this session (read at connect).
     volume_mode: VolumeMode,
     /// the current track's progressive-download feeder. A track
     /// change MUST abort the previous feeder — left alone it downloads the
@@ -429,7 +425,7 @@ impl QconnectRendererEngine for DaemonRendererEngine {
             .map_err(|err| err.to_string())
     }
     fn set_volume(&self, fraction: f32) -> Result<(), String> {
-        // T10 (OD4, §7.4): volume-mode gate. In `Locked` mode the player stays
+        // Volume-mode gate. In `Locked` mode the player stays
         // at 100 % and a controller's remote SetVolume is acknowledged-but-
         // ignored (logged at info), so the DAC keeps receiving full-scale,
         // bit-perfect samples. `Software` (default) applies it via the core.
@@ -759,7 +755,7 @@ impl QconnectRendererEngine for DaemonRendererEngine {
         }
     }
 
-    /// The daemon's own ceiling: `playback.quality` (upstream#693).
+    /// The daemon's own ceiling: `playback.quality`.
     ///
     /// Read fresh on every load rather than captured at connect, so a
     /// `pibuz settings set playback.quality cd` binds the NEXT track without a
@@ -809,7 +805,7 @@ async fn download_remote_audio(url: &str) -> Result<Vec<u8>, String> {
     Ok(bytes.to_vec())
 }
 
-// T10 (OD4, §7.4): volume-mode policy tests. These pin the decision the engine's
+// Volume-mode policy tests. These pin the decision the engine's
 // `set_volume` gate and the session host's join-time volume report consult — the
 // two enforcement points of the software|locked contract.
 #[cfg(test)]
@@ -1109,7 +1105,7 @@ mod tests {
 
     #[test]
     fn default_mode_is_software_od4() {
-        // Unset / empty / unknown all resolve to the OD4 default (software).
+        // Unset / empty / unknown all resolve to the default (software).
         assert_eq!(VolumeMode::default(), VolumeMode::Software);
         assert_eq!(VolumeMode::from_kv(None), VolumeMode::Software);
         assert_eq!(VolumeMode::from_kv(Some("")), VolumeMode::Software);

@@ -1,12 +1,12 @@
-// crates/pibuz/src/api/sse.rs — the `GET /api/events` Server-Sent Events stream
-// (CONSOLE ext). A live push feed of CoreEvents so a client (a plasmoid, a bar
+// crates/pibuz/src/api/sse.rs — the `GET /api/events` Server-Sent Events stream.
+// A live push feed of CoreEvents so a client (a plasmoid, a bar
 // applet, `pibuz watch`) reacts to playback/queue/library changes without
 // polling.
 //
 // Concurrency: the control-plane serve loop is single-threaded, so an open SSE
 // stream would starve every other request. `serve()` therefore moves this onto
 // its OWN thread (Request is Send); `stream` blocks there until the client
-// disconnects (respond() errors) or the bus closes. The rusqlite-free bus is a
+// disconnects (respond() errors) or the bus closes. The bus is a
 // tokio broadcast, drained here with `blocking_recv()` from the plain thread.
 //
 // Wire format: one SSE frame per emitted event —

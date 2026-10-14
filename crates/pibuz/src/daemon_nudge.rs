@@ -1,17 +1,14 @@
-//! Nudging a running daemon to reload its settings.
-//!
-//! These lived in `login.rs` until the account path was removed, which made
-//! plain what they always were: not authentication at all, but the local IPC
-//! every `pibuz settings set` uses to tell a running daemon that something on
-//! disk changed. They outlived login because they were never part of it.
+//! Nudging a running daemon to reload its settings: the local IPC every
+//! `pibuz settings set` uses to tell a running daemon that something on disk
+//! changed.
 
 use crate::paths::ProfileRoots;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
-/// Three-state outcome of the ping-then-reload nudge. 04-settings-portability.md
-/// §5.3 step 7 needs "daemon simply not running" (not an error) distinguished
+/// Three-state outcome of the ping-then-reload nudge. `settings import` needs
+/// "daemon simply not running" (not an error) distinguished
 /// from "daemon up but the reload was refused/500" (exit 1 with the restart
 /// hint) — a single bool conflates them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,7 +23,7 @@ pub enum NudgeOutcome {
 
 /// Best-effort `GET /api/ping` → `POST /api/settings/reload` against a local
 /// daemon. `token` carries the opt-in `[server] token` as
-/// `Authorization: Bearer` when present; T5 callers pass `None`.
+/// `Authorization: Bearer` when present.
 pub fn nudge_reload_outcome(host: &str, token: Option<&str>) -> NudgeOutcome {
     if !http_request_2xx(host, "GET", "/api/ping", token) {
         return NudgeOutcome::DaemonDown;
@@ -39,15 +36,15 @@ pub fn nudge_reload_outcome(host: &str, token: Option<&str>) -> NudgeOutcome {
 }
 
 /// Boolean skin over [`nudge_reload_outcome`] for the callers that only need
-/// "did a running daemon acknowledge?" (login/logout/`settings set` — they are
-/// specified to work daemon-down, 02 §2.2, so any non-reload is just "the
-/// daemon picks it up on next start").
+/// "did a running daemon acknowledge?" (`settings set` and friends — they work
+/// daemon-down, so any non-reload is just "the daemon picks it up on next
+/// start").
 pub fn nudge_reload(host: &str, token: Option<&str>) -> bool {
     nudge_reload_outcome(host, token) == NudgeOutcome::Reloaded
 }
 
-/// The local daemon's reload address. Credentials are written to the LOCAL
-/// config root, so the daemon to nudge is always local; its port comes from the
+/// The local daemon's reload address. Settings are written to the LOCAL
+/// data root, so the daemon to nudge is always local; its port comes from the
 /// same `pibuz.toml` the daemon reads (default 8182).
 pub(crate) fn nudge_host(roots: &ProfileRoots) -> String {
     let port = crate::config::PibuzConfig::load(&roots.config_file())

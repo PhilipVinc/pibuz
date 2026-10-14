@@ -1,10 +1,10 @@
-// crates/pibuz/src/cli/status.rs — the `status` and `ping` verbs (02 §2.2).
+// crates/pibuz/src/cli/status.rs — the `status` and `ping` verbs.
 //
 // Both render an already-parsed API payload; neither holds state. `status` also
-// runs the version-skew check (§1.6, from the /api/status payload — it carries
+// runs the version-skew check (from the /api/status payload — it carries
 // `version` + `api_version`, so it needs no /api/info fallback) and, on the
-// daemon box, the linger check (§1.4). Exit codes come from the frozen table
-// (§1.3): 0 healthy · 3 unreachable · 5 device unopenable.
+// daemon box, the linger check. Exit codes come from the frozen table: 0
+// healthy · 3 unreachable · 5 device unopenable · 6 audio thread stuck.
 use serde_json::Value;
 
 use crate::cli::client::ApiClient;
@@ -44,7 +44,7 @@ pub async fn status(host: Option<String>, json: bool, verbose: bool, roots: &Pro
         }
     };
 
-    // Version skew (§1.6): breaking api_version mismatch refuses; a semver-only
+    // Version skew: breaking api_version mismatch refuses; a semver-only
     // mismatch is a warning that does not stop the render.
     let daemon_api = payload
         .get("api_version")
@@ -72,7 +72,7 @@ pub async fn status(host: Option<String>, json: bool, verbose: bool, roots: &Pro
         print!("{}", render(&payload, client.host(), verbose));
     }
 
-    // Linger check on the daemon box only (§1.4) — a warning, never fatal.
+    // Linger check on the daemon box only — a warning, never fatal.
     if client.is_local() {
         if let Some(w) = linger_warning() {
             eprintln!("{w}");
@@ -539,7 +539,7 @@ fn last_error(p: &Value) -> Option<String> {
     None
 }
 
-/// `loginctl show-user $USER -p Linger` → the §1.4 linger warning on `Linger=no`.
+/// `loginctl show-user $USER -p Linger` → the linger warning on `Linger=no`.
 /// Any failure (no loginctl, no session) → no warning.
 fn linger_warning() -> Option<String> {
     let user = std::env::var("USER").ok().filter(|u| !u.is_empty())?;

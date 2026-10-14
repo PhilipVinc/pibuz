@@ -16,9 +16,10 @@ pub enum LockError {
 }
 
 impl InstanceLock {
-    /// flock on <data_root>/pibuz.lock, taken BEFORE the port bind (01 §8.1-4).
-    /// Two daemons on one root = one device_uuid presented twice + two session.db
-    /// writers — the lock is what protects those invariants, not the port.
+    /// flock on <data_root>/pibuz.lock, taken BEFORE the port bind. Two
+    /// daemons on one root = one device_uuid presented twice + two writers of
+    /// one settings.toml — the lock is what protects those invariants, not the
+    /// port.
     pub fn acquire(data_root: &Path) -> Result<Self, LockError> {
         std::fs::create_dir_all(data_root).map_err(|e| LockError::Io(e.to_string()))?;
         let path = data_root.join("pibuz.lock");

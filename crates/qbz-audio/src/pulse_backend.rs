@@ -1,7 +1,7 @@
 //! PulseAudio backend (legacy compatibility)
 //!
 //! Similar to PipeWire backend but for systems running PulseAudio only.
-//! Uses same approach: pactl + PULSE_SINK + CPAL "pulse" device.
+//! Uses same approach: pactl + CPAL "pulse" device.
 
 use super::backend::{AudioBackend, AudioBackendType, AudioDevice, BackendConfig, BackendResult};
 use super::pipewire_backend::PipeWireBackend;

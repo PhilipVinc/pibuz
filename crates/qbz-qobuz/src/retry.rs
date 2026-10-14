@@ -2,7 +2,7 @@
 //!
 //! A single transient network blip (5xx, timeout, connection reset, 429)
 //! on the next track's `file/url` or a CMAF segment used to be terminal:
-//! the play failed and the frontend auto-skipped the track, walking the
+//! the play failed and the track was skipped, walking the
 //! queue on a run of blips. Long Hi-Res tracks (Dream Theater / Yes) are
 //! the worst case because their large downloads keep the link busy for
 //! minutes, raising the odds of catching a blip. See issue #467.
@@ -52,7 +52,7 @@ pub fn reqwest_is_transient(e: &reqwest::Error) -> bool {
 /// *status*, not a transport error.
 pub fn classify_reqwest(e: &reqwest::Error, context: &str) -> FetchError {
     // Redacted, not raw: this wraps the CMAF segment fetch, whose URL carries
-    // the signed token, and the message is logged (upstream#780 item 10).
+    // the signed token, and the message is logged.
     // The host is kept, so classification and diagnosis are unchanged.
     FetchError::Transient(format!(
         "{}: {}",

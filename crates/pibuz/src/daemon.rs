@@ -1,8 +1,5 @@
-// crates/pibuz/src/daemon.rs — the `pibuz run` boot sequence (01-architecture.md
-// §8.1, NORMATIVE order) and the graceful shutdown (§8.2). Later tasks splice into the numbered steps: the
-// playback driver (T4) at step 10, the HTTP server (T6) at step 11, QConnect
-// (T9/T10) at step 12. Until they land the daemon boots a playable core and
-// parks on signals — API-less but fully diagnosable in-process.
+// crates/pibuz/src/daemon.rs — the `pibuz run` boot sequence, in numbered steps
+// whose order matters, and the ordered graceful shutdown.
 use std::sync::{Arc, Mutex};
 
 use qbz_app::playback_driver::{self, DriverDeps};
@@ -18,10 +15,10 @@ use crate::lock::{InstanceLock, LockError};
 use crate::paths::ProfileRoots;
 use crate::state::{DaemonShared, LatchedErrors, QconnectStatus};
 
-/// The composed runtime handoff produced by [`boot`] and consumed by later
-/// tasks: T4 spawns the playback driver on `runtime` + `shared`, T6 serves
-/// `bus` over HTTP/SSE, T9/T10 wire QConnect. Held alive by [`run`] through the
-/// signal park so the core stays up.
+/// The composed runtime handoff produced by [`boot`]: [`run`] spawns the
+/// playback driver on `runtime` + `shared`, serves `bus` over HTTP/SSE and
+/// wires QConnect to all three. Held alive by [`run`] through the signal park
+/// so the core stays up.
 pub struct BootedRuntime {
     pub runtime: Arc<AppRuntime<DaemonAdapter>>,
     pub shared: Arc<Mutex<DaemonShared>>,
@@ -29,7 +26,7 @@ pub struct BootedRuntime {
     /// Background session-restore retry (network-class boot failure only). Held
     /// so shutdown can abort+join it BEFORE releasing the audio device: it holds
     /// an `Arc<AppRuntime>` clone, so leaving it running would keep the Player
-    /// alive past `drop(booted)` and break the #521 clock-release ordering (§8.2).
+    /// alive past `drop(booted)` and break the #521 clock-release ordering.
     pub auth_retry: Option<JoinHandle<()>>,
 }
 
@@ -39,8 +36,8 @@ pub struct BootedRuntime {
 pub async fn run(roots: ProfileRoots, cfg: PibuzConfig, warns: Vec<String>) -> Result<i32, String> {
     // 1. argv parse happened in main().
     //
-    // 2. instance lock on the DATA ROOT, taken BEFORE any port bind (§8.3): it,
-    //    not the port, protects the single-device_uuid / single-session.db
+    // 2. instance lock on the DATA ROOT, taken BEFORE any port bind: it, not
+    //    the port, protects the one-device_uuid / one-settings.toml-writer
     //    invariants. A second daemon on the same root is diagnosed → exit 3.
     //
     //    And before LOGGING, because installing the logger rotates `qbz.log`
@@ -62,15 +59,15 @@ pub async fn run(roots: ProfileRoots, cfg: PibuzConfig, warns: Vec<String>) -> R
     // Idempotent (`Once`), so the later call stays a no-op.
     #[cfg(target_os = "linux")]
     qbz_audio::alsa_error_handler::install_once();
-    // 4. config: surface unknown-key warnings (they never abort — D14).
+    // 4. config: surface unknown-key warnings (they never abort).
     for w in &warns {
         log::warn!("[config] unknown key: {w}");
     }
     // 5. port bind + foreign-occupant diagnosis — STATELESS, so it runs BEFORE
-    //    stores (6) and runtime composition (7) per the §8.1 order. On a bind
-    //    conflict the occupant is probed with GET /api/ping: a pibuz answer means
-    //    a stale foreign root (the lock said this root was free), anything else
-    //    the §2.2 "another process" copy. The socket is bound here but not served
+    //    stores (6) and runtime composition (7). On a bind conflict the
+    //    occupant is probed with GET /api/ping: a pibuz answer means a stale
+    //    foreign root (the lock said this root was free), anything else the
+    //    "another process" copy. The socket is bound here but not served
     //    until step 11 — connections queue in the listen backlog through boot.
     let bind_addr = resolve_bind_addr(&cfg)?;
     let bound = match crate::api::bind(bind_addr) {
@@ -83,9 +80,9 @@ pub async fn run(roots: ProfileRoots, cfg: PibuzConfig, warns: Vec<String>) -> R
         }
     };
     if !bind_addr.ip().is_loopback() {
-        // FB6: the default bind is now 0.0.0.0 — LAN-first posture (Sonos/
-        // Chromecast parity), not a misconfiguration. One INFO line, not a
-        // stderr warning; loopback binds stay silent.
+        // The default bind is 0.0.0.0 — LAN-first posture (Sonos/Chromecast
+        // parity), not a misconfiguration. One INFO line, not a stderr
+        // warning; loopback binds stay silent.
         log::info!(
             "{}",
             crate::cli::copy::lan_posture_note(&bind_addr.to_string())
@@ -101,16 +98,15 @@ pub async fn run(roots: ProfileRoots, cfg: PibuzConfig, warns: Vec<String>) -> R
         s.bus = Some(booted.bus.clone());
     }
 
-    // 10. playback driver (T4). Spawn the 450 ms headless orchestrator on the
+    // 10. playback driver. Spawn the 450 ms headless orchestrator on the
     //     booted runtime + shared state. It runs safely regardless of auth: with
     //     no session the queue is empty and each tick is a near-no-op. The
-    //     streaming quality is resolved from daemon_prefs through the SAME key
-    //     contract the desktop uses (playback_quality(), playback.rs:170-172),
-    //     so hi-res never silently downgrades. 11. HTTP serve (T6) · 12. QConnect
-    //     (T9/T10) splice after this, reading `booted`.
+    //     streaming quality is resolved from daemon_prefs through
+    //     `quality_from_key`, the one key contract every quality read shares,
+    //     so hi-res never silently downgrades.
     let prefs = daemon_prefs::load_at(&roots.data);
     let quality = playback_driver::quality_from_key(&prefs.streaming_quality);
-    // T11: a live-updatable cell, not a value captured once — `settings/reload`
+    // A live-updatable cell, not a value captured once — `settings/reload`
     // re-reads `daemon_prefs` and writes here so the driver's OWN auto-advance
     // (gapless prefetch, natural-end advance) picks up a `playback.quality`
     // change without a restart. Manual play/next/prev already re-read
@@ -118,11 +114,11 @@ pub async fn run(roots: ProfileRoots, cfg: PibuzConfig, warns: Vec<String>) -> R
     // cell is what makes the BACKGROUND driver loop equally live.
     let quality_cell = Arc::new(std::sync::Mutex::new(quality));
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    // T10 (§7.2): the driver's `ReportEdge` action pulses this Notify; the
+    // The driver's `ReportEdge` action pulses this Notify; the
     // QConnect report scheduler (step 12) waits on it. Created BEFORE the driver
     // so `on_edge` can capture it, and shared with `qconnect::start`.
     let report_notify = Arc::new(tokio::sync::Notify::new());
-    // The same edge, pulsed onto a SECOND Notify for the events bridge (10e):
+    // The same edge, pulsed onto a SECOND Notify for the events bridge:
     // two subscribers on one Notify would race for the single stored permit.
     let edge_notify = Arc::new(tokio::sync::Notify::new());
     let deps = build_driver_deps(
@@ -149,7 +145,7 @@ pub async fn run(roots: ProfileRoots, cfg: PibuzConfig, warns: Vec<String>) -> R
     let events_bridge =
         crate::events_bridge::spawn(&booted.runtime, booted.bus.clone(), edge_notify);
 
-    // 10c¾. Event hook (CONSOLE): fork `hooks.script` (or `QBZD_HOOK`) once per
+    // 10c¾. Event hook: fork `hooks.script` (or `QBZD_HOOK`) once per
     //       forwarded bus event with QBZ_* variables in its environment — push
     //       integration for headless boxes (moOde-style renderer coordination).
     //       Holds no Arc<AppRuntime>; aborted for a clean shutdown.
@@ -164,21 +160,21 @@ pub async fn run(roots: ProfileRoots, cfg: PibuzConfig, warns: Vec<String>) -> R
         None => None,
     };
 
-    // 11. HTTP serve (02 §3) on the already-bound socket. `ApiState` carries a
+    // 11. HTTP serve on the already-bound socket. `ApiState` carries a
     //     second audio store (a path; every read goes to the file) for the status
     //     audio block, the tokio handle for the async queue read, and the opt-in
-    //     [server] token (None = open). 12. QConnect (T9/T10) splices after this.
+    //     [server] token (None = open).
     let api_audio = qbz_audio::settings::AudioSettingsStore::new_at(&roots.data)
         .map_err(|e| format!("error: could not open the audio settings store for the API: {e}"))?;
-    // T11: the reload handler's "did a routing-critical field change" diff
+    // The reload handler's "did a routing-critical field change" diff
     // needs a starting point — seed it from what's on disk right now (the same
     // settings the Player was constructed with at step 6/7).
     let initial_audio_settings = api_audio.get_settings().unwrap_or_default();
-    // T11: the running QConnect service is not constructed until step 12
-    // (AFTER the API starts serving, per the normative boot order, 01 §8.1) —
-    // this cell lets the reload route reach it anyway: empty until `qconnect
-    // ::start` below populates it, harmlessly no-op'd by the reload handler in
-    // the vanishingly small window before that.
+    // The running QConnect service is not constructed until step 12 (AFTER
+    // the API starts serving) — this cell lets the reload route reach it
+    // anyway: empty until `qconnect::start` below populates it, harmlessly
+    // no-op'd by the reload handler in the vanishingly small window before
+    // that.
     let qconnect_control: Arc<std::sync::OnceLock<crate::qconnect::QconnectControl>> =
         Arc::new(std::sync::OnceLock::new());
     let api = crate::api::serve(
@@ -201,13 +197,13 @@ pub async fn run(roots: ProfileRoots, cfg: PibuzConfig, warns: Vec<String>) -> R
     );
     log::info!("control API listening on {bind_addr}");
 
-    // 12. QConnect (T9): mint the daemon's OWN device identity in the daemon-root
-    //     KV, decide auto-connect from the persisted startup mode (cli_override =
-    //     None so the KV that `pibuz qconnect enable|disable` writes is never
-    //     shadowed), and — when enabled — connect-on-Ready with the bounded retry
-    //     schedule. Reads NOTHING from pibuz.toml. Held to shut the session down
-    //     ahead of playback (§8.2-1); it also clones `Arc<AppRuntime>`, so it must
-    //     drop before `drop(booted)` (the #521 ordering).
+    // 12. QConnect: mint the daemon's OWN device identity in the data root's
+    //     settings.toml, decide auto-connect from the persisted startup mode
+    //     (the value `pibuz qconnect enable|disable` writes), and — when
+    //     enabled — connect-on-Ready with the bounded retry schedule. Reads
+    //     NOTHING from pibuz.toml. Held to shut the session down ahead of
+    //     playback (shutdown step 1); it also clones `Arc<AppRuntime>`, so it
+    //     must drop before `drop(booted)` (the #521 ordering).
     let mut qconnect = crate::qconnect::start(
         booted.runtime.clone(),
         booted.shared.clone(),
@@ -215,17 +211,16 @@ pub async fn run(roots: ProfileRoots, cfg: PibuzConfig, warns: Vec<String>) -> R
         report_notify,
         booted.bus.subscribe(),
     );
-    // T11: publish the reload route's handle onto the running service now that
+    // Publish the reload route's handle onto the running service now that
     // it exists (`connect`/`disconnect`/device-name refresh — see
     // `qconnect::QconnectControl`).
     let _ = qconnect_control.set(qconnect.control());
 
     // 13. park on SIGTERM/SIGINT. NO startup audio "hygiene": both candidate
-    //     fns are verified no-ops from a fresh process and re-adding them is the
-    //     documented skeptic-correction #1 trap (§8.1).
+    //     fns are verified no-ops from a fresh process; do not re-add them.
     wait_for_signal().await;
 
-    // ── Shutdown (§8.2, ordered). Step 1: disconnect the QConnect session (and
+    // ── Shutdown (ordered). Step 1: disconnect the QConnect session (and
     //    stop its auto-connect watcher) BEFORE playback is stopped, then drop the
     //    handle so its Arc<AppRuntime> clone is released ahead of `drop(booted)`.
     qconnect.shutdown().await;
@@ -237,9 +232,6 @@ pub async fn run(roots: ProfileRoots, cfg: PibuzConfig, warns: Vec<String>) -> R
     if let Err(e) = driver.await {
         log::warn!("driver task join failed: {e:?}");
     }
-    // T10 (§7.5): stop the queue-persistence subscriber before the authoritative
-    // final save, so it neither races the flush below nor keeps its
-    // `Arc<AppRuntime>` clone alive past `drop(booted)` (#521 ordering).
     // Stop the events bridge BEFORE `drop(booted)`: it upgrades its Weak to a
     // strong Arc<AppRuntime> for the span of each wake (#521 ordering).
     events_bridge.abort();
@@ -260,15 +252,15 @@ pub async fn run(roots: ProfileRoots, cfg: PibuzConfig, warns: Vec<String>) -> R
     // Stop the API thread and JOIN it: its `ApiState` holds an `Arc<AppRuntime>`
     // clone, which must drop before `drop(booted)` releases the audio device
     // ahead of the #521 pair — the same ordering constraint as the driver and
-    // auth-retry tasks (§8.2).
+    // auth-retry tasks.
     api.shutdown();
     // The reload route's OnceLock handle also clones `QconnectControl`, which
     // holds an `Arc<AppRuntime>` (via `DaemonQconnectService.runtime`) — drop
-    // it before `drop(booted)` too, same #521/§8.2 ordering as the driver,
-    // queue-persist and auth-retry tasks above.
+    // it before `drop(booted)` too, same #521 ordering as the driver and
+    // auth-retry tasks above.
     drop(qconnect_control);
     // Release the audio device by dropping the runtime (its Player) BEFORE the
-    // #521 pair (§8.2 step 3 precedes step 4).
+    // #521 pair.
     drop(booted);
     //    THE #521 PAIR runs unconditionally on Linux: a forced PipeWire clock
     //    left set would pin the whole system's sample rate after the process
@@ -283,16 +275,16 @@ pub async fn run(roots: ProfileRoots, cfg: PibuzConfig, warns: Vec<String>) -> R
     Ok(0) // instance lock released on drop of `_lock`
 }
 
-/// Steps 6-9 of §8.1: open the daemon-root stores and compose the runtime.
+/// Steps 6-9 of the boot: open the daemon-root stores and compose the runtime.
 async fn boot(
     roots: &ProfileRoots,
     cfg: &PibuzConfig,
     warn_count: usize,
 ) -> Result<BootedRuntime, String> {
     // 6.+7. stores + runtime composition. `with_audio_settings` takes the
-    // settings the caller already opened, so everything routes through the T2
+    // settings the caller already opened, so everything routes through the
     // daemon roots rather than any global path.
-    let store = qbz_audio::settings::AudioSettingsStore::new_at(&roots.data)?; // settings.rs:263
+    let store = qbz_audio::settings::AudioSettingsStore::new_at(&roots.data)?;
     let settings = store.get_settings()?;
     let (adapter, _rx) = DaemonAdapter::new();
     let bus = adapter.sender();
@@ -306,19 +298,13 @@ async fn boot(
         Some(roots.data.clone()),
     ));
 
-    // Offline-tolerant (§8.1-8): a network failure here still leaves a locally
+    // Offline-tolerant: a network failure here still leaves a locally
     // usable core; a missing DAC is likewise non-fatal (Player starts deviceless
     // and retries with backoff — never the spotifyd #1097 crash-exit).
     if let Err(e) = runtime.init().await {
         log::warn!("core init did not complete (continuing offline-tolerant): {e}");
     }
 
-    // Playlist recommendations (CONSOLE): open the per-user artist-vector store
-    // at the DAEMON root — mirrors qbz/src/auth.rs:145-149, but slint-free and
-    // session-independent. The store is a CACHE the suggestions engine reads/
-    // writes; vectors are built on demand from MusicBrainz + Qobuz, so this
-    // needs no listening history. Best-effort: a failed open leaves
-    // `generate_playlist_suggestions` working un-cached (artist_vectors = None).
     let shared = new_shared(cfg);
     if let Ok(mut s) = shared.lock() {
         s.startup_warnings = warn_count as u32;
@@ -339,10 +325,10 @@ async fn boot(
 }
 
 /// Assemble the driver's host side channels: the streaming-quality resolver and
-/// the daemon-shared latching / tick-timestamping hooks. T10: `on_edge` now
-/// pulses the QConnect report `Notify` so the report scheduler reports on the
-/// same transition/periodic edges the driver detects (§7.2) — and, on a second
-/// `Notify`, the events bridge (10c½) that publishes those edges to the bus.
+/// the daemon-shared latching / tick-timestamping hooks. `on_edge` pulses the
+/// QConnect report `Notify` so the report scheduler reports on the same
+/// transition/periodic edges the driver detects — and, on a second `Notify`,
+/// the events bridge (10c½) that publishes those edges to the bus.
 fn build_driver_deps(
     quality_cell: Arc<std::sync::Mutex<qbz_models::Quality>>,
     shared: Arc<Mutex<DaemonShared>>,
@@ -361,7 +347,7 @@ fn build_driver_deps(
                 .map(|q| *q)
                 .unwrap_or(qbz_models::Quality::UltraHiRes)
         }),
-        // T10: signal the report scheduler on every ReportEdge. `notify_one`
+        // Signal the report scheduler on every ReportEdge. `notify_one`
         // stores a single permit if the scheduler is mid-report, so no edge is
         // lost and rapid edges coalesce into one report.
         on_edge: Arc::new(move || {
@@ -405,7 +391,7 @@ fn build_driver_deps(
 
 /// Fresh shared state.
 fn new_shared(cfg: &PibuzConfig) -> Arc<Mutex<DaemonShared>> {
-    let _ = cfg; // reserved: premute defaults wire in with later tasks.
+    let _ = cfg; // reserved: nothing in the config seeds shared state yet.
     Arc::new(Mutex::new(DaemonShared {
         last_errors: LatchedErrors::default(),
         driver_last_tick: None,
@@ -420,7 +406,7 @@ fn new_shared(cfg: &PibuzConfig) -> Arc<Mutex<DaemonShared>> {
     }))
 }
 
-/// Resolve `[server] bind:port` to a `SocketAddr` (01 §10.1). A malformed value
+/// Resolve `[server] bind:port` to a `SocketAddr`. A malformed value
 /// is a fatal boot error that names the fix (exit 1).
 fn resolve_bind_addr(cfg: &PibuzConfig) -> Result<std::net::SocketAddr, String> {
     use std::net::ToSocketAddrs;
@@ -436,7 +422,7 @@ fn resolve_bind_addr(cfg: &PibuzConfig) -> Result<std::net::SocketAddr, String> 
         })
 }
 
-/// The step-5 bind-conflict diagnosis (02 §8.1-5 / §2.2): a pibuz occupant on a
+/// The step-5 bind-conflict diagnosis: a pibuz occupant on a
 /// different data root vs. an unrelated process on the port.
 fn diagnose_port_conflict(addr: std::net::SocketAddr) -> String {
     if crate::api::probe_is_pibuz(addr) {
@@ -447,7 +433,7 @@ fn diagnose_port_conflict(addr: std::net::SocketAddr) -> String {
 }
 
 /// Render an [`InstanceLock`] failure. For the already-running case this prints
-/// the frozen exit-3 error voice (02 §1.3/§1.4) and exits 3 directly — the new
+/// the frozen exit-3 error voice and exits 3 directly — the new
 /// process must never clobber the running one. An I/O failure returns a String
 /// that propagates to a generic exit 1.
 fn diagnose_lock(e: LockError) -> String {
@@ -468,7 +454,7 @@ fn diagnose_lock(e: LockError) -> String {
 }
 
 /// Park until SIGTERM or SIGINT. A second signal after this returns lets the
-/// default handler take over → immediate exit (§8.2).
+/// default handler take over → immediate exit.
 async fn wait_for_signal() {
     #[cfg(unix)]
     {
@@ -497,34 +483,30 @@ async fn wait_for_signal() {
     }
 }
 
-// ============================ T11: settings reload ============================
-// `POST /api/settings/reload` (02-cli-and-api.md §3.3.17; `crate::api::settings
-// ::reload` is the thin HTTP wrapper) re-reads every engine store and applies
-// what changed: audio (routing-critical -> `Player::reinit_device`, the rest ->
+// =============================== settings reload ===============================
+// `POST /api/settings/reload` (`crate::api::settings::reload` is the thin HTTP
+// wrapper) re-reads every engine setting and applies what changed: audio
+// (routing-critical -> `Player::reinit_device`, the rest ->
 // `Player::reload_settings`), the daemon's own streaming-quality cell (the
-// driver's background auto-advance), the QConnect KV (device-name cache +
-// connect/disconnect reconciliation). Never re-reads `pibuz.toml` (§3.1.2 —
-// process config is boot-only). Response = the post-reload `/api/status` body,
-// composed by the caller — zero new shapes (03-setup-tui.md §4.3: the
-// reinit/reload narrative is composed CLIENT-side from the CLI's own copy of
-// the Apply-ladder classification, never carried on the wire).
+// driver's background auto-advance), the `[qconnect]` section (device-name
+// cache + connect/disconnect reconciliation). Never re-reads `pibuz.toml`
+// (process config is boot-only). Response = the post-reload `/api/status` body,
+// composed by the caller — zero new shapes (the reinit/reload narrative is
+// composed CLIENT-side from the CLI's own copy of the Apply-ladder
+// classification, never carried on the wire).
 
-/// The single entry point the HTTP route calls. Order matters only at the
-/// margin (independent domains): audio/quality/qconnect-KV first, credentials
-/// last, so a login/logout settles the auth state before QConnect decides
-/// whether to (re)connect against it.
+/// The single entry point the HTTP route calls. The three domains are
+/// independent of each other.
 pub(crate) async fn reload(state: &crate::api::ApiState) {
     reload_audio(state);
     reload_quality(state);
     reload_qconnect(state).await;
 }
 
-/// Re-read the audio settings and apply it to the live `Player`. A struct
+/// Re-read the audio settings and apply them to the live `Player`. A struct
 /// refresh (`reload_settings`) always happens; the output device is ADDITIONALLY
 /// reinitialized only when a routing-critical field actually changed since the
-/// last reload (mirrors the desktop's `Apply::Reinit` — `qbz/src/settings.rs:
-/// 87-94`, per-key classification `:877-967,1134-1290`; 03-setup-tui.md §4.3
-/// lists the same 9 fields).
+/// last reload.
 pub(crate) fn reload_audio(state: &crate::api::ApiState) {
     let fresh = match state.audio.get_settings() {
         Ok(s) => s,
@@ -555,10 +537,9 @@ pub(crate) fn reload_audio(state: &crate::api::ApiState) {
     }
 }
 
-/// The Reinit-class field set (03-setup-tui.md §4.3 / `qbz/src/settings.rs:
-/// 877-967,1134-1290`): backend, device, ALSA plugin, exclusive mode, DAC
-/// passthrough, hardware volume, lock-output
-/// (`skip_sink_switch`). Every other `AudioSettings` field is Reload-class —
+/// The Reinit-class field set: backend, device, ALSA plugin, exclusive mode,
+/// DAC passthrough, hardware volume, lock-output (`skip_sink_switch`). Every
+/// other `AudioSettings` field is Reload-class —
 /// `player.reload_settings` above already covers it unconditionally.
 pub(crate) fn audio_routing_changed(
     old: &qbz_audio::settings::AudioSettings,
@@ -586,10 +567,10 @@ pub(crate) fn reload_quality(state: &crate::api::ApiState) {
     }
 }
 
-/// Re-cache the QConnect device-name override from the daemon-root KV (so the
-/// NEXT connect uses whatever `pibuz qconnect name` / `settings set
-/// qconnect.device_name` most recently wrote — 03-setup-tui.md §3.4: "applies
-/// on the next connection", never forcing a reconnect just for a rename), then
+/// Re-cache the QConnect device-name override from the data root's
+/// settings.toml (so the NEXT connect uses whatever `pibuz qconnect name` /
+/// `settings set qconnect.device_name` most recently wrote — a rename applies
+/// on the next connection, never forcing a reconnect on its own), then
 /// reconcile the connect/disconnect state against the freshly-read
 /// `startup_mode` (`pibuz qconnect enable|disable` — idempotent either way, see
 /// `qconnect::QconnectControl`). A no-op before step 12 populates the cell.
@@ -670,7 +651,7 @@ mod tests {
         assert!(s.last_errors.transport.is_none());
     }
 
-    // ======================= T11: settings/reload =======================
+    // ========================== settings/reload ==========================
 
     fn base_audio_settings() -> qbz_audio::settings::AudioSettings {
         qbz_audio::settings::AudioSettings::default()

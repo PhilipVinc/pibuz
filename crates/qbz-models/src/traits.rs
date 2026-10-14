@@ -1,32 +1,30 @@
 //! Core traits for QBZ
 //!
-//! This module defines the key traits that enable multiple frontends:
 //! - FrontendAdapter: Receives events from the core
-//! - Additional interface traits as needed
 
 use async_trait::async_trait;
 
 use crate::events::CoreEvent;
 
-/// Adapter trait that frontends implement to receive events from QBZ core.
+/// Adapter trait the host implements to receive events from QBZ core.
 ///
-/// This is the primary integration point for any frontend (Tauri, Slint, Iced, etc.).
-/// The core calls `on_event` whenever something happens that the frontend should know about.
+/// The core calls `on_event` whenever something happens that the host should
+/// know about. pibuz's adapter fans every event out on a broadcast bus.
 ///
 /// # Example
 ///
 /// ```rust,ignore
 /// use qbz_models::{FrontendAdapter, CoreEvent};
 ///
-/// struct TauriAdapter {
-///     app_handle: tauri::AppHandle,
+/// struct BusAdapter {
+///     tx: tokio::sync::broadcast::Sender<CoreEvent>,
 /// }
 ///
 /// #[async_trait]
-/// impl FrontendAdapter for TauriAdapter {
+/// impl FrontendAdapter for BusAdapter {
 ///     async fn on_event(&self, event: CoreEvent) {
-///         // Emit event to Tauri webview
-///         self.app_handle.emit("core-event", event).ok();
+///         // No live receiver is not an error.
+///         let _ = self.tx.send(event);
 ///     }
 /// }
 /// ```

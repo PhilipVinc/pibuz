@@ -17,7 +17,7 @@ const BUNDLE_BASE_URL: &str = "https://play.qobuz.com";
 
 /// Per-request ceiling for the bundle fetch. The login page is tiny but the
 /// bundle.js is ~7 MB and served from a CDN that is sometimes very slow; without
-/// this, a stalled download blocks the entire app startup indefinitely.
+/// this, a stalled download blocks startup indefinitely.
 const BUNDLE_FETCH_TIMEOUT: Duration = Duration::from_secs(45);
 /// Extra attempts after the first on a failed/timed-out extraction.
 const BUNDLE_EXTRACTION_RETRIES: usize = 2;
@@ -201,7 +201,7 @@ async fn extract_bundle_tokens_once(client: &Client) -> Result<(BundleTokens, St
 /// with a small retry loop, and persist the result to the on-disk cache.
 ///
 /// This is the network ("cold") path. Prefer [`load_cached_bundle`] +
-/// [`refresh_bundle_if_changed`] on warm starts so the UI never blocks on the
+/// [`refresh_bundle_if_changed`] on warm starts so startup never blocks on the
 /// 7 MB download.
 pub async fn extract_and_cache_bundle_tokens(client: &Client) -> Result<BundleTokens> {
     let mut last_err: Option<ApiError> = None;
@@ -245,7 +245,7 @@ pub async fn extract_and_cache_bundle_tokens(client: &Client) -> Result<BundleTo
 /// Background refresh: cheaply re-check the current bundle version. If Qobuz
 /// rotated the bundle, re-extract (and re-cache) the new secrets and return
 /// them; if unchanged, just bump the cache freshness timestamp and return
-/// `None`. Never blocks the UI — call from a spawned task.
+/// `None`. Call from a spawned task: it is network-bound.
 pub async fn refresh_bundle_if_changed(
     client: &Client,
     cached_version: &str,
@@ -267,9 +267,8 @@ pub async fn refresh_bundle_if_changed(
     extract_and_cache_bundle_tokens(client).await.ok()
 }
 
-/// Backwards-compatible one-shot extraction (no caching). Retained for callers
-/// that just want a live fetch; the app startup path uses
-/// [`extract_and_cache_bundle_tokens`] instead.
+/// One-shot extraction (no caching), for a caller that just wants a live
+/// fetch; startup uses [`extract_and_cache_bundle_tokens`] instead.
 pub async fn extract_bundle_tokens(client: &Client) -> Result<BundleTokens> {
     extract_bundle_tokens_once(client).await.map(|(t, _)| t)
 }
@@ -410,7 +409,7 @@ fn char_bounded(s: &str, lo: usize, hi: usize) -> &str {
 
 /// CMAF seed candidates from the bundle, best-scoring first.
 ///
-/// Unlike `appId` and `appSecret`, the seed carries no label to anchor a regex
+/// Unlike `appId` and `appSecret`, the seed carries no label to anchor a match
 /// on — the value is just a 32-hex string literal, and a 7 MB minified bundle
 /// holds plenty of those. So this does not try to identify it: it collects
 /// every 32-hex literal, scores each by what appears NEAR it

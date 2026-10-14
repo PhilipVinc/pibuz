@@ -3,7 +3,6 @@
 //! This module contains all shared data types used across the application:
 //! - Media types: Track, Album, Artist, Playlist
 //! - Quality/streaming types
-//! - Search and favorites types
 //! - Image and metadata types
 
 use serde::{Deserialize, Serialize};
@@ -12,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 /// A seed track resolved for the `/dynamic/suggest` `track_to_analysed`
 /// payload (DailyQ / WeeklyQ). Field names match the Qobuz wire shape
-/// exactly; `0` marks an unknown id (mirrors Tauri's `?? 0`).
+/// exactly; `0` marks an unknown id.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrackToAnalyse {
     pub track_id: u64,
@@ -83,11 +82,10 @@ pub struct UserSession {
     #[serde(default)]
     pub subscription_valid_until: Option<String>,
     /// Account territory (ISO 3166-1 alpha-2, e.g. "FR") from the login
-    /// response. `serde(default)` keeps pre-v10 persisted sessions loadable.
+    /// response. `serde(default)` keeps sessions serialized without it loadable.
     #[serde(default)]
     pub country_code: Option<String>,
-    /// Account language (ISO 639-1, e.g. "fr") from the login response —
-    /// the default target for lyrics translation ("Auto").
+    /// Account language (ISO 639-1, e.g. "fr") from the login response.
     #[serde(default)]
     pub language_code: Option<String>,
 }
@@ -142,12 +140,11 @@ pub struct StreamRestriction {
     pub code: String,
 }
 
-// ============ External streaming (Cast / DLNA) ============
+// ============ Delivered stream quality ============
 
-/// Resolved audio quality actually delivered for an external stream, in the
-/// kHz convention used across the catalog and [`StreamUrl`]. Surfaced so the
-/// UI can show the REAL quality of a cast stream, which can fall back below
-/// the requested tier (HiRes -> Lossless -> Mp3) without the user knowing.
+/// Resolved audio quality actually delivered for a stream, in the kHz
+/// convention used across the catalog and [`StreamUrl`]. It can fall back
+/// below the requested tier (HiRes -> Lossless -> Mp3).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamQualityInfo {
     /// Qobuz format id: 5=MP3, 6=Lossless, 7=HiRes, 27=UltraHiRes.
@@ -270,14 +267,13 @@ pub struct Track {
     #[serde(default)]
     pub title: String,
     /// Subtitle/edition info from Qobuz (e.g. "Player's Ball Mix",
-    /// "Nine Inch Noize Version", "Remastered 2024"). Frontend renders
-    /// it parenthesized after the title so remix and reissue albums are
-    /// distinguishable from originals (issue #360).
+    /// "Nine Inch Noize Version", "Remastered 2024"). Qobuz keeps it out of
+    /// `title`; it is what tells a remix or reissue apart from the original
+    /// (issue #360).
     pub version: Option<String>,
     /// Classical "work" the track belongs to (e.g. "Symphony No. 9 in D minor,
     /// Op. 125"). Qobuz returns it on the track object (always present in the
-    /// envelope, `null` for non-classical catalog). Drives the per-work section
-    /// headers on the album view, mirroring the official Qobuz player (PR #536).
+    /// envelope, `null` for non-classical catalog).
     pub work: Option<String>,
     pub isrc: Option<String>,
     #[serde(default)]
@@ -336,7 +332,7 @@ pub struct Album {
     pub release_date_original: Option<String>,
     /// Date the album becomes available for streaming (ISO YYYY-MM-DD).
     /// When in the future, the album is upcoming and cannot be fetched
-    /// via `get_album` yet — Release Watch uses this to gate clicks.
+    /// via `get_album` yet.
     pub release_date_stream: Option<String>,
     /// Whether the album is currently streamable. False for upcoming
     /// releases, regional restrictions, or label takedowns.
@@ -391,14 +387,13 @@ pub struct Album {
     pub artists: Option<Vec<AlbumArtist>>,
     /// Release variant label ("2009 Remaster", "Hi-Res", "Deluxe Edition", …).
     /// Qobuz keeps this out of `title`; the web player appends it in parens so
-    /// re-editions of the same album are distinguishable. Surfaced the same way
-    /// on every album title (see `format_album_title`).
+    /// re-editions of the same album are distinguishable.
     #[serde(default)]
     pub version: Option<String>,
     /// Album-level composer credit (single Artist). The official web player
     /// renders this — NOT the per-track `composer` — as the "… • X
     /// (composer)" tail of the header credit line, and suppresses it when the
-    /// name is the "Various Composers" placeholder. See `album::build_credits`.
+    /// name is the "Various Composers" placeholder.
     #[serde(default)]
     pub composer: Option<Artist>,
 }
@@ -477,7 +472,7 @@ pub struct Label {
     pub name: String,
 }
 
-// ============ Artist Page Types (/artist/page) ============
+// ============ Award field deserializers ============
 
 fn deserialize_award_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
@@ -503,8 +498,6 @@ where
     })
 }
 
-// ============ Artist Story Types (/artist/story) ============
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -512,7 +505,7 @@ mod tests {
     #[test]
     fn user_session_deserializes_pre_v10_json() {
         // Sessions persisted before the country/language capture must still
-        // load: both new fields default to None (feature stays Auto-off).
+        // load: both new fields default to None.
         let json = r#"{
             "user_auth_token": "token",
             "user_id": 1705826,
@@ -555,8 +548,7 @@ mod tests {
 ///   publicationId, publicationName, awardSlug,
 ///   awardedAt: long, …}
 /// - `/artist/page`    — PageArtistAward {id: int, name, awarded_at}
-///   id is emitted as String downstream so the frontend has a single
-///   type to carry into /award/page and /award/getAlbums. The `alias`
+///   id is normalized to a String so all three land in one type. The `alias`
 ///   list covers the LegacyAwardDto field name the web app never sees
 ///   but the mobile API uses.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -619,7 +611,7 @@ pub struct Genre {
     pub id: u64,
     pub name: String,
     /// Full ancestor id chain (top-level first, self last) as sent by the
-    /// discover endpoints. Absent on older cached payloads → None.
+    /// discover endpoints. Absent → None.
     #[serde(default)]
     pub path: Option<Vec<u64>>,
 }

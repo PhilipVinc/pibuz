@@ -1,18 +1,17 @@
-// crates/pibuz/src/cli/queue.rs — the `queue list/add/remove/clear` verbs
-// (02-cli-and-api.md §2.2). Each is exactly one HTTP request (§1.1); the pure
-// index-translation and rendering helpers below are unit-tested without a
-// running daemon.
+// crates/pibuz/src/cli/queue.rs — the `queue` verbs. Each is exactly one HTTP
+// request; the pure index-translation and rendering helpers below are
+// unit-tested without a running daemon.
 //
-// INDEX CONVENTION (normative, cross-doc-fixed, §3.3.13/§3.3.15/§2.2 queue
-// remove note): the wire is 0-based everywhere (the same space as
+// INDEX CONVENTION: the wire is 0-based everywhere (the same space as
 // `GET /api/queue`'s `current_index`). This file is the ONLY place a 1-based
-// position exists — `queue list`'s `#` column and `queue remove <INDEX>`'s
-// argument. The translation happens exactly at this boundary:
+// position exists — `queue list`'s `#` column and the position arguments of
+// `queue remove`/`move`/`jump`. The translation happens exactly at this
+// boundary:
 //   - display: `cli_position(api_index_0based) -> 1-based` (used by the
 //     `queue list` table renderer).
 //   - input: `cli_index_to_api(cli_position_1based) -> 0-based, Result` (used
-//     by `queue remove`; position 0 is a usage error — there is no "0th"
-//     track).
+//     by `remove`/`move`/`jump`; position 0 is a usage error — there is no
+//     "0th" track).
 use serde_json::Value;
 
 use crate::cli::client::ApiClient;
@@ -20,8 +19,8 @@ use crate::paths::ProfileRoots;
 
 // ============================ list ============================
 
-/// `pibuz queue list [--json]` — renders `GET /api/queue` (§2.2/§3.3.13).
-/// Exit: 0 · 1 · 3 (no needs_auth in `list`'s Errors column, §3.3.13).
+/// `pibuz queue list [--json]` — renders `GET /api/queue`.
+/// Exit: 0 · 1 · 3.
 pub async fn list(host: Option<String>, json: bool, roots: &ProfileRoots) -> i32 {
     let client = ApiClient::new(host, roots);
     match client.get("/api/queue").await {
@@ -40,31 +39,31 @@ pub async fn list(host: Option<String>, json: bool, roots: &ProfileRoots) -> i32
     }
 }
 
-/// The §2.2 table header, verbatim (column starts: `#`@4, `track`@7,
+/// The table header, verbatim (column starts: `#`@4, `track`@7,
 /// `artist`@47, `len` right-aligned in the trailing 4-wide field).
 const HEADER: &str = "    #  track                                   artist            len";
 
 /// How many played rows render above the current track. A render cap only —
-/// the wire `history` field is the full list (the §2.2 example shows one
-/// played row; three keeps a long session's table from being mostly past).
+/// the wire `history` field is the full list (three keeps a long session's
+/// table from being mostly past).
 const HISTORY_RENDER_CAP: usize = 3;
 
-/// The §2.2 `queue list` table: up to [`HISTORY_RENDER_CAP`] played rows
+/// The `queue list` table: up to [`HISTORY_RENDER_CAP`] played rows
 /// (from the response's additive `history` field, recent-first on the wire,
 /// rendered oldest-first), the current track marked `->`, then `upcoming` —
 /// all numbered with the 1-based display position via `cli_position`.
 ///
 /// History-row numbering is the linear-play reconstruction: positions count
 /// back from the current track (`current - 1`, `current - 2`, …), which is
-/// exact in the §2.2 example's sequential case. Under shuffle or after
+/// exact in the sequential case. Under shuffle or after
 /// index jumps a played track's TRUE absolute position is not derivable
 /// from the wire shape (history entries carry no index), so those rows'
 /// numbers are best-effort context — `queue remove` against them stays
-/// safe: the daemon re-validates every index server-side (§3.3.15).
+/// safe: the daemon re-validates every index server-side.
 ///
 /// When nothing is current (`current_index: null`), `upcoming` already
-/// holds the ENTIRE queue (`QueueManager::get_state_full`,
-/// qbz-player/src/queue.rs:1036-1082), numbering starts at 1, and no
+/// holds the ENTIRE queue (`QueueManager::get_state_full` in qbz-player),
+/// numbering starts at 1, and no
 /// history rows render (there is no current row to anchor them to).
 fn render_queue_list(v: &Value) -> String {
     let current_index = v
@@ -126,8 +125,8 @@ fn render_row(is_current: bool, position: usize, track: &Value) -> String {
 
 // ============================ add ============================
 
-/// `pibuz queue add <TRACK_ID> [--next]` -> `POST /api/queue/add` (§2.2/
-/// §3.3.14). Exit: 0 · 1 · 3 · 4 (needs_auth) · 6 (unknown id).
+/// `pibuz queue add <TRACK_ID> [--next]` -> `POST /api/queue/add`.
+/// Exit: 0 · 1 · 3 · 6 (unknown id).
 pub async fn add(host: Option<String>, roots: &ProfileRoots, track_id: u64, next: bool) -> i32 {
     let client = ApiClient::new(host, roots);
     let position = if next { "next" } else { "end" };
@@ -144,13 +143,12 @@ pub async fn add(host: Option<String>, roots: &ProfileRoots, track_id: u64, next
     }
 }
 
-/// `added: Spain – Chick Corea (next)` (§2.2, verbatim). The daemon
-/// additively returns the materialized `tracks` (api/queue.rs's `add` doc
-/// comment explains why: the documented `{"added","total_tracks"}` sketch
-/// alone has no title/artist, and §1.1 forbids a second request to fetch
-/// them). A response without `tracks` (an older daemon, or the batch path
-/// with `track_ids.len() > 1`, which this CLI never sends) falls back to the
-/// bare count.
+/// `added: Spain – Chick Corea (next)`. The daemon additively returns the
+/// materialized `tracks` (api/queue.rs's `add` doc comment explains why:
+/// `{"added","total_tracks"}` alone has no title/artist, and a verb makes
+/// one request, never a second to fetch them). A response without `tracks`
+/// (an older daemon, or the batch path with `track_ids.len() > 1`, which this
+/// CLI never sends) falls back to the bare count.
 fn render_added(v: &Value, next: bool) -> String {
     let suffix = if next { " (next)" } else { "" };
     let track = v
@@ -173,11 +171,11 @@ fn render_added(v: &Value, next: bool) -> String {
 
 // ============================ remove ============================
 
-/// `pibuz queue remove <INDEX>` -> `POST /api/queue/remove` (§2.2/§3.3.15).
+/// `pibuz queue remove <INDEX>` -> `POST /api/queue/remove`.
 /// `index` is the 1-based position `queue list` displayed; translated to the
 /// API's 0-based index at this boundary. Exit: 0 · 1 (removing the playing
 /// track — server `bad_request`, not one of `error_from_envelope`'s
-/// special-cased codes, §3.1.3) · 2 (position 0, local usage error) · 3 ·
+/// special-cased codes) · 2 (position 0, local usage error) · 3 ·
 /// 6 (out of range — server `not_found`).
 pub async fn remove(host: Option<String>, roots: &ProfileRoots, index: usize) -> i32 {
     let api_index = match cli_index_to_api(index) {
@@ -227,12 +225,12 @@ fn render_removed(v: &Value) -> String {
 
 // ============================ clear ============================
 
-/// `pibuz queue clear [--keep-current]` -> `POST /api/queue/clear` (§2.2/
-/// §3.3.16). The flag is a plain bool (clap default `false` when absent):
+/// `pibuz queue clear [--keep-current]` -> `POST /api/queue/clear`.
+/// The flag is a plain bool (clap default `false` when absent):
 /// bare `queue clear` sends `keep_current: false` (a full reset — the
 /// harshest reading of "clear"); `--keep-current` sends `true` (preserve the
 /// now-playing track). The API's own default (`true` when the field is
-/// OMITTED, §3.3.16) never applies here — this CLI always sends the field
+/// OMITTED) never applies here — this CLI always sends the field
 /// explicitly. Exit: 0 · 1 · 3.
 pub async fn clear(host: Option<String>, roots: &ProfileRoots, keep_current: bool) -> i32 {
     let client = ApiClient::new(host, roots);
@@ -290,7 +288,7 @@ pub async fn move_(host: Option<String>, roots: &ProfileRoots, from: usize, to: 
 }
 
 /// `pibuz queue jump <POS>` -> `POST /api/queue/jump`. POS is 1-based; jumping
-/// starts audio (a click-to-play-row). Exit: 0 · 1 · 2 · 3 · 4 · 6.
+/// starts audio (a click-to-play-row). Exit: 0 · 1 · 2 · 3 · 6.
 pub async fn jump(host: Option<String>, roots: &ProfileRoots, position: usize) -> i32 {
     let index = match cli_index_to_api(position) {
         Ok(i) => i,
@@ -372,8 +370,8 @@ mod tests {
 
     #[test]
     fn cli_index_to_api_shifts_1based_to_0based() {
-        // 02 §3.3.15's own example state: current_index=1 (0-based) IS
-        // position 2 (1-based) in the §2.2 table — this is the inverse.
+        // current_index=1 (0-based) IS position 2 (1-based) in the `queue
+        // list` table — this is the inverse.
         assert_eq!(cli_index_to_api(1), Ok(0));
         assert_eq!(cli_index_to_api(2), Ok(1));
         assert_eq!(cli_index_to_api(14), Ok(13));
@@ -402,11 +400,11 @@ mod tests {
 
     #[test]
     fn render_queue_list_reproduces_the_documented_example_byte_exact() {
-        // 02 §2.2's documented state, verbatim: current_index=1 (0-based) ->
+        // A known state: current_index=1 (0-based) ->
         // "Spain" at row #2 with the `->` marker; the played "Captain
         // Marvel" (from the additive `history` field, recent-first) at row
         // #1 above it; "500 Miles High" (the sole `upcoming` entry) at #3.
-        // Every byte, including column padding, is the spec's.
+        // Every byte, including column padding, is pinned.
         let v = serde_json::json!({
             "current_track": {"id": 176544871, "title": "Spain", "artist": "Chick Corea", "duration_secs": 581},
             "current_index": 1,

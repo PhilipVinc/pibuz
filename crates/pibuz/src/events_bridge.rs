@@ -2,10 +2,10 @@
 // CoreEvent bus.
 //
 // The 450 ms playback driver detects track/play-state transitions
-// (`DriverAction::ReportEdge` -> `deps.on_edge`), but nothing translated those
-// edges into the playback CoreEvent variants the bus consumers were written
-// for: those variants never fired, and `/api/events` (SSE) / `pibuz watch` carried no playback traffic at
-// all. This task closes that gap: it wakes on the same edge Notify pulse the
+// (`DriverAction::ReportEdge` -> `deps.on_edge`), but does not emit the
+// playback CoreEvent variants the bus consumers are written for; without this
+// bridge `/api/events` (SSE) / `pibuz watch` carry no playback traffic at all.
+// This task wakes on the same edge Notify pulse the
 // QConnect report scheduler uses (with a 2 s poll fallback, because
 // `plan_tick` only reports edges while a track id is present — a stop that
 // clears the track id would otherwise go unseen), reads the live player state,
@@ -87,7 +87,7 @@ pub fn spawn(
                 let _ = bus.send(CoreEvent::PlaybackStateChanged { state });
                 last_state = Some(state);
                 // A stop ends the "current track": forget it so replaying the
-                // same track emits a fresh TrackStarted (scrobbling, hooks).
+                // same track emits a fresh TrackStarted (hooks, SSE clients).
                 if state == PlaybackState::Stopped {
                     last_track_id = 0;
                 }

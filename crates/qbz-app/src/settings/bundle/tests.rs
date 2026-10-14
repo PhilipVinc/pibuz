@@ -1,7 +1,7 @@
 // crates/qbz-app/src/settings/bundle/tests.rs — the normative test suite for
-// the settings portability engine. Per 04-settings-portability.md, "the
-// classification table IS the test suite": one test per §3/§5 rule. The engine
-// takes a `LiveSystem` by injection, so nothing here touches audio hardware.
+// the settings portability engine. The classification table IS the test
+// suite: one test per §3/§5 rule. The engine takes a `LiveSystem` by
+// injection, so nothing here touches audio hardware.
 
 use super::*;
 use serde_json::json;
@@ -538,7 +538,7 @@ fn remember_last_maps_to_on_in_adapted() {
 
 #[test]
 fn library_folders_skipped_on_daemon() {
-    // §2.6: the P0 daemon has no local library.
+    // §2.6: the daemon has no local library.
     let p = scratch("folders");
     let bundle = bundle_with(json!({
         "library_folders": [ { "path": "/mnt/music", "network_fs": false } ]

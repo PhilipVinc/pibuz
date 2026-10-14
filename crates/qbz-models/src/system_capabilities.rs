@@ -2,7 +2,7 @@
 //!
 //! Probes the host environment at startup to derive a runtime profile that
 //! tunes resource-heavy behaviors (prefetch depth, streaming buffer size,
-//! prefetch quality cap) for memory-constrained machines like the
+//! L1 cache budget, decoded ring depth) for memory-constrained machines like the
 //! Raspberry Pi 3B (1 GB RAM, issue #331).
 //!
 //! Detection is one-shot, cached in a `OnceLock`, and pure once given the
@@ -16,9 +16,8 @@ use std::sync::OnceLock;
 pub enum MemoryClass {
     /// >= 2 GB RAM. Default behavior, no caps applied.
     Normal,
-    /// < 2 GB RAM. Reduces prefetch and buffer footprints to keep room
-    /// for the WebView and avoid swap thrash on Raspberry Pi-class
-    /// devices.
+    /// < 2 GB RAM. Reduces prefetch and buffer footprints to avoid
+    /// swap thrash on Raspberry Pi-class devices.
     LowMemory,
 }
 
@@ -42,7 +41,7 @@ pub struct MemoryProfile {
     /// Upper bound for the L1 (in-memory) audio cache. The 400 MB figure
     /// this is capped at is sized for Normal-class desktops; on a Pi 3B
     /// (1 GB total) that single subsystem could consume 40 % of RAM, which
-    /// guarantees swap thrash before the watchdog can react. Scaled by
+    /// guarantees swap thrash. Scaled by
     /// [`l1_cache_bytes_for_total_kb`] so a 2 GB Pi 5 — nominally
     /// Normal-class — does not get a desktop's cache either.
     pub audio_cache_l1_max_bytes: usize,
@@ -116,8 +115,7 @@ pub struct MemoryProfile {
 /// never reached the prefetch path — a log line and `/api/status` were its only
 /// readers, where it told a 1 GB Pi's owner their board did not prefetch Hi-Res
 /// while it did — and it has been deleted. The memory watchdog was never built
-/// either; its `MemoryPressure` snapshot and `read_memory_pressure` sat here
-/// with no caller until they were deleted.
+/// either.
 ///
 /// This is no longer the whole gate, because that allocation is no longer
 /// forced. `qbz_player`'s `plan_successor` picks the destination from the size
@@ -273,7 +271,7 @@ pub const FORCE_MEM_TOTAL_KB_ENV: &str = "QBZ_FORCE_MEM_TOTAL_KB";
 /// host clears [`GAPLESS_MIN_TOTAL_KB`]. A knob that set the CLASS alone would
 /// describe a board that does not exist, and the paths worth testing are the
 /// ones real boards take. `QBZ_FORCE_MEM_TOTAL_KB=439000` is a Pi 3A / Zero 2 W
-/// exactly: LowMemory, 72 MB of L1, an 8 MB window ceiling, a 2 s decoded ring,
+/// exactly: LowMemory, 72 MB of L1, an 8 MB window ceiling, a 4 s decoded ring,
 /// and below the floor, so the successor planning only those boards reach can be
 /// exercised on a laptop or on a Pi that has RAM to spare.
 ///

@@ -3,9 +3,9 @@ pub struct WsTransportConfig {
     pub endpoint_url: String,
     pub jwt_qws: Option<String>,
     /// When `true`, a connect attempt with `jwt_qws == None` is a hard
-    /// credential error instead of silently skipping the AUTHENTICATE frame
-    /// (gap #12). Defaults to `false` so the InMemory / test transport path
-    /// keeps working without a JWT.
+    /// credential error instead of silently skipping the AUTHENTICATE frame.
+    /// Defaults to `false` so the InMemory / test transport path keeps working
+    /// without a JWT.
     pub require_jwt: bool,
     pub reconnect_backoff_ms: u64,
     pub reconnect_backoff_max_ms: u64,
@@ -20,7 +20,7 @@ pub struct WsTransportConfig {
     pub reconnect_max_attempts: Option<u32>,
     /// When `> 0`, reaching `Exhausted` no longer terminates the transport
     /// loop: it idles this long (shutdown-cancellable), resets the attempt
-    /// counter / backoff to base, and retries instead of giving up (gap #7).
+    /// counter / backoff to base, and retries instead of giving up.
     /// Default `0` preserves the legacy terminate-on-exhausted behavior used
     /// by tests; the real config sets 60s.
     pub reconnect_idle_retry_ms: u64,

@@ -8,13 +8,6 @@
 //!
 //! # What must not change by accident
 //!
-//! (This header used to read "This code is IMMUTABLE" and point at
-//! `qbz-nix-docs/AUDIO_BACKENDS.md`. That file is not in this tree — it went
-//! with the desktop UI — and the code below has been rewritten many times
-//! since. It was a stale marker of exactly the kind CLAUDE.md warns about, so
-//! here are the invariants it was trying to protect, stated where they can be
-//! checked.)
-//!
 //! - **The bit-perfect path does not touch the samples.** On the ALSA-direct
 //!   path the only permitted operations between the decoder and the device are
 //!   the format conversion in [`alsa_direct::encode_into`] and an explicit

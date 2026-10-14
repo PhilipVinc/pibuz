@@ -1,23 +1,17 @@
-//! Output sink enumeration (frontend-shaped diagnostic).
+//! Output sink enumeration over CPAL.
 //!
-//! Provides a small, frontend-facing struct (`OutputSinkInfo`) listing the
-//! available CPAL output devices. This is the same data the legacy
-//! `get_pipewire_sinks` command exposed — the simpler shape (`name`,
-//! `description`, `volume`, `is_default`) used by the audio settings UI
-//! and the AudioOutputBadges component.
+//! Provides a small struct (`OutputSinkInfo`) listing the available CPAL
+//! output devices: just `name`, `description`, `volume` and `is_default`.
 //!
 //! NOTE: This is the same CPAL host the Player itself opens, so the
 //! `name` returned here is guaranteed to be a valid identifier the
 //! audio backend can re-open later. It is intentionally NOT the richer
 //! `AudioDevice` struct from `backend::AudioBackend::enumerate_devices`,
-//! which carries sample-rate probing data the Settings UI does not need.
+//! which carries sample-rate probing data a device list does not need.
 
 use serde::Serialize;
 
-/// Frontend-shaped info for a single audio output device.
-///
-/// Mirrors the legacy `PipewireSink` struct so the existing TypeScript
-/// `PipewireSink` interface can consume V2 output unchanged.
+/// Info for a single audio output device.
 #[derive(Debug, Clone, Serialize)]
 pub struct OutputSinkInfo {
     /// Internal name (e.g. CPAL device name; on Linux this is the
@@ -27,7 +21,7 @@ pub struct OutputSinkInfo {
     /// user-readable; on macOS/Windows the name itself is descriptive.
     pub description: String,
     /// Current volume percentage (0–100). CPAL does not expose this so
-    /// it is always `None` here; preserved for API compatibility.
+    /// it is always `None` here.
     pub volume: Option<u32>,
     /// Whether this is the default sink.
     pub is_default: bool,
@@ -50,7 +44,7 @@ fn cpal_device_name(device: &rodio::cpal::Device) -> Option<String> {
 /// any other. What that means here is that this walks the whole ALSA PCM
 /// namespace, `/etc/alsa/conf.d` drop-ins included, and must therefore never
 /// hand libasound a PCM it could `abort()` on. On macOS/Windows it is the
-/// platform default. Output is shaped for the audio settings UI.
+/// platform default.
 ///
 /// CRITICAL: The returned `name` is exactly the CPAL device name, so it
 /// matches what the audio backend uses to re-open the device later. Do
@@ -92,10 +86,6 @@ pub fn list_output_sinks() -> Result<Vec<OutputSinkInfo>, String> {
             // keys on the id, and on ALSA the two are different strings.
             let pcm_id = crate::device_filter::cpal_pcm_id(&device).unwrap_or_else(|| name.clone());
 
-            // Same diagnostic logging as the legacy command, so log output
-            // for the V2 command matches what users / support reports
-            // already document.
-            //
             // The probe is a DIAGNOSTIC and is treated as one. It used to run
             // unconditionally, on every PCM in the namespace, on a path the
             // `status` endpoint polls every few seconds — and probing a

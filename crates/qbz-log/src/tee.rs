@@ -1,4 +1,4 @@
-//! The composite [`log::Log`] that fans every record to stderr, the ring, and the file.
+//! The composite [`log::Log`] that fans every record to stderr and the file.
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -9,9 +9,9 @@ use log::{Log, Metadata, Record};
 use crate::line::LogLine;
 use crate::redact;
 
-/// Wraps `env_logger`'s built `Logger` and tees every record to the in-memory ring and
+/// Wraps `env_logger`'s built `Logger` and tees every record to stderr and
 /// (optionally) the on-disk log file, with secret redaction applied once at this single
-/// write choke point. **All** sinks (ring, file, and stderr) receive the redacted text.
+/// write choke point. Both sinks receive the redacted text.
 pub struct TeeLogger {
     pub(crate) inner: env_logger::Logger,
     pub(crate) file: Option<Mutex<BufWriter<File>>>,
@@ -38,7 +38,7 @@ impl Log for TeeLogger {
     }
 
     fn log(&self, record: &Record) {
-        // Honor the inner logger's filter so the ring matches what stderr would show.
+        // Honor the inner logger's filter, for both sinks.
         if !self.inner.enabled(record.metadata()) {
             return;
         }

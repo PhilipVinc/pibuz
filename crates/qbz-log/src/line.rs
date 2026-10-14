@@ -1,9 +1,9 @@
-//! The ring/file element: a single captured log record.
+//! A single captured log record.
 
 use log::Level;
 
-/// One captured log line. `message` is **already redacted** by the time it lands
-/// in the ring or the file (redaction happens at the single write choke point in
+/// One captured log line. `message` is **already redacted** by the time it is
+/// written to stderr or the file (redaction happens at the single write choke point in
 /// [`crate::tee::TeeLogger`]).
 #[derive(Clone)]
 pub struct LogLine {

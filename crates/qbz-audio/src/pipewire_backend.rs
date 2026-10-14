@@ -1,10 +1,11 @@
 //! PipeWire audio backend
 //!
 //! Uses PipeWire/PulseAudio for audio output with device selection.
-//! - Enumerates devices using pactl (pretty names)
-//! - Sets PULSE_SINK environment variable for device routing
+//! - Enumerates devices with `pw-dump`, falling back to `pactl`
+//! - Routes to the selected sink by making it the system default
+//!   (`pactl set-default-sink`), or, with `skip_sink_switch`, through
+//!   `PIPEWIRE_NODE` without touching the default
 //! - Creates stream using CPAL "pulse" or "pipewire" device
-//! - Does NOT change system default (only affects QBZ)
 
 use super::backend::{AudioBackend, AudioBackendType, AudioDevice, BackendConfig, BackendResult};
 use rodio::{
@@ -24,7 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 static CLOCK_FORCE_APPLIED: AtomicBool = AtomicBool::new(false);
 
 /// Restores the `PIPEWIRE_NODE` env var to its previous value when dropped, so
-/// locked-mode sink targeting (Tier 2a, #263) does not leak into later stream
+/// locked-mode sink targeting (#263) does not leak into later stream
 /// opens. Edition 2021: `set_var`/`remove_var` are safe.
 #[cfg(target_os = "linux")]
 struct PwNodeEnvGuard(Option<String>);
@@ -370,7 +371,7 @@ impl PipeWireBackend {
 /// exited successfully within `timeout`. Availability probing only — a missing
 /// binary, a failing exit, or a timeout all mean "not available". Bounded so
 /// the audio thread can never hang on a wedged daemon (#591/#592: playback
-/// start must fail fast and fall back, not sit behind the 45s UI watchdog).
+/// start must fail fast and fall back, not hang).
 fn probe_command_ok(program: &str, args: &[&str], timeout: std::time::Duration) -> bool {
     use std::process::Stdio;
     let mut child = match Command::new(program)
@@ -416,8 +417,8 @@ fn probe_command_ok(program: &str, args: &[&str], timeout: std::time::Duration) 
 /// unit-testable against a captured fixture.
 ///
 /// Selects objects of `type == "PipeWire:Interface:Node"` whose
-/// `info.props["media.class"] == "Audio/Sink"`. The `node.name` is the id the
-/// HiFi wizard otherwise asks the user to paste by hand. `device.bus` is read
+/// `info.props["media.class"] == "Audio/Sink"`. The `node.name` is the id this
+/// backend opens and `output_device` stores. `device.bus` is read
 /// from the node props (present in practice) and, when absent, cross-referenced
 /// via the node's `device.id` against the `PipeWire:Interface:Device` objects.
 /// `max_sample_rate` is intentionally left `None`: `pw-dump`'s `EnumFormat`
@@ -645,9 +646,9 @@ impl AudioBackend for PipeWireBackend {
 
         // Force PipeWire to use the effective sample rate (for bit-perfect playback).
         //
-        // Tier 1 (issue #263): when skip_sink_switch ("Lock output device") is ON, the
-        // user has asked QBZ not to mutate GLOBAL graph state to preserve external
-        // routing (JACK/qjackctl/qpwgraph). So we skip the global `clock.force-rate`
+        // Issue #263: when skip_sink_switch is ON, the user has asked QBZ not to
+        // mutate GLOBAL graph state to preserve external routing
+        // (JACK/qjackctl/qpwgraph). So we skip the global `clock.force-rate`
         // write too — not just `set-default-sink`. This trades device-native-rate
         // playback for routing freedom (PipeWire resamples when track rate != graph
         // rate). Safe: skip_sink_switch is transitively mutually exclusive with
@@ -832,7 +833,7 @@ impl AudioBackend for PipeWireBackend {
         };
         log::info!("[PipeWire Backend] Buffer size: {:?}", cpal_buffer_size);
 
-        // Tier 2a (#263): in locked mode (skip_sink_switch) QBZ does NOT steal the
+        // #263: in locked mode (skip_sink_switch) QBZ does NOT steal the
         // system default sink, so route THIS stream to the selected sink via the
         // pipewire-ALSA plugin's PIPEWIRE_NODE env — it targets that node WITHOUT
         // changing the system default. The guard restores the prior env value
@@ -881,9 +882,9 @@ impl AudioBackend for PipeWireBackend {
         // Re-applying now that the stream exists forces PipeWire to reconfigure
         // the graph at the correct rate.
         //
-        // Tier 1 (issue #263): also gated by skip_sink_switch — in "Lock output
-        // device" mode QBZ never writes the global clock force (pre-stream OR
-        // re-apply), so the user's external routing/graph clock is left untouched.
+        // Issue #263: also gated by skip_sink_switch — in locked mode QBZ never
+        // writes the global clock force (pre-stream OR re-apply), so the user's
+        // external routing/graph clock is left untouched.
         if !config.skip_sink_switch && effective_rate != 44100 && effective_rate != 48000 {
             let _ = Command::new("pw-metadata")
                 .args([
@@ -954,7 +955,7 @@ impl AudioBackend for PipeWireBackend {
         // up — device enumeration already succeeds natively via `pw-dump` on
         // those systems, so the availability probe must accept the same proof.
         // Order: native socket (no subprocess) → pw-dump → pactl (kept as the
-        // fallback for PulseAudio-only systems, preserving pre-2.0 behavior).
+        // fallback for PulseAudio-only systems).
         // Subprocess probes are time-bounded so a wedged daemon can never
         // stall stream init on the audio thread.
         if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {

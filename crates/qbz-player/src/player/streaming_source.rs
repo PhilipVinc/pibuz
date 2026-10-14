@@ -1,19 +1,21 @@
 //! Buffered media source for streaming playback.
 //!
 //! Provides two main components:
-//! 1. `BufferedMediaSource` - Wraps an async HTTP response to provide a synchronous
-//!    `Read + Seek` interface required by symphonia decoders.
+//! 1. `BufferedMediaSource` - Wraps an async download (an HTTP body, or CMAF
+//!    segments) to provide the synchronous `Read + Seek` interface required by
+//!    symphonia decoders.
 //! 2. `IncrementalStreamingSource` - A rodio Source that decodes audio packets
 //!    incrementally as they become available, allowing playback to start before
 //!    the entire file is downloaded.
 //!
 //! # Design
 //!
-//! The source uses a growing buffer that accumulates data from the HTTP response.
+//! The buffer holds runs of downloaded bytes, bounded to a window ahead of the
+//! reader plus a pinned header (see `StreamingConfig::window_bytes`).
 //! - Reads block if requesting data not yet buffered
-//! - Seek forward blocks until data is available
-//! - Seek backward works within buffered data
-//! - Seek beyond current buffer position blocks until data arrives
+//! - A seek outside the buffered data asks the feeder to restart there
+//!   (`StreamSeekMode::RangeRequests`), or waits for the download to reach it
+//!   (`StreamSeekMode::Sequential`)
 //!
 //! # Thread Safety
 //!
@@ -66,7 +68,7 @@ impl Default for StreamingConfig {
             // This allows playback to start quickly while still having enough
             // buffer to handle network jitter
             initial_buffer_bytes: 512 * 1024,
-            // 100MB max buffer
+            // Fallback window; callers size it from the byte-rate.
             window_bytes: DEFAULT_WINDOW_BYTES,
         }
     }
@@ -96,7 +98,7 @@ impl StreamingConfig {
     ///
     /// Result is clamped to the process-wide cap configured via
     /// [`set_max_initial_buffer_bytes`] (typically derived from the host's
-    /// memory profile — see qbz-core's system_capabilities). On
+    /// memory profile — see `qbz_models::system_capabilities`). On
     /// memory-constrained hosts the slow-connection branches would
     /// otherwise inflate to 2 MB, which is exactly the wrong direction
     /// when "slow connection" is itself a symptom of swap thrash
@@ -584,8 +586,9 @@ impl BufferState {
     /// backwards must find its own bytes, and an outgoing reader is still
     /// entitled to the ones under its cursor.
     ///
-    /// Only under `RangeRequests`. A `Sequential` feeder (CMAF) cannot re-fetch
-    /// what it discards, so it is never trimmed.
+    /// Only under `RangeRequests`. A `Sequential` feeder (a CMAF stream whose
+    /// segment table does not cover every segment) cannot re-fetch what it
+    /// discards, so it is never trimmed.
     fn trim_behind_readers(&mut self) {
         if self.seek_mode != StreamSeekMode::RangeRequests {
             return;
@@ -765,7 +768,6 @@ impl SharedBuffer {
 
     /// Block until the buffer changes: data pushed, an error recorded, or
     /// the feeder reporting itself done.
-    /// Wait for the feeder to make progress.
     ///
     /// UNBOUNDED, deliberately: a reader that gave up after a timeout would
     /// report a short read, and symphonia would take that for a corrupt stream.
@@ -992,9 +994,6 @@ impl BufferedMediaSource {
             .unwrap_or(false)
     }
 
-    /// Check if the feeder is done and left nothing missing (full file in
-    /// buffer). A range feeder only reports completion once every gap is
-    /// filled, so this keeps meaning "the whole track is here".
     /// Give up on this stream: wake every blocked reader and make the next
     /// read report EOF.
     ///
@@ -1053,6 +1052,9 @@ impl BufferedMediaSource {
         }
     }
 
+    /// Check if the feeder is done and left nothing missing (full file in
+    /// buffer). A range feeder only reports completion once every gap is
+    /// filled, so this keeps meaning "the whole track is here".
     pub fn is_complete(&self) -> bool {
         if let Ok(state) = self.shared.state.lock() {
             state.download_complete && state.download_error.is_none()
@@ -1114,16 +1116,12 @@ impl BufferedMediaSource {
     /// Returns None if the download is not complete, failed, or (after a
     /// range jump the feeder never backfilled) has a hole in it.
     ///
-    /// IMPORTANT: This clones the buffer rather than moving it. Earlier
+    /// IMPORTANT: This copies the buffer rather than moving it. Earlier
     /// attempts to use `mem::take` here regressed playback — the
     /// `Source` impl is still actively reading from the buffer when
     /// the promotion path calls this, and zeroing the buffer out from
     /// under the reader caused immediate EOF (tracks ending 10s into a
-    /// 104s file). Cloning is the safe choice; the audible hiccup at
-    /// promotion that the move attempted to fix needs a different
-    /// approach (shared `Arc<Vec<u8>>` ownership, or off-thread copy).
-    /// The whole track's bytes, as the shared [`TrackBytes`] every consumer
-    /// downstream expects.
+    /// 104s file).
     ///
     /// Returns `TrackBytes` rather than `Vec<u8>` on purpose. A Hi-Res track is
     /// 200 MB+, and the old signature cost TWO full copies of it: the `Vec`
@@ -2153,9 +2151,8 @@ impl MediaSource for SealedFileSource {
 /// the post-seek decode window is ~O(seek point density) instead of
 /// O(position).
 ///
-/// Non-Symphonia formats (notably rodio's native MP4/AAC path) aren't
-/// supported here; callers must fall back to `decode_with_fallback` +
-/// `skip_duration` when `new` returns `Err`.
+/// When Symphonia cannot open the bytes, `new` returns `Err` and callers
+/// fall back to `decode_with_fallback` + `skip_duration`.
 pub struct InMemorySource {
     sample_rate: u32,
     channels: u16,
@@ -2643,12 +2640,11 @@ pub(crate) mod tests {
     /// `abandon` wakes a reader that is blocked waiting for bytes, and does it
     /// as a clean EOF rather than an error.
     ///
-    /// This is the mechanism behind `release_streaming_source`, which is called
-    /// from eleven places in the audio thread and, until now, from no test at
-    /// all. A decoder abandoned by a stop that timed out otherwise sits in this
-    /// wait for as long as the download takes, holding the boxed source and the
-    /// whole track's buffer — 120-220 MB at Hi-Res — for the life of the
-    /// process. Clearing the slot cannot do it: the `Arc` is shared, and the
+    /// This is the mechanism behind `release_streaming_source`, which the audio
+    /// thread calls wherever it drops a streaming source. A decoder abandoned
+    /// by a stop that timed out otherwise sits in this wait for as long as the
+    /// download takes, holding the boxed source and the whole track's buffer —
+    /// 120-220 MB at Hi-Res — for the life of the process. Clearing the slot cannot do it: the `Arc` is shared, and the
     /// last reference is the wedged thread's.
     ///
     /// EOF and not an error is the load-bearing part. Symphonia turns a

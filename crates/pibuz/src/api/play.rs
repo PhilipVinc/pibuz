@@ -1,23 +1,23 @@
-// crates/pibuz/src/api/play.rs — POST /api/play (02-cli-and-api.md §2.3/§3.4
-// row 23, P1). The headline "originate playback" verb: pibuz resolves a piece
-// of content — a track, album, playlist, artist, or a Qobuz URL — materializes
-// it into the queue server-side, and starts audio through the SHIPPED driver
-// ritual. This is what turns the daemon from a receiver into a source.
+// crates/pibuz/src/api/play.rs — POST /api/play. The "originate playback"
+// verb: pibuz resolves a piece of content — a track, album, playlist, artist,
+// or a Qobuz URL — materializes it into the queue server-side, and starts
+// audio through the same ritual as a cold start. This is what turns the
+// daemon from a receiver into a source.
 //
 // Materialization is server-side and never trusts a client-built QueueTrack
 // (same discipline as queue::add): each Track comes from the core
 // (get_album / get_playlist / get_artist_tracks / get_tracks_batch) and is
 // mapped by the shared queue::track_to_queue_track. Audio ALWAYS starts through
-// core.play_track_resolved + save_session_now — the exact cold-start tail
-// playback::cold_start uses — never a bare cursor move (control-surface §2.2);
-// the protected qbz-player/qbz-audio crates are untouched.
+// core.play_track_resolved — the exact cold-start tail playback::cold_start
+// uses — never a bare cursor move.
 //
 // Body: one of {"track_id": N} | {"album_id": "..."} | {"playlist_id": N} |
 // {"artist_id": N} | {"url": "https://open.qobuz.com/..."}, plus optional
 // {"index": N} (0-based start position within the resolved list). A URL wins
 // over the id fields and is resolved to one of the id kinds first. Errors:
 // 400 bad_request (no selector / bad URL), 404 not_found
-// (unknown id / empty resolution), 503 audio_unavailable (start failed).
+// (unknown id / empty resolution). A failed start is not an HTTP error: it
+// latches into `last_errors.stream`.
 use std::io::Cursor;
 
 use serde_json::Value;
@@ -52,12 +52,10 @@ pub fn play(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
 }
 
 /// Materialize resolved catalog `tracks` into the queue and cold-start the
-/// chosen one through the SHIPPED ritual (set_queue → play_track_resolved →
-/// save_session_now) — never a bare cursor move (control-surface §2.2). The
-/// protected qbz-player/qbz-audio crates are untouched. `context` stamps
-/// "playing from" provenance (context_kind ∈ album|artist|playlist —
-/// qbz-models/src/playback.rs:60-71); `start_index` is the 0-based start
-/// position. Shared by `play` (selector-resolved) and `radio` (seed-generated).
+/// chosen one through the cold-start ritual (set_queue → play_track_resolved)
+/// — never a bare cursor move. `context` stamps "playing from" provenance
+/// (context_kind ∈ album|artist|playlist); `start_index` is the 0-based start
+/// position.
 pub(crate) fn start_resolved(
     state: &ApiState,
     tracks: Vec<Track>,
@@ -131,8 +129,8 @@ enum Selector {
     Artist(u64),
 }
 
-/// A URL wins over the id fields (§3.4 row 23: "URL resolved server-side"),
-/// resolved via the pure `resolve_link` (qbz-qobuz/src/link_resolver.rs:50).
+/// A URL wins over the id fields, resolved server-side via the pure
+/// `resolve_link` (qbz-qobuz/src/link_resolver.rs).
 /// Otherwise the first present id field is used.
 fn parse_selector(body: &Value) -> Result<Selector, (String, String)> {
     let hint = "body: {\"album_id\":\"...\"} | {\"track_id\":N} | {\"playlist_id\":N} | \
@@ -226,8 +224,8 @@ fn clamp_index(idx: Option<u64>, len: usize) -> usize {
 }
 
 /// A compact now-playing summary for the response (title/artist for the CLI's
-/// human line; the full state is one `pibuz now` away — §1.1 one-request rule
-/// is satisfied because this rides the same response).
+/// human line; the full state is one `pibuz now` away — the CLI still makes
+/// one request because this rides the same response).
 fn summary(qt: &QueueTrack) -> Value {
     serde_json::json!({
         "id": qt.id,

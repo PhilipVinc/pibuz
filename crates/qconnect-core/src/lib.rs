@@ -1,6 +1,6 @@
 //! qconnect-core
 //!
-//! UI-agnostic queue domain primitives for Qobuz Connect.
+//! Queue and renderer-state domain primitives for Qobuz Connect.
 
 pub mod pending;
 pub mod queue;

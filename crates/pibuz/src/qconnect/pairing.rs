@@ -1,7 +1,3 @@
-// DAEMON-ORIGINAL (like hooks.rs/events_bridge.rs) — no desktop twin; the
-// desktop pairs implicitly through the logged-in account and never serves this
-// surface, so there is nothing to converge with.
-//
 //! Local pairing surface for Qobuz Connect: mDNS advertisement + the three
 //! `/streamcore` HTTP endpoints the Qobuz app calls when a user picks this
 //! device in the output selector.
@@ -14,17 +10,17 @@
 //!     finally `POST /streamcore/connect-to-qconnect` with
 //!     `{session_id, jwt_qconnect: {jwt, exp, endpoint}, jwt_api: {jwt, exp}}`.
 //!
-//! The handed-over `jwt_qconnect` is the SAME credential class the account path
-//! obtains from `/qws/createToken` (`WsTransportConfig.jwt_qws` + endpoint), but
+//! The handed-over `jwt_qconnect` is the SAME credential class
+//! `/qws/createToken` returns (`WsTransportConfig.jwt_qws` + endpoint), but
 //! minted for the CASTER's session — so any Qobuz account on the LAN can hand
 //! this device a session, with last-write-wins takeover semantics. The tokens
 //! land in the in-memory [`PairingStore`]; `DaemonQconnectService::connect`
 //! prefers a live pairing token over `/qws/createToken` discovery.
 //!
-//! The handed-over `jwt_api` is the streaming credential when no account is
-//! logged in: `reconnect_for_pairing` installs it on the `QobuzClient` as an
-//! `Authorization: Bearer` fallback (a logged-in account always outranks it),
-//! and the refresh heartbeat below keeps both JWTs alive past their expiry.
+//! The handed-over `jwt_api` is the streaming credential:
+//! `reconnect_for_pairing` installs it on the `QobuzClient` as its
+//! `Authorization: Bearer`, and the refresh heartbeat below keeps both JWTs
+//! alive past their expiry.
 //! Tokens are never persisted (a daemon restart just waits for the next
 //! handoff POST) and never logged (registered with the qbz-log redactor on
 //! receipt and on every refresh).
@@ -67,8 +63,8 @@ pub struct PairingTokens {
     pub ws_jwt: String,
     pub ws_exp: u64,
     pub ws_endpoint: String,
-    /// Streaming credential for the account-less path (`Authorization:
-    /// Bearer`), installed on the client by `reconnect_for_pairing`.
+    /// Streaming credential (`Authorization: Bearer`), installed on the client
+    /// by `reconnect_for_pairing`.
     pub api_jwt: Option<String>,
     pub api_exp: u64,
 }

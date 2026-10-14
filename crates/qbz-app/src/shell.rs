@@ -36,8 +36,8 @@ impl<A: FrontendAdapter + Send + Sync + 'static> AppRuntime<A> {
 
     /// Initialize the core (extracts Qobuz bundle tokens).
     ///
-    /// Best-effort and offline-tolerant: a network failure here leaves the
-    /// core usable for local/offline playback, matching [`QbzCore::init`].
+    /// Best-effort: a network failure here leaves the core usable, matching
+    /// [`QbzCore::init`].
     pub async fn init(&self) -> Result<(), String> {
         self.core.init().await.map_err(|e| e.to_string())
     }

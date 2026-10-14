@@ -1,5 +1,5 @@
-// crates/pibuz/src/api/playback.rs — routes 4-12 (02-cli-and-api.md §3.3.4-12):
-// GET /api/now-playing + the 8 POST /api/playback/* transport routes.
+// crates/pibuz/src/api/playback.rs — GET /api/now-playing + the POST
+// /api/playback/* transport routes.
 //
 // There is no auth gate. These routes used to answer 409 `needs_auth` off the
 // account state machine; this daemon has no account path, so that state was
@@ -14,13 +14,12 @@
 // playback went with the local-library code, and Qobuz serves PCM only, so
 // there is no state left for it to guard.
 //
-// Mute is daemon-owned state in `DaemonShared.{muted, premute_volume}` (T2
-// seam), with stash-then-zero / restore semantics.
+// Mute is daemon-owned state in `DaemonShared.{muted, premute_volume}`, with
+// stash-then-zero / restore semantics.
 // The reported `playback.volume` is always the NOMINAL (pre-mute) level, both
 // muted and unmuted: `premute_volume` when muted, the live player volume
 // otherwise. This is what makes `now`'s and `mute`'s human lines ("vol 80%",
-// "muted (was 80%)") trivial reads of one JSON field, and mirrors the
-// desktop's PREMUTE_VOLUME/MUTED pair exactly, just relocated.
+// "muted (was 80%)") trivial reads of one JSON field.
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -29,14 +28,13 @@ use tiny_http::Response;
 
 use super::{canon_volume, err_json, json, ApiState};
 
-/// `GET /api/now-playing` (02 §3.3.4). `playback` is the serialized
-/// `PlaybackEvent` (qbz-player/src/player/mod.rs:925) with `shuffle`/`repeat`
+/// `GET /api/now-playing`. `playback` is the serialized
+/// `PlaybackEvent` (qbz-player) with `shuffle`/`repeat`
 /// filled in from the queue (the player itself leaves them `None` — "Set by
 /// caller with access to queue state") plus the daemon-owned `muted` field,
-/// plus an ADDITIVE `queue_len` (02 §3.1.4 allows additive fields within
+/// plus an ADDITIVE `queue_len` (additive fields are allowed within
 /// api_version 1; needed so `pibuz now`'s stopped-state render, "stopped ·
-/// queue 14 tracks", has a count — the documented playing-state example has
-/// no queue count because nothing needs one while a track is loaded).
+/// queue 14 tracks", has a count).
 /// `track` is the current `QueueTrack`, or `null` when nothing is loaded.
 pub fn now_playing(state: &ApiState) -> Response<Cursor<Vec<u8>>> {
     let player = state.runtime.core().player();
@@ -70,7 +68,7 @@ pub fn now_playing(state: &ApiState) -> Response<Cursor<Vec<u8>>> {
     )
 }
 
-/// `POST /api/playback/play` (02 §3.3.5). Resume if paused; cold-start the
+/// `POST /api/playback/play`. Resume if paused; cold-start the
 /// current queue track when `!has_loaded_audio()`.
 pub fn play(state: &ApiState) -> Response<Cursor<Vec<u8>>> {
     let player = state.runtime.core().player();
@@ -88,8 +86,8 @@ pub fn play(state: &ApiState) -> Response<Cursor<Vec<u8>>> {
     }
 }
 
-/// `POST /api/playback/pause` (02 §3.3.6). Never cold-starts; exit set is
-/// 0 · 1 · 3 (no 5, §2.2) so a `Player::pause` channel failure is
+/// `POST /api/playback/pause`. Never cold-starts; exit set is
+/// 0 · 1 · 3 (no 5) so a `Player::pause` channel failure is
 /// [`runtime_error`], not a 503 `audio_unavailable`.
 pub fn pause(state: &ApiState) -> Response<Cursor<Vec<u8>>> {
     match state.runtime.core().pause() {
@@ -98,11 +96,10 @@ pub fn pause(state: &ApiState) -> Response<Cursor<Vec<u8>>> {
     }
 }
 
-/// `POST /api/playback/toggle` (02 §3.3.7). Mirrors the desktop's
-/// `toggle_play_pause`: playing -> pause; paused-with-loaded-audio -> resume;
-/// nothing loaded -> cold-start (same gate as `play`). Exit 5 is reserved for
-/// the cold-start branch (`cold_start`'s own 503 `audio_unavailable`) — the
-/// pause/resume branches use [`runtime_error`] like plain `pause`/`stop`.
+/// `POST /api/playback/toggle`: playing -> pause; paused-with-loaded-audio ->
+/// resume; nothing loaded -> cold-start (same gate as `play`). Exit 5 is
+/// reserved for the cold-start branch (`cold_start`'s own 503
+/// `audio_unavailable`) — the pause/resume branches use [`runtime_error`] like plain `pause`/`stop`.
 pub fn toggle(state: &ApiState) -> Response<Cursor<Vec<u8>>> {
     let player = state.runtime.core().player();
     let ev = player.get_playback_event();
@@ -126,7 +123,7 @@ pub fn toggle(state: &ApiState) -> Response<Cursor<Vec<u8>>> {
     }
 }
 
-/// `POST /api/playback/stop` (02 §3.3.8). Never cold-starts; same exit-set
+/// `POST /api/playback/stop`. Never cold-starts; same exit-set
 /// reasoning as `pause`.
 pub fn stop(state: &ApiState) -> Response<Cursor<Vec<u8>>> {
     match state.runtime.core().stop() {
@@ -135,22 +132,22 @@ pub fn stop(state: &ApiState) -> Response<Cursor<Vec<u8>>> {
     }
 }
 
-/// `POST /api/playback/next` (02 §3.3.9).
+/// `POST /api/playback/next`.
 pub fn next(state: &ApiState) -> Response<Cursor<Vec<u8>>> {
     advance(state, true)
 }
 
-/// `POST /api/playback/previous` (02 §3.3.10).
+/// `POST /api/playback/previous`.
 pub fn previous(state: &ApiState) -> Response<Cursor<Vec<u8>>> {
     advance(state, false)
 }
 
-/// `POST /api/playback/seek` (02 §3.3.11). Body `{"position": N}` (absolute)
+/// `POST /api/playback/seek`. Body `{"position": N}` (absolute)
 /// or `{"delta": N}` (additive seconds). Returns the CLAMPED target — the
-/// value `Player::seek` will settle on (`qbz-player/src/player/mod.rs:5134`
-/// clamps to duration) — rather than a live re-read, since `seek` only sends
-/// an async command to the audio thread; the clamp is deterministic so the
-/// "post-state" is knowable synchronously.
+/// value `Player::seek` will settle on (it clamps to duration) — rather than a
+/// live re-read, since `seek` only sends an async command to the audio
+/// thread; the clamp is deterministic so the "post-state" is knowable
+/// synchronously.
 pub fn seek(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
     let player = state.runtime.core().player();
     let ev = player.get_playback_event();
@@ -180,10 +177,10 @@ pub fn seek(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
     )
 }
 
-/// `POST /api/playback/volume` (02 §3.3.12). One of three body forms:
+/// `POST /api/playback/volume`. One of three body forms:
 /// `{"volume": F}` (absolute 0.0-1.0), `{"delta": F}` (additive), or
 /// `{"mute": "on"|"off"|"toggle"}` (also `pibuz mute`'s route — no dedicated
-/// route, §2.2).
+/// route).
 pub fn volume(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
     let player = state.runtime.core().player();
     let live = player.get_playback_event().volume;
@@ -224,7 +221,7 @@ pub fn volume(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
     )
 }
 
-/// `POST /api/playback/shuffle` (CONSOLE). Body `{"mode": "on"|"off"|"toggle"}`
+/// `POST /api/playback/shuffle`. Body `{"mode": "on"|"off"|"toggle"}`
 /// (default `toggle`). Returns the resulting shuffle state. No auth — a
 /// queue-mode toggle touches no Qobuz session; state also surfaces in
 /// `/api/status` and `/api/now-playing`.
@@ -255,7 +252,7 @@ pub fn shuffle(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
     json(200, serde_json::json!({"shuffle": enabled}))
 }
 
-/// `POST /api/playback/repeat` (CONSOLE). Body `{"mode": "off"|"all"|"one"}`.
+/// `POST /api/playback/repeat`. Body `{"mode": "off"|"all"|"one"}`.
 /// No auth. Returns the applied mode.
 pub fn repeat(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
     let mode = body.get("mode").and_then(|v| v.as_str()).unwrap_or("");
@@ -308,9 +305,8 @@ fn apply_mute(state: &ApiState, live: f32, arg: &str) -> Response<Cursor<Vec<u8>
         }
     };
 
-    // Desktop fallback for a never-set / zero premute level (playback.rs:3944,
-    // 3956): 0.7, so a mute taken at volume 0 still restores to something
-    // audible on unmute.
+    // Fallback for a never-set / zero premute level: 0.7, so a mute taken at
+    // volume 0 still restores to something audible on unmute.
     let (nominal, set_result) = if mute_on && !guard.muted {
         let stash = if live > 0.0 { live } else { 0.7 };
         guard.premute_volume = stash;
@@ -347,10 +343,10 @@ fn apply_mute(state: &ApiState, live: f32, arg: &str) -> Response<Cursor<Vec<u8>
     )
 }
 
-/// `next`/`previous` (02 §3.3.9-10): SPAWN
+/// `next`/`previous`: SPAWN
 /// `qbz_app::playback_driver::skip_and_play` — repeat-one off (a manual skip
-/// must move), then the FULL ritual (skip-walk → play → prefetch → persist),
-/// never a bare cursor move (02 §2.2 trap).
+/// must move), then the FULL ritual (skip-walk → play → prefetch), never a
+/// bare cursor move.
 ///
 /// Spawn-and-ack: the API serve loop is single-threaded, and the ritual's
 /// load leg (resolve+fetch) can block for many seconds on a slow link — an
@@ -380,7 +376,7 @@ fn advance(state: &ApiState, forward: bool) -> Response<Cursor<Vec<u8>>> {
 }
 
 /// `play`/`toggle`'s cold-start branch: resolve the
-/// current queue track, then SPAWN resolve+play+persist — the same ritual
+/// current queue track, then SPAWN resolve+play — the same ritual
 /// tail `advance_and_play` runs, minus the cursor-move (we're playing the
 /// CURRENT track, not advancing to a new one) and the gapless prefetch (the
 /// running driver's tick-based `ArmGapless` picks that up on a later tick
@@ -425,14 +421,14 @@ fn cold_start(state: &ApiState) -> Result<(), Response<Cursor<Vec<u8>>>> {
 
 /// Streaming quality for a play-time resolve, from the daemon's persisted
 /// prefs — the SAME key contract `daemon.rs` uses to seed the driver's
-/// `DriverDeps.quality` closure at boot (01 §10.3), so a cold-start play and
+/// `DriverDeps.quality` closure at boot, so a cold-start play and
 /// the next auto-advance never pick different tiers.
 pub(crate) fn resolve_quality(state: &ApiState) -> qbz_models::Quality {
     let prefs = qbz_app::settings::daemon_prefs::load_at(&state.roots.data);
     qbz_app::playback_driver::quality_from_key(&prefs.streaming_quality)
 }
 
-/// A generic runtime failure, exit 1 (02 §1.3's catch-all) — e.g. the
+/// A generic runtime failure, exit 1 (the catch-all) — e.g. the
 /// player's command channel is dead. `code` "internal" is NOT one of
 /// `error_from_envelope`'s special-cased codes, so it falls to
 /// `CliError::Runtime` client-side.

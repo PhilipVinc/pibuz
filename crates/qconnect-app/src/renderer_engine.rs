@@ -1,4 +1,4 @@
-//! Engine seam for QConnect renderer-side playback (slice 6).
+//! Engine seam for QConnect renderer-side playback.
 //!
 //! The hard-won renderer orchestration (echo-seek rejection, cursor align,
 //! queue materialize, shuffle deferral, load dedup window) lives ABOVE this
@@ -31,7 +31,7 @@ pub trait QconnectRendererEngine: Send + Sync {
     fn resume(&self) -> Result<(), String>;
     fn pause(&self) -> Result<(), String>;
     fn stop(&self) -> Result<(), String>;
-    /// Seek in WHOLE SECONDS (matches `QbzCore::seek` / `CoreBridge::seek`).
+    /// Seek in WHOLE SECONDS (matches `QbzCore::seek`).
     fn seek(&self, position_secs: u64) -> Result<(), String>;
     /// Volume as a 0.0–1.0 fraction (caller normalizes via `normalize_volume_to_fraction`).
     fn set_volume(&self, fraction: f32) -> Result<(), String>;
@@ -42,7 +42,7 @@ pub trait QconnectRendererEngine: Send + Sync {
     /// Whether the audio thread currently holds decodable audio for the loaded
     /// track. Distinct from `get_playback_state().track_id`: `stop()` clears the
     /// audio buffer + flips this false but LEAVES `current_track_id` untouched,
-    /// so after a controller->renderer handoff (which stopped local playback) the
+    /// so after handing the render to a peer (which stopped local playback) the
     /// track id can still match the target while NO audio is buffered. The
     /// takeback force-stream reads this to know a reload is required even when the
     /// track id matches (`should_reload_remote_track` alone would skip it and the
@@ -63,7 +63,7 @@ pub trait QconnectRendererEngine: Send + Sync {
     async fn get_all_queue_tracks(&self) -> (Vec<QueueTrack>, Option<usize>);
     async fn set_queue(&self, tracks: Vec<QueueTrack>, start_index: Option<usize>);
     /// The deferred-shuffle core: a real shuffle order, never an invented
-    /// identity order (Slint must call this, not fake it via `set_queue`).
+    /// identity order (an implementor must not fake it via `set_queue`).
     async fn set_queue_with_order(
         &self,
         tracks: Vec<QueueTrack>,
@@ -83,8 +83,8 @@ pub trait QconnectRendererEngine: Send + Sync {
     /// progressive stream into the player and SPAWN the HTTP feeder; on a
     /// streaming error, fall back to a full download + `play_data`. The impl owns
     /// `reqwest`, the `BufferWriter`, and the detached spawn — none of which
-    /// crosses this crate boundary. `start_position_secs` is the seek target
-    /// (QConnect callers pass 0; resume is local-only).
+    /// crosses this crate boundary. `start_position_secs` is where the stream
+    /// starts: 0 for a fresh track, the handed-off position on a takeback.
     ///
     /// This is the ONLY method that touches the protected bit-perfect seams
     /// (`play_data` / `play_streaming_dynamic`). It MUST pass the probed
@@ -107,15 +107,14 @@ pub trait QconnectRendererEngine: Send + Sync {
     /// This renderer's OWN quality ceiling, or `None` when it is uncapped.
     ///
     /// The controller's `max_audio_quality` is a request; this is the local
-    /// policy that bounds it (see [`crate::session::cap_quality`]). The desktop
-    /// has no such setting and takes the default; pibuz returns the configured
-    /// `playback.quality`, read fresh so a `settings set` applies to the next
-    /// load without a reconnect.
+    /// policy that bounds it (see [`crate::session::cap_quality`]). The default
+    /// is uncapped; pibuz returns the configured `playback.quality`, read fresh
+    /// so a `settings set` applies to the next load without a reconnect.
     fn local_max_quality(&self) -> Option<Quality> {
         None
     }
 
-    // ---- report-back source (the single per-frontend "engine read") ----
+    // ---- report-back source (the single "engine read") ----
     /// The ACTUAL DAC output format `(sample_rate, bit_depth)` under bit-perfect
     /// passthrough — read from `player().state`. Drives the file/device
     /// audio-quality reports. Read-only; never device init.

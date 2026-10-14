@@ -1,7 +1,7 @@
 //! QBZ Core Orchestrator
 //!
 //! The main orchestrator that connects all QBZ subsystems and provides
-//! a unified API for frontends.
+//! a unified API for the daemon.
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -17,8 +17,8 @@ use crate::error::CoreError;
 
 /// Core orchestrator for QBZ
 ///
-/// This is the main entry point for any frontend (Tauri, Slint, Iced, CLI, etc.)
-/// It provides a unified API and emits events through the FrontendAdapter.
+/// The daemon's entry point to the queue, the player and the Qobuz API. It
+/// emits events through the FrontendAdapter the host supplies.
 pub struct QbzCore<A: FrontendAdapter> {
     /// Frontend adapter for event emission
     adapter: Arc<A>,
@@ -33,9 +33,9 @@ pub struct QbzCore<A: FrontendAdapter> {
 }
 
 impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
-    /// Create a new QbzCore instance with the given frontend adapter and player
+    /// Create a new QbzCore instance with the given adapter and player
     ///
-    /// The Player must be created by the frontend with appropriate audio settings.
+    /// The Player must be created by the caller with appropriate audio settings.
     /// QbzCore orchestrates playback through this player.
     pub fn new(adapter: A, player: Player) -> Self {
         Self {
@@ -52,8 +52,8 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
     /// This should be called once at startup to set up all subsystems.
     /// Best-effort: if bundle token extraction fails (e.g. no network), the
     /// core still finishes initialization so queue manager and player remain
-    /// usable for offline/local playback. API calls will then return
-    /// `CoreError::NotInitialized` until the client is rebuilt with tokens.
+    /// usable. API calls will then return `CoreError::NotInitialized` until the
+    /// client is rebuilt with tokens.
     pub async fn init(&self) -> Result<(), CoreError> {
         let mut initialized = self.initialized.write().await;
         if *initialized {
@@ -158,7 +158,7 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
 
     /// Get the full queue state without the upcoming/history caps that
     /// `get_queue_state` applies. Used by clients that paginate the
-    /// upcoming list and need the complete play history (Queue sidebar).
+    /// upcoming list and need the complete play history.
     pub async fn get_queue_state_full(&self) -> QueueState {
         let queue = self.queue.read().await;
         queue.get_state_full()
@@ -340,9 +340,8 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
         track
     }
 
-    /// Jump to a track by its position in the upcoming list (as shown in the
-    /// Queue sidebar). Shuffle-aware: resolves through `shuffle_order` when
-    /// shuffle is active.
+    /// Jump to a track by its position in the upcoming list. Shuffle-aware:
+    /// resolves through `shuffle_order` when shuffle is active.
     pub async fn play_upcoming_at(&self, upcoming_index: usize) -> Option<QueueTrack> {
         let queue = self.queue.write().await;
         let track = queue.play_upcoming_at(upcoming_index);
@@ -435,8 +434,8 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
 
     /// Set the "stop after this song" marker on a queue track id. Replaces any
     /// previous marker (single marker). Silent no-op if the id is not in the queue.
-    /// Intentionally does NOT emit `CoreEvent::QueueUpdated` — the marker is a UI
-    /// intent the frontend reflects via its own queue snapshot, and emitting here
+    /// Intentionally does NOT emit `CoreEvent::QueueUpdated` — the marker is read
+    /// back through the queue snapshot (`stop_after_track_id`), and emitting here
     /// risks QConnect echo loops.
     pub async fn set_stop_after(&self, track_id: u64) {
         self.queue.write().await.set_stop_after(track_id);
@@ -467,8 +466,8 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
     /// through `next_track`, so the core pointer can lag the live track and
     /// the now-playing card goes stale. This moves the pointer to the track
     /// with `id` and returns it plus whether the pointer moved; a queue
-    /// update is emitted only when it did. Frontend-agnostic — the playback
-    /// poll loop calls this to keep now-playing in sync (ADR-006).
+    /// update is emitted only when it did. The playback poll loop calls this to
+    /// keep now-playing in sync.
     pub async fn sync_current_to_id(&self, id: u64) -> Option<(QueueTrack, bool)> {
         let queue = self.queue.write().await;
         let result = queue.sync_current_to_id(id);
@@ -560,8 +559,6 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
         Arc::clone(&self.player)
     }
 
-    // ==================== Favorites ====================
-
     // ==================== Playlists ====================
 
     /// Get playlist by ID
@@ -632,8 +629,7 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
 }
 
 /// Normalize an artist name for dedupe: trim, lowercase, collapse
-/// whitespace. Used by the discovery pipeline so "Iron  Maiden" and
-/// "iron maiden" hash to the same key in the dismiss store.
+/// whitespace, so "Iron  Maiden" and "iron maiden" hash to the same key.
 pub fn normalize_artist_name(name: &str) -> String {
     name.trim()
         .to_lowercase()

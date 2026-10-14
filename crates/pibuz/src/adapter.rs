@@ -1,9 +1,9 @@
-// crates/pibuz/src/adapter.rs — the daemon's FrontendAdapter (01-architecture.md §2.1).
+// crates/pibuz/src/adapter.rs — the daemon's FrontendAdapter.
 //
-// The desktop shells push core events into a UI framework; the daemon has no UI,
-// so it fans every CoreEvent out over a tokio broadcast bus. The playback driver
-// (T4) and any future SSE/watch surface (T7+) subscribe to the same bus. The
-// adapter itself is a thin, cheap forwarder — `on_event` never blocks.
+// The daemon has no UI, so it fans every CoreEvent out over a tokio broadcast
+// bus; SSE (`/api/events`), the event hook and the QConnect session all
+// subscribe to the same bus. The adapter itself is a thin, cheap forwarder —
+// `on_event` never blocks.
 use async_trait::async_trait;
 use qbz_models::{CoreEvent, FrontendAdapter};
 use tokio::sync::broadcast;
@@ -19,7 +19,7 @@ impl DaemonAdapter {
     /// need a producing handle can `drop` the receiver and later `subscribe()`
     /// via [`DaemonAdapter::sender`].
     pub fn new() -> (Self, broadcast::Receiver<CoreEvent>) {
-        // CoreEvent is Clone (qbz-models/src/events.rs:12); 256 slots absorbs a
+        // CoreEvent is Clone (qbz-models/src/events.rs); 256 slots absorbs a
         // burst of position ticks before a slow subscriber sees Lagged.
         let (tx, rx) = broadcast::channel(256);
         (Self { tx }, rx)

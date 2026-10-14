@@ -13,8 +13,8 @@
 //!    looked up. The file is read on the first lookup and created on the first
 //!    measurement, so those installs never write to the card at all.
 //! 3. **It lives where the caller says.** The directory is supplied, like
-//!    `AudioSettingsStore::new_at`, so a daemon with its own profile root keeps
-//!    its cache inside it instead of in the desktop app's data directory.
+//!    `AudioSettingsStore::new_at`, so the cache sits inside the daemon's own
+//!    profile root rather than in a directory this crate guesses at.
 //!
 //! # The file
 //!

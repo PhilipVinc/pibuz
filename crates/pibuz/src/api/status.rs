@@ -1,9 +1,5 @@
-// crates/pibuz/src/api/status.rs — `GET /api/status` composite contract
-// (02-cli-and-api.md §3.3.3; memo D14). Struct shape only in T2 — the
-// `auth`/`qconnect`/`last_errors` sections already read from `DaemonShared`;
-// `audio`/`playback`/`network` are placeholders wired by T3 (audio/playback
-// driver), T6 (HTTP server + network reachability) and T10 (qconnect report
-// tick, already flowing through `DaemonShared::qconnect`).
+// crates/pibuz/src/api/status.rs — the `GET /api/status` composite contract
+// and `GET /api/info`.
 use std::io::Cursor;
 
 use serde::Serialize;
@@ -83,7 +79,7 @@ pub struct BufferStatus {
     /// to `window_max_bytes` (the profile's ceiling) at the top and 2 MB at
     /// the bottom. Seconds rather than bytes because a byte constant is a
     /// different amount of music at every quality. `null` only when the
-    /// settings DB could not be read — which is a different fact from `0`.
+    /// audio settings could not be read — which is a different fact from `0`.
     pub window_seconds: Option<u8>,
     pub window_max_bytes: usize,
     /// Process-wide cap on the initial buffer a stream waits for before it
@@ -113,9 +109,9 @@ pub struct AudioStatus {
     pub configured_device: Option<String>,
     pub device_present: bool,
     pub device_open: bool,
-    /// `BitPerfectMode` serde variants: "DirectHardware"|"PluginFallback"|"Disabled"
-    /// (crates/qbz-audio/src/backend.rs:226-233). Kept as a plain string here so
-    /// this crate does not need to depend on the exact qbz-audio enum shape yet.
+    /// A `BitPerfectMode` serde variant (see `bitperfect_label`). Kept as a
+    /// plain string here so this crate does not depend on the exact qbz-audio
+    /// enum shape.
     pub bit_perfect: Option<String>,
     /// Rate the DECODED STREAM runs at — what the file was encoded at.
     pub sample_rate: Option<u32>,
@@ -162,10 +158,10 @@ pub struct NetworkStatus {
     pub online: bool,
 }
 
-// ============================ live handlers (T6) ============================
+// ============================== live handlers ==============================
 
-/// `GET /api/info` (02 §3.3.2) — identity for the CLI's version-skew diagnosis
-/// (§1.6, the single sanctioned second request). Deliberately minimal.
+/// `GET /api/info` — identity for the CLI's version-skew diagnosis (the
+/// single sanctioned second request). Deliberately minimal.
 pub fn info(state: &super::ApiState) -> Response<Cursor<Vec<u8>>> {
     let uptime = state
         .shared
@@ -186,7 +182,7 @@ pub fn info(state: &super::ApiState) -> Response<Cursor<Vec<u8>>> {
     )
 }
 
-/// `GET /api/status` (02 §3.3.3) — the composite daemon status. ALWAYS 200;
+/// `GET /api/status` — the composite daemon status. ALWAYS 200;
 /// the CLI maps degradation (a missing device) to exit codes.
 pub fn status(state: &super::ApiState) -> Response<Cursor<Vec<u8>>> {
     let doc = assemble_live(state);
@@ -393,8 +389,8 @@ fn assemble_live(state: &super::ApiState) -> StatusDoc {
     }
 }
 
-/// `BitPerfectMode` → its serde variant string (02 §3.3.3, plus
-/// `"DirectNamedDevice"` for a named PCM whose chain we cannot see into).
+/// `BitPerfectMode` → its serde variant string (`"DirectNamedDevice"` is
+/// for a named PCM whose chain we cannot see into).
 /// `None` = no active stream.
 fn bitperfect_label(m: Option<qbz_audio::BitPerfectMode>) -> Option<String> {
     use qbz_audio::BitPerfectMode as M;
@@ -425,9 +421,8 @@ fn backend_label(b: Option<qbz_audio::AudioBackendType>) -> Option<String> {
     })
 }
 
-/// Best-effort presence check. Exact device identity is refined in T10; here a
-/// substring match on either side tolerates the CPAL-name vs `hw:` mismatch
-/// without false negatives on a match.
+/// Best-effort presence check: a substring match on either side tolerates the
+/// CPAL-name vs `hw:` mismatch without false negatives on a match.
 ///
 /// The ALSA backend answers from `/proc/asound` instead, and deliberately: an
 /// enumeration goes through `snd_device_name_hint`, which resolves every PCM
@@ -595,7 +590,7 @@ mod tests {
 
     #[test]
     fn status_doc_mirrors_the_top_level_contract_keys() {
-        // 02-cli-and-api.md §3.3.3 top-level keys, exactly.
+        // The top-level keys, exactly.
         let json = serde_json::to_value(idle_doc()).unwrap();
         let obj = json.as_object().unwrap();
         for key in [
@@ -619,7 +614,7 @@ mod tests {
 
     #[test]
     fn the_new_sections_are_additive_only() {
-        // The §3.3.3 keys an existing reader knows must all still be there and
+        // The keys an existing reader knows must all still be there and
         // still mean what they meant — `memory`/`cache`/`buffers` are ADDED
         // beside them, which is why this needs no `api_version` bump and why
         // the moOde overlay (which polls /api/now-playing, not this) is
@@ -711,7 +706,7 @@ mod tests {
 
     #[test]
     fn audio_block_serializes_the_documented_keys() {
-        // 02 §3.3.3 audio object — the shape the live assembler fills.
+        // The audio object — the shape the live assembler fills.
         let json = serde_json::to_value(idle_doc()).unwrap();
         let audio = json["audio"].as_object().unwrap();
         for key in [

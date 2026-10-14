@@ -1,8 +1,5 @@
-// crates/pibuz/src/paths.rs — daemon profile roots (01-architecture.md §4.2).
-// The daemon owns a fully separate profile from the desktop: `~/.config/pibuz`,
-// `~/.local/share/pibuz`, `~/.cache/pibuz`. It NEVER opens desktop
-// `~/.local/share/qbz/**` at runtime (that only happens inside
-// `settings export --from desktop`, 04 §4.1 — out of scope here).
+// crates/pibuz/src/paths.rs — daemon profile roots: `~/.config/pibuz`,
+// `~/.local/share/pibuz`, `~/.cache/pibuz`, or the overrides `resolve` takes.
 //
 // PRE-RENAME PROFILES. The daemon shipped as `qbzd` through 2.3.2 and wrote
 // `~/.config/qbzd`, `~/.local/share/qbzd`, `~/.cache/qbzd`. That data root

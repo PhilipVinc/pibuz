@@ -615,7 +615,7 @@ impl AlsaBackend {
         devices.push(AudioDevice {
             id: "default".to_string(),
             name: "default".to_string(),
-            description: None, // Frontend shows "System Default"
+            description: None,
             is_default: true,
             max_sample_rate: Some(384000),
             supported_sample_rates: None,
@@ -813,7 +813,7 @@ impl AlsaBackend {
         // to the plughw: path below, which lets ALSA auto-resample in kernel/
         // userspace. Falling back to CPAL is not an option because CPAL's device
         // enumeration does not reliably expose raw hw: devices by the same name
-        // the UI stored (front:CARD=X,DEV=Y vs hw:CARD=X,DEV=Y), and the lookup
+        // the settings hold (front:CARD=X,DEV=Y vs hw:CARD=X,DEV=Y), and the lookup
         // fails with a misleading "Device not found" error. See issue #288.
         let mut hw_rate_unsupported = false;
         if let Some(card_name) = extract_card_name_from_device(device_id) {
@@ -1214,13 +1214,6 @@ impl AudioBackend for AlsaBackend {
             config.alsa_plugin
         );
 
-        // Find the device by name/id.
-        //
-        // If /proc/asound shows this device exists but CPAL's enumeration
-        // cannot match it, the app stored a name format CPAL does not expose
-        // (e.g. front:CARD=X,DEV=Y when CPAL only yields hw:CARD=X,DEV=Y for
-        // the raw device). Surface that distinction in the error so users
-        // don't chase ghosts wondering why their DAC "disappeared".
         // A named config PCM never reaches rodio. `DeviceSinkBuilder::from_device`
         // below asks cpal for the device's default config, cpal answers by
         // reading the PCM's hardware-parameter space, and libasound answers a
@@ -1238,6 +1231,13 @@ impl AudioBackend for AlsaBackend {
             }
         }
 
+        // Find the device by name/id.
+        //
+        // If /proc/asound shows this device exists but CPAL's enumeration
+        // cannot match it, the configured id is in a format CPAL does not expose
+        // (e.g. front:CARD=X,DEV=Y when CPAL only yields hw:CARD=X,DEV=Y for
+        // the raw device). Surface that distinction in the error so users
+        // don't chase ghosts wondering why their DAC "disappeared".
         let device = if let Some(device_id) = &config.device_id {
             log::info!("[ALSA Backend] Looking for device: {}", device_id);
             let primary = self

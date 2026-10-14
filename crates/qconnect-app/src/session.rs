@@ -1,9 +1,7 @@
-//! Frontend-agnostic session/liveness primitives for Qobuz Connect.
+//! Session/liveness primitives for Qobuz Connect.
 //!
-//! These are pure functions and pure data enums relocated out of the Tauri
-//! adapter so that both the shipping Tauri adapter and a future Slint adapter
-//! can share the exact same session-arbitration / liveness logic. Behavior is
-//! byte-for-byte identical to the prior Tauri-side definitions.
+//! Pure functions and pure data enums: the session-arbitration and liveness
+//! logic, plus the session-topology types the sync accumulator holds.
 
 use qbz_models::Quality;
 use qconnect_core::{QConnectQueueState, QConnectRendererState, QueueItem};
@@ -14,14 +12,13 @@ use crate::queue_resolution::{
     ordered_queue_cursors, QconnectOrderedQueueCursor,
 };
 
-/// Lifecycle state surfaced to the UI so the toggle can reflect what the user
-/// asked for (`running`) separately from what the transport currently has
-/// (`Connecting`/`Connected`/`Reconnecting`). Without this distinction the UI
-/// reads the toggle as "off" while the backend reconnect loop is alive,
-/// leaving the user unable to disable QConnect (issue #358).
+/// Lifecycle state surfaced to the host so it can report what the user asked
+/// for (`running`) separately from what the transport currently has
+/// (`Connecting`/`Connected`/`Reconnecting`). Without this distinction a
+/// reconnect loop that is still alive reads as "off", leaving the user unable
+/// to disable QConnect (issue #358).
 ///
-/// Pure data — no Tauri dependency. The Tauri `types.rs` re-exports this for the
-/// command surface; the session layer emits it via `QconnectAppEvent::LifecycleChanged`.
+/// Pure data; the session layer emits it via `QconnectAppEvent::LifecycleChanged`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum QconnectLifecycleState {
@@ -38,32 +35,30 @@ pub enum QconnectLifecycleState {
     /// reconnect loop is running.
     Reconnecting,
     /// `MaxReconnectAttemptsExceeded` fired — runtime auto-stopped, last error
-    /// surfaced. User can re-enable from UI.
+    /// surfaced.
     Exhausted,
 }
 
-/// Playing-state wire value for PLAYING. Mirrors the Tauri adapter's
-/// `PLAYING_STATE_PLAYING` (the renderer reports playing_state == 2 while
-/// actively playing). `pub(crate)` so the relocated session-apply/watchdog
-/// logic in `app.rs` reads the same constant.
+/// Playing-state wire value for PLAYING (the renderer reports
+/// playing_state == 2 while actively playing). `pub(crate)` so the
+/// session-apply/watchdog logic in `app.rs` reads the same constant.
 pub(crate) const PLAYING_STATE_PLAYING: i32 = 2;
 
 /// Playing-state wire value for UNKNOWN (== 0). The freeze path stamps a dead
 /// renderer's cached `playing_state` to UNKNOWN so the projection stops lying.
-/// Mirrors the Tauri adapter's `PLAYING_STATE_UNKNOWN`.
 pub(crate) const PLAYING_STATE_UNKNOWN: i32 = 0;
 
 /// JoinSession `reason` wire values (proto tag 3): a first join from a fresh
 /// runtime is a controller request, a join after a transport drop carries the
 /// reconnection reason so the server treats it as session continuity rather
-/// than a brand-new controller (P1-2).
+/// than a brand-new controller.
 pub const JOIN_SESSION_REASON_CONTROLLER_REQUEST: i32 = 1;
 pub const JOIN_SESSION_REASON_RECONNECTION: i32 = 2;
 
 /// Official "renderer LOST" silence budget. A *playing* active peer renderer
 /// that sends no RENDERER_STATE_UPDATED for this long is considered
 /// unreachable (webplayer arms setTimeout(...,12e3) on onPlayerStateUpdated
-/// while playingState==PLAY). See 05-sync-status-queue.md §1.
+/// while playingState==PLAY).
 pub const QCONNECT_RENDERER_LOST_TIMEOUT_MS: u64 = 12_000;
 
 /// Pure arming predicate for the renderer-liveness watchdog: arm only while the
@@ -81,8 +76,8 @@ pub fn should_arm_renderer_watchdog(playing_state: Option<i32>, is_active_peer: 
 /// from a paused peer while it is itself playing locally — both for a device
 /// that plays on its own. This one never does: a phone casting to it, or handing
 /// it the session over the LAN, decides when it is the output. (An idle-session
-/// auto-claim inherited from the desktop app made every daemon start, and so
-/// every moOde renderer toggle, grab an idle session uninvited.) Nor does it ever
+/// auto-claim once made every daemon start, and so every moOde renderer toggle,
+/// grab an idle session uninvited.) Nor does it ever
 /// push its own queue on connect: the cloud's queue is the truth, and the local
 /// one is only a copy of an earlier session's.
 pub fn should_reclaim_render(was_active: bool, server_idle: bool) -> bool {
@@ -90,8 +85,7 @@ pub fn should_reclaim_render(was_active: bool, server_idle: bool) -> bool {
 }
 
 /// Pure selector for the JoinSession `reason`: a post-drop rejoin carries
-/// RECONNECTION, the first join from a fresh runtime carries CONTROLLER_REQUEST
-/// (P1-2).
+/// RECONNECTION, the first join from a fresh runtime carries CONTROLLER_REQUEST.
 pub fn deferred_join_reason(has_disconnected: bool) -> i32 {
     if has_disconnected {
         JOIN_SESSION_REASON_RECONNECTION
@@ -100,7 +94,7 @@ pub fn deferred_join_reason(has_disconnected: bool) -> i32 {
     }
 }
 
-/// Pure predicate (P1-8): keep re-asking for queue state after a Lagged
+/// Pure predicate: keep re-asking for queue state after a Lagged
 /// broadcast drop until the session_uuid is confirmed or the attempt budget is
 /// spent. Stops immediately once the session_uuid is known.
 pub fn should_reask_queue_state(
@@ -112,7 +106,7 @@ pub fn should_reask_queue_state(
 }
 
 /// Wire renderer status from `MESSAGE_TYPE_SRVR_CTRL_RENDERER_STATE_UPDATED`
-/// (`status` field, decoded at qconnect-protocol decoder.rs:801).
+/// (`status` field, decoded in qconnect-protocol's `decoder.rs`).
 /// Wire enum: UNKNOWN=0, ACTIVE_CONNECTED=1, ACTIVE_DISCONNECTED=2, INACTIVE=3.
 /// Per the official client's `Ya` collapse, UNKNOWN and any UNRECOGNIZED value
 /// map to INACTIVE.
@@ -179,13 +173,11 @@ pub fn cap_quality(requested: Quality, cap: Option<Quality>) -> Quality {
 }
 
 // ---------------------------------------------------------------------------
-// Session topology types (relocated from the Tauri adapter — slice 2+4).
+// Session topology types.
 //
 // These are pure data describing who is in a QConnect session and the cloud's
-// per-renderer view. They move here (frontend-agnostic) so both the Tauri and
-// Slint adapters share one session-topology model under a single lock. Field
-// visibility is widened to `pub` because the adapters access these fields
-// across the crate boundary; serialized shape is unchanged.
+// per-renderer view, held in the sync accumulator under a single lock. Fields
+// are `pub` because the host reads them across the crate boundary.
 // ---------------------------------------------------------------------------
 
 /// Per-renderer cached state derived from session-management events
@@ -229,11 +221,9 @@ pub struct QconnectRendererInfo {
     pub volume_remote_control: Option<i32>,
 }
 
-/// Resolved local-device identity injected by the frontend adapter into the
-/// session layer. Lets `refresh_local_renderer_id` stay frontend-agnostic: the
-/// Tauri adapter resolves it from its persisted device uuid + device-info
-/// builder, the Slint adapter from the shared qbz-app identity — qconnect-app
-/// never depends on the persistence/transport crates.
+/// Resolved local-device identity injected by the host into the session layer.
+/// `refresh_local_renderer_id` matches on this data, so qconnect-app never
+/// depends on the persistence/transport crates.
 #[derive(Debug, Clone, Default)]
 pub struct LocalIdentity {
     pub device_uuid: String,
@@ -244,8 +234,7 @@ pub struct LocalIdentity {
 }
 
 /// Snapshot of the last reported file (stream) audio quality, used to dedup
-/// outbound RndrSrvrFileAudioQualityChanged reports. Moved here with the
-/// session topology so the relocated sync accumulator is self-contained.
+/// outbound RndrSrvrFileAudioQualityChanged reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QconnectFileAudioQualitySnapshot {
     pub sampling_rate: i32,
@@ -257,7 +246,6 @@ pub struct QconnectFileAudioQualitySnapshot {
 /// Resolve the local renderer id within the session by matching the injected
 /// local identity: first by exact device_uuid, then by a unique device
 /// fingerprint (name+brand+model+type), then a looser name+type fingerprint.
-/// Identical resolution order to the prior Tauri-side fn; identity is now data.
 pub fn refresh_local_renderer_id(session: &mut QconnectSessionState, identity: &LocalIdentity) {
     if let Some(renderer_id) = session
         .renderers
@@ -275,8 +263,8 @@ pub fn refresh_local_renderer_id(session: &mut QconnectSessionState, identity: &
     let local_device_type = identity.device_type;
 
     // Some server ADD_RENDERER payloads omit device_uuid for the local renderer.
-    // Fall back to a unique device fingerprint so controller-side handoff logic
-    // can still distinguish local vs peer renderers.
+    // Fall back to a unique device fingerprint so the handoff logic can still
+    // distinguish local vs peer renderers.
     if let Some(renderer_id) = find_unique_renderer_id(session, |renderer| {
         renderer.friendly_name.as_deref() == local_friendly_name
             && renderer.brand.as_deref() == local_brand
@@ -367,11 +355,8 @@ pub fn find_unique_renderer_id(
 }
 
 // ---------------------------------------------------------------------------
-// Session-projection helpers (relocated from the Tauri adapter — slice 6, Slint
-// port). Pure functions over the cloud queue + cached per-renderer state. They
-// move here (frontend-agnostic) so the Tauri event sink AND the Slint event sink
-// build the same renderer projection from one definition. Byte-for-byte
-// identical to the prior Tauri-side bodies.
+// Session-projection helpers. Pure functions over the cloud queue + cached
+// per-renderer state, building a renderer projection from one definition.
 // ---------------------------------------------------------------------------
 
 /// Snapshot the queue item a cursor points at, normalizing the queue_item_id for
@@ -539,7 +524,7 @@ mod tests {
     fn cap_quality_is_a_ceiling_and_never_a_floor() {
         use Quality::{HiRes, Lossless, Mp3, UltraHiRes};
 
-        // No cap: the controller's request stands (the desktop's behaviour).
+        // No cap: the controller's request stands.
         assert_eq!(cap_quality(UltraHiRes, None), UltraHiRes);
 
         // A cap below the request clamps — including the `None` level that

@@ -258,8 +258,8 @@ them. Pass the class instead, as `release_finished_track_on` /
 The ring depth is NOT one of these, despite reading the same singleton: the
 sizing lives in the pure `qbz_audio::pcm_ring::ring_capacity_frames`, which takes
 both the override and the profile's seconds as arguments, and
-`auto_takes_the_hosts_profile` already pins 6 s for a Normal board and 2 s for a
-low-memory one. Running the ENGINE at 2 s would test no new logic — the fill,
+`auto_takes_the_hosts_profile` already pins 6 s for a Normal board and 4 s for a
+low-memory one. Running the ENGINE at 4 s would test no new logic — the fill,
 drain and boundary handling are depth-independent; what a shallower ring changes
 is how long the decoder may stall before the ring runs dry, and no test can
 settle that honestly, because it depends on real decode speed and real I/O.
@@ -270,7 +270,7 @@ lookup still happens at the call site.
 **To run the whole daemon as a board it is not**, set
 `QBZ_FORCE_MEM_TOTAL_KB` to that board's MemTotal in kB before starting it:
 `QBZ_FORCE_MEM_TOTAL_KB=439000 pibuz ...` is a Pi 3A / Zero 2 W exactly —
-LowMemory, 72 MB of L1, an 8 MB window ceiling, a 2 s ring, and below
+LowMemory, 72 MB of L1, an 8 MB window ceiling, a 4 s ring, and below
 `GAPLESS_MIN_TOTAL_KB`, which is the only way to reach the successor planning
 that only 512 MB boards take. Add `audio.cache_to_disk false` for the half of
 that board with no card to spill to. It logs a warning at startup so nobody

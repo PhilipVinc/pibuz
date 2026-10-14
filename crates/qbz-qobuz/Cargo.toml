@@ -34,8 +34,6 @@ chrono = { workspace = true }
 # Filesystem (bundle-token cache location)
 dirs = "6"
 
-# Regex
-
 # Logging
 log = { workspace = true }
 
@@ -44,9 +42,6 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 
 [dev-dependencies]
-# Used only by examples/lyrics_probe.rs (read-only live probe of the lyrics
-# endpoint): loads the saved OAuth token / credentials for login.
-
 # Tests construct a QobuzClient, which builds a reqwest client. The workspace
 # pins reqwest's `rustls-tls-webpki-roots-no-provider`, so a process-level
 # rustls CryptoProvider must be installed first or that panics with "No

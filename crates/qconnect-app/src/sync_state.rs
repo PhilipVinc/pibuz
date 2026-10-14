@@ -1,4 +1,4 @@
-//! Cross-frontend QConnect remote-sync accumulator.
+//! QConnect remote-sync accumulator.
 //!
 //! Caches the cloud's renderer/queue snapshots, the most recent
 //! materialization, the session topology, the per-renderer cached state, the
@@ -10,8 +10,7 @@
 //! `last_renderer_playing_state`, and the materialize path reads `last_renderer_*`
 //! together with `last_applied_queue_state`, all atomically. Splitting these
 //! across two locks would tear the takeover decision. So it stays ONE struct
-//! under ONE lock. Relocated here (slice 2+4) so both the Tauri and Slint
-//! adapters share it; the owning `Mutex` is held by the adapter / `QconnectApp`.
+//! under ONE lock; the owning `Mutex` is shared by the host and `QconnectApp`.
 //!
 //! Mutated by the event sink (on inbound events), the renderer engine (on
 //! materialize/apply), track loading (on load attempt), and the service loop
@@ -50,19 +49,19 @@ pub struct QconnectRemoteSyncState {
     /// Session topology — stored from session management events (types 81-87).
     pub session: QconnectSessionState,
     /// The session_uuid for which we last ran the full deferred renderer-join
-    /// body. Used to make the deferred join idempotent (P1-8): when a SESSION_STATE
+    /// body. Used to make the deferred join idempotent: when a SESSION_STATE
     /// arrives with the same session_uuid we skip the join reports but still
     /// re-AskForRendererState.
     pub last_joined_session_uuid: Option<String>,
     pub session_renderer_states: HashMap<i32, QconnectSessionRendererState>,
-    /// Track of the most recent load attempt across paths (V2 play handoff and
-    /// ensure_remote_track_loaded). Used to suppress redundant reloads when an
-    /// echo SetState arrives during the in-progress buffer/decode window of a
-    /// previously triggered load.
+    /// Track of the most recent load attempt across paths
+    /// (ensure_remote_track_loaded and force_remote_track_stream). Used to
+    /// suppress redundant reloads when an echo SetState arrives during the
+    /// in-progress buffer/decode window of a previously triggered load.
     pub last_load_attempt: Option<(u64, Instant)>,
     /// The last `SetActive` (message 43) this renderer actually HONOURED.
     ///
-    /// The cloud states the active role outright, and this fork acts on it, so
+    /// The cloud states the active role outright, and the renderer acts on it, so
     /// the value is worth keeping: it is the only answer available while
     /// `session.local_renderer_id` is still unresolved, which is exactly when
     /// [`crate::session::local_renderer_role`] returns `None`.
@@ -72,7 +71,7 @@ pub struct QconnectRemoteSyncState {
     /// be recorded here either — otherwise the daemon keeps playing while its
     /// published role says it stood down.
     pub local_render_active: Option<bool>,
-    /// Monotonic epoch for the renderer-liveness watchdog (P0-1). Every armed
+    /// Monotonic epoch for the renderer-liveness watchdog. Every armed
     /// RENDERER_STATE_UPDATED bumps this; a spawned 12s task captures the value
     /// and no-ops on wake if it was superseded (reset/disarm). Disarm =
     /// pause/stop/active-change/disconnect, which also bump it.
@@ -80,9 +79,7 @@ pub struct QconnectRemoteSyncState {
 }
 
 /// Set each cached renderer's `active` flag to match the session's current
-/// active renderer id. Pure mutation over the relocated accumulator; relocated
-/// from the Tauri adapter (slice 2+4) so the shared session-apply logic in
-/// `app.rs` and the Tauri adapter both call one definition.
+/// active renderer id. Pure mutation over the accumulator.
 pub fn sync_session_renderer_active_flags(state: &mut QconnectRemoteSyncState) {
     for (renderer_id, renderer_state) in &mut state.session_renderer_states {
         renderer_state.active = state
@@ -93,8 +90,7 @@ pub fn sync_session_renderer_active_flags(state: &mut QconnectRemoteSyncState) {
 }
 
 /// Get-or-insert the cached per-renderer state for `renderer_id`, seeding its
-/// `active` flag from the session's current active renderer. Pure mutation;
-/// relocated from the Tauri adapter (slice 2+4). Byte-identical behavior.
+/// `active` flag from the session's current active renderer. Pure mutation.
 pub fn ensure_session_renderer_state(
     state: &mut QconnectRemoteSyncState,
     renderer_id: i32,
@@ -114,9 +110,7 @@ pub fn ensure_session_renderer_state(
 
 /// Cache the queue_item/track ids + playing_state derived from a renderer
 /// snapshot into the accumulator, so subsequent outbound reports and visible
-/// projections reuse them. Pure mutation; relocated from the Tauri adapter
-/// (slice 6, Slint port) so both the Tauri and Slint event sinks share one
-/// definition. Byte-identical behavior.
+/// projections reuse them. Pure mutation.
 pub fn cache_renderer_snapshot(
     state: &mut QconnectRemoteSyncState,
     renderer_snapshot: &QConnectRendererState,

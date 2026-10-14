@@ -1,6 +1,6 @@
 // crates/pibuz/src/cli/watch.rs — `pibuz watch`, the CLI caller for the
-// `GET /api/events` SSE stream (CONSOLE ext). Opens a long-lived connection and
-// prints events as they arrive; the shipped verb behind the P1 route (§3.1.4).
+// `GET /api/events` SSE stream. Opens a long-lived connection and prints
+// events as they arrive.
 //
 // Default output is newline-delimited JSON — one CoreEvent `data` payload per
 // line, pipe-friendly (`pibuz watch | jq`). `--raw` passes the SSE frames

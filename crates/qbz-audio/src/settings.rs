@@ -1,9 +1,5 @@
-//! Audio settings persistence
-//!
-//! Stores user preferences for audio output device, exclusive mode, and DAC passthrough.
-//!
-//! NOTE: Tauri command wrappers remain in qbz-nix. This module contains only
-//! the core types and persistence logic.
+//! Audio settings: the `[audio]` section of `settings.toml`, and the store
+//! that reads and writes it.
 
 use crate::{AlsaPlugin, AudioBackendType};
 use qbz_models::settings_file::{self, Sections};
@@ -67,7 +63,7 @@ pub struct AudioSettings {
     /// How a volume percentage becomes an amplitude multiplier: `perceptual`
     /// (MPD's exponential mapping, the default) or `linear` (the fraction
     /// scales amplitude directly). See [`crate::volume_curve`] for why linear
-    /// makes a slider that is unusable below its top tenth. Software volume
+    /// makes a slider that is useful only in its bottom tenth. Software volume
     /// only — an ALSA hardware mixer owns its own, already dB-scaled, mapping.
     #[serde(default = "default_volume_curve")]
     pub volume_curve: String,
@@ -191,9 +187,6 @@ pub struct AudioSettings {
     pub skip_sink_switch: bool,
 }
 
-/// Perceptual by default: it is what every other player on the host does, and a
-/// linear amplitude fader is unusable above its bottom tenth
-/// (see [`crate::volume_curve`]).
 /// Caching to disk is the default: it is what makes gapless work on the small
 /// players that are most of the fleet.
 fn default_cache_to_disk() -> bool {
@@ -209,10 +202,6 @@ fn default_cache_to_disk() -> bool {
 /// a magic number at the construction site is half the point of the setting.
 pub const DEFAULT_DISK_CACHE_MB: u16 = 800;
 
-/// On by default. The promotion needs an rlimit the service unit grants, and
-/// degrades to a single info line where it is absent, so defaulting it on costs
-/// nothing on a host that cannot use it and is the right answer on every host
-/// that can. See [`crate::rt`].
 /// See [`AudioSettings::stream_window_seconds`]. Eight seconds is ~4.8 MB at
 /// 24/192 and ~2.1 MB at 24/96 — the same order as ohPipeline's 1.5 MB
 /// reservoir, which is a shipping renderer against this same CDN.
@@ -220,10 +209,17 @@ fn default_stream_window_seconds() -> u8 {
     8
 }
 
+/// On by default. The promotion needs an rlimit the service unit grants, and
+/// degrades to a single info line where it is absent, so defaulting it on costs
+/// nothing on a host that cannot use it and is the right answer on every host
+/// that can. See [`crate::rt`].
 fn default_writer_rt_priority() -> u8 {
     crate::rt::DEFAULT_WRITER_RT_PRIORITY
 }
 
+/// Perceptual by default: it is what every other player on the host does, and a
+/// linear amplitude fader is unusable above its bottom tenth
+/// (see [`crate::volume_curve`]).
 fn default_volume_curve() -> String {
     crate::volume_curve::VolumeCurve::Perceptual
         .as_key()
@@ -240,7 +236,7 @@ impl Default for AudioSettings {
             // default output, shared with other apps like any normal player — no
             // bit-perfect, no `pactl`. See AudioBackendType::default(). "Auto"
             // (None) and explicit backends (PipeWire / ALSA) are honored as-is;
-            // this only sets what a fresh install and the Reset action land on.
+            // this only sets what a fresh install and `reset_all` land on.
             //
             // History: this defaulted to Some(PipeWire) on Linux to dodge a rodio
             // DeviceSink-drop-on-resume race on the CPAL path (#375), but that
@@ -693,8 +689,8 @@ mod tests {
         // A NULL backend_type means "Auto" (system default output). It must be
         // preserved across restarts — never backfilled to a concrete backend on
         // store open (the old #375 backfill hard-coded PipeWire and froze OOTB
-        // playback on hosts without `pactl`, #470). Only the explicit Reset
-        // action rewrites settings.
+        // playback on hosts without `pactl`, #470). Only an explicit
+        // `reset_all` rewrites settings.
         let dir = unique_test_dir("backend-null-auto");
         {
             let store = AudioSettingsStore::new_at(&dir).expect("open store");

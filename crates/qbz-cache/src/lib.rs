@@ -1,8 +1,9 @@
 //! QBZ Cache - Audio caching system
 //!
 //! Provides two-level caching for audio data:
-//! - **L1 (Memory)**: In-memory LRU cache (~400MB, fast access)
-//! - **L2 (Disk)**: Disk-based playback cache (~800MB, persistent)
+//! - **L1 (Memory)**: In-memory LRU cache (sized to the host's RAM, fast access)
+//! - **L2 (Disk)**: Disk-based playback cache (~800MB by default), sealed and
+//!   wiped on every start
 //!
 //! ## Architecture
 //!
@@ -15,7 +16,7 @@
 //! ┌─────────────────────────────────────────────────────────┐
 //! │              L1 Memory Cache (AudioCache)                │
 //! │  - Fast HashMap + LRU tracking                           │
-//! │  - ~400MB limit (3-4 Hi-Res tracks)                      │
+//! │  - Limit sized to the host's RAM                         │
 //! │  - Evicted tracks spill to L2                            │
 //! └─────────────────────────────────────────────────────────┘
 //!                           │ miss/evict
@@ -23,7 +24,7 @@
 //! ┌─────────────────────────────────────────────────────────┐
 //! │              L2 Disk Cache (PlaybackCache)               │
 //! │  - File-based storage                                    │
-//! │  - ~800MB limit                                          │
+//! │  - ~800MB limit by default                               │
 //! │  - LRU eviction by access time                           │
 //! └─────────────────────────────────────────────────────────┘
 //!                           │ miss

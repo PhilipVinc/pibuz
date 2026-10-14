@@ -1,14 +1,13 @@
 //! QConnect transport config + credential discovery + device identity for the
 //! pibuz daemon.
 //!
-//! Ports the desktop `qconnect_transport.rs` config layer. The Qobuz client is
-//! reached via `runtime.core().client()` — an `Arc<RwLock<Option<QobuzClient>>>`
-//! (may be `None` before the API is initialized). Two daemon adaptations vs. the
-//! desktop copy (§1.4, §4): (1) the device uuid and Connect settings resolve
-//! against the DAEMON root's `settings.toml` — its OWN device_uuid, minted
-//! fresh; (2) the default device name is "Pibuz (hostname)" (OD6). The
-//! load/persist helpers take the data root (`*_at`), so T11 (settings) drives the
-//! same file the connect path reads.
+//! The Qobuz client is reached via `runtime.core().client()` — an
+//! `Arc<RwLock<Option<QobuzClient>>>` (may be `None` before the API is
+//! initialized). The device uuid and Connect settings resolve against the
+//! DAEMON root's `settings.toml` — its OWN device_uuid, minted fresh — and the
+//! default device name is "Pibuz (hostname)". The load/persist helpers take
+//! the data root (`*_at`), so `pibuz settings` drives the same file the
+//! connect path reads.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -32,8 +31,8 @@ use crate::qconnect::engine::VolumeMode;
 const DEFAULT_QCONNECT_DEVICE_BRAND: &str = "Pibuz";
 const DEFAULT_QCONNECT_DEVICE_MODEL: &str = "Pibuz";
 // DeviceType as the web player's protobuf enum numbers it. It picks the icon
-// the apps draw next to the name; the daemon is a network streamer, not the
-// "computer" the desktop app it forked from announced.
+// the apps draw next to the name; the daemon is a network streamer, not a
+// "computer".
 const DEFAULT_QCONNECT_DEVICE_TYPE: i32 = DEVICE_TYPE_STREAMER;
 const DEVICE_TYPE_STREAMER: i32 = 2;
 /// Wire value -> the name the LAN pairing surface (mDNS TXT `type`,
@@ -147,7 +146,7 @@ pub fn resolve_system_hostname() -> String {
     "Desktop".to_string()
 }
 
-/// Returns "Pibuz ({hostname})" as the default device name (OD6). Only a
+/// Returns "Pibuz ({hostname})" as the default device name. Only a
 /// default: a name set in the daemon settings wins, and so does
 /// `QBZ_QCONNECT_DEVICE_NAME`. A box that never set one is renamed in the
 /// Qobuz app by this, which is the point — it is the same endpoint, under the
@@ -170,12 +169,10 @@ pub fn resolve_qconnect_friendly_name(custom_name: Option<&str>) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Device-info + join payload shapes (piece a). Mirror the Tauri adapter
-// `types.rs` `QconnectDeviceInfoPayload` / `QconnectDeviceCapabilitiesPayload` /
-// `QconnectJoinSessionRequest` exactly so the wire frames the server sees are
-// byte-identical between the frontends + the daemon. Built from the device-
-// identity resolvers above; the uuid resolves against the daemon root so the
-// daemon keeps ONE identity of its own.
+// Device-info + join payload shapes, exactly as the Connect server expects
+// them on the wire. Built from the device-identity resolvers above; the uuid
+// resolves against the daemon root so the daemon keeps ONE identity of its
+// own.
 // ---------------------------------------------------------------------------
 
 // AudioQuality wire levels: 1=mp3, 2=cd, 3=hires_l1(96k), 4=hires_l2(192k) --
@@ -199,7 +196,7 @@ fn volume_remote_control(mode: VolumeMode) -> i32 {
         VolumeMode::Software | VolumeMode::External => VOLUME_REMOTE_CONTROL_ALLOWED,
     }
 }
-/// Renderer buffer-state wire value for OK/ready (mirrors the Tauri adapter).
+/// Renderer buffer-state wire value for OK/ready.
 pub const BUFFER_STATE_OK: i32 = 2;
 /// Renderer buffer-state wire value for "filling the buffer, not yet audible"
 /// (`BufferState.BUFFER_STATE_BUFFERING`, field 2 of the protocol's
@@ -242,10 +239,11 @@ fn load_persisted_device_name() -> Option<String> {
         .and_then(|root| load_device_name_at(root))
 }
 
-/// Read from the KV like the name, rather than threaded from `connect()`, so
-/// every path that builds a device info agrees with the others. `connect()`
-/// reads the same key once per connect, and a change applies on the next one,
-/// so the capability and the mode the engine enforces move together.
+/// Read from settings.toml like the name, rather than threaded from
+/// `connect()`, so every path that builds a device info agrees with the
+/// others. `connect()` reads the same key once per connect, and a change
+/// applies on the next one, so the capability and the mode the engine enforces
+/// move together.
 fn load_persisted_volume_mode() -> VolumeMode {
     VolumeMode::from_kv(
         DAEMON_DATA_ROOT
@@ -256,7 +254,7 @@ fn load_persisted_volume_mode() -> VolumeMode {
 }
 
 // ---------------------------------------------------------------------------
-// The local quality cap on the cast path (upstream#693).
+// The local quality cap on the cast path.
 //
 // `playback.quality` (daemon_prefs.streaming_quality) used to bind only the
 // local playback path (`api/playback.rs::resolve_quality`). As a QConnect
@@ -315,7 +313,7 @@ pub fn default_qconnect_device_info() -> QconnectDeviceInfoPayload {
 }
 
 /// Build the device-info payload, overriding the friendly name when a custom
-/// device name is set. Mirrors the Tauri `default_qconnect_device_info_with_name`.
+/// device name is set.
 pub fn default_qconnect_device_info_with_name(
     custom_name: Option<&str>,
 ) -> QconnectDeviceInfoPayload {
@@ -337,8 +335,7 @@ pub fn default_qconnect_device_info_with_name(
 
 /// Resolve THIS device's identity for injection into the frontend-agnostic
 /// session-apply logic in qconnect-app (`apply_session_management_event` takes a
-/// `LocalIdentity` so the crate never depends on the persistence layer). Mirrors
-/// the Tauri `resolve_local_identity`.
+/// `LocalIdentity` so the crate never depends on the persistence layer).
 pub fn resolve_local_identity() -> qconnect_app::LocalIdentity {
     let info = default_qconnect_device_info();
     qconnect_app::LocalIdentity {
@@ -390,7 +387,7 @@ pub fn save_startup_mode_at(
 }
 
 /// Load the daemon volume mode (`volume_mode` = "software" | "locked" |
-/// "external"; 01 §7.4). None when unset.
+/// "external"). None when unset.
 pub fn load_volume_mode_at(root: &Path) -> Option<String> {
     qconnect_settings::load(root)
         .volume_mode
@@ -446,9 +443,9 @@ pub fn save_initial_volume_at(root: &Path, percent: u8) -> Result<(), String> {
 }
 
 /// Build the WS transport config: env overrides first, then auto-discovery via
-/// `qws/createToken`. Mirrors the Tauri `resolve_transport_config` (the per-option
-/// knobs are deferred — the connect path uses defaults + env). `require_jwt =
-/// true` (hard) and `reconnect_idle_retry_ms = 60s` match the hardened defaults.
+/// `qws/createToken`. The connect path uses defaults + env; there are no
+/// per-option knobs. `require_jwt = true` (hard) and
+/// `reconnect_idle_retry_ms = 60s` match the hardened defaults.
 pub async fn resolve_transport_config(runtime: &Runtime) -> Result<WsTransportConfig, String> {
     let mut endpoint_url = normalize_opt_string(std::env::var("QBZ_QCONNECT_WS_ENDPOINT").ok());
     let mut jwt_qws = normalize_opt_string(std::env::var("QBZ_QCONNECT_JWT_QWS").ok())
@@ -678,7 +675,7 @@ mod tests {
 
     #[test]
     fn default_device_name_is_qbz_hostname_form() {
-        // OD6: the daemon default is "Pibuz (hostname)", never the desktop
+        // The daemon default is "Pibuz (hostname)", never the inherited
         // "Qbz - hostname" form.
         std::env::set_var("HOSTNAME", "studio-pi");
         let name = resolve_default_qconnect_device_name();
@@ -695,7 +692,7 @@ mod tests {
         assert_eq!(uuid, "env-override-uuid-123");
     }
 
-    /// upstream#693 — what the daemon ADVERTISES has to be the configured
+    /// What the daemon ADVERTISES has to be the configured
     /// cap, not a constant. A controller that respects the capability never
     /// offers above it, which is the half of the fix that keeps hi-res off the
     /// wire instead of merely off the DAC.

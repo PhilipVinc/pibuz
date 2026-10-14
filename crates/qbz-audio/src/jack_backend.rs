@@ -1,4 +1,4 @@
-//! Native JACK output backend (#263 Tier 3).
+//! Native JACK output backend (#263).
 //!
 //! QBZ appears as a first-class JACK client (`qbz`) with stable output ports
 //! `qbz:out_FL` / `qbz:out_FR`, patchable in qjackctl / qpwgraph / Reaper. The
@@ -151,8 +151,8 @@ impl JackStream {
     }
 
     /// The JACK graph sample rate. The player resamples each track to this rate
-    /// before feeding. (Runtime graph-rate changes are a slice-3.2 item; today
-    /// this is read once at open.)
+    /// before feeding. Read once at open: a runtime graph-rate change is not
+    /// followed.
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
     }

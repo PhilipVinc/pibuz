@@ -58,7 +58,7 @@ impl MediaSource for CursorMediaSource {
 /// Extract ReplayGain metadata from raw audio file bytes.
 ///
 /// Searches for ReplayGain track gain and peak values in:
-/// - Vorbis comments (FLAC, Ogg): `REPLAYGAIN_TRACK_GAIN`, `REPLAYGAIN_TRACK_PEAK`
+/// - Vorbis comments (FLAC): `REPLAYGAIN_TRACK_GAIN`, `REPLAYGAIN_TRACK_PEAK`
 /// - ID3v2 TXXX frames: `replaygain_track_gain`
 /// - Standard tag keys mapped by Symphonia
 ///

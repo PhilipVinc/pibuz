@@ -1,10 +1,10 @@
-// crates/pibuz/src/config.rs — pibuz.toml: PROCESS concerns only (D14 single-source rule).
-// Engine settings (audio/playback/qconnect content) live in the stores — never here.
-// QConnect startup_mode/device_name/volume_mode live SOLELY in the [qconnect]
-// section of the data root's settings.toml (03 §3.4/§6), not in this file.
+// crates/pibuz/src/config.rs — pibuz.toml: PROCESS concerns only, so every
+// setting has exactly one home. Engine settings (audio/playback/qconnect
+// content) live in the data root's settings.toml — never here. QConnect
+// startup_mode/device_name/volume_mode live SOLELY in its [qconnect] section.
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Deserialize, Serialize)] // Serialize: `pibuz config show --json` (T11)
+#[derive(Debug, Deserialize, Serialize)] // Serialize: `pibuz config show --json`
 #[serde(default)]
 pub struct PibuzConfig {
     pub config_version: u32,
@@ -17,7 +17,7 @@ pub struct PibuzConfig {
 pub struct ServerCfg {
     pub bind: String,
     pub port: u16,
-    /// Opt-in shared secret (02 §3.1.2). Default `None` = the control plane is
+    /// Opt-in shared secret. Default `None` = the control plane is
     /// UNAUTHENTICATED (loopback and LAN alike). When set, every route except
     /// `GET /api/ping` requires `Authorization: Bearer <token>`; a mismatch is
     /// `401 invalid_token`. A plain config value the user writes — there is no
@@ -33,11 +33,11 @@ pub struct LogCfg {
 impl Default for ServerCfg {
     fn default() -> Self {
         Self {
-            bind: "0.0.0.0".into(), // LAN-first posture (FB6): Sonos/Chromecast-style
+            bind: "0.0.0.0".into(), // LAN-first posture: Sonos/Chromecast-style
             // open renderer; the Origin shield still guards browsers and
             // `[server] token` remains the opt-in restriction for powerusers.
             port: 8182,
-            token: None, // open by default (02 §3.1.2)
+            token: None, // open by default
         }
     }
 }
@@ -59,8 +59,8 @@ impl Default for PibuzConfig {
     }
 }
 
-/// Known keys, one entry per (table, key). Kept literal so the sweep and the
-/// spec table diff cleanly. Released keys are never renamed without an alias.
+/// Known keys, one entry per (table, key). Released keys are never renamed
+/// without an alias.
 const KNOWN: &[(&str, &str)] = &[
     ("", "config_version"),
     ("", "data_root"),
@@ -112,9 +112,8 @@ mod tests {
     use super::*;
     #[test]
     fn defaults_match_spec() {
-        // 01-architecture.md §10.1 (FB6: default bind widened to 0.0.0.0 for
-        // LAN-first control — restrict via [server] bind or token to opt back
-        // into loopback-only).
+        // The default bind is 0.0.0.0 for LAN-first control — restrict via
+        // [server] bind or token to opt back into loopback-only.
         let (c, warns) = PibuzConfig::from_str("").unwrap();
         assert_eq!(c.config_version, 1);
         assert_eq!(c.server.bind, "0.0.0.0");
@@ -124,13 +123,14 @@ mod tests {
     }
     #[test]
     fn unknown_keys_warn_never_error() {
-        // D14 / operator §5.4 (J5 silent-revert guard)
+        // A typo'd key warns, so it is not silently ignored, but never
+        // stops the daemon from starting.
         let (_c, warns) = PibuzConfig::from_str("[server]\nbindd = \"0.0.0.0\"\n").unwrap();
         assert_eq!(warns, vec!["[server].bindd".to_string()]);
     }
     #[test]
     fn server_token_defaults_none_and_parses_when_set() {
-        // 02-cli-and-api.md §3.1.2: `[server] token` is opt-in — absent = None
+        // `[server] token` is opt-in — absent = None
         // (open control plane); present = the shared secret, no warning.
         let (open, warns) = PibuzConfig::from_str("").unwrap();
         assert_eq!(open.server.token, None);

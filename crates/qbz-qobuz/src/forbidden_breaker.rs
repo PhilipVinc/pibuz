@@ -10,7 +10,7 @@
 //!
 //! This breaker converts "hammer until IP-banned" into "back off and recover":
 //! once a small number of 403s land in quick succession it opens for an
-//! exponential cooldown, during which the hot streaming/favorites paths
+//! exponential cooldown, during which the hot streaming paths
 //! short-circuit WITHOUT touching the network. After the cooldown a single
 //! probe is allowed through; a success closes the breaker, another 403 re-opens
 //! it immediately with a longer cooldown.
@@ -21,7 +21,7 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// Consecutive 403s (across the streaming/favorites paths) that open the breaker.
+/// Consecutive 403s (across the streaming paths) that open the breaker.
 const OPEN_THRESHOLD: u32 = 3;
 /// First cooldown once the breaker opens.
 const BASE_COOLDOWN: Duration = Duration::from_secs(30);

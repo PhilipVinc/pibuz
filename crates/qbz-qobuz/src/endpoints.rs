@@ -1,9 +1,7 @@
 //! API endpoint definitions.
 //!
-//! What remains is the renderer's surface: log in, resolve a track / album /
-//! playlist, open a CMAF session and get a file URL. The catalog paths — search,
-//! discover, awards, labels, radio, favorites, playlist editing, lyrics — went
-//! with the methods that called them when the account path was removed.
+//! The renderer's surface: log in, resolve a track / album / playlist, open a
+//! CMAF session and get a file URL.
 
 pub const BASE_URL: &str = "https://www.qobuz.com/api.json/0.2";
 

@@ -33,7 +33,7 @@ rusqlite = { version = "0.31", features = ["bundled"], optional = true }
 toml = "0.9"
 
 # Lock-free SPSC ring buffer (f32-native) for the JACK feeder -> RT callback
-# handoff (#263 Tier 3). f32 elements avoid any byte/alignment handling.
+# handoff (#263). f32 elements avoid any byte/alignment handling.
 ringbuf = "0.4"
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -46,7 +46,7 @@ libc = "0.2"
 # Kept in lockstep with alsa (0.11 -> alsa-sys 0.4); a single alsa-sys is
 # required because of the `links = "alsa"` constraint shared with cpal.
 alsa-sys = "0.4"
-# JACK native backend (#263 Tier 3): QBZ as a first-class JACK client with stable
+# JACK native backend (#263): QBZ as a first-class JACK client with stable
 # ports, for patching into qjackctl / qpwgraph / Reaper. Behind the `jack`
 # feature and OFF by default -- see [features] below.
 jack = { version = "0.13", optional = true }
@@ -64,7 +64,7 @@ workspace = true
 #
 # JACK is a routing tool: it makes the daemon a patchable client in a graph
 # (qjackctl, qpwgraph, Reaper), at the cost of resampling to the graph's one
-# fixed rate. Desktop builds want it; a headless bit-perfect endpoint does not,
+# fixed rate. A routing setup wants it; a headless bit-perfect endpoint does not,
 # and `pibuz` on moOde is exactly that -- ALSA straight to a `hw:` device, no
 # JACK server anywhere on the box.
 #

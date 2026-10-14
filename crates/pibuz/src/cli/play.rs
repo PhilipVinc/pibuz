@@ -1,7 +1,7 @@
-// crates/pibuz/src/cli/play.rs — the `pibuz play [CONTENT]` verb (02 §2.3).
+// crates/pibuz/src/cli/play.rs — the `pibuz play [CONTENT]` verb.
 //
-// Bare `pibuz play` resumes / cold-starts the current queue (the shipped P0
-// route POST /api/playback/play, delegated to `transport::play` so there is
+// Bare `pibuz play` resumes / cold-starts the current queue (POST
+// /api/playback/play, delegated to `transport::play` so there is
 // one resume implementation). With a content argument it plays that content
 // via POST /api/play: `track:ID` | `album:ID` | `artist:ID` | `playlist:ID` |
 // a Qobuz URL | a bare numeric track id. Exit codes come from the frozen table

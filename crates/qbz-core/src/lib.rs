@@ -3,14 +3,14 @@
 //! This crate provides the main entry point for QBZ:
 //! - [`QbzCore<A: FrontendAdapter>`]: Main orchestrator struct
 //! - Connects all subsystems (audio, player, queue, API)
-//! - Provides unified public API for frontends
+//! - Emits [`CoreEvent`]s through the [`FrontendAdapter`] the host supplies
 //!
 //! # Architecture
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────┐
 //! │                      qbz-core (Tier 3)                      │
-//! │         Main orchestrator, entry point for frontends        │
+//! │         Main orchestrator, entry point for the daemon       │
 //! └─────────────────────────────────────────────────────────────┘
 //!                              ↑
 //!          ┌───────────────────┼───────────────────┐
@@ -37,14 +37,15 @@
 //! #[async_trait::async_trait]
 //! impl FrontendAdapter for MyAdapter {
 //!     async fn on_event(&self, event: CoreEvent) {
-//!         // Handle event, update UI
+//!         // Handle event
 //!         println!("Event: {:?}", event);
 //!     }
 //! }
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), CoreError> {
-//!     let core = QbzCore::new(MyAdapter);
+//!     // `player`: a `qbz_player::Player` built with the audio settings
+//!     let core = QbzCore::new(MyAdapter, player);
 //!     core.init().await?;
 //!     core.login("email", "password").await?;
 //!     // ... use core

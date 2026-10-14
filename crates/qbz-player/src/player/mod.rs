@@ -120,10 +120,10 @@ enum AudioCommand {
     ReinitDevice { device_name: Option<String> },
     /// Release the output device WITHOUT reopening it: drops the active
     /// stream (freeing an exclusive ALSA `hw:` grab)
-    /// and un-suspends / un-forces anything QBZ parked, so PipeWire can
-    /// reclaim a device QBZ was holding. User-triggered from settings.
+    /// and un-suspends / un-forces anything we parked, so PipeWire can
+    /// reclaim a device we were holding.
     ReleaseDevice,
-    /// Append next track to current engine for gapless playback (Rodio only)
+    /// Append next track to current engine for gapless playback
     PlayNext {
         audio: TrackAudio,
         track_id: u64,
@@ -388,7 +388,7 @@ fn extract_audio_metadata_full(data: &TrackBytes) -> Result<AudioMetadata, Strin
         .sample_rate
         .ok_or_else(|| "No sample rate in codec params".to_string())?;
 
-    // ALAC and some other formats don't include channel info in initial codec params
+    // Some streams don't include channel info in initial codec params
     // Default to stereo (2 channels) which is the most common case
     let channels = track
         .codec_params
@@ -406,10 +406,6 @@ fn extract_audio_metadata_full(data: &TrackBytes) -> Result<AudioMetadata, Strin
     })
 }
 
-/// True when a cached FLAC is a lower quality than `requested`, so the
-/// cache entry should be bypassed and the track re-fetched. Ported from
-/// the Tauri `cached_quality_below_requested` helper: an unparseable
-/// buffer is assumed compatible.
 /// How much of a cache file the header-only readers get.
 ///
 /// Rate, bit depth and ReplayGain all live in FLAC metadata blocks at the very
@@ -427,6 +423,9 @@ fn read_head(file: &qbz_cache::CachedFile, len: usize) -> Option<TrackBytes> {
     file.head(len).map(TrackBytes::from)
 }
 
+/// True when a cached FLAC is a lower quality than `requested`, so the
+/// cache entry should be bypassed and the track re-fetched. An unparseable
+/// buffer is assumed compatible.
 fn cached_quality_below_requested(data: &TrackBytes, requested: Quality) -> bool {
     let meta = match extract_audio_metadata_full(data) {
         Ok(m) => m,
@@ -441,7 +440,7 @@ fn cached_quality_below_requested(data: &TrackBytes, requested: Quality) -> bool
 /// quality bug actually lived at: the decision was right in isolation and
 /// still refused every file, and nothing exercised the path that reads one.
 ///
-/// Note the `unwrap_or(false)`: a head we cannot parse is treated as unusable
+/// Note the `unwrap_or(false)`: a head we cannot read is treated as unusable
 /// and re-fetched, which is the safe direction but is also silent.
 pub(crate) fn l2_copy_is_usable(file: &qbz_cache::CachedFile, requested: Quality) -> bool {
     read_head(file, HEAD_BYTES)
@@ -488,15 +487,6 @@ pub(crate) fn quality_below_requested(
     }
 }
 
-/// Decode fully-buffered audio and land on `position` using Symphonia's
-/// native seek, so the cost is a seek-table lookup (or, for the Qobuz FLACs
-/// that ship STREAMINFO and nothing else, an in-memory bisection) rather
-/// than decoding and discarding every sample before it — which for a 124s
-/// offset at 96kHz is 23.8M samples and seconds of CPU on a Pi.
-///
-/// `None` when Symphonia cannot probe the format (rodio-only MP4/AAC) or
-/// the seek fails; the caller then falls back to `decode_with_fallback` +
-/// `skip_duration`, which always works.
 /// The stream's own bytes, on the card, if the L2 cache holds them.
 ///
 /// The disk tee stages exactly the file the stream serves, and resuming from
@@ -579,6 +569,15 @@ fn decode_at(
     Ok(Box::new(decode()?.skip_duration(offset)))
 }
 
+/// Decode fully-buffered audio and land on `position` using Symphonia's
+/// native seek, so the cost is a seek-table lookup (or, for the Qobuz FLACs
+/// that ship STREAMINFO and nothing else, an in-memory bisection) rather
+/// than decoding and discarding every sample before it — which for a 124s
+/// offset at 96kHz is 23.8M samples and seconds of CPU on a Pi.
+///
+/// `None` when Symphonia cannot probe the bytes or the seek fails; the caller
+/// then falls back to `decode_with_fallback` + `skip_duration`, which always
+/// works.
 fn seek_in_memory(
     data: &TrackBytes,
     position: Duration,
@@ -597,42 +596,21 @@ fn seek_in_memory(
     Some(Box::new(source))
 }
 
-/// Decode straight from a file on disk, for a track that is already in the L2
-/// cache (see [`TrackAudio::File`]). The decoder reads through a `BufReader`,
-/// so the resident cost is its own buffers rather than the whole track.
+#[allow(clippy::too_many_arguments)]
+/// How far into a track the gapless prefetch may arm.
 ///
-/// Only the primary decoder is tried: the L2 cache holds decrypted FLAC written
-/// by this player, never the isomp4 shapes `decode_with_fallback` exists to
-/// rescue. A caller that gets `Err` here still has the in-memory path.
-/// Should a track of `total` bytes be kept on DISK rather than in memory?
+/// Not a lead time — the prefetch now runs beside playback rather than racing
+/// it, so it has the rest of the track. This is only "long enough to know the
+/// stream is healthy", which the window filling already demonstrates.
+const GAPLESS_ARM_AFTER_SECS: u64 = 5;
+
+/// Decoded-ring fill below which the margin is worth a line in the log.
 ///
-/// Yes exactly when two of them will not fit the L1 budget — the playing track
-/// and the prefetched next one is the pair the cache exists to hold, and when it
-/// cannot hold both, holding them anyway is what took a 1 GB Pi into swap.
-///
-/// Asked twice, so it lives in one place: once before a download starts (the
-/// CMAF segment table gives the size up front, so a big track is written
-/// straight to the card as it decrypts) and once about bytes already in hand.
-/// Reset everything that must not survive into a NEW track, whatever path the
-/// track arrived on.
-///
-/// There is more than one way a track starts — `Play` for a buffer, and
-/// `PlayStreaming` for everything the Qobuz app selects — and each one used to
-/// carry its own copy of this ritual. `PlayStreaming` was missing it entirely,
-/// which meant selecting a track from another album left the PREVIOUS album's
-/// prepared successor in place: the prefetch for the new track could never arm
-/// (`request_armed` still true), and the stale `pending` named a track the
-/// freshly-rebuilt engine did not have queued, so the transition at the end of
-/// the new track swapped to it and stalled.
-///
-/// One function, called by both, so the next path that starts a track cannot
-/// quietly forget half of it.
-/// Every gate on "ask for the next track now".
-///
-/// Eight conditions that were only ever readable as one inline `&&` chain, which
-/// is how a stale `request_armed` — left set by a track change that forgot to
-/// clear it — could silently stop all prefetching with nothing in the log to say
-/// so. Named and tested here so each gate's purpose survives.
+/// 12,000 frames is 125 ms at 96 kHz and 272 ms at 44.1 kHz — well under the
+/// 2-3 s the ring is sized for, so a healthy stream never trips it, and a
+/// stream that does is one scheduling hiccup from an audible gap.
+const RING_LOW_WATER_FRAMES: u64 = 12_000;
+
 /// Every gate on "ask for the next track now", in order:
 ///
 /// * `enabled` — the user's setting AND the host being able to afford a second
@@ -653,21 +631,6 @@ fn seek_in_memory(
 /// Named and tested because as one inline `&&` chain it was unreadable, and a
 /// stale `request_armed` left by a track change that forgot to clear it stopped
 /// all prefetching with nothing in the log to say so.
-#[allow(clippy::too_many_arguments)]
-/// How far into a track the gapless prefetch may arm.
-///
-/// Not a lead time — the prefetch now runs beside playback rather than racing
-/// it, so it has the rest of the track. This is only "long enough to know the
-/// stream is healthy", which the window filling already demonstrates.
-const GAPLESS_ARM_AFTER_SECS: u64 = 5;
-
-/// Decoded-ring fill below which the margin is worth a line in the log.
-///
-/// 12,000 frames is 125 ms at 96 kHz and 272 ms at 44.1 kHz — well under the
-/// 2-3 s the ring is sized for, so a healthy stream never trips it, and a
-/// stream that does is one scheduling hiccup from an audible gap.
-const RING_LOW_WATER_FRAMES: u64 = 12_000;
-
 fn should_arm_prefetch(
     enabled: bool,
     transition_consumed_pending: bool,
@@ -711,9 +674,9 @@ fn release_streaming_source(slot: &mut Option<Arc<BufferedMediaSource>>) {
 ///
 /// The copy buys an instant seek and an instant gapless hand-off, at the price
 /// of holding both copies of the track for the seconds it takes. That is a fair
-/// trade on a desktop and a fatal one on a 1 GB Pi, where both copies of a
-/// 200 MB+ Hi-Res track are resident at once — and the buffer already held
-/// serves resume and seek perfectly well.
+/// trade on a host with RAM to spare and a fatal one on a 1 GB Pi, where both
+/// copies of a 200 MB+ Hi-Res track are resident at once — and the buffer
+/// already held serves resume and seek perfectly well.
 ///
 /// A named function rather than an expression inline in the audio thread, for
 /// the same reason `release_finished_track_on` takes its class: the decision is
@@ -895,6 +858,20 @@ fn fail_play(
     thread_state.record_stream_error(message);
 }
 
+/// Reset everything that must not survive into a NEW track, whatever path the
+/// track arrived on.
+///
+/// There is more than one way a track starts — `Play` for a buffer, and
+/// `PlayStreaming` for everything the Qobuz app selects — and each one used to
+/// carry its own copy of this ritual. `PlayStreaming` was missing it entirely,
+/// which meant selecting a track from another album left the PREVIOUS album's
+/// prepared successor in place: the prefetch for the new track could never arm
+/// (`request_armed` still true), and the stale `pending` named a track the
+/// freshly-rebuilt engine did not have queued, so the transition at the end of
+/// the new track swapped to it and stalled.
+///
+/// One function, called by both, so the next path that starts a track cannot
+/// quietly forget half of it.
 fn begin_new_track(
     thread_state: &SharedState,
     gapless_pending: &mut Option<GaplessPending>,
@@ -926,6 +903,15 @@ fn gapless_rate_mismatch(current_hz: u32, next_rate: f64) -> bool {
     next_hz != current_hz
 }
 
+/// Should a track of `total` bytes be kept on DISK rather than in memory?
+///
+/// Yes exactly when two of them will not fit the L1 budget — the playing track
+/// and the prefetched next one is the pair the cache exists to hold, and when it
+/// cannot hold both, holding them anyway is what took a 1 GB Pi into swap.
+///
+/// Asked twice, so it lives in one place: once before a download starts (the
+/// CMAF segment table gives the size up front, so a big track is written
+/// straight to the card as it decrypts) and once about bytes already in hand.
 pub(crate) fn spill_to_disk(total: usize, budget: usize) -> bool {
     total.saturating_mul(2) > budget
 }
@@ -1080,6 +1066,12 @@ fn cmaf_take_request(
     Ok(Some(next))
 }
 
+/// Decode straight from a file on disk, for a track that is already in the L2
+/// cache (see [`TrackAudio::File`]). The decoder reads through a `BufReader`,
+/// so the resident cost is its own buffers rather than the whole track.
+///
+/// Only the primary decoder is tried: the L2 cache holds decrypted FLAC written
+/// by this player. A caller that gets `Err` here still has the in-memory path.
 fn decode_file_with_fallback(
     file: &qbz_cache::CachedFile,
 ) -> Result<Box<dyn Source<Item = f32> + Send>, String> {
@@ -1285,7 +1277,7 @@ enum StreamType {
     },
     #[cfg(target_os = "linux")]
     AlsaDirect(Arc<qbz_audio::AlsaDirectStream>),
-    /// Native JACK output (#263 Tier 3). QBZ as a JACK client with stable ports;
+    /// Native JACK output (#263). The player as a JACK client with stable ports;
     /// NOT bit-perfect (resampled to the graph rate).
     #[cfg(target_os = "linux")]
     Jack(Arc<qbz_audio::JackStream>),
@@ -1585,9 +1577,7 @@ fn try_init_stream_with_backend(
     // every platform instead of returning None — returning None made the caller
     // fall through to the legacy CPAL path, which forced the track rate onto the
     // shared default device: that froze the seekbar with no audio AND left a
-    // process-wide stuck audio handle that survived Reset (#470). "Auto" is
-    // resolved to a concrete backend in the UI; this is the backend-side safety
-    // net for any remaining None (legacy installs, headless callers).
+    // process-wide stuck audio handle that survived Reset (#470).
     let backend_type = audio_settings
         .backend_type
         .unwrap_or(qbz_audio::AudioBackendType::SystemDefault);
@@ -1658,7 +1648,7 @@ fn try_init_stream_with_backend(
         }
     }
 
-    // JACK (#263 Tier 3): create the JACK client/stream directly (not via the
+    // JACK (#263): create the JACK client/stream directly (not via the
     // MixerDeviceSink trait). Opt-in routing-freedom mode, NOT bit-perfect.
     #[cfg(target_os = "linux")]
     if backend_type == AudioBackendType::Jack {
@@ -1736,13 +1726,13 @@ pub struct PlaybackEvent {
     #[serde(default)]
     pub gapless_next_track_id: u64,
     /// Bit-perfect mode of the current stream. None when no stream is active.
-    /// Lets the UI show whether playback is direct-hardware bit-perfect, going
+    /// Says whether playback is direct-hardware bit-perfect, going
     /// through plughw software resample, or running on a shared system path
     /// (pipewire/pulse/cpal) where bit-perfect is not guaranteed.
     #[serde(default)]
     pub bit_perfect_mode: Option<BitPerfectMode>,
     /// Streaming buffer progress (0.0..1.0). `None` when not streaming or
-    /// the track is fully buffered — drives the seek-bar cache overlay.
+    /// the track is fully buffered.
     #[serde(default)]
     pub buffer_progress: Option<f32>,
 }
@@ -1805,8 +1795,8 @@ pub struct SharedState {
     /// Stream error flag (set when ALSA/audio errors are detected)
     stream_error: Arc<AtomicBool>,
     /// Optional user-readable explanation paired with `stream_error`.
-    /// Drained by the Tauri polling loop to emit a frontend toast and then
-    /// cleared, so the UI fires the notification exactly once per error.
+    /// Drained by the playback driver, which latches it into `/api/status`,
+    /// `/api/events` and the hook, so each error is reported exactly once.
     stream_error_message: Arc<std::sync::RwLock<Option<String>>>,
     /// Actual sample rate of the current stream (Hz) — what the decoder
     /// produces, i.e. the rate the file was encoded at.
@@ -1921,9 +1911,6 @@ impl SharedState {
         self.stream_error.load(Ordering::SeqCst)
     }
 
-    /// Record a user-readable error explanation alongside `stream_error=true`.
-    /// The message is drained once via `take_stream_error_message` so the UI
-    /// fires the toast exactly once per error.
     /// Whether an error message is recorded and not yet drained — so a
     /// generic follow-up does not overwrite the specific cause.
     pub fn has_pending_stream_error(&self) -> bool {
@@ -1933,6 +1920,9 @@ impl SharedState {
             .unwrap_or(false)
     }
 
+    /// Record a user-readable error explanation alongside `stream_error=true`.
+    /// The message is drained once via `take_stream_error_message` so the
+    /// driver reports it exactly once per error.
     pub fn record_stream_error(&self, message: impl Into<String>) {
         self.stream_error.store(true, Ordering::SeqCst);
         if let Ok(mut m) = self.stream_error_message.write() {
@@ -2129,11 +2119,10 @@ impl SharedState {
     /// Millisecond-precision companion to [`Self::current_position`] — the
     /// exact same derivation WITHOUT the whole-second truncation. READ-ONLY
     /// state derivation from the existing anchors (`playback_start_millis`
-    /// is already epoch-ms; `position_at_start`/`position`/`duration` are
+    /// is already in ms; `position_at_start`/`position`/`duration` are
     /// seconds): no stream, seek, format or device path is touched.
     ///
-    /// Added for the lyrics sync engine (karaoke needs sub-second
-    /// resolution); semantics mirror `current_position` line by line:
+    /// Semantics mirror `current_position` line by line:
     /// paused / no anchor → stored coarse position ×1000; playing →
     /// `position_at_start*1000 + (now_ms - start_millis)`, clamped to
     /// `duration*1000`.
@@ -2283,8 +2272,8 @@ impl Player {
             // Infallible by construction, and opened on first use. This used
             // to `panic!` on a disk error — on the audio thread, before a note
             // had played — so a full or read-only card meant total silence
-            // rather than normalization without a cache (upstream#780
-            // item 1). `LoudnessCache` now degrades to memory instead.
+            // rather than normalization without a cache. `LoudnessCache` now
+            // degrades to memory instead.
             let loudness_cache = Arc::new(match thread_data_root {
                 Some(root) => LoudnessCache::open_at(root),
                 None => LoudnessCache::in_memory(),
@@ -2303,7 +2292,7 @@ impl Player {
                                analyzer_tx: &SyncSender<AnalyzerMessage>,
                                analyzer_enabled: &Arc<AtomicBool>|
              -> Box<dyn Source<Item = f32> + Send> {
-                // Normalization: dynamic (Phase 2) > static (Phase 1 fallback) > none (bit-perfect)
+                // Normalization: dynamic > static (fallback) > none (bit-perfect)
                 let source: Box<dyn Source<Item = f32> + Send> =
                     if let Some(gain_atomic) = gain_atomic {
                         let initial_gain = normalization_gain.unwrap_or(1.0);
@@ -2537,7 +2526,7 @@ impl Player {
             let mut current_normalization_gain: Option<f32> = None;
             // Current track's dynamic gain atomic (shared with DynamicAmplify + LoudnessAnalyzer)
             let mut current_gain_atomic: Option<Arc<AtomicU32>> = None;
-            // Gapless: pending next track that has been appended to the Sink
+            // Gapless: pending next track that has been appended to the engine
             let mut gapless_pending: Option<GaplessPending> = None;
             // Gapless request guard: once we request "next" for a track, do not re-arm
             // until track changes or playback state is reset.
@@ -3162,10 +3151,9 @@ impl Player {
 
                             // Track metadata is known-good at command time. Store the
                             // duration NOW — current_position() clamps to it, so leaving
-                            // it 0 until after the buffer wait freezes the bar at 0:00,
-                            // and a Resume that recovers this source after a failed setup
-                            // would pin the bar at 0:00 forever (#508 follow-up, 2.0.1
-                            // Flatpak report 2026-07-15).
+                            // it 0 until after the buffer wait freezes the position at
+                            // 0:00, and a Resume that recovers this source after a failed
+                            // setup would pin it at 0:00 forever (#508 follow-up).
                             thread_state.duration.store(duration_secs, Ordering::SeqCst);
 
                             let StreamRecreateDecision {
@@ -3517,7 +3505,7 @@ impl Player {
                             let buffer_ready = buffer_sufficient(&source);
 
                             // A newer play intent superseded this one while we
-                            // were waiting (user clicked another track). Bail
+                            // were waiting (another track was picked). Bail
                             // out immediately — the newer PlayStreaming command
                             // is queued right behind us — instead of blocking
                             // the audio thread up to 60s on a download that no
@@ -3535,8 +3523,8 @@ impl Player {
 
                             if !buffer_ready && !source.has_min_buffer() {
                                 // #595 attributes feeder-death vs plain timeout;
-                                // #594 clears the transport state so the UI does
-                                // not sit on a phantom "playing" with no engine.
+                                // #594 clears the transport state so the controller
+                                // does not sit on a phantom "playing" with no engine.
                                 let err_msg = match source.download_error() {
                                     Some(err) => {
                                         log::error!(
@@ -3702,8 +3690,8 @@ impl Player {
                                 );
                             }
 
-                            // Set duration from track metadata (passed from frontend)
-                            // This allows the seekbar to show progress even during streaming
+                            // Set duration from track metadata (passed by the caller).
+                            // This lets the position advance even during streaming
                             thread_state.duration.store(duration_secs, Ordering::SeqCst);
 
                             // Normalization for streaming: try ReplayGain from buffered data,
@@ -3837,9 +3825,8 @@ impl Player {
                                 // something and landing on the paused position
                                 // again.
                                 enum ResumeInput {
-                                    /// Full file in memory: cache hit, local
-                                    /// library, or a stream that finished
-                                    /// downloading.
+                                    /// Full file in memory: a cache hit, or a
+                                    /// stream that finished downloading.
                                     Memory(TrackBytes),
                                     /// A still-streaming source whose feeder
                                     /// serves range requests, so the resume
@@ -4248,7 +4235,6 @@ impl Player {
                                 .store(0, Ordering::SeqCst);
                             thread_state.position_at_start.store(0, Ordering::SeqCst);
                             // Defer dropping the stream so a Play immediately following Stop
-                            // (the frontend's track-change pattern is Stop → Play, not append)
                             // can reuse the open device. Tearing CoreAudio down between every
                             // track was producing the audible click on track change. The idle
                             // loop's pause-suspend handler (below) drops the stream when this
@@ -4258,7 +4244,7 @@ impl Player {
                                 Instant::now() + Duration::from_millis(PAUSE_SUSPEND_DELAY_MS),
                             );
                             // Reset the PipeWire clock if WE forced it. The call is
-                            // self-gating (reset_pipewire_clock no-ops unless QBZ set
+                            // self-gating (reset_pipewire_clock no-ops unless we set
                             // the force), so it is now unconditional: the previous
                             // pw_force_bitperfect gate missed plain (no-passthrough)
                             // PipeWire users and leaked a forced rate after stop (#263).
@@ -4306,7 +4292,7 @@ impl Player {
 
                             // Four cases reach this handler:
                             //   * full-file playback (current_audio_data set).
-                            //     Cache and local-library playback arrive this
+                            //     Cache playback arrives this
                             //     way and skip the streaming branch entirely
                             //     (issue #335).
                             //   * streaming, download complete (buffered
@@ -4420,7 +4406,7 @@ impl Player {
                             thread_state.set_gapless_next_track_id(0);
 
                             // After take(), every failure path must clear playing
-                            // state — otherwise UI can show "playing" with no engine.
+                            // state — otherwise the controller is told "playing" with no engine.
                             if let Some(engine) = current_engine.take() {
                                 engine.stop();
                             }
@@ -4481,8 +4467,7 @@ impl Player {
                             // the audio thread on long seeks (especially FLAC
                             // Hi-Res). Cached path falls back to decode_with_
                             // fallback + skip_duration if Symphonia can't
-                            // probe the format (e.g., rodio-only MP4/AAC),
-                            // preserving existing behavior for those cases.
+                            // probe the bytes.
                             let skip_duration = Duration::from_secs(position_secs);
                             let skipped_source: Box<dyn Source<Item = f32> + Send> = if let Some(
                                 ref stream_src,
@@ -4555,9 +4540,8 @@ impl Player {
                                 };
                                 match native {
                                     Some(src) => src,
-                                    // rodio's decoders cover a few formats
-                                    // Symphonia cannot probe (MP4/AAC), so keep the
-                                    // slow path rather than refusing the seek.
+                                    // Symphonia could not seek, so keep the slow
+                                    // path rather than refusing the seek.
                                     None => match decode_file_with_fallback(file) {
                                         Ok(mut src) => match src.try_seek(skip_duration) {
                                             Ok(()) => src,
@@ -4733,10 +4717,10 @@ impl Player {
                                 engine.stop();
                             }
                             drop(stream_opt.take());
-                            // Undo anything QBZ parked so PipeWire / WirePlumber can
+                            // Undo anything we parked so PipeWire / WirePlumber can
                             // reclaim the device (e.g. a DAC left invisible to other
                             // apps after bit-perfect ALSA Direct held it exclusively).
-                            // Both calls are self-gating no-ops if QBZ didn't set them.
+                            // Both calls are self-gating no-ops if we didn't set them.
                             #[cfg(target_os = "linux")]
                             {
                                 qbz_audio::alsa_backend::resume_suspended_sink();
@@ -4755,7 +4739,7 @@ impl Player {
                             sample_rate,
                             channels,
                         } => {
-                            // Gapless: append next track to existing Rodio Sink
+                            // Gapless: append next track to the existing engine
                             let engine = match current_engine.as_mut() {
                                 Some(e) => e,
                                 None => {
@@ -4881,7 +4865,7 @@ impl Player {
                                 &analyzer_enabled,
                             );
 
-                            // Append to existing Sink (gapless queue).
+                            // Append to the existing engine (gapless queue).
                             // Late-gapless race: this append can arrive AFTER
                             // the engine went empty at natural end ("track
                             // finished" already set thread_state.is_playing =
@@ -4954,7 +4938,7 @@ impl Player {
                             if now.duration_since(last_empty_check) >= Duration::from_millis(500) {
                                 last_empty_check = now;
 
-                                // Update streaming buffer progress for UI seekbar
+                                // Update streaming buffer progress
                                 if let Some(streaming_src) = current_streaming_source.as_ref() {
                                     let progress = streaming_src.progress().unwrap_or(1.0);
                                     thread_state.set_buffer_progress(progress);
@@ -4970,9 +4954,10 @@ impl Player {
                                     if streaming_src.is_complete() {
                                         // Promotion copies the whole track so the
                                         // streaming buffer can be dropped. That is a
-                                        // fair trade on a desktop and a fatal one on a
-                                        // 1 GB Pi: for the seconds it takes, BOTH
-                                        // copies of a 200 MB+ Hi-Res track are resident.
+                                        // fair trade on a host with RAM to spare and a
+                                        // fatal one on a 1 GB Pi: for the seconds it
+                                        // takes, BOTH copies of a 200 MB+ Hi-Res track
+                                        // are resident.
                                         // The buffer we already hold serves resume and
                                         // seek perfectly well, so on a low-memory host
                                         // we keep it and skip the copy entirely.
@@ -5090,26 +5075,6 @@ impl Player {
                                 // Gapless transition detection: when position exceeds current
                                 // track duration, the queued next track has started playing.
                                 //
-                                // ORDERING NOTE: the polling loop in lib.rs reads `track_id`,
-                                // `gapless_next_track_id`, and other fields as separate atomic
-                                // loads, so it can observe an inconsistent intermediate state
-                                // if these stores aren't ordered carefully. The frontend's
-                                // `isGaplessTransition` predicate requires
-                                // `event.gapless_next_track_id === 0` AND
-                                // `event.track_id !== currentTrack.id`. If the polling loop
-                                // reads `track_id` post-swap but `gapless_next_track_id`
-                                // pre-reset, both conditions can't be satisfied simultaneously
-                                // and the frontend mis-classifies the gapless transition as an
-                                // external track change — leaving the UI stuck on the previous
-                                // title while the audio plays the new track.
-                                //
-                                // To eliminate that race, clear the "transition complete"
-                                // markers (`gapless_next_track_id`, `gapless_ready`) BEFORE
-                                // mutating `track_id`. Any racing reader either sees the old
-                                // track_id with cleared slots (no transition observed yet, will
-                                // catch up on next tick) or the new track_id with cleared slots
-                                // (clean gapless transition), but never the inconsistent
-                                // mid-swap mix.
                                 // ONE transition, whichever signal reports it.
                                 //
                                 // There were two copies of this swap: a
@@ -5159,17 +5124,13 @@ impl Player {
                                         );
                                     }
 
-                                    // ORDERING NOTE: the polling loop in lib.rs reads
-                                    // `track_id`, `gapless_next_track_id` and the rest as
-                                    // separate atomic loads, so it can observe an inconsistent
+                                    // ORDERING NOTE: `get_playback_event` reads `track_id`,
+                                    // `gapless_next_track_id` and the rest as separate atomic
+                                    // loads, so the playback driver can observe an inconsistent
                                     // intermediate state if these stores are not ordered
-                                    // carefully. The frontend's `isGaplessTransition` predicate
-                                    // requires `gapless_next_track_id === 0` AND
-                                    // `track_id !== currentTrack.id`; if the loop read
-                                    // `track_id` post-swap but `gapless_next_track_id`
-                                    // pre-reset, neither could hold and the transition was
-                                    // mis-read as an external track change, leaving the UI on
-                                    // the previous title while the audio played the new one.
+                                    // carefully: `track_id` post-swap beside
+                                    // `gapless_next_track_id` pre-reset is a mix no real state
+                                    // ever had.
                                     //
                                     // So clear the "transition complete" markers BEFORE
                                     // mutating `track_id`. A racing reader then sees either the
@@ -5209,11 +5170,11 @@ impl Player {
                                     release_streaming_source(&mut current_streaming_source);
                                 }
 
-                                // Gapless readiness: signal the frontend that it
+                                // Gapless readiness: signal the driver that it
                                 // is time to prepare the next track.
                                 //
-                                // The trigger is THIS track being fully
-                                // buffered, not a countdown to its end.
+                                // The trigger is THIS track's buffer (see the
+                                // gate below), not a countdown to its end.
                                 //
                                 // It used to be a fixed lead: 5s, then 10s once
                                 // an offline-cache HiRes decrypt was found to
@@ -5229,7 +5190,7 @@ impl Player {
                                 // The lead did not fail at the margin — it never
                                 // won.
                                 //
-                                // Arming on completion instead costs no PEAK
+                                // Arming on the buffer instead costs no PEAK
                                 // memory: either way two whole tracks are
                                 // resident at the hand-off, and the lead only
                                 // decides how LONG that peak is held, not how
@@ -5241,14 +5202,6 @@ impl Player {
                                 // "next" is not waste, it plays exactly the
                                 // track just fetched.
                                 //
-                                // `is_complete()` on the current stream is the
-                                // signal, and it was already required here: a
-                                // stream still DOWNLOADING has no tail to hand
-                                // over, a COMPLETE one does. On a low-memory
-                                // host promotion is skipped precisely so the
-                                // buffer is not copied, so the slot is never
-                                // cleared and `is_none()` would never fire.
-                                // Same rule as the PlayNext guard.
                                 // The host half is not a preference and is not
                                 // overridable by the setting: a successor this
                                 // board can neither hold in RAM nor stream to a
@@ -5310,7 +5263,7 @@ impl Player {
                                     gapless_request_armed = true;
                                 }
 
-                                // Original: check if ALL sources are done (engine empty)
+                                // Check if ALL sources are done (engine empty)
                                 if let Some(ref engine) = current_engine {
                                     if engine.empty()
                                         && thread_state.is_playing.load(Ordering::SeqCst)
@@ -6192,7 +6145,7 @@ impl Player {
         match result {
             Ok(Some(data)) => {
                 // Brief delay before the cache write to avoid racing the
-                // audio thread, matching the Tauri prefetch path.
+                // audio thread.
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 let len = data.len();
                 self.audio_cache.insert(track_id, data);
@@ -6332,14 +6285,6 @@ impl Player {
         )
     }
 
-    /// Fetch a track's audio bytes for a gapless handoff: L1 memory →
-    /// L2 disk → CMAF `download_full_sized` (legacy full download as fallback).
-    /// Does not start playback — the caller passes the bytes to
-    /// `play_next`. Returns `None` only when every tier fails.
-    ///
-    /// Ports the L1/L2/CMAF tiers of Tauri's `v2_play_next_gapless`; the
-    /// ephemeral / offline-cache / local-library tiers are intentionally
-    /// omitted as they do not exist in the Slint MVP.
     /// Tell the L2 cache which tracks must not be evicted: the one playing and
     /// the one being staged for the hand-off.
     ///
@@ -6369,6 +6314,10 @@ impl Player {
         l2.set_pinned(ids);
     }
 
+    /// Fetch a track's audio for a gapless handoff: L1 memory →
+    /// L2 disk → CMAF `download_full_sized` (legacy full download as fallback).
+    /// Does not start playback — the caller hands the result to `play_next`
+    /// or `play_next_file`. Returns `None` only when every tier fails.
     pub async fn fetch_for_gapless(
         &self,
         client: &QobuzClient,
@@ -6808,8 +6757,7 @@ impl Player {
         Ok(())
     }
 
-    /// Play from raw audio data (for cached tracks)
-    /// Play from raw audio data (for cached / offline tracks).
+    /// Play from raw audio data.
     ///
     /// Bumps play generation so this call supersedes any in-flight
     /// `play_track` that has not yet applied audio.
@@ -6822,8 +6770,6 @@ impl Player {
         self.apply_play_data(data, track_id, 0, 0)
     }
 
-    /// Send `Play` without bumping generation (used by `play_track` after
-    /// its own `begin_play` + supersede checks).
     /// Start `track_id` from a file in the L2 cache.
     ///
     /// The file twin of [`Self::apply_play_data`]: same command, same audio
@@ -6874,6 +6820,8 @@ impl Player {
         Ok(())
     }
 
+    /// Send `Play` without bumping generation (used by `play_track` after
+    /// its own `begin_play` + supersede checks).
     fn apply_play_data(
         &self,
         data: impl Into<TrackBytes>,
@@ -6927,7 +6875,6 @@ impl Player {
         Ok(())
     }
 
-    /// Queue next track for gapless playback (appends to current Sink without stopping)
     /// Queue the next track for a gapless transition, decoding it from its L2
     /// cache FILE instead of from bytes in memory.
     ///
@@ -6966,6 +6913,8 @@ impl Player {
             })
     }
 
+    /// Queue next track for gapless playback (appends to the current engine
+    /// without stopping)
     pub fn play_next(&self, data: impl Into<TrackBytes>, track_id: u64) -> Result<(), String> {
         let data: TrackBytes = data.into();
         let meta = extract_audio_metadata_full(&data)
@@ -7020,9 +6969,9 @@ impl Player {
     }
 
     /// `play_streaming` without bumping generation (used by play paths that
-    /// already did their own `begin_play` + supersede checks, like
-    /// a mid-intent bump here would invalidate a strictly
-    /// newer play that started in the meantime).
+    /// already did their own `begin_play` + supersede checks; a mid-intent
+    /// bump here would invalidate a strictly newer play that started in the
+    /// meantime).
     fn apply_play_streaming(
         &self,
         track_id: u64,
@@ -7154,8 +7103,8 @@ impl Player {
         // unlike `speed_mbps`, which is estimated from the tiny init fetch and
         // is latency-dominated — it lands on the slowest ladder rung for every
         // connection. Clamped to 256KB (format-detection minimum) .. 8MB (the
-        // process-wide ladder cap has no desktop caller, so this is the
-        // effective ceiling protecting low-memory hosts).
+        // process-wide ladder cap bounds only the ladder, not this floor, so
+        // this is the effective ceiling protecting low-memory hosts).
         let (user_secs, window_secs) = self
             .audio_settings
             .lock()
@@ -7376,18 +7325,17 @@ impl Player {
     }
 
     /// Release the output device without reopening it. Drops the active
-    /// stream — freeing an exclusive ALSA `hw:` grab — and un-suspends / un-forces anything QBZ parked, so
-    /// PipeWire/WirePlumber can reclaim a device QBZ was holding (e.g. a DAC
-    /// left invisible to other apps after bit-perfect ALSA Direct). Pair
-    /// with a device re-enumeration in the UI to surface a freed or
-    /// hot-plugged DAC without restarting the app.
+    /// stream — freeing an exclusive ALSA `hw:` grab — and un-suspends /
+    /// un-forces anything we parked, so PipeWire/WirePlumber can reclaim a
+    /// device we were holding (e.g. a DAC left invisible to other apps after
+    /// bit-perfect ALSA Direct).
     pub fn release_device(&self) -> Result<(), String> {
         self.tx
             .send(AudioCommand::ReleaseDevice)
             .map_err(|e| format!("Failed to send release command: {}", e))
     }
 
-    /// Reload audio settings from fresh config (e.g., after database update)
+    /// Reload audio settings from fresh config (e.g., after a settings change)
     /// Call this before reinit_device() to ensure Player uses latest settings
     pub fn reload_settings(&self, settings: AudioSettings) -> Result<(), String> {
         if let Ok(mut current_settings) = self.audio_settings.lock() {
@@ -7409,7 +7357,7 @@ impl Player {
         })
     }
 
-    /// Get playback event for emitting to frontend
+    /// Get a snapshot of the playback state as a `PlaybackEvent`
     pub fn get_playback_event(&self) -> PlaybackEvent {
         let sample_rate = self.state.get_sample_rate();
         let bit_depth = self.state.get_bit_depth();
@@ -7473,8 +7421,8 @@ mod tests {
     fn format_change_on_default_backend_rebuilds_for_native_rate() {
         // #449 regression guard: a decoded sample-rate/channel change must
         // rebuild the output stream on EVERY backend, not just the bit-perfect
-        // ones, so the device follows the track's native rate. 1.2.10 got this
-        // "for free" because Stop dropped the stream; once that drop was
+        // ones, so the device follows the track's native rate. This came "for
+        // free" while Stop dropped the stream; once that drop was
         // deferred to avoid a track-change click (e93fcaec), reusing the stream
         // on the default/PipeWire backend left the node locked to the first
         // track's rate for every subsequent track. Same-rate tracks still
@@ -8122,9 +8070,9 @@ mod memory_policy_tests {
 
     /// Copying a fully-buffered track out of its streaming buffer buys an
     /// instant seek, at the price of holding both copies while it happens. That
-    /// is a fair trade on a desktop and a fatal one on a 1 GB Pi, where a
-    /// Hi-Res track is 200 MB+ and the buffer already held serves seek and
-    /// resume perfectly well.
+    /// is a fair trade on a host with RAM to spare and a fatal one on a 1 GB Pi,
+    /// where a Hi-Res track is 200 MB+ and the buffer already held serves seek
+    /// and resume perfectly well.
     #[test]
     fn the_streaming_buffer_is_promoted_only_where_a_second_copy_is_affordable() {
         assert!(should_promote_streaming_buffer(MemoryClass::Normal));

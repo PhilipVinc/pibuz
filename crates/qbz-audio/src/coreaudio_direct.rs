@@ -1,10 +1,8 @@
 //! CoreAudio direct access for macOS
 //!
-//! Provides device capability probing and sample rate switching on macOS
-//! using the coreaudio-rs safe wrappers.
-//!
-//! Phase 1: Device probing + nominal sample rate switching (shared mode)
-//! Phase 2 (future): Hog mode + integer mode + IO proc for bit-perfect playback
+//! Provides device capability probing, nominal sample rate switching, Hog
+//! Mode and hardware volume on macOS using the coreaudio-rs safe wrappers.
+//! There is no integer mode and no IO proc: playback itself goes through CPAL.
 
 #![cfg_attr(target_os = "macos", allow(deprecated))]
 

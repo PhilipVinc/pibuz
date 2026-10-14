@@ -128,8 +128,7 @@ pub fn parse_login_response(response: &serde_json::Value) -> Result<UserSession>
         .and_then(parse_subscription_valid_until);
 
     // Account territory + language (snake_case wire names, verbatim in Qobuz's
-    // own embedded /user/login fixture). Absent on older captures -> None
-    // (feature stays off).
+    // own embedded /user/login fixture). Absent on older captures -> None.
     let country_code = user
         .get("country_code")
         .and_then(|v| v.as_str())
@@ -227,7 +226,7 @@ mod tests {
 
     #[test]
     fn parse_login_response_tolerates_missing_country_and_language() {
-        // Older captures / partial payloads: both stay None (feature off),
+        // Older captures / partial payloads: both stay None,
         // the rest of the session parses as before.
         let response = login_response(serde_json::json!({}));
         let session = parse_login_response(&response).expect("valid login response");

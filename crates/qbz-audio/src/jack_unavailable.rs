@@ -10,8 +10,7 @@
 //! headless build has no reason to carry. See `[features]` in Cargo.toml.
 //!
 //! Deliberately kept in a SEPARATE file rather than as `#[cfg]` arms inside
-//! `jack_backend.rs`: that file is shared with the desktop tree, and this way
-//! it needs no edit at all.
+//! `jack_backend.rs`: this way that file needs no `cfg` of its own.
 
 use std::convert::Infallible;
 

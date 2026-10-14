@@ -1,7 +1,7 @@
 //! Playback Engine Abstraction
 //!
 //! Unified interface for different playback backends:
-//! - Rodio (PipeWire, Pulse, ALSA via CPAL) - uses rodio::Sink
+//! - Rodio (PipeWire, Pulse, ALSA via CPAL) - uses rodio::Player
 //! - ALSA Direct (hw: devices) - bypasses rodio, writes directly to ALSA PCM
 //!
 //! ALSA Direct uses a single long-lived writer thread with a source queue
@@ -11,9 +11,7 @@
 use qbz_audio::pcm_ring::{BoundaryKind, RingLink};
 use qbz_audio::AudioOut;
 // The PCM engine takes `dyn AudioOut`; the Jack variant still names its
-// concrete stream. `AlsaDirectStream` was imported here for the DoP variant
-// only — with that gone, only the LINUX build can see the import is unused,
-// which is the same cfg trap CLAUDE.md records, running the other way.
+// concrete stream.
 #[cfg(target_os = "linux")]
 use qbz_audio::JackStream;
 use ringbuf::traits::{Consumer, Producer, Split};
@@ -139,7 +137,7 @@ pub enum PlaybackEngine {
         /// writer passes samples through untouched.
         volume: Arc<AtomicU32>,
     },
-    /// Native JACK output (#263 Tier 3). Mirrors AlsaDirect (gapless source queue
+    /// Native JACK output (#263). Mirrors AlsaDirect (gapless source queue
     /// + a single long-lived feeder thread), but the feeder resamples each source
     ///   to the JACK graph rate and writes interleaved stereo f32 into the client's
     ///   lock-free ring buffer via `JackStream::write_f32`. NOT bit-perfect.
@@ -256,7 +254,7 @@ impl PlaybackEngine {
         }
     }
 
-    /// Create a JACK engine with a gapless source queue (#263 Tier 3). Spawns one
+    /// Create a JACK engine with a gapless source queue (#263). Spawns one
     /// long-lived feeder thread that resamples each source to the JACK graph rate
     /// and writes it to the client's ring buffer.
     #[cfg(target_os = "linux")]
@@ -641,13 +639,6 @@ impl PlaybackEngine {
         }
     }
 
-    /// Position within the current track, in seconds, from the AUDIO clock.
-    ///
-    /// `None` for the backends that do not track it. On ALSA Direct this is
-    /// derived from frames the DAC has actually converted — frames handed over
-    /// minus `snd_pcm_delay` — so it is what the listener is hearing, not what
-    /// the writer has written. The two differ by the whole hardware ring, which
-    /// is up to a second on the buffer a Pi is told to use.
     /// Lowest decoded-ring fill since this was last asked, in frames, with the
     /// number of reads that found it empty.
     ///
@@ -669,6 +660,13 @@ impl PlaybackEngine {
         }
     }
 
+    /// Position within the current track, in seconds, from the AUDIO clock.
+    ///
+    /// `None` for the backends that do not track it. On ALSA Direct this is
+    /// derived from frames the DAC has actually converted — frames handed over
+    /// minus `snd_pcm_delay` — so it is what the listener is hearing, not what
+    /// the writer has written. The two differ by the whole hardware ring, which
+    /// is up to a second on the buffer a Pi is told to use.
     pub fn position_secs(&self) -> Option<u64> {
         match self {
             Self::Rodio { .. } => None,
@@ -718,6 +716,13 @@ fn keepalive_poll_interval(depth_ms: u32, when_off: Duration) -> Duration {
     Duration::from_millis(u64::from(depth_ms / 2).clamp(5, 100))
 }
 
+/// The two gates on the keep-alive, named so they can be tested.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn would_keep_alive(primed: bool, depth_ms: u32) -> bool {
+    primed && depth_ms > 0
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 /// Hold a floor of silence under an idle PCM, if the host asked for it.
 ///
 /// `primed` says whether this stream has already played something. It gates
@@ -738,13 +743,7 @@ fn keepalive_poll_interval(depth_ms: u32, when_off: Duration) -> Duration {
 /// Best effort otherwise: a device that refuses silence must not take the
 /// writer thread down with it. One warning, then we go quiet about it — the
 /// idle paths call this many times a second.
-/// The two gates on the keep-alive, named so they can be tested.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn would_keep_alive(primed: bool, depth_ms: u32) -> bool {
-    primed && depth_ms > 0
-}
-
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+///
 /// Returns the frames of silence actually queued.
 ///
 /// The count is not decoration. `snd_pcm_delay` reports everything the device
@@ -1331,7 +1330,7 @@ pub(crate) fn writer_chunk_frames(period_frames: usize, buffer_frames: usize) ->
     from_period.clamp(MIN_CHUNK, ceiling.min(MAX_CHUNK))
 }
 
-/// Single long-lived feeder thread for JACK (#263 Tier 3).
+/// Single long-lived feeder thread for JACK (#263).
 ///
 /// Mirrors `alsa_writer_thread`, but writes graph-rate interleaved STEREO f32
 /// into the JACK client's lock-free ring buffer via `JackStream::write_f32`

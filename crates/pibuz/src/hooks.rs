@@ -1,4 +1,4 @@
-// crates/pibuz/src/hooks.rs — run a user script on daemon events (CONSOLE ext).
+// crates/pibuz/src/hooks.rs — run a user script on daemon events.
 //
 // Headless integrators (moOde, Volumio, home-grown setups) need PUSH
 // notifications to coordinate the daemon with the rest of an audio box — stop
@@ -41,8 +41,8 @@ pub fn script(roots: &ProfileRoots) -> Option<PathBuf> {
 }
 
 /// Spawn the hook dispatcher. Holds no `Arc<AppRuntime>` (only the script path
-/// and the bus receiver), so it sits outside the §8.2 audio-release ordering —
-/// the caller aborts it for a clean shutdown, like the scrobbler.
+/// and the bus receiver), so it sits outside the #521 audio-release ordering —
+/// the caller aborts it for a clean shutdown.
 pub fn spawn(script: PathBuf, mut rx: broadcast::Receiver<CoreEvent>) -> JoinHandle<()> {
     use broadcast::error::RecvError;
     tokio::spawn(async move {

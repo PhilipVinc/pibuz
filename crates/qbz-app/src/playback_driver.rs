@@ -1,21 +1,19 @@
 // crates/qbz-app/src/playback_driver.rs — the headless playback orchestrator.
 //
-// This re-hosts, as a PURE decision function plus a thin IO shell, the playback
-// bookkeeping that today only exists inside the desktop's 450 ms poll loop
-// 450 ms poll loop: end-of-track detection, auto-advance, gapless pre-queue,
-// stop-after, seamless-transition cursor sync and the periodic session-position
-// save. The unit tests pin the observable contract (01-architecture.md §3.2).
+// The playback bookkeeping, as a PURE decision function plus a thin IO shell
+// that polls the player every 450 ms: end-of-track detection, auto-advance,
+// gapless pre-queue, stop-after, seamless-transition cursor sync and the
+// QConnect report edge. The unit tests pin the observable contract.
 //
 // Split of concerns:
 //   * `plan_tick`      — side-effect-free: (state, event, queue, error) → actions
 //   * `advance_state`  — the pure state-update rule the shell applies each tick
-//   * `next_playable`  — bounded unstreamable skip-walk (mirrors
-//                        `playback.rs::advance_to_playable`, capped at
-//                        `MAX_OFFLINE_SKIPS`)
+//   * `next_playable`  — bounded unstreamable skip-walk, capped at
+//                        `MAX_OFFLINE_SKIPS`
 //   * `run_driver`     — the 450 ms IO shell that reads the player, calls
 //                        `plan_tick`, and executes the resulting actions
-//   * `advance_and_play` — the full advance ritual (skip-walk → play → prefetch
-//                        → persist), reused verbatim by the CLI next/prev routes
+//   * `advance_and_play` — the full advance ritual (skip-walk → play →
+//                        prefetch), reused verbatim by the CLI next/prev routes
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,44 +24,35 @@ use qbz_player::PlaybackEvent;
 
 use crate::shell::AppRuntime;
 
-/// Poll cadence — the same 450 ms the desktop loop uses
-/// (`playback.rs:4088`).
+/// Poll cadence.
 const TICK_MS: u64 = 450;
 
-/// QConnect report cadence while playing: every ~4 ticks ≈ 2 s
-/// (`playback.rs:4069`, `QCONNECT_REPORT_EVERY_N_TICKS`).
+/// QConnect report cadence while playing: every ~4 ticks ≈ 2 s.
 const QCONNECT_REPORT_EVERY_N_TICKS: u64 = 4;
 
-/// Bounded skip-walk ceiling for unavailable tracks (Tauri #467 parity;
-/// `playback.rs:226`, `MAX_OFFLINE_SKIPS = 5`).
+/// Bounded skip-walk ceiling for unavailable tracks (issue #467).
 const MAX_OFFLINE_SKIPS: usize = 5;
 
 /// A side effect the shell must perform this tick. Produced by [`plan_tick`],
-/// executed by [`run_driver`]. Consumed by later tasks (T7 next/prev reuses the
-/// advance ritual, T10 wires `ReportEdge`, T11 the settings reload).
+/// executed by [`run_driver`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DriverAction {
     /// Reconcile the queue cursor to the id the engine is actually playing
-    /// (a seamless gapless hand-off; `playback.rs:4340`).
+    /// (a seamless gapless hand-off).
     SyncCursorTo(u64),
-    /// Pre-queue this upcoming track's bytes for a gapless transition
-    /// (`playback.rs:4387`).
+    /// Pre-queue this upcoming track's bytes for a gapless transition.
     ArmGapless(u64),
     /// The current track ended and there is a next playable track — run the
-    /// full advance ritual (`playback.rs:4743`).
+    /// full advance ritual.
     AdvanceAndPlay,
-    /// The ended track was stop-after-marked — halt (pause), never advance
-    /// (`playback.rs:4720`).
+    /// The ended track was stop-after-marked — halt (pause), never advance.
     PauseStopAfter,
-    /// Persist the live position (throttled ~5 s; `playback.rs:4307`).
-    /// Latch a drained stream-error message so `status` stays diagnosable
-    /// (`playback.rs:4111`).
+    /// Latch a drained stream-error message so `status` stays diagnosable.
     LatchError(String),
     /// Emit an outbound QConnect renderer-state report on a transition or the
-    /// ~2 s periodic cadence (`playback.rs:4648`).
+    /// ~2 s periodic cadence.
     ReportEdge,
-    /// The current track ended and nothing is playable — stop
-    /// (`playback.rs:4751`).
+    /// The current track ended and nothing is playable — stop.
     QueueFinished,
     /// The player moved off this track. On a memory-constrained host its bytes
     /// are dropped from the L1 cache now (they spill to L2) instead of waiting
@@ -72,8 +61,8 @@ pub enum DriverAction {
     ReleaseCachedTrack(u64),
 }
 
-/// The previous tick's snapshot: the desktop loop's `last_track_id` /
-/// `seen_position` / `was_playing` (plus duration for [`DriverState::after`]).
+/// The previous tick's snapshot: track, position and play state (plus duration
+/// for [`DriverState::after`]).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LastTick {
     pub track_id: u64,
@@ -93,22 +82,20 @@ impl LastTick {
     }
 }
 
-/// The driver's carried-over state between ticks — the loop-local `mut`
-/// variables of `start_poll_loop`, hoisted into a value so the decision is a
-/// pure function of it.
+/// The driver's carried-over state between ticks, held as a value so the
+/// decision is a pure function of it.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DriverState {
-    /// Previous tick (`last_track_id`, `seen_position`, `was_playing`).
+    /// Previous tick.
     pub last: LastTick,
-    /// ~11-tick throttle counter for the periodic position save.
     /// Track id an `ArmGapless` already fired for, so the ticker does not
-    /// re-request it every tick (`gapless_requested_for`).
+    /// re-request it every tick.
     pub gapless_requested_for: u64,
     /// ~4-tick throttle counter for the periodic QConnect report.
     pub report_tick: u64,
-    /// Last track id we emitted a `ReportEdge` for (`last_reported_track_id`).
+    /// Last track id we emitted a `ReportEdge` for.
     pub last_reported_track_id: u64,
-    /// Last play-state we emitted a `ReportEdge` for (`last_reported_playing`).
+    /// Last play-state we emitted a `ReportEdge` for.
     pub last_reported_playing: bool,
 }
 
@@ -126,8 +113,8 @@ impl DriverState {
     }
 }
 
-/// The queue shape the decision needs, projected from `QbzCore::get_queue_state`
-/// each tick: the current track id, the `(id, streamable)` upcoming list, the
+/// The queue shape the decision needs, projected from
+/// `QbzCore::get_queue_state_full` each tick: the current track id, the `(id, streamable)` upcoming list, the
 /// repeat key and the stop-after marker.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct QueueSnapshot {
@@ -135,15 +122,11 @@ pub struct QueueSnapshot {
     pub upcoming: Vec<(u64, bool)>,
     pub repeat: String,
     pub stop_after: Option<u64>,
-    /// True when autoplay mode is "infinite" — logged-unsupported in P0 and
-    /// treated as queue-finished (01 §3.1-5c).
+    /// True when autoplay mode is "infinite" — unsupported, logged and treated
+    /// as queue-finished. Nothing sets it yet.
     pub autoplay_infinite: bool,
 }
 
-/// Bounded skip-walk to the first streamable upcoming track. Returns
-/// `(index, track_id)` of the first `playable == true` entry within `max_walk`
-/// steps, or `None` when none is found inside the bound (never walks forever).
-/// Mirrors `playback.rs::advance_to_playable`'s `MAX_OFFLINE_SKIPS` cap.
 /// Whether a gapless successor that has finished downloading is still the one
 /// to queue.
 ///
@@ -170,6 +153,9 @@ pub fn gapless_fetch_still_wanted(armed_against: u64, now_playing: u64) -> bool 
     armed_against != 0 && armed_against == now_playing
 }
 
+/// Bounded skip-walk to the first streamable upcoming track. Returns
+/// `(index, track_id)` of the first `playable == true` entry within `max_walk`
+/// steps, or `None` when none is found inside the bound (never walks forever).
 pub fn next_playable(upcoming: &[(u64, bool)], max_walk: usize) -> Option<(usize, u64)> {
     for (i, &(id, playable)) in upcoming.iter().enumerate() {
         if i >= max_walk {
@@ -184,8 +170,8 @@ pub fn next_playable(upcoming: &[(u64, bool)], max_walk: usize) -> Option<(usize
 
 /// The pure per-tick decision. Side-effect-free: given the carried state, the
 /// live player event, the queue projection and any drained stream error, decide
-/// which [`DriverAction`]s the shell must perform. Order mirrors the desktop
-/// loop so the shell executes effects in the same sequence.
+/// which [`DriverAction`]s the shell must perform, in the order the shell
+/// executes them.
 pub fn plan_tick(
     state: &DriverState,
     ev: &PlaybackEvent,
@@ -195,16 +181,15 @@ pub fn plan_tick(
     let mut actions = Vec::new();
     let last = &state.last;
 
-    // 1. Stream-error latch (playback.rs:4111): the player records a
+    // 1. Stream-error latch: the player records a
     //    user-readable message drained exactly once per failure.
     if let Some(msg) = stream_error {
         actions.push(DriverAction::LatchError(msg.to_string()));
     }
 
-    // 3. Seamless gapless transition (playback.rs:4324-4371): the engine advanced
-    //    to a new track WITHOUT a stop (track-id change while still playing).
-    //    Sync the cursor and STOP — the desktop `continue`s before every block
-    //    below, so no other action fires this tick.
+    // 2. Seamless gapless transition: the engine advanced to a new track
+    //    WITHOUT a stop (track-id change while still playing). Sync the cursor
+    //    and STOP: no other action fires this tick.
     let seamless_change = ev.track_id != 0
         && last.track_id != 0
         && ev.track_id != last.track_id
@@ -218,7 +203,7 @@ pub fn plan_tick(
         return actions;
     }
 
-    // 4. Gapless prefetch trigger (playback.rs:4387-4401): the engine wants the
+    // 3. Gapless prefetch trigger: the engine wants the
     //    next track pre-queued and none is armed; arm the first playable upcoming
     //    exactly once per current track, suppressed when the current track is
     //    stop-after-marked (so it ends naturally and the marker can fire).
@@ -235,11 +220,10 @@ pub fn plan_tick(
         }
     }
 
-    // 5. End-of-track edge (playback.rs:4489-4496): the previous tick was
-    //    playing, this tick is not, the track id held (or went to 0), and the
-    //    previous position was within 2 s of the (current) duration. Uses the
-    //    live `ev.duration` guard + previous `last.position` exactly as the
-    //    desktop's `duration > 0 && seen_position + 2 >= duration`.
+    // 4. End-of-track edge: the previous tick was playing, this tick is not,
+    //    the track id held (or went to 0), and the previous position was within
+    //    2 s of the (current) duration: the live `ev.duration` guard plus the
+    //    previous `last.position`, `duration > 0 && position + 2 >= duration`.
     //
     //    OR this tick's position is AT the duration: the player parks it there
     //    only when the engine has run dry, never on a pause. That is how a file
@@ -253,9 +237,8 @@ pub fn plan_tick(
         && ev.duration > 0
         && (last.position + 2 >= ev.duration || ev.position >= ev.duration);
 
-    // 6. QConnect report edge (playback.rs:4648-4673): report on a track/play
-    //    transition OR the ~2 s periodic cadence while playing. Runs regardless
-    //    of `track_ended` (the desktop report block precedes the advance block).
+    // 5. QConnect report edge: report on a track/play transition OR the ~2 s
+    //    periodic cadence while playing. Runs regardless of `track_ended`.
     let next_report_tick = state.report_tick.wrapping_add(1);
     if ev.track_id != 0 {
         let transition = ev.track_id != state.last_reported_track_id
@@ -267,7 +250,7 @@ pub fn plan_tick(
         }
     }
 
-    // 7. Track-end handling (playback.rs:4705-4762): stop-after HALTS (pause,
+    // 6. Track-end handling: stop-after HALTS (pause,
     //    never advance, ahead of any repeat/shuffle); else advance to the next
     //    playable track; else the queue is finished. repeat one/all always yield
     //    a next track (QueueManager owns the replay/wrap), so they never finish.
@@ -292,8 +275,7 @@ pub fn plan_tick(
     actions
 }
 
-/// The pure state-update rule applied after [`plan_tick`] each tick. Replicates
-/// how the desktop loop mutates its carried variables, branch by branch.
+/// The pure state-update rule applied after [`plan_tick`] each tick.
 pub fn advance_state(
     prev: &DriverState,
     ev: &PlaybackEvent,
@@ -317,12 +299,10 @@ pub fn advance_state(
         .iter()
         .any(|a| matches!(a, DriverAction::ReportEdge));
 
-    //     // seamless `continue`.
-
     if seamless {
-        // Seamless branch (playback.rs:4363-4369): last <- ev, gapless guard
-        // cleared, report trackers untouched (the `continue` precedes the report
-        // block, so report_tick does NOT advance this tick).
+        // Seamless branch: last <- ev, gapless guard cleared, report trackers
+        // untouched (`plan_tick` returned before the report edge, so
+        // report_tick does NOT advance this tick).
         return DriverState {
             last: LastTick::from_event(ev),
             gapless_requested_for: 0,
@@ -332,7 +312,7 @@ pub fn advance_state(
         };
     }
 
-    // Non-seamless: the report block runs (playback.rs:4648) so report_tick
+    // Non-seamless: the report edge was evaluated, so report_tick
     // advances; the report trackers move only when a ReportEdge fired.
     let report_tick = prev.report_tick.wrapping_add(1);
     let (last_reported_track_id, last_reported_playing) = if reported {
@@ -341,8 +321,8 @@ pub fn advance_state(
         (prev.last_reported_track_id, prev.last_reported_playing)
     };
 
-    // Edge trackers (playback.rs:4676-4700): last_track_id/seen_position update
-    // only when track_id != 0; was_playing tracks is_playing unconditionally.
+    // Edge trackers: track id and position update only when track_id != 0;
+    // is_playing is tracked unconditionally.
     let mut last = if ev.track_id != 0 {
         LastTick::from_event(ev)
     } else {
@@ -359,8 +339,8 @@ pub fn advance_state(
         prev.gapless_requested_for
     };
 
-    // Track-end handler resets the edge trackers + the gapless guard
-    // (playback.rs:4728-4742, both the stop-after and advance branches).
+    // Track-end handler resets the edge trackers + the gapless guard (both the
+    // stop-after and advance branches).
     if ended {
         last = LastTick::default();
         gapless_requested_for = 0;
@@ -378,7 +358,7 @@ pub fn advance_state(
 /// Map a `streaming_quality` preference key to a request-layer [`Quality`].
 ///
 /// Unknown/unset keys fall back to the top tier so hi-res never silently
-/// downgrades (01 §3.1).
+/// downgrades.
 pub fn quality_from_key(key: &str) -> Quality {
     match key {
         "mp3" => Quality::Mp3,
@@ -397,7 +377,7 @@ pub fn quality_from_key(key: &str) -> Quality {
 pub struct DriverDeps {
     /// Resolve the streaming quality at play time (pibuz passes the daemon prefs).
     pub quality: Arc<dyn Fn() -> Quality + Send + Sync>,
-    /// Report-edge signal (T10 wires the QConnect renderer report).
+    /// Report-edge signal (pibuz pulses the QConnect renderer report).
     pub on_edge: Arc<dyn Fn() + Send + Sync>,
     /// Latch a drained error under a category ("stream" | "transport" | "auth").
     pub on_latch: Arc<dyn Fn(&str, String) + Send + Sync>,
@@ -414,7 +394,7 @@ const AUDIO_THREAD_STUCK: Duration = Duration::from_secs(90);
 /// The 450 ms IO shell. Each tick: read the player event, drain the stream-error
 /// latch, project the queue, `plan_tick`, execute the actions, then
 /// `advance_state`. Breaks when `shutdown` flips to `true`; the loop is thin by
-/// design (01 §3.2 — too thin to hide bugs). Runs safely from boot regardless of
+/// design — too thin to hide bugs. Runs safely from boot regardless of
 /// auth: with no session the queue is empty and every tick is a near-no-op.
 pub async fn run_driver<A: FrontendAdapter + Send + Sync + 'static>(
     runtime: Arc<AppRuntime<A>>,
@@ -462,7 +442,7 @@ pub async fn run_driver<A: FrontendAdapter + Send + Sync + 'static>(
             _ => {}
         }
 
-        // Drain-once stream-error message (playback.rs:4111).
+        // Drain-once stream-error message.
         let stream_error = player.state.take_stream_error_message();
         let queue = queue_snapshot(core).await;
 
@@ -524,7 +504,7 @@ pub async fn run_driver<A: FrontendAdapter + Send + Sync + 'static>(
                     }
                 }
                 DriverAction::PauseStopAfter => {
-                    // The ended track is the queue's current track (playback.rs:4708).
+                    // The ended track is the queue's current track.
                     let finished = queue.current;
                     if finished != 0 && core.consume_stop_after_if(finished).await {
                         if let Err(e) = core.pause() {
@@ -532,8 +512,7 @@ pub async fn run_driver<A: FrontendAdapter + Send + Sync + 'static>(
                         }
                     } else {
                         // Marker cleared between the snapshot and the consume — fall
-                        // through to the normal advance (desktop parity: stop-after
-                        // and advance share one track-end block).
+                        // through to the normal advance.
                         advance_and_play_logged(&runtime, (deps.quality)()).await;
                     }
                 }
@@ -612,14 +591,13 @@ fn repeat_after_manual_skip(mode: RepeatMode) -> Option<RepeatMode> {
     (mode == RepeatMode::One).then_some(RepeatMode::Off)
 }
 
-/// The FULL advance ritual, reused verbatim by the CLI next/prev routes (T7):
+/// The FULL advance ritual, reused verbatim by the CLI next/prev routes:
 /// bounded skip-walk to the next (or previous) playable track → play it → warm
-/// the successors for gapless → persist the session. Never a bare cursor move
-/// (02 §2.2). The skip-walk mirrors `playback.rs::advance_to_playable` (capped
-/// at `MAX_OFFLINE_SKIPS`); `next_track()`/`previous_track()` are the atomic
-/// cursor movers — `forward` selects which one, so `pibuz next` and `pibuz prev`
-/// share this one ritual instead of duplicating the play → prefetch → persist
-/// tail.
+/// the successors for gapless. Never a bare cursor move. The skip-walk is
+/// capped at `MAX_OFFLINE_SKIPS`; `next_track()`/`previous_track()` are the
+/// atomic cursor movers — `forward` selects which one, so `pibuz next` and
+/// `pibuz prev` share this one ritual instead of duplicating the play →
+/// prefetch tail.
 pub async fn advance_and_play<A: FrontendAdapter + Send + Sync + 'static>(
     runtime: &AppRuntime<A>,
     quality: Quality,
@@ -636,9 +614,8 @@ pub async fn advance_and_play<A: FrontendAdapter + Send + Sync + 'static>(
         let Some(track) = step else {
             break None; // queue edge
         };
-        // Playable gate: local files always attempt (they play from disk);
-        // streamable Qobuz tracks OK. Daemon P0 has no offline tier, so an
-        // unstreamable remote track is a skip (mirrors advance_to_playable).
+        // Playable gate: a streamable track plays, an unstreamable one is a
+        // skip. (`is_local` is never set: there is no local library here.)
         if track.streamable || track.is_local {
             break Some(track);
         }
@@ -663,8 +640,7 @@ pub async fn advance_and_play<A: FrontendAdapter + Send + Sync + 'static>(
 }
 
 /// Warm the player cache for the next upcoming track (best-effort; failures are
-/// logged, never fatal). Mirrors `playback.rs::kick_prefetch` for the daemon:
-/// only remote, non-local, not-already-cached tracks are fetched.
+/// logged, never fatal). Only remote, not-already-cached tracks are fetched.
 async fn prefetch_successors<A: FrontendAdapter + Send + Sync + 'static>(
     runtime: &AppRuntime<A>,
     quality: Quality,
@@ -707,7 +683,7 @@ async fn queue_snapshot<A: FrontendAdapter + Send + Sync + 'static>(
         upcoming,
         repeat: repeat_to_str(state.repeat).to_string(),
         stop_after: state.stop_after_track_id,
-        // Autoplay "infinite" is a later-task wiring; P0 never sets it.
+        // Nothing sets autoplay "infinite" yet.
         autoplay_infinite: false,
     }
 }
@@ -1149,8 +1125,8 @@ mod residency_session_tests {
     /// should be instant and LRU will evict when something needs the room.
     ///
     /// Pinned so nobody "simplifies" the gate away and calls the low-memory
-    /// behaviour the default — that would make every desktop back-skip re-read
-    /// from disk.
+    /// behaviour the default — that would make every back-skip on a roomy host
+    /// re-read from disk.
     #[test]
     fn the_same_playlist_on_a_normal_host_deliberately_keeps_them() {
         let (tracks, _) = worst_residency_over_a_gapless_playlist(MemoryClass::Normal);

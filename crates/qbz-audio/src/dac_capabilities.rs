@@ -1,14 +1,11 @@
-//! Headless DAC capability probe (HiFi wizard Slice 2).
-//!
-//! Mirrors the old Tauri `v2_query_dac_capabilities` so the Slint wizard can
-//! query a DAC's real supported sample rates + pretty description WITHOUT a
-//! Tauri command. The actual detection already lived in this crate
-//! (`PipeWireBackend::get_sink_supported_rates`, `get_device_supported_rates`);
-//! this module just assembles the DTO frontend-agnostically. Read-only.
+//! Headless DAC capability probe: a DAC's real supported sample rates and
+//! pretty description, in one DTO. The detection itself lives elsewhere in
+//! this crate (`PipeWireBackend::get_sink_supported_rates`,
+//! `get_device_supported_rates`); this module only assembles it. Read-only.
 
 use serde::{Deserialize, Serialize};
 
-/// DAC capability descriptor surfaced to the wizard.
+/// DAC capability descriptor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DacCapabilities {
     pub node_name: String,
@@ -19,7 +16,7 @@ pub struct DacCapabilities {
     pub error: Option<String>,
     /// True when `sample_rates` came from real detection (`/proc/asound` /
     /// ALSA), false when it is the `FALLBACK_RATES` common set. Consumers that
-    /// derive a quality cap from the ceiling (#638 fix 3) must disclose the
+    /// derive a quality cap from the ceiling (#638) must disclose the
     /// fallback case — the cap still applies, but is not guaranteed to match
     /// the hardware. `serde(default)` keeps old serialized payloads readable.
     #[serde(default)]
@@ -32,7 +29,7 @@ const FALLBACK_RATES: [u32; 6] = [44100, 48000, 88200, 96000, 176400, 192000];
 
 /// Nominal format list. NOTE: these are NOT probed — ALSA does not expose a
 /// clean per-node format capability here, so we report the common set honestly
-/// as nominal (matches the prior Tauri behavior; do not present it as measured).
+/// as nominal (do not present it as measured).
 fn nominal_formats() -> Vec<String> {
     vec![
         "S16LE".to_string(),
@@ -49,7 +46,7 @@ fn assemble(
     description: Option<String>,
 ) -> DacCapabilities {
     // Computed BEFORE the fallback collapses into `sample_rates`, so the DTO
-    // can tell a real ceiling from the assumed common set (#638 F26).
+    // can tell a real ceiling from the assumed common set (#638).
     let rates = detected_rates.filter(|r| !r.is_empty());
     let detected = rates.is_some();
     let sample_rates = rates.unwrap_or_else(|| FALLBACK_RATES.to_vec());
@@ -67,7 +64,7 @@ fn assemble(
 /// Detect a DAC's real supported sample rates + pretty description, headlessly.
 /// Read-only — reads `/proc/asound` and runs `pw-dump`; never opens a stream.
 pub fn query_dac_capabilities(node_name: &str) -> DacCapabilities {
-    // Pretty description from robust (pw-dump-backed, Slice 0) enumeration.
+    // Pretty description from the pw-dump-backed enumeration.
     let description =
         crate::backend::BackendManager::create_backend(crate::backend::AudioBackendType::PipeWire)
             .ok()

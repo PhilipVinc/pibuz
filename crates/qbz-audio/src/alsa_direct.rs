@@ -746,7 +746,6 @@ pub fn f32_to_s32(sample: f32) -> i32 {
     (sample * 2_147_483_648.0) as i32
 }
 
-/// Direct ALSA PCM stream for hw: devices
 /// Reusable integer conversion buffers for [`AlsaDirectStream::write_f32`].
 ///
 /// The writer thread calls `write_f32` for every chunk of audio for as long as
@@ -766,6 +765,7 @@ struct ConvScratch {
     bytes: Vec<u8>,
 }
 
+/// Direct ALSA PCM stream, bypassing rodio/CPAL.
 #[cfg(target_os = "linux")]
 pub struct AlsaDirectStream {
     pcm: Arc<Mutex<PCM>>,
@@ -1509,7 +1509,6 @@ impl AlsaDirectStream {
         }
     }
 
-    /// Stop PCM immediately (prepare for next playback)
     /// Ramp the signal down to zero over `fade_ms`, then hold silence for
     /// `pad_ms`, so the clock stops from a settled state AND gets there without
     /// a step. See [`fade_ramp_into`] for why both halves are needed.
@@ -1604,9 +1603,9 @@ impl AlsaDirectStream {
     /// LOSSLESS (the writer hands the discarded frames back on resume) rather
     /// than to advertise a fade that does not happen.
     ///
-    /// What this does remove is the xrun. Today a pause simply stops writing:
-    /// the device plays out a ring's worth of audio nobody asked for and then
-    /// underruns, so every pause ends in a click.
+    /// What this does remove is the xrun. Without it a pause simply stops
+    /// writing: the device plays out a ring's worth of audio nobody asked for
+    /// and then underruns, so every pause ends in a click.
     pub fn discard_queued(&self) -> Result<(), String> {
         let pcm = self
             .pcm
@@ -1627,6 +1626,8 @@ impl AlsaDirectStream {
             .map_err(|e| format!("Failed to prepare PCM after pause: {e}"))
     }
 
+    /// Stop the PCM: ramp down, drop whatever is queued, and prepare it for
+    /// the next playback.
     pub fn stop(&self) -> Result<(), String> {
         // Land on silence before halting the clock, so the DAC is not left
         // holding whatever sample the track ended on. See `STOP_PAD_MS`.

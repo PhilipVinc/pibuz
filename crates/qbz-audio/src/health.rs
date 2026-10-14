@@ -1,14 +1,14 @@
-//! Audio-stack health probes + distro detection (HiFi wizard Slice 6 / check step).
+//! Audio-stack health probes + distro detection.
 //!
-//! Cheap, read-only shell probes that tell the wizard what (if anything) is
-//! missing on a Linux audio stack, plus `/etc/os-release` distro detection so
-//! the check step can show the right `apt`/`dnf`/`pacman` remediation. None of
-//! this opens a stream — purely diagnostic.
+//! Cheap, read-only shell probes that tell what (if anything) is missing on a
+//! Linux audio stack, plus `/etc/os-release` distro detection so a caller can
+//! name the right `apt`/`dnf`/`pacman` remediation. None of this opens a
+//! stream — purely diagnostic.
 
 use std::process::Command;
 
 /// Result of the audio-stack probes. All best-effort; a failed probe reads as
-/// `false` (the wizard then surfaces the matching remediation).
+/// `false`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AudioStackHealth {
     /// WirePlumber session manager is running (`systemctl --user is-active`).
@@ -26,7 +26,7 @@ pub struct AudioStackHealth {
 }
 
 impl AudioStackHealth {
-    /// Everything the wizard needs for bit-perfect playback is present.
+    /// Everything PipeWire bit-perfect playback needs is present.
     pub fn is_ready(&self) -> bool {
         self.wireplumber_active && self.cpal_sees_pipewire && self.any_devices
     }
@@ -64,8 +64,7 @@ pub fn audio_stack_health() -> AudioStackHealth {
     }
 }
 
-/// Linux distribution family — drives the per-distro install commands. Order
-/// matches the wizard's distro dropdown.
+/// Linux distribution family — drives the per-distro install commands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Distro {
     Debian,
@@ -84,7 +83,7 @@ pub enum Distro {
 }
 
 impl Distro {
-    /// Dropdown order (index = position here). `Other` stays last.
+    /// Display order (index = position here). `Other` stays last.
     pub const ALL: [Distro; 10] = [
         Distro::Debian,
         Distro::Antix,
@@ -105,8 +104,8 @@ impl Distro {
             .unwrap_or(Self::ALL.len() - 1)
     }
 
-    /// Human label for the dropdown (mirrors the Tauri DistroSelector, plus the
-    /// systemd-free families called out so the init-aware commands make sense).
+    /// Human label, with the systemd-free families called out so the
+    /// init-aware commands make sense.
     pub fn label(self) -> &'static str {
         match self {
             Distro::Debian => "Ubuntu / Debian / Mint / Pop!_OS",
@@ -138,7 +137,7 @@ pub enum InitSystem {
 }
 
 impl InitSystem {
-    /// Dropdown order (index = position here). `Unknown` stays last.
+    /// Display order (index = position here). `Unknown` stays last.
     pub const ALL: [InitSystem; 6] = [
         InitSystem::Systemd,
         InitSystem::OpenRc,
@@ -170,7 +169,7 @@ impl InitSystem {
 /// App packaging sandbox. Inside one, host files (`/etc/os-release`, `/run`,
 /// `/proc/1`) reflect the SANDBOX/runtime, not the user's host — so host
 /// detection must read the host-exposed paths, and init detection can't be
-/// trusted (it falls back to the manual override).
+/// trusted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sandbox {
     None,
@@ -194,7 +193,7 @@ pub fn detect_sandbox() -> Sandbox {
 /// dir, with a `/proc/1/comm` fallback.
 ///
 /// In a sandbox these all reflect the SANDBOX, not the host, so we return
-/// `Unknown` and let the wizard's init override decide.
+/// `Unknown`.
 pub fn detect_init() -> InitSystem {
     if detect_sandbox() != Sandbox::None {
         return InitSystem::Unknown;

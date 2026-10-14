@@ -7,9 +7,7 @@
 //! `reqwest::Error`'s own `Display` embeds the full request URL, which means the
 //! ordinary act of reporting a failed fetch — `format!("{err}")`, a `log::warn!`,
 //! an error string handed back to the daemon API — writes that credential to
-//! `pibuz.log`. That is the file people attach to bug reports (upstream#780
-//! item 10; the desktop's Plex/Jellyfin/Subsonic clients strip the URL for this
-//! exact reason and the fix never reached the Qobuz client).
+//! the log. That is the file people attach to bug reports.
 //!
 //! Everything here is text-level on purpose: it runs over a message that may
 //! already be a chain of several errors from several layers, so it cannot

@@ -1,7 +1,7 @@
 //! QConnect startup mode: persisted preference for whether QConnect
-//! auto-connects when the app launches.
+//! auto-connects when the daemon starts.
 //!
-//! Pure logic only — no SQLite, no FS. Persistence lives in the host, next to
+//! Pure logic only — no I/O. Persistence lives in the host, next to
 //! its `device_name` handling (`pibuz::qconnect::transport`).
 
 use serde::{Deserialize, Serialize};

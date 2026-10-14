@@ -1,20 +1,15 @@
-//! Daemon-side local-queue -> Connect-cloud publish (the desktop's
-//! `sync_local_queue_if_changed`, qconnect_service.rs:875).
+//! Daemon-side local-queue -> Connect-cloud publish.
 //!
-//! The daemon was queue RECEIVE-ONLY: a daemon-originated queue (CLI or API)
-//! never reached the cloud, so controllers rendered a
-//! different queue than the one actually playing (design doc had flagged this
-//! as knowingly unported — design-input/qconnect-headless.md:250-252).
+//! Without it a daemon-originated queue (CLI or API) never reaches the cloud,
+//! and controllers render a different queue than the one actually playing.
 //!
 //! The gates, in order: live runtime -> `is_local_renderer_active` (a peer
 //! owns playback -> the peer publishes) -> non-empty -> echo-suppress vs the
-//! cloud's last-applied queue -> per-session `last_pushed_queue_ids` latch.
-//! The desktop's offline-only skip and local-track admission went with its
-//! local library: every track in a daemon queue is a Qobuz track.
+//! cloud's last-applied queue -> per-session `last_pushed_queue_ids` latch
+//! -> admission (every track must be a Qobuz track).
 //!
-//! Trigger: the desktop calls it on every track transition from its poll loop.
-//! The daemon instead runs a debounced `CoreEvent::QueueUpdated` subscriber,
-//! which ALSO covers queue edits while paused/stopped — a transition-only hook
+//! Trigger: a debounced `CoreEvent::QueueUpdated` subscriber, which ALSO
+//! covers queue edits while paused/stopped — a hook on track transitions
 //! would miss those.
 
 use std::sync::Arc;

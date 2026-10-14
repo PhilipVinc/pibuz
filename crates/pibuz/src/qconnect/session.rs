@@ -3,19 +3,17 @@
 //! [`DaemonSessionLoopHost`] implements the frontend-agnostic
 //! `qconnect_app::SessionLoopHost` so the shared `run_session_loop` drives
 //! lifecycle, reconnect bootstrap/resync, deferred renderer-join, and
-//! reconnect-exhausted teardown through this adapter — exactly as
-//! `SlintSessionLoopHost` does.
+//! reconnect-exhausted teardown through this adapter.
 //!
-//! Two DELIBERATE daemon-copy behavior fixes vs. the desktop (OD2 — desktop call
-//! sites untouched; owner may fold these back into the shared path later):
-//!   (a) `deferred_renderer_join` reports the player's REAL volume instead of the
-//!       hardcoded `json!({"volume": 100})` (qconnect_service.rs:2711-2715; §7.4).
+//! Two DELIBERATE behaviours, labelled FIX (a) and (b) where they happen:
+//!   (a) `deferred_renderer_join` reports the player's REAL volume (as the
+//!       volume mode allows) instead of a hardcoded 100.
 //!   (b) `bootstrap_after_reconnect` RE-RESOLVES transport credentials via
 //!       `resolve_transport_config` so a reconnect after JWT expiry recovers
-//!       (IV3 — the WS transport reuses `last_config` and never re-resolves
-//!       `/qws/createToken`; design-input/qconnect-headless.md §7.6.7).
+//!       (the WS transport reuses `last_config` and never re-resolves
+//!       `/qws/createToken` on its own).
 //!
-//! The desktop's D5 offline-mode parks are dropped: pibuz has no offline MODE.
+//! pibuz has no offline MODE, so an exhausted reconnect never parks offline.
 
 use std::sync::Arc;
 
@@ -29,7 +27,7 @@ use serde_json::json;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use super::engine::VolumeMode; // T10 (OD4): join-time volume report honors the mode
+use super::engine::VolumeMode; // join-time volume report honors the mode
 use super::sink::{DaemonEventSink, DaemonQconnectApp};
 use super::transport::{
     default_qconnect_device_info, default_qconnect_device_info_with_name,
@@ -54,8 +52,8 @@ pub struct DaemonSessionLoopHost {
     pub sink: Arc<DaemonEventSink>,
     pub runtime: Runtime,
     pub shared: Arc<std::sync::Mutex<DaemonShared>>,
-    /// T10 (OD4): resolved volume policy — the deferred renderer join reports 100
-    /// in `Locked` mode, the real player volume in `Software`.
+    /// Resolved volume policy — the deferred renderer join reports 100 in
+    /// `Locked` mode, the real player volume otherwise.
     pub volume_mode: VolumeMode,
     /// Volume to set on ourselves when a session picks this device, as a
     /// percentage; `None` leaves the player alone. See
@@ -80,16 +78,14 @@ impl SessionLoopHost for DaemonSessionLoopHost {
     }
 
     async fn bootstrap_after_reconnect(&self) {
-        // FIX (b) (IV3, daemon-copy only): the WS transport reuses `last_config`
-        // on in-loop reconnects and never re-resolves `/qws/createToken`, so a
-        // reconnect after the JWT expires keeps failing. Re-resolve the transport
-        // credentials (fresh `/qws/createToken`) and latch the new config into the
-        // runtime so a subsequent full reconnect uses valid credentials. The
-        // desktop copy does NOT do this.
+        // FIX (b): the WS transport reuses `last_config` on in-loop reconnects
+        // and never re-resolves `/qws/createToken`, so a reconnect after the
+        // JWT expires keeps failing. Re-resolve the transport credentials
+        // (fresh `/qws/createToken`) and latch the new config into the runtime
+        // so a subsequent full reconnect uses valid credentials.
         // Pairing: same source order as `connect()` — a live
         // handed-over token outranks a fresh `/qws/createToken` (the paired
-        // session must survive its own reconnects, not fall back to the
-        // daemon account's session).
+        // session must survive its own reconnects).
         let fresh = match super::pairing::valid_ws_tokens(&self.pairing_store) {
             Some(tokens) => Ok(super::pairing::transport_config_from(&tokens)),
             None => resolve_transport_config(&self.runtime).await,
@@ -120,7 +116,7 @@ impl SessionLoopHost for DaemonSessionLoopHost {
             &self.app,
             &self.sync_state,
             &self.runtime,
-            self.volume_mode, // T10 (OD4): 100 in Locked, real in Software
+            self.volume_mode, // 100 in Locked, real otherwise
             self.initial_volume,
             &session_uuid,
             reason,
@@ -150,21 +146,20 @@ impl SessionLoopHost for DaemonSessionLoopHost {
         }
         if let Ok(mut s) = self.shared.lock() {
             s.latch_qconnect_session_down("exhausted");
-            // 01 §9.3: reconnect-exhausted is a real network-class failure —
+            // Reconnect-exhausted is a real network-class failure —
             // latch `network.online` false (the success side latches true in
             // `latch_lifecycle_into_shared` on the next `Connected` transition).
             s.set_network_online(false);
             s.emit_qconnect_session_changed();
         }
         log::warn!("[QConnect] Reconnect exhausted ({attempts}): {last_reason}");
-        // Daemon has no offline MODE, so the desktop's idle-retry offline park is
-        // dropped: keep idling (the transport's internal 60s idle rearm keeps
-        // trying) unless idle-retry is off, in which case break + drop.
+        // No offline MODE to park in: keep idling (the transport's internal 60s
+        // idle rearm keeps trying) unless idle-retry is off, in which case
+        // break + drop.
         !idle_retry_active
     }
 
     async fn on_loop_error(&self, message: String) {
-        // Slint copy surfaced a toast here — daemon logs it.
         log::error!("[QConnect] session loop error: {message}");
     }
 }
@@ -172,7 +167,6 @@ impl SessionLoopHost for DaemonSessionLoopHost {
 /// Controller-side bootstrap: JoinSession (works without a session_uuid) then ask
 /// for the current queue state. The renderer-side join is deferred until the
 /// server sends SESSION_STATE with a session_uuid (handled in the session loop).
-/// Mirrors the Tauri `bootstrap_remote_presence`.
 pub async fn bootstrap_remote_presence(
     app: &Arc<DaemonQconnectApp>,
     custom_device_name: Option<String>,
@@ -239,15 +233,14 @@ fn join_volume_fraction(initial_volume: Option<u8>, mode: VolumeMode) -> Option<
 }
 
 /// Deferred renderer join: called from the session loop when SESSION_STATE with a
-/// session_uuid arrives. Idempotent per uuid (P1-8). Mirrors the Tauri
-/// `deferred_renderer_join`, reading the current track duration via
-/// `runtime.core().get_track` and the current volume via
+/// session_uuid arrives. Idempotent per uuid. Reads the current track duration
+/// via `runtime.core().get_track` and the current volume via
 /// `runtime.core().get_playback_state()`.
 pub async fn deferred_renderer_join(
     app: &Arc<DaemonQconnectApp>,
     sync_state: &Arc<Mutex<QconnectRemoteSyncState>>,
     runtime: &Runtime,
-    volume_mode: VolumeMode,    // T10 (OD4): join-time volume report policy
+    volume_mode: VolumeMode,    // join-time volume report policy
     initial_volume: Option<u8>, // join-time volume safety (qconnect.initial_volume)
     session_uuid: &str,
     join_reason: i32,
@@ -327,7 +320,7 @@ pub async fn deferred_renderer_join(
             .unwrap_or(0),
         None => 0,
     };
-    // FIX (c) (daemon-copy only): report the player's REAL state, not a
+    // FIX (c): report the player's REAL state, not a
     // hardcoded stopped-at-zero. A RECONNECTION rejoin (and a pairing takeover
     // that lands mid-playback) happens while audio is live, and announcing
     // "stopped, 0:00" made the controller show 0:00 and treat us as idle until
@@ -335,7 +328,7 @@ pub async fn deferred_renderer_join(
     // volume. Position is MILLISECONDS on the wire; the player reports seconds.
     let live = runtime.core().get_playback_state();
     let live_is_current = live.track_id != 0 && Some(live.track_id) == current_track_id;
-    // FIX (c2) (daemon-copy only): only state what we actually know, and leave
+    // FIX (c2): only state what we actually know, and leave
     // every unknown field out. A PAIRING HANDOFF joins as active with no
     // renderer state at all — the controller's SetState is still in flight — so
     // `live_is_current` is false, and announcing "STOPPED, 0:00 of 0:00" there
@@ -408,11 +401,11 @@ pub async fn deferred_renderer_join(
     }
 
     // 3. Report volume and max audio quality.
-    // FIX (a) (§7.4, daemon-copy only): report the player's REAL volume, not the
-    // desktop's hardcoded 100. `get_playback_state().volume` is a 0.0-1.0
-    // fraction; the wire wants a 0-100 percent.
-    // T10 (OD4): the volume MODE decides — `Software` reports the real percent,
-    // `Locked` reports 100 fixed (no software attenuation on the bit-perfect path).
+    // FIX (a): report the player's REAL volume, not a hardcoded 100.
+    // `get_playback_state().volume` is a 0.0-1.0 fraction; the wire wants a
+    // 0-100 percent. The volume MODE decides — `Software`/`External` report
+    // the real percent, `Locked` reports 100 fixed (no software attenuation
+    // on the bit-perfect path).
     let volume_pct = volume_mode.reported_volume_pct(runtime.core().get_playback_state().volume);
     let volume_report = RendererReport::new(
         RendererReportType::RndrSrvrVolumeChanged,

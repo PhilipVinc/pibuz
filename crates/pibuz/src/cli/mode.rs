@@ -1,6 +1,6 @@
-// crates/pibuz/src/cli/mode.rs — the `pibuz shuffle` and `pibuz repeat` verbs
-// (02 §2.2 CONSOLE additions). Each is one POST to a playback route; state
-// also surfaces in `pibuz now`/`status`.
+// crates/pibuz/src/cli/mode.rs — the `pibuz shuffle` and `pibuz repeat` verbs.
+// Each is one POST to a playback route; state also surfaces in `pibuz
+// now`/`status`.
 use crate::cli::client::ApiClient;
 use crate::paths::ProfileRoots;
 

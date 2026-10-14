@@ -1,10 +1,7 @@
-//! Renderer playback-state report (the UI-free body of the desktop
-//! `report_playback_state`, qconnect_service.rs:592).
+//! Renderer playback-state report.
 //!
-//! Daemon adaptation vs. the Slint copy (§1.4): the desktop `report_playback_state`
-//! is a method on `SlintQconnectService` driven by the Slint playback POLL LOOP;
-//! here it is a free function the T10 report tick calls on a tokio interval. No
-//! behavior change — it still self-gates on `is_local_renderer_active`, resolves
+//! `report_playback_state` is a free function the report tick calls on a tokio
+//! interval. It self-gates on `is_local_renderer_active`, resolves
 //! current/next queue_item_id from the playing track, sends a
 //! `RndrSrvrStateUpdated`, keeps the app's renderer position in sync, and reports
 //! the live output format for the controller's quality badge. `position_ms` /
@@ -232,8 +229,7 @@ fn classify_audio_quality(sample_rate: u32, bit_depth: u32) -> i32 {
 }
 
 /// Build a file-audio-quality snapshot from the live output format, or None when
-/// the format isn't known yet. Pure mirror of the Tauri
-/// `build_qconnect_file_audio_quality_snapshot`.
+/// the format isn't known yet.
 fn build_file_audio_quality_snapshot(
     sample_rate: u32,
     bit_depth: u32,
@@ -251,8 +247,7 @@ fn build_file_audio_quality_snapshot(
 }
 
 /// Resolve the current + next `queue_item_id` for a playing `track_id` from the
-/// cloud queue snapshot, caching the result into the sync accumulator. Mirrors
-/// the Tauri `resolve_queue_item_ids_by_track_id`.
+/// cloud queue snapshot, caching the result into the sync accumulator.
 async fn resolve_queue_item_ids_by_track_id(
     app: &Arc<DaemonQconnectApp>,
     sync_state: &Arc<Mutex<QconnectRemoteSyncState>>,
@@ -274,23 +269,22 @@ async fn resolve_queue_item_ids_by_track_id(
     }
 }
 
-// T10 (§7.2, §3.1-7): the report-tick scheduler. The desktop reports from its
-// 450 ms Slint poll loop; the daemon has no such loop, so a dedicated tokio task
-// owns the cadence. It calls `report_playback_state` on the LIVE session (a no-op
-// when not connected or when a peer owns playback, since the body self-gates on
-// `is_local_renderer_active`).
+// The report-tick scheduler. The daemon has no UI poll loop to report from, so
+// a dedicated tokio task owns the cadence. It calls `report_playback_state` on
+// the LIVE session (a no-op when not connected or when a peer owns playback,
+// since the body self-gates on `is_local_renderer_active`).
 //
-// Two triggers, per §7.2 ("~2 s tokio interval while playing + edge-triggered on
-// track/play-state transitions"):
+// Two triggers (~2 s while playing + edge-triggered on track/play-state
+// transitions):
 //   * `notify` — the driver's `DriverAction::ReportEdge` signal (daemon.rs wires
-//     `on_edge -> Notify::notify_one`). The landed T4 driver folds the ~2 s
-//     periodic cadence AND the transition edges into this one signal
-//     (playback.rs:4648, `transition || periodic`).
-//   * a ~2 s `interval` — the periodic FLOOR of §3.1-7. Because the driver
+//     `on_edge -> Notify::notify_one`). The driver folds the ~2 s periodic
+//     cadence AND the transition edges into this one signal
+//     (`playback_driver`, `transition || periodic`).
+//   * a ~2 s `interval` — the periodic FLOOR. Because the driver
 //     already supplies the periodic edge, the interval is RESET on every wake so
 //     it only elapses when the edge stream goes quiet (no double-reporting during
 //     active playback); interval-driven reports are additionally gated on
-//     `is_playing`, so a paused/stopped renderer stays silent like the desktop.
+//     `is_playing`, so a paused/stopped renderer stays silent.
 pub async fn run_report_scheduler(
     notify: Arc<tokio::sync::Notify>,
     inner: Arc<Mutex<super::DaemonQconnectInner>>,

@@ -1,6 +1,7 @@
 //! qconnect-transport-ws
 //!
-//! WS transport trait + in-memory transport used during POC development.
+//! WS transport trait, the native WebSocket transport, and an in-memory
+//! transport for tests.
 
 mod config;
 mod error;
