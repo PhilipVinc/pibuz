@@ -3,7 +3,7 @@
 Notable changes per release. Versions are plain semver; releases are `vX.Y.Z`
 tags on `main`.
 
-## 2.7.0 — unreleased
+## 2.7.0 — 2026-10-15
 
 ### Changed
 
