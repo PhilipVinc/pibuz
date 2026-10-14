@@ -16,7 +16,7 @@ NOT renamed: hook scripts on other people's boxes read them.
 A standard Cargo workspace: manifest at the repo root, members under `crates/`,
 artifacts in `target/`. Plain `cargo build` / `cargo test` from the root work.
 
-The workspace is `pibuz` plus **exactly** its dependency closure — 14 crates, the
+The workspace is `pibuz` plus **exactly** its dependency closure — 13 crates, the
 set `cargo tree -p pibuz` resolves. If you find yourself adding a workspace member,
 check whether `pibuz` really needs it.
 

@@ -5,8 +5,9 @@
 
 use std::sync::Arc;
 
+use crate::orchestrator::QbzCore;
 use qbz_audio::AudioSettings;
-use qbz_core::{FrontendAdapter, QbzCore};
+use qbz_models::FrontendAdapter;
 use qbz_player::Player;
 
 /// Composition root.
@@ -52,7 +53,7 @@ impl<A: FrontendAdapter + Send + Sync + 'static> AppRuntime<A> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qbz_core::NoOpAdapter;
+    use qbz_models::NoOpAdapter;
 
     fn test_runtime() -> AppRuntime<NoOpAdapter> {
         // Building the runtime builds a `reqwest` client, and the workspace

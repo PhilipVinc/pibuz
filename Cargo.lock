@@ -1702,7 +1702,6 @@ dependencies = [
  "mdns-sd",
  "qbz-app",
  "qbz-audio",
- "qbz-core",
  "qbz-log",
  "qbz-models",
  "qbz-player",
@@ -1875,7 +1874,6 @@ dependencies = [
  "log",
  "qbz-audio",
  "qbz-cache",
- "qbz-core",
  "qbz-models",
  "qbz-player",
  "qbz-qobuz",
@@ -1884,6 +1882,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
  "tokio",
  "uuid",
 ]
@@ -1935,22 +1934,6 @@ dependencies = [
  "rand 0.10.1",
  "sha2",
  "thiserror 2.0.18",
-]
-
-[[package]]
-name = "qbz-core"
-version = "2.7.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "log",
- "qbz-models",
- "qbz-player",
- "qbz-qobuz",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
 ]
 
 [[package]]

@@ -9,7 +9,6 @@ repository.workspace = true
 qbz-models = { path = "../qbz-models" }
 qbz-audio = { path = "../qbz-audio" }
 qbz-player = { path = "../qbz-player" }
-qbz-core = { path = "../qbz-core" }
 qbz-qobuz = { path = "../qbz-qobuz" }
 reqwest = { workspace = true }
 serde = { workspace = true }
@@ -20,6 +19,7 @@ log = { workspace = true }
 # [features] below.
 rusqlite = { version = "0.31", features = ["bundled"], optional = true }
 uuid = { version = "1", features = ["v4"] }
+thiserror = { workspace = true }
 chrono = { workspace = true }
 
 # TLS provider selection

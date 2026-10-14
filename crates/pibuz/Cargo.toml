@@ -14,7 +14,6 @@ path = "src/main.rs"
 # workspace crates — the slint-free column ONLY (01-architecture.md §1.2)
 qbz-models = { path = "../qbz-models" }
 qbz-app = { path = "../qbz-app" }
-qbz-core = { path = "../qbz-core" }
 qbz-player = { path = "../qbz-player" }
 qbz-audio = { path = "../qbz-audio" }          # PROTECTED — read-only consumer
 qbz-qobuz = { path = "../qbz-qobuz" }

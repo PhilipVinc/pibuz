@@ -1,3 +1,4 @@
+pub mod orchestrator;
 pub mod playback_driver;
 pub mod settings;
 pub mod shell;

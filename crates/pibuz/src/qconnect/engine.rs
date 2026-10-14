@@ -17,8 +17,8 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use qbz_app::orchestrator::QbzCore;
 use qbz_app::shell::AppRuntime;
-use qbz_core::QbzCore;
 use qbz_models::{Quality, QueueTrack, RepeatMode, Track};
 use qbz_player::PlaybackState;
 use qconnect_app::QconnectRendererEngine;

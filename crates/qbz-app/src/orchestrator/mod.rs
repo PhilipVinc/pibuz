@@ -13,7 +13,9 @@ use qbz_models::{
 use qbz_player::{PlaybackState, Player, QueueManager};
 use qbz_qobuz::QobuzClient;
 
-use crate::error::CoreError;
+mod error;
+
+pub use error::CoreError;
 
 /// Core orchestrator for QBZ
 ///

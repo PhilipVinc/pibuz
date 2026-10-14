@@ -196,7 +196,7 @@ pub fn remove(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
         // are benign (a 404 here; a queue edit the playing-row gate was one tick
         // too late to refuse) — never a panic, never corruption
         // (`QueueManager::remove_track` re-checks bounds under its own lock).
-        // TODO: an atomic remove-guard primitive in qbz-core.
+        // TODO: an atomic remove-guard primitive in the orchestrator.
         None => err_json(
             404,
             "not_found",

@@ -1,4 +1,4 @@
-//! Error types for qbz-core
+//! The orchestrator's error type.
 
 use thiserror::Error;
 

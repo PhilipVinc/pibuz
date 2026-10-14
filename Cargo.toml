@@ -7,7 +7,6 @@ members = [
     "crates/qbz-audio",
     "crates/qbz-player",
     "crates/qbz-qobuz",
-    "crates/qbz-core",
     "crates/qbz-cache",
     "crates/qbz-cmaf",
     "crates/qconnect-core",

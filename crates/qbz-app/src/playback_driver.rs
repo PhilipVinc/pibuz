@@ -18,7 +18,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use qbz_core::{FrontendAdapter, QbzCore};
+use crate::orchestrator::QbzCore;
+use qbz_models::FrontendAdapter;
 use qbz_models::{Quality, QueueTrack, RepeatMode};
 use qbz_player::PlaybackEvent;
 
