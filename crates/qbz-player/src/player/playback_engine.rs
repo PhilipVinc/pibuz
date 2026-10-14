@@ -19,9 +19,9 @@ use ringbuf::{HeapCons, HeapProd, HeapRb};
 use rodio::{mixer::Mixer, Player as RodioPlayer, Source};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// A boxed sample iterator that can be sent across threads
 type BoxedSampleIter = Box<dyn Iterator<Item = f32> + Send>;
@@ -139,6 +139,10 @@ pub(crate) enum PlaybackEngine {
         /// one end-of-stream marker, so resuming it would "play" an empty ring
         /// that nothing will ever report the end of again.
         finished: Arc<AtomicBool>,
+        /// Set once, by the writer, when it gives up on the device: why. See
+        /// `ClockWatch`. A failed engine is never `empty()`, because the
+        /// player reads that as the end of the track and moves on.
+        device_failure: Arc<OnceLock<String>>,
         hardware_volume: bool,
         /// Software volume for the writer thread, as f32 bits — the same
         /// idiom `SharedState::volume` and the normalization `gain_atomic`
@@ -184,6 +188,7 @@ impl PlaybackEngine {
         let volume = Arc::new(AtomicU32::new(1.0f32.to_bits()));
         let link = Arc::new(RingLink::new());
         let finished = Arc::new(AtomicBool::new(false));
+        let device_failure = Arc::new(OnceLock::new());
 
         let channels = stream.channels();
         let capacity_frames = qbz_audio::pcm_ring::ring_capacity_frames(
@@ -234,6 +239,7 @@ impl PlaybackEngine {
             let transition_c = source_transition.clone();
             let volume_c = volume.clone();
             let finished_c = finished.clone();
+            let failure_c = device_failure.clone();
             thread::spawn(move || {
                 alsa_writer_thread(
                     consumer,
@@ -241,6 +247,7 @@ impl PlaybackEngine {
                     link_c,
                     playing_c,
                     finished_c,
+                    failure_c,
                     stop_c,
                     pos_c,
                     transition_c,
@@ -261,6 +268,7 @@ impl PlaybackEngine {
             link,
             source_transition,
             finished,
+            device_failure,
             hardware_volume,
             volume,
         }
@@ -621,14 +629,29 @@ impl PlaybackEngine {
             Self::AlsaDirect {
                 is_playing,
                 source_queue,
+                device_failure,
                 ..
-            } => !is_playing.load(Ordering::SeqCst) && source_queue.is_empty(),
+            } => {
+                device_failure.get().is_none()
+                    && !is_playing.load(Ordering::SeqCst)
+                    && source_queue.is_empty()
+            }
             #[cfg(target_os = "linux")]
             Self::Jack {
                 is_playing,
                 source_queue,
                 ..
             } => !is_playing.load(Ordering::SeqCst) && source_queue.is_empty(),
+        }
+    }
+
+    /// Why the output stopped converting audio, once the writer has given up
+    /// on it. `None` while the device is fine, and always on the backends that
+    /// do not check.
+    pub(crate) fn device_failure(&self) -> Option<String> {
+        match self {
+            Self::AlsaDirect { device_failure, .. } => device_failure.get().cloned(),
+            _ => None,
         }
     }
 
@@ -1006,6 +1029,7 @@ fn alsa_writer_thread(
     link: Arc<RingLink>,
     is_playing: Arc<AtomicBool>,
     finished: Arc<AtomicBool>,
+    device_failure: Arc<OnceLock<String>>,
     should_stop: Arc<AtomicBool>,
     position_frames: Arc<AtomicU64>,
     source_transition: Arc<AtomicBool>,
@@ -1058,6 +1082,11 @@ fn alsa_writer_thread(
     let mut ring_empty_since: Option<std::time::Instant> = None;
     let started_at = std::time::Instant::now();
     let mut finished_reported = false;
+    let mut clock_watch = ClockWatch::new(
+        stream.sample_rate(),
+        stream.clock_speed(),
+        stream.buffer_frames(),
+    );
 
     log::info!(
         "[ALSA Direct Engine] Writer thread started — chunk {chunk_frames} frames, \
@@ -1209,6 +1238,12 @@ fn alsa_writer_thread(
                 Ok(frames) => frames,
                 Err(e) => {
                     log::error!("[ALSA Direct Engine] Write failed: {e}");
+                    // Not the end of the track, and the player must not take
+                    // it for one. A write fails during a stop only after the
+                    // join, so this is the device.
+                    if !should_stop.load(Ordering::SeqCst) {
+                        let _ = device_failure.set(format!("the output device failed: {e}"));
+                    }
                     break 'thread;
                 }
             };
@@ -1317,6 +1352,25 @@ fn alsa_writer_thread(
         let played_total = link
             .frames_handed()
             .saturating_sub(stream.delay_frames() as u64);
+
+        // A device that takes audio faster than its clock can play it is not
+        // playing it. Give up on it here, before the race reaches the end of
+        // the track, and put the position back where the audio was lost.
+        if let Some(stall) = clock_watch.observe(Instant::now(), played_total) {
+            position_frames.store(
+                segment_offset_frames
+                    .saturating_add(stall.last_good_frames.saturating_sub(segment_base_frames)),
+                Ordering::SeqCst,
+            );
+            let message = format!(
+                "the output device stopped converting audio: it took {:.1} s in {} ms",
+                stall.advanced_frames as f64 / f64::from(stream.sample_rate()).max(1.0),
+                stall.over.as_millis()
+            );
+            log::error!("[ALSA Direct Engine] {message}");
+            let _ = device_failure.set(message);
+            break 'thread;
+        }
         // Monotonic within a segment: a resume hands frames back that were
         // already counted, so `delay` briefly exceeds what `handed` accounts
         // for and the difference dips. Holding the last value flat for those
@@ -1332,6 +1386,83 @@ fn alsa_writer_thread(
     is_playing.store(false, Ordering::SeqCst);
     link.close();
     log::info!("[ALSA Direct Engine] Writer thread finished");
+}
+
+/// Judges whether the device is really CLOCKING the audio it accepts.
+///
+/// Seen on the Pi: a USB DAC that stopped answering mid-track kept "taking"
+/// audio. Each write succeeded, each xrun recovered, and the ring was thrown
+/// away every ~15 ms, so the device owed nothing and `handed - delay` said
+/// everything had been played. A 368 s track was consumed in ~25 s, decode
+/// speed being the only limit, and the player moved on to the next one.
+///
+/// No real device consumes faster than its clock, so that is the test, and it
+/// is the same on every backend: over a window of wall time, the audio clock
+/// may advance by what the device's rate allows, twice over for jitter, plus
+/// two hardware rings for the jumps that are legitimate — the whole ring
+/// counted at once before a stream starts, and a pause throwing away what was
+/// queued. A dead device beats that by an order of magnitude.
+///
+/// It trips as soon as the advance exceeds what a FULL window would allow,
+/// without waiting for the window to pass, so how much audio is lost is
+/// bounded by that allowance rather than by how fast the race runs.
+#[derive(Debug)]
+pub(crate) struct ClockWatch {
+    /// What the device's clock consumes per second of wall time.
+    frames_per_sec: f64,
+    /// The legitimate jumps: two hardware rings.
+    slack_frames: u64,
+    /// Where the current window began: when, and the clock reading then.
+    window: Option<(Instant, u64)>,
+}
+
+/// A device judged to have stopped converting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ClockStall {
+    /// The clock reading at the start of the window it failed in: the last
+    /// one the device's own rate can account for.
+    pub(crate) last_good_frames: u64,
+    /// How far the clock ran in that window.
+    pub(crate) advanced_frames: u64,
+    /// Over how much wall time.
+    pub(crate) over: Duration,
+}
+
+impl ClockWatch {
+    /// Long enough that scheduling jitter is small next to it, short enough
+    /// that a 15x race loses a few seconds of a track rather than the rest.
+    const WINDOW: Duration = Duration::from_millis(250);
+
+    pub(crate) fn new(sample_rate: u32, clock_speed: f64, buffer_frames: usize) -> Self {
+        Self {
+            frames_per_sec: f64::from(sample_rate) * clock_speed.max(0.0),
+            slack_frames: 2 * buffer_frames as u64,
+            window: None,
+        }
+    }
+
+    /// Take a clock reading. `Some` when the device has consumed more than
+    /// its rate can explain.
+    pub(crate) fn observe(&mut self, now: Instant, played_total: u64) -> Option<ClockStall> {
+        let (start, base) = *self.window.get_or_insert((now, played_total));
+        let elapsed = now.saturating_duration_since(start);
+        let advanced = played_total.saturating_sub(base);
+        let judged_over = elapsed.max(Self::WINDOW);
+        let allowed =
+            (2.0 * judged_over.as_secs_f64() * self.frames_per_sec) as u64 + self.slack_frames;
+        if advanced > allowed {
+            self.window = None;
+            return Some(ClockStall {
+                last_good_frames: base,
+                advanced_frames: advanced,
+                over: elapsed,
+            });
+        }
+        if elapsed >= Self::WINDOW {
+            self.window = Some((now, played_total));
+        }
+        None
+    }
 }
 
 /// How far into the CURRENT SOURCE the DAC has got, monotonically.
@@ -1540,6 +1671,103 @@ mod track_position_tests {
     #[test]
     fn a_boundary_that_has_not_been_reached_yet_reads_as_zero() {
         assert_eq!(segment_played_frames(100, 500, 0), 0);
+    }
+}
+
+#[cfg(test)]
+mod clock_watch_tests {
+    use super::{ClockStall, ClockWatch};
+    use std::time::{Duration, Instant};
+
+    const RATE: u32 = 44_100;
+    const RING: usize = 22_050; // 500 ms
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    /// Feed `steps` readings `step` apart, the clock advancing by `per_step`
+    /// each time; the first stall, if any.
+    fn run(
+        watch: &mut ClockWatch,
+        t0: Instant,
+        start: u64,
+        step: Duration,
+        per_step: u64,
+        steps: u32,
+    ) -> Option<ClockStall> {
+        (1..=steps).find_map(|i| watch.observe(t0 + step * i, start + per_step * u64::from(i)))
+    }
+
+    #[test]
+    fn a_device_playing_at_its_rate_never_trips() {
+        let mut watch = ClockWatch::new(RATE, 1.0, RING);
+        let t0 = Instant::now();
+        watch.observe(t0, 0);
+        // Ten minutes in 10 ms steps, exactly on the clock.
+        assert_eq!(run(&mut watch, t0, 0, ms(10), 441, 60_000), None);
+    }
+
+    /// The jumps that are real: the whole ring counted the moment a stream is
+    /// primed (the device owes nothing until it starts), and the ring a pause
+    /// throws away.
+    #[test]
+    fn a_ring_counted_at_once_is_not_a_stall() {
+        let mut watch = ClockWatch::new(RATE, 1.0, RING);
+        let t0 = Instant::now();
+        assert_eq!(watch.observe(t0, 0), None);
+        assert_eq!(watch.observe(t0 + ms(1), RING as u64), None);
+        assert_eq!(watch.observe(t0 + ms(2), 2 * RING as u64), None);
+    }
+
+    /// A paused or idle writer reads the same clock for minutes; picking up
+    /// again must not look like the whole gap was consumed at once.
+    #[test]
+    fn a_long_idle_then_playing_again_does_not_trip() {
+        let mut watch = ClockWatch::new(RATE, 1.0, RING);
+        let t0 = Instant::now();
+        assert_eq!(run(&mut watch, t0, 0, ms(100), 0, 3_000), None);
+        let t1 = t0 + ms(300_000);
+        assert_eq!(run(&mut watch, t1, 0, ms(10), 441, 1_000), None);
+    }
+
+    /// The Pi's numbers: ~15x real time, decode-limited. Caught within a
+    /// window, with the position handed back from before the race.
+    #[test]
+    fn a_device_consuming_fifteen_times_its_rate_trips_within_a_window() {
+        let mut watch = ClockWatch::new(RATE, 1.0, RING);
+        let t0 = Instant::now();
+        assert_eq!(run(&mut watch, t0, 0, ms(10), 441, 100), None);
+        let healthy_until = 441 * 100;
+        let t1 = t0 + ms(1_000);
+        let stall = run(&mut watch, t1, healthy_until, ms(10), 441 * 15, 1_000)
+            .expect("a 15x race must trip");
+        assert!(stall.over <= ClockWatch::WINDOW, "took {:?}", stall.over);
+        assert!(stall.last_good_frames <= healthy_until + 441 * 25);
+        // What a full window allows, and not much more, is all that is lost.
+        let allowed = 2 * RATE as u64 / 4 + 2 * RING as u64;
+        assert!(stall.advanced_frames <= allowed + 441 * 15);
+    }
+
+    /// A race faster than the readings: trips on the first one past the bound.
+    #[test]
+    fn an_instant_race_trips_on_the_first_reading() {
+        let mut watch = ClockWatch::new(RATE, 1.0, RING);
+        let t0 = Instant::now();
+        watch.observe(t0, 0);
+        let stall = watch
+            .observe(t0 + ms(1), 30 * RATE as u64)
+            .expect("thirty seconds in a millisecond");
+        assert_eq!(stall.last_good_frames, 0);
+    }
+
+    /// The virtual DAC's faster clock is the clock it is judged against.
+    #[test]
+    fn a_fast_virtual_clock_is_judged_at_its_own_speed() {
+        let mut watch = ClockWatch::new(RATE, 100.0, RING);
+        let t0 = Instant::now();
+        watch.observe(t0, 0);
+        assert_eq!(run(&mut watch, t0, 0, ms(10), 44_100, 500), None);
     }
 }
 
@@ -2106,5 +2334,77 @@ mod engine_behaviour_tests {
         engine.set_volume(0.3);
         #[cfg(target_os = "linux")]
         assert_eq!(out.mixer_writes(), vec![0.3]);
+    }
+    /// Seen on the Pi, 2026-10-11: a moOde restart mid-track left the Modius
+    /// not answering USB. Every write "succeeded", every xrun "recovered",
+    /// and a 368 s track went by in ~25 s, reported as playing, before the
+    /// queue skipped on to the next one the same way. Nothing was heard.
+    ///
+    /// The contract: a device that takes audio far faster than its clock can
+    /// play it has failed. The engine must say so, keep the position where
+    /// the listener actually lost the audio, and NOT read as a track that
+    /// finished — that is what made the player advance the queue.
+    #[test]
+    fn a_dac_that_stops_converting_fails_instead_of_racing_through_the_track() {
+        const TRACK_SECS: f32 = 30.0;
+        // Slow enough that the clock bound means something, fast enough that
+        // the second of audio before the death takes a quarter of a second.
+        let out = device_at(4.0);
+        let mut engine = PlaybackEngine::new_alsa_direct(out.clone(), false);
+        engine.append(tone(TRACK_SECS, 0.25), 0);
+
+        assert!(wait_for("a second of the track to play", || {
+            engine.position_secs().is_some_and(|p| p >= 1)
+        }));
+        out.kill();
+        let died_at = engine.position_secs().expect("a position");
+
+        assert!(
+            wait_for("the engine to report the device", || engine
+                .device_failure()
+                .is_some()),
+            "the engine never noticed: the device took {} frames and played none of them, \
+             and the position reads {:?}s of a {TRACK_SECS}s track",
+            out.frames_lost(),
+            engine.position_secs()
+        );
+        assert!(
+            !engine.empty(),
+            "a failed device read as a finished track — the player advances the queue on that"
+        );
+        let frozen = engine.position_secs().expect("a position");
+        assert!(
+            frozen <= died_at + 1,
+            "the position ran on to {frozen}s after the device died at {died_at}s"
+        );
+        // Bounded by the clock check, not by the length of the track.
+        let lost_secs = out.frames_lost() / u64::from(RATE);
+        assert!(
+            lost_secs < 10,
+            "{lost_secs}s of audio went into a dead device before the engine noticed"
+        );
+        engine.stop();
+    }
+    /// The other half of the contract: a healthy device, taken through the
+    /// clock jumps that are real — the primed ring counted at once, a pause
+    /// throwing the queue away, the resume — is never judged dead.
+    #[test]
+    fn a_healthy_device_through_a_pause_is_never_judged_dead() {
+        let out = device_at(10.0);
+        let mut engine = PlaybackEngine::new_alsa_direct(out.clone(), false);
+        engine.append(tone(4.0, 0.25), 0);
+        assert!(wait_for("a second of the track to play", || {
+            engine.position_secs().is_some_and(|p| p >= 1)
+        }));
+        engine.pause();
+        std::thread::sleep(Duration::from_millis(50));
+        engine.play();
+        assert!(
+            wait_for("the track to finish", || engine.empty()),
+            "the track never finished: {:?}",
+            engine.device_failure()
+        );
+        assert_eq!(engine.device_failure(), None);
+        engine.stop();
     }
 }

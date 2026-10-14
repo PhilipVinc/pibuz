@@ -34,6 +34,12 @@
 //!   ([`VirtualAudioOut::underruns`]) instead of being silently absorbed.
 //! - **Discard.** [`AudioOut::discard_queued`] throws away what is queued and
 //!   returns to the un-started state, as `snd_pcm_drop` + `prepare` does.
+//! - **A DAC that stops converting.** After [`VirtualAudioOut::kill`] every
+//!   write is accepted at once and none of it is played, which is what a USB
+//!   DAC that stopped answering looked like through ALSA on a Pi: each write
+//!   "succeeded", each xrun "recovered", and the ring was thrown away every
+//!   ~15 ms. The writer saw a device that took audio as fast as it could be
+//!   decoded and owed nothing.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -79,6 +85,11 @@ pub struct VirtualAudioOut {
     silence_written: AtomicU64,
     /// Times the ring emptied while the clock was running.
     underruns: AtomicU64,
+    /// Set by [`Self::kill`]: the device accepts everything and plays nothing.
+    dead: AtomicBool,
+    /// Frames accepted and thrown away unplayed: what was queued when the
+    /// device died, and everything handed over since.
+    lost: AtomicU64,
     /// Every frame handed over, in order, when recording is on.
     tape: Mutex<Option<Vec<f32>>>,
     /// Every level a caller tried to put on the (absent) hardware mixer, so a
@@ -107,6 +118,8 @@ impl VirtualAudioOut {
             written: AtomicU64::new(0),
             silence_written: AtomicU64::new(0),
             underruns: AtomicU64::new(0),
+            dead: AtomicBool::new(false),
+            lost: AtomicU64::new(0),
             tape: Mutex::new(None),
             mixer_writes: Mutex::new(Vec::new()),
         }
@@ -179,6 +192,28 @@ impl VirtualAudioOut {
         (clock.played, queued, written)
     }
 
+    /// Stop converting, the way a USB DAC that stops answering does.
+    ///
+    /// What is queued is lost, and from here on every write is accepted at
+    /// once and thrown away, with the device prepared and owing nothing. It
+    /// never errors: on the Pi, ALSA's recovery succeeded every time.
+    pub fn kill(&self) {
+        let mut clock = self.clock.lock().expect("clock");
+        self.advance(&mut clock);
+        let written = self.written.load(Ordering::Acquire);
+        self.lost
+            .fetch_add(written.saturating_sub(clock.played), Ordering::AcqRel);
+        clock.played = written;
+        clock.state = ClockState::Prepared;
+        clock.carry = 0.0;
+        self.dead.store(true, Ordering::Release);
+    }
+
+    /// Frames accepted and never played because the device was dead.
+    pub fn frames_lost(&self) -> u64 {
+        self.lost.load(Ordering::Acquire)
+    }
+
     /// True once the clock is consuming.
     pub fn is_running(&self) -> bool {
         self.clock.lock().expect("clock").state == ClockState::Running
@@ -217,6 +252,18 @@ impl VirtualAudioOut {
 
     /// Accept up to `frames`, blocking (in virtual time) until there is room.
     fn accept(&self, frames: usize, cancel: &AtomicBool, silence: bool) -> usize {
+        if self.dead.load(Ordering::Acquire) {
+            // Taken at once and gone: written, never queued, never played.
+            let mut clock = self.clock.lock().expect("clock");
+            let written = self.written.fetch_add(frames as u64, Ordering::AcqRel) + frames as u64;
+            if silence {
+                self.silence_written
+                    .fetch_add(frames as u64, Ordering::AcqRel);
+            }
+            self.lost.fetch_add(frames as u64, Ordering::AcqRel);
+            clock.played = written;
+            return frames;
+        }
         let mut accepted = 0usize;
         while accepted < frames {
             if cancel.load(Ordering::SeqCst) {
@@ -284,6 +331,10 @@ impl AudioOut for VirtualAudioOut {
         self.period_frames
     }
 
+    fn clock_speed(&self) -> f64 {
+        self.speed
+    }
+
     fn write_f32(&self, samples: &[f32], cancel: &AtomicBool) -> Result<usize, String> {
         let channels = usize::from(self.channels).max(1);
         let frames = samples.len() / channels;
@@ -333,7 +384,9 @@ impl AudioOut for VirtualAudioOut {
 
     fn start_if_prepared(&self) -> Result<(), String> {
         let mut clock = self.clock.lock().expect("clock");
-        if clock.state == ClockState::Prepared {
+        // A dead device "starts" and is back in prepared at once: on the Pi
+        // the xrun came straight after the start, and the recovery prepared it.
+        if clock.state == ClockState::Prepared && !self.dead.load(Ordering::Acquire) {
             clock.state = ClockState::Running;
             clock.last_tick = Instant::now();
             clock.carry = 0.0;
@@ -511,6 +564,32 @@ mod tests {
             "a second top-up wrote {again} of {written} frames — the depth is a ceiling, \
              not a target to refill from scratch"
         );
+    }
+
+    /// The dead device as the writer sees it: every write lands at once, the
+    /// device owes nothing, and nothing is played.
+    #[test]
+    fn a_killed_device_takes_everything_and_plays_nothing() {
+        let out = VirtualAudioOut::new(44_100, 2, 100, 1.0);
+        out.write_f32(&vec![0.1f32; out.buffer_frames() * 2], &cancel())
+            .unwrap();
+        assert!(out.is_running());
+        out.kill();
+        let lost_at_death = out.frames_lost();
+        assert!(lost_at_death > 0, "what was queued when it died is lost");
+
+        // Ten rings, far more than it could hold, all accepted without waiting.
+        let started = Instant::now();
+        let ten_rings = out.buffer_frames() * 10;
+        let accepted = out
+            .write_f32(&vec![0.1f32; ten_rings * 2], &cancel())
+            .unwrap();
+        out.start_if_prepared().unwrap();
+        assert_eq!(accepted, ten_rings);
+        assert!(started.elapsed() < Duration::from_millis(50));
+        assert_eq!(out.delay_frames(), 0, "a dead device owes nothing");
+        assert!(!out.is_running(), "and never gets going");
+        assert_eq!(out.frames_lost(), lost_at_death + ten_rings as u64);
     }
 
     #[test]

@@ -43,6 +43,16 @@ pub trait AudioOut: Send + Sync {
     /// One period, in frames, as granted.
     fn period_frames(&self) -> usize;
 
+    /// Seconds of audio the device's clock consumes per second of wall time.
+    ///
+    /// 1.0 for every real device. The virtual DAC runs its clock faster so a
+    /// test can play a whole track in milliseconds, and the writer's check
+    /// that the device is really clocking what it accepts has to judge it
+    /// against the clock it actually has.
+    fn clock_speed(&self) -> f64 {
+        1.0
+    }
+
     /// Hand interleaved `f32` frames over, returning how many FRAMES the device
     /// accepted.
     ///

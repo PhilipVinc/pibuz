@@ -662,6 +662,32 @@ fn release_streaming_source(slot: &mut Option<Arc<BufferedMediaSource>>) {
     }
 }
 
+/// Give the output device back: stop the engine first, then drop the stream,
+/// which closes the PCM.
+///
+/// What the pause-suspend does after two seconds, and what a device that
+/// stopped converting needs before it can be opened again: closing and
+/// reopening the PCM is what brought a dead USB DAC back on the Pi.
+fn release_output(engine: &mut Option<PlaybackEngine>, stream: &mut Option<StreamType>) {
+    if let Some(engine) = engine.take() {
+        engine.stop();
+    }
+    drop(stream.take());
+    // Reset the PipeWire clock if WE forced it (self-gating; see
+    // reset_pipewire_clock).
+    #[cfg(target_os = "linux")]
+    qbz_audio::pipewire_backend::PipeWireBackend::reset_pipewire_clock();
+    // The exclusive device is released, so resume any PipeWire sink we
+    // suspended for it — a self-gating no-op otherwise (#263).
+    #[cfg(target_os = "linux")]
+    qbz_audio::alsa_backend::resume_suspended_sink();
+}
+
+/// How long after reopening a device that stopped converting a second
+/// failure counts as the same one. Inside it the play fails instead of
+/// reopening again, so a DAC that is really gone costs one reopen, not a loop.
+const DEVICE_REOPEN_COOLDOWN: Duration = Duration::from_secs(30);
+
 /// Whether a fully-buffered streaming track should be COPIED out of its
 /// streaming buffer into an owned `TrackBytes` for the cached-transition path.
 ///
@@ -2524,6 +2550,9 @@ impl Player {
             const PAUSE_SUSPEND_DELAY_MS: u64 = 2000;
             let mut pause_suspend_deadline: Option<Instant> = None;
             let mut last_empty_check = Instant::now();
+            // When a device that stopped converting was last reopened. See
+            // DEVICE_REOPEN_COOLDOWN.
+            let mut last_device_reopen: Option<Instant> = None;
             // Current track's normalization gain factor (stored for reuse on resume/seek)
             let mut current_normalization_gain: Option<f32> = None;
             // Current track's dynamic gain atomic (shared with DynamicAmplify + LoudnessAnalyzer)
@@ -5240,6 +5269,76 @@ impl Player {
                                     gapless_request_armed = true;
                                 }
 
+                                // The device stopped converting (see the engine's
+                                // `ClockWatch`). Checked AFTER the hand-off above,
+                                // so the track being resumed is the one that was
+                                // audible, and BEFORE the end check below, which
+                                // is what used to read a dead DAC as a finished
+                                // track and walk it down the queue.
+                                //
+                                // Closing and reopening the PCM is what brought
+                                // the Modius back on the Pi, and Resume is exactly
+                                // that: it rebuilds the engine at the position the
+                                // engine froze, so nothing the listener missed is
+                                // skipped. Once per cooldown; a second failure
+                                // inside it is a device that is really gone.
+                                if let Some(failure) = current_engine
+                                    .as_ref()
+                                    .and_then(PlaybackEngine::device_failure)
+                                {
+                                    let frozen_secs = current_engine
+                                        .as_ref()
+                                        .and_then(PlaybackEngine::position_secs);
+                                    release_output(&mut current_engine, &mut stream_opt);
+                                    // Not playing first, so the position below is
+                                    // read verbatim rather than extrapolated.
+                                    thread_state.is_playing.store(false, Ordering::SeqCst);
+                                    if let Some(secs) = frozen_secs {
+                                        thread_state.position.store(secs, Ordering::SeqCst);
+                                    }
+                                    // A queued next track went with the engine.
+                                    thread_state.set_gapless_ready(false);
+                                    thread_state.set_gapless_next_track_id(0);
+                                    gapless_pending = None;
+                                    gapless_request_armed = false;
+
+                                    let reopen = last_device_reopen
+                                        .is_none_or(|at| at.elapsed() >= DEVICE_REOPEN_COOLDOWN);
+                                    if reopen {
+                                        last_device_reopen = Some(Instant::now());
+                                        log::warn!(
+                                            "Audio thread: {failure}; reopening it and resuming at {}s",
+                                            thread_state.position.load(Ordering::SeqCst)
+                                        );
+                                        handle_command(
+                                            AudioCommand::Resume { cached: None },
+                                            &mut current_engine,
+                                            &mut current_audio_data,
+                                            &mut current_audio_file,
+                                            &mut current_streaming_source,
+                                            &mut stream_opt,
+                                            &mut current_device_name,
+                                            &mut consecutive_sink_failures,
+                                            &mut pause_suspend_deadline,
+                                            &mut current_track_sample_rate,
+                                            &mut current_track_channels,
+                                            &mut current_normalization_gain,
+                                            &mut current_gain_atomic,
+                                            &mut gapless_pending,
+                                            &mut gapless_request_armed,
+                                        );
+                                    } else {
+                                        log::error!(
+                                            "Audio thread: {failure}, again within {}s of reopening it; stopping",
+                                            DEVICE_REOPEN_COOLDOWN.as_secs()
+                                        );
+                                        thread_state.record_stream_error(format!(
+                                            "The audio device stopped playing: {failure}"
+                                        ));
+                                    }
+                                    continue;
+                                }
+
                                 // Check if ALL sources are done (engine empty)
                                 if let Some(ref engine) = current_engine {
                                     if engine.empty()
@@ -5271,23 +5370,12 @@ impl Player {
                         if stream_opt.is_some() {
                             let now = Instant::now();
                             if now >= deadline {
-                                if let Some(engine) = current_engine.take() {
-                                    engine.stop();
-                                }
-                                drop(stream_opt.take());
+                                // The PipeWire clock reset inside is unconditional
+                                // now — the previous pw_force_bitperfect gate leaked
+                                // a forced rate for plain (no-passthrough) PipeWire
+                                // users (#263).
+                                release_output(&mut current_engine, &mut stream_opt);
                                 pause_suspend_deadline = None;
-                                // Reset the PipeWire clock if WE forced it (self-gating;
-                                // see reset_pipewire_clock). Unconditional now — the
-                                // previous pw_force_bitperfect gate leaked a forced rate
-                                // for plain (no-passthrough) PipeWire users (#263).
-                                #[cfg(target_os = "linux")]
-                                qbz_audio::pipewire_backend::PipeWireBackend::reset_pipewire_clock(
-                                );
-                                // The exclusive device is now released (stream dropped
-                                // above), so resume any PipeWire sink we suspended for
-                                // exclusive access — self-gating no-op otherwise (#263).
-                                #[cfg(target_os = "linux")]
-                                qbz_audio::alsa_backend::resume_suspended_sink();
                                 log::info!("Audio thread: suspended stream after pause");
                                 continue;
                             }
