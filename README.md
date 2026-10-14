@@ -40,6 +40,7 @@ pibuz supports cross compilation through a few scripts in the scripts directory.
 ```bash
 ./scripts/build-aarch64-pibuz.sh      # native on ARM, or cross via Docker on x86-64
 ./scripts/pibuz-to-pi.sh              # copy the binary to the Pi and restart the service
+./scripts/pibuz-to-pi.sh --deb        # same, as a package moOde's renderer page detects
 ```
 
 A 4 GB Pi can build the daemon natively. The cross path uses `Cross.toml` to supply the arm64 dev libs inside the `cross` image.

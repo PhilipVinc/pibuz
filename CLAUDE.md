@@ -63,6 +63,7 @@ cargo build --release -p pibuz
 ./scripts/cargo-test.sh          # whole workspace, same command CI runs
 ./scripts/build-aarch64-pibuz.sh  # Pi binary: native on ARM, cross via Docker on x86-64
 ./scripts/pibuz-to-pi.sh          # copy to the Pi, restart the service
+./scripts/pibuz-to-pi.sh --deb    # same, as a dpkg package moOde's renderer page detects
 ./scripts/pibuz-acceptance.sh     # end-to-end against a running daemon
 ```
 
