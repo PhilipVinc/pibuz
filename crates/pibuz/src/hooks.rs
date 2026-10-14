@@ -11,7 +11,7 @@
 // Enablement: the `QBZD_HOOK` env var wins when set (empty disables);
 // otherwise the persisted `daemon_prefs.hook_script` path, written by `pibuz
 // settings set hooks.script`. Changing it needs a daemon restart (the
-// dispatcher spawns at boot, like MPRIS).
+// dispatcher spawns at boot).
 //
 // The dispatcher never waits for the script inside the recv loop (a slow
 // script would lag the broadcast bus) — each event forks detached and a small
@@ -104,7 +104,7 @@ const STOP_SETTLE: std::time::Duration = std::time::Duration::from_secs(5);
 /// a takeover, `stopped` for two seconds, a full stop/start of the daemon, and
 /// the renderer vanished from the new controller's app until it rejoined.
 ///
-/// Only the HOOK is held back. SSE and MPRIS still see every state as it
+/// Only the HOOK is held back. SSE still sees every state as it
 /// happens; a script that forks per event is the consumer that acts on a
 /// flicker. A genuine stop reaches it [`STOP_SETTLE`] late, which is noise
 /// next to how long a stopped session stays stopped.

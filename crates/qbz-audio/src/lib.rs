@@ -52,7 +52,6 @@ pub mod coreaudio_direct;
 pub mod dac_capabilities;
 pub mod dac_probe;
 pub mod device_filter;
-pub mod device_reservation;
 pub mod dynamic_amplify;
 pub mod health;
 // `jack_backend` is the real client when the `jack` feature is on, and a
@@ -94,7 +93,6 @@ pub use backend::{
 pub use coreaudio_direct::CoreAudioExclusiveGuard;
 pub use dac_capabilities::{query_dac_capabilities, DacCapabilities};
 pub use dac_probe::{negotiated_active_rate, negotiated_stream_rate, NegotiatedRate};
-pub use device_reservation::{DeviceReservation, ReservationError};
 pub use dynamic_amplify::DynamicAmplify;
 pub use health::{
     audio_stack_health, detect_distro, detect_init, detect_sandbox, AudioStackHealth, Distro,

@@ -3,7 +3,7 @@
 //! pibuz AND settings::bundle share one struct (D2).
 //!
 //! Stored as two sections of `settings.toml`, named after the CLI keys that
-//! set them: `[playback]` holds `quality` and `mpris`, `[hooks]` holds
+//! set them: `[playback]` holds `quality`, `[hooks]` holds
 //! `script`. They used to be `daemon_prefs.json`, which is folded in and
 //! deleted on first use.
 use qbz_models::settings_file::{self, Sections};
@@ -15,10 +15,6 @@ use std::path::Path;
 pub struct DaemonPrefs {
     /// "mp3" | "cd" | "hires" | "hires_plus".
     pub streaming_quality: String,
-    /// Whether the daemon publishes MPRIS system media controls at boot
-    /// (CONSOLE ext). Default ON; the `QBZD_MPRIS` env var overrides it when
-    /// set. Toggling this needs a daemon restart (the service spawns at boot).
-    pub mpris_enabled: bool,
     /// Absolute path of an executable the daemon runs on playback/session
     /// events (CONSOLE ext), with the event in `QBZ_*` environment variables.
     /// Empty = hooks off (the default). The `QBZD_HOOK` env var overrides it
@@ -30,7 +26,6 @@ impl Default for DaemonPrefs {
     fn default() -> Self {
         Self {
             streaming_quality: "hires_plus".into(),
-            mpris_enabled: true,
             hook_script: String::new(),
         }
     }
@@ -40,7 +35,6 @@ impl Default for DaemonPrefs {
 #[serde(default)]
 struct PlaybackSection {
     quality: String,
-    mpris: bool,
 }
 
 impl Default for PlaybackSection {
@@ -48,7 +42,6 @@ impl Default for PlaybackSection {
         let d = DaemonPrefs::default();
         Self {
             quality: d.streaming_quality,
-            mpris: d.mpris_enabled,
         }
     }
 }
@@ -91,7 +84,6 @@ fn from_sections(sections: &Sections) -> Result<DaemonPrefs, String> {
     let hooks: HooksSection = sections.get(HOOKS)?;
     Ok(DaemonPrefs {
         streaming_quality: playback.quality,
-        mpris_enabled: playback.mpris,
         hook_script: hooks.script,
     })
 }
@@ -101,7 +93,6 @@ fn to_sections(sections: &mut Sections, prefs: &DaemonPrefs) -> Result<(), Strin
         PLAYBACK,
         &PlaybackSection {
             quality: prefs.streaming_quality.clone(),
-            mpris: prefs.mpris_enabled,
         },
     )?;
     sections.set(
@@ -154,7 +145,6 @@ mod tests {
         let dir = unique_test_dir("missing");
         let prefs = load_at(&dir);
         assert_eq!(prefs.streaming_quality, "hires_plus");
-        assert!(prefs.mpris_enabled);
         assert!(!dir.exists(), "a read must not create the data root");
     }
 
@@ -163,9 +153,6 @@ mod tests {
         let dir = unique_test_dir("roundtrip");
         update_at(&dir, |p| {
             p.streaming_quality = "cd".into();
-            // Non-default (default is true) so the roundtrip actually
-            // exercises the field, not just its presence.
-            p.mpris_enabled = false;
             // Non-default (default is empty) for the same reason.
             p.hook_script = "/usr/local/bin/qbz-hook.sh".into();
         })
@@ -173,7 +160,6 @@ mod tests {
         let loaded = load_at(&dir);
 
         assert_eq!(loaded.streaming_quality, "cd");
-        assert!(!loaded.mpris_enabled);
         assert_eq!(loaded.hook_script, "/usr/local/bin/qbz-hook.sh");
         let text = std::fs::read_to_string(settings_file::path(&dir)).unwrap();
         assert!(
@@ -198,7 +184,6 @@ mod tests {
         let loaded = load_at(&dir);
 
         assert_eq!(loaded.streaming_quality, "mp3");
-        assert!(!loaded.mpris_enabled);
         assert_eq!(loaded.hook_script, "/opt/hook.sh");
         assert!(!dir.join(LEGACY_JSON).exists());
         assert!(!dir.join("playback_preferences.db").exists());

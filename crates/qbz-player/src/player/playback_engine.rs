@@ -199,8 +199,7 @@ impl PlaybackEngine {
         // The DECODER holds no `Arc<AlsaDirectStream>`, and that is a
         // deliberate safety property rather than an accident of what it needs.
         //
-        // The stream owns the exclusive `hw:` handle and the D-Bus device
-        // reservation, and issue #521 is what happens when a surviving clone of
+        // The stream owns the exclusive `hw:` handle, and issue #521 is what happens when a surviving clone of
         // it outlives a stop: the device stays open and the NEXT stream fails to
         // start. The decoder is the thread that CAN get stuck — it is the one
         // allowed to block on the network — so if a stop ever has to abandon a

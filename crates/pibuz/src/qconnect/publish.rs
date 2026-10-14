@@ -1,7 +1,7 @@
 //! Daemon-side local-queue -> Connect-cloud publish (the desktop's
 //! `sync_local_queue_if_changed`, qconnect_service.rs:875).
 //!
-//! The daemon was queue RECEIVE-ONLY: a daemon-originated queue (CLI/TUI/MPRIS)
+//! The daemon was queue RECEIVE-ONLY: a daemon-originated queue (CLI or API)
 //! never reached the cloud, so controllers rendered a
 //! different queue than the one actually playing (design doc had flagged this
 //! as knowingly unported — design-input/qconnect-headless.md:250-252).
@@ -238,7 +238,7 @@ pub fn spawn_queue_cloud_publish(
 ///
 /// A controller's own `SetVolume` is reported back by the shared renderer
 /// (`QconnectApp`'s SetVolume echo); nothing reported a change made HERE — an
-/// integrator's `POST /api/playback/volume`, MPRIS — so the app's slider sat
+/// integrator's `POST /api/playback/volume` — so the app's slider sat
 /// where it was while the level moved under it. In `external` mode that is
 /// the whole point of the POST (issue #3): the level lives with whoever owns
 /// the DAC, and this is how the phone learns it.

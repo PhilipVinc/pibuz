@@ -20,7 +20,7 @@
 # Dep list is kept in sync with build-aarch64-pibuz.sh's DEPS array and the
 # workflow's `system deps` step, and it is short on purpose. libssl-dev,
 # libdbus-1-dev, clang/libclang-dev and cmake all used to be here and none was
-# ever used: TLS is rustls, MPRIS is zbus, nothing runs bindgen, and aws-lc-sys
+# ever used: TLS is rustls, nothing uses D-Bus, nothing runs bindgen, and aws-lc-sys
 # builds its C with cc on aarch64. libjack-jackd2-dev left with them when the
 # JACK backend became qbz-audio's off-by-default `jack` feature — jack-sys
 # cannot even BUILD without jack.pc, so its mere presence in the graph was the

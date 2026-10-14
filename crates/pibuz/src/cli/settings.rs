@@ -117,10 +117,8 @@ const KEY_TABLE: &[(&str, ApplyClass)] = &[
     ("audio.normalization_enabled", ApplyClass::Reload),
     ("audio.normalization_target_lufs", ApplyClass::Reload),
     ("audio.pw_force_bitperfect", ApplyClass::Reload),
-    ("audio.reserve_dac_while_running", ApplyClass::Reload),
     // --- playback (daemon_prefs) --------------------------------------------
     ("playback.quality", ApplyClass::None),
-    ("playback.mpris", ApplyClass::None),
     // --- qconnect (the [qconnect] section, T9) ------------------------------
     ("qconnect.device_name", ApplyClass::None),
     ("qconnect.startup_mode", ApplyClass::None),
@@ -147,6 +145,7 @@ const IGNORED_KEYS: &[&str] = &[
     "playback.autoplay",
     "playback.persist_session",
     "playback.resume_playback_position",
+    "playback.mpris",
 ];
 
 fn classify(key: &str) -> Option<ApplyClass> {
@@ -576,9 +575,7 @@ fn read_all(roots: &ProfileRoots) -> Result<Vec<(&'static str, String)>, String>
             "audio.normalization_enabled" => render_bool(audio.normalization_enabled),
             "audio.normalization_target_lufs" => audio.normalization_target_lufs.to_string(),
             "audio.pw_force_bitperfect" => render_bool(audio.pw_force_bitperfect),
-            "audio.reserve_dac_while_running" => render_bool(audio.reserve_dac_while_running),
             "playback.quality" => prefs.streaming_quality.clone(),
-            "playback.mpris" => render_bool(prefs.mpris_enabled),
             "qconnect.device_name" => render_opt_string(&qconnect_kv::load_device_name_at(root)),
             "qconnect.startup_mode" => qconnect_kv::load_startup_mode_at(root).as_str().to_string(),
             "qconnect.volume_mode" => {
@@ -804,21 +801,10 @@ fn write_one(roots: &ProfileRoots, key: &str, raw: &str) -> Result<ApplyClass, S
                 .set_pw_force_bitperfect(v)
                 .map_err(SetError::Io)?
         }
-        "audio.reserve_dac_while_running" => {
-            let v = parse_bool(raw).map_err(SetError::Usage)?;
-            open_audio(roots)
-                .map_err(SetError::Io)?
-                .set_reserve_dac_while_running(v)
-                .map_err(SetError::Io)?
-        }
         "playback.quality" => {
             let v = parse_streaming_quality(raw).map_err(SetError::Usage)?;
             daemon_prefs::update_at(&roots.data, |p| p.streaming_quality = v)
                 .map_err(SetError::Io)?;
-        }
-        "playback.mpris" => {
-            let v = parse_bool(raw).map_err(SetError::Usage)?;
-            daemon_prefs::update_at(&roots.data, |p| p.mpris_enabled = v).map_err(SetError::Io)?;
         }
         "qconnect.device_name" => {
             qconnect_kv::persist_device_name_at(&roots.data, parse_output_device(raw).as_deref())
@@ -1086,11 +1072,6 @@ pub fn config_show(json: bool, roots: &ProfileRoots) -> i32 {
         },
     );
     line("log.level", "log.level", cfg.log.level.clone());
-    line(
-        "mpris.enabled",
-        "mpris.enabled",
-        cfg.mpris.enabled.to_string(),
-    );
     0
 }
 

@@ -14,7 +14,6 @@ members = [
     "crates/qconnect-protocol",
     "crates/qconnect-transport-ws",
     "crates/qconnect-app",
-    "crates/qbz-media-controls",
     "crates/qbz-log",
     "crates/pibuz",
 ]

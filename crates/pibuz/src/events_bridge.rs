@@ -4,9 +4,7 @@
 // The 450 ms playback driver detects track/play-state transitions
 // (`DriverAction::ReportEdge` -> `deps.on_edge`), but nothing translated those
 // edges into the playback CoreEvent variants the bus consumers were written
-// for: mpris.rs and scrobble_engine.rs both carry TrackStarted /
-// PlaybackStateChanged / PositionUpdated / VolumeChanged arms that never
-// fired, and `/api/events` (SSE) / `pibuz watch` carried no playback traffic at
+// for: those variants never fired, and `/api/events` (SSE) / `pibuz watch` carried no playback traffic at
 // all. This task closes that gap: it wakes on the same edge Notify pulse the
 // QConnect report scheduler uses (with a 2 s poll fallback, because
 // `plan_tick` only reports edges while a track id is present — a stop that
@@ -37,7 +35,7 @@ const FALLBACK_POLL: Duration = Duration::from_secs(2);
 ///   current-track metadata),
 /// * `PlaybackStateChanged` on a playing/paused/stopped change,
 /// * `PositionUpdated` on every wake while playing (~2 s cadence, the
-///   scrobbler's timing source and the MPRIS progress feed),
+///   progress feed for SSE clients),
 /// * `VolumeChanged` on a volume change.
 pub fn spawn(
     runtime: &Runtime,
@@ -74,7 +72,7 @@ pub fn spawn(
                 }
             }
 
-            // Same three-way mapping as the MPRIS seed: loaded-but-not-playing
+            // Three-way mapping: loaded-but-not-playing
             // audio is Paused, nothing loaded is Stopped. Dedup on the MAPPED
             // state, not `is_playing` — paused and stopped are both
             // not-playing, and a pause -> stop transition must still emit.

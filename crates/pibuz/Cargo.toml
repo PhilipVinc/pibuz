@@ -18,7 +18,6 @@ qbz-core = { path = "../qbz-core" }
 qbz-player = { path = "../qbz-player" }
 qbz-audio = { path = "../qbz-audio" }          # PROTECTED — read-only consumer
 qbz-qobuz = { path = "../qbz-qobuz" }
-qbz-media-controls = { path = "../qbz-media-controls" } # MPRIS/media-key control (CONSOLE ext); mpris-server on Linux
 qbz-log = { path = "../qbz-log" }
 qconnect-core = { path = "../qconnect-core" }
 qconnect-protocol = { path = "../qconnect-protocol" }
@@ -72,8 +71,8 @@ sqlite-migrate = ["qbz-app/sqlite-migrate", "qbz-audio/sqlite-migrate"]
 # it in their own packaging rather than have it appear here.
 #
 # `$auto` resolves the runtime deps from what the binary actually links:
-# libasound2 and libjack-jackd2-0 (jack-sys), plus libc/libgcc. No TLS or D-Bus
-# runtime dep — rustls and zbus are pure Rust.
+# libasound2 and libjack-jackd2-0 (jack-sys), plus libc/libgcc. No TLS runtime
+# dep — rustls is pure Rust.
 [package.metadata.deb]
 maintainer = "Filippo Vicentini <filippovicentini@gmail.com>"
 copyright = "2024 blitzkriegfc, 2026 Filippo Vicentini, MIT"

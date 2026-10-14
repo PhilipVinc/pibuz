@@ -589,7 +589,7 @@ async fn advance_and_play_logged<A: FrontendAdapter + Send + Sync + 'static>(
 }
 
 /// A skip the LISTENER asked for — next/previous from the control API (the CLI,
-/// moOde) or MPRIS — as opposed to a track running out. In repeat-one the
+/// moOde) — as opposed to a track running out. In repeat-one the
 /// queue's `next()` hands back the current track, which is right when a track
 /// ends and wrong for a skip: pressing next just restarted the song. The web
 /// player turns repeat off on a manual skip and then moves; so does this, and

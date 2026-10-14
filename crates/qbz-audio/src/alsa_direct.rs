@@ -747,16 +747,6 @@ pub fn f32_to_s32(sample: f32) -> i32 {
 }
 
 /// Direct ALSA PCM stream for hw: devices
-///
-/// Field order is significant: Rust drops struct fields top-to-bottom, so the
-/// `PCM` is dropped first (releasing the kernel-level exclusive grip on the
-/// `hw:` device) BEFORE `_reservation` drops (releasing the
-/// `org.freedesktop.ReserveDevice1.Audio<N>` bus name back to PipeWire).
-///
-/// Reversing this order would tell PipeWire "go ahead, take the device" while
-/// the kernel still has the FD open — guaranteed `EBUSY` ping-pong on the next
-/// stream open. `_reservation` is intentionally the last field for that
-/// reason; do not rearrange.
 /// Reusable integer conversion buffers for [`AlsaDirectStream::write_f32`].
 ///
 /// The writer thread calls `write_f32` for every chunk of audio for as long as
@@ -800,11 +790,6 @@ pub struct AlsaDirectStream {
     /// `device_id` names. Set after construction (see `set_mixer_device`)
     /// because it comes from settings, not from the PCM open.
     mixer_device: Option<String>,
-    /// D-Bus device reservation held for the entire stream lifetime
-    /// (Lifetime A per the design spec). Acquired before `PCM::new()` in
-    /// `Self::new()`; released on `Drop` *after* the PCM closes (see field-order
-    /// note on the struct above).
-    _reservation: crate::DeviceReservation,
 }
 
 /// Compile-only stub so the type resolves off Linux; every method on it is a
@@ -844,15 +829,6 @@ pub fn mixer_ctl_name(device_id: &str) -> Option<String> {
     Some(format!("hw:{card}"))
 }
 
-/// Defensive settle delay between reservation acquisition and PCM open.
-///
-/// Only applied when the reservation actually transitioned ownership (i.e.
-/// `DeviceReservation::is_active()` is `true`). Sized conservatively; do not
-/// reduce without revisiting the Lifetime-A safety contract on
-/// `DeviceReservation::acquire`.
-#[cfg(target_os = "linux")]
-const PIPEWIRE_VACATE_MARGIN: std::time::Duration = std::time::Duration::from_millis(50);
-
 /// Scale `selem`'s playback volume to `volume` (0.0-1.0) on every channel.
 ///
 /// Per-channel failures are ignored on purpose: a mono or 2-channel element
@@ -891,30 +867,6 @@ impl AlsaDirectStream {
             sample_rate,
             channels
         );
-
-        // Acquire D-Bus device reservation BEFORE opening the PCM. This signals
-        // PipeWire/WirePlumber to release the device first if it currently
-        // holds it. Held for the entire `AlsaDirectStream` lifetime
-        // (Lifetime A per the design spec) and released on `Drop` after the
-        // PCM closes — see the field-order comment on the struct.
-        //
-        // This is the canonical Lifetime-A consumer the `acquire` doc-comment's
-        // tight-coupling rule allows: a `DeviceReservation` is created
-        // immediately before a real `PCM::new()` and held for as long as that
-        // PCM is open.
-        let reservation = crate::DeviceReservation::acquire(device_id)
-            .map_err(|e| format!("Cannot acquire exclusive device '{}': {}", device_id, e))?;
-
-        // Defensive margin only matters when the reservation actually displaced
-        // a holder (or could have). On the degraded D-Bus path the bus name is
-        // not held at all, so PipeWire's view of the device hasn't changed and
-        // no settle delay is needed. PIPEWIRE_VACATE_MARGIN is conservative;
-        // PipeWire-side release latency is typically much shorter, but this
-        // margin is part of the design spec's Lifetime-A safety contract — do
-        // not reduce without revisiting the spec.
-        if reservation.is_active() {
-            std::thread::sleep(PIPEWIRE_VACATE_MARGIN);
-        }
 
         // Open PCM device
         let pcm = PCM::new(device_id, Direction::Playback, false)
@@ -990,9 +942,6 @@ impl AlsaDirectStream {
             last_frame: Mutex::new(Vec::new()),
             device_id: device_id.to_string(),
             mixer_device: None,
-            // Last field: drops after `pcm` so the kernel-level exclusive
-            // grip is released before the D-Bus bus name is freed.
-            _reservation: reservation,
         })
     }
 

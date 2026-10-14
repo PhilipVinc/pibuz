@@ -16,7 +16,7 @@ NOT renamed: hook scripts on other people's boxes read them.
 A standard Cargo workspace: manifest at the repo root, members under `crates/`,
 artifacts in `target/`. Plain `cargo build` / `cargo test` from the root work.
 
-The workspace is `pibuz` plus **exactly** its dependency closure — 15 crates, the
+The workspace is `pibuz` plus **exactly** its dependency closure — 14 crates, the
 set `cargo tree -p pibuz` resolves. If you find yourself adding a workspace member,
 check whether `pibuz` really needs it.
 
@@ -378,7 +378,7 @@ Cargo.toml cannot express: `scripts/pibuz-to-pi.sh` stamps
 identified later.
 
 It is the ONLY `QBZD_*` name that was renamed. The others — `QBZD_HOOK`,
-`QBZD_HOST`, `QBZD_MPRIS`, `QBZD_TOKEN` — are read from the environment at
+`QBZD_HOST`, `QBZD_TOKEN` — are read from the environment at
 RUNTIME by other people's scripts and stay as they are.
 
 ## Branches, CI and releases

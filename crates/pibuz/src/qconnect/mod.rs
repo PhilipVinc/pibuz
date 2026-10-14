@@ -788,8 +788,8 @@ pub fn start(
     // push the local queue to the cloud when it changed. Runs for the daemon
     // lifetime; a no-op until a connect installs a runtime (and gated to
     // active-local-renderer sessions inside the publish body).
-    // Volume-publish subscriber (publish.rs): a volume changed HERE (the API,
-    // MPRIS) reaches the controller's slider. Same lifetime and gates.
+    // Volume-publish subscriber (publish.rs): a volume changed HERE (the API)
+    // reaches the controller's slider. Same lifetime and gates.
     let volume_publish_task = Some(publish::spawn_volume_cloud_publish(
         Arc::clone(&service.inner),
         Arc::clone(&service.runtime),

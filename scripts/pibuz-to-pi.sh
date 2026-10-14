@@ -11,8 +11,8 @@
 #
 # HOW IT BUILDS
 #   A native arm64 Linux container under colima — not a cross toolchain. pibuz
-#   links ALSA, D-Bus and OpenSSL, and matching the Pi's own libraries is far
-#   easier than persuading a cross linker to find aarch64 copies of all three.
+#   links ALSA, and matching the Pi's own library is far easier than
+#   persuading a cross linker to find an aarch64 copy of it.
 #   `zig cc` was tried and rejected for exactly that reason.
 #
 #   Rust artifacts live in a docker VOLUME, never on the virtiofs mount: cargo

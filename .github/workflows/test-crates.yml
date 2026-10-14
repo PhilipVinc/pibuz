@@ -48,7 +48,7 @@ jobs:
           # ONLY for the `jack`-feature check below: the shipped build no longer
           # needs it (qbz-audio gates JACK behind an off-by-default feature), but
           # jack-sys cannot BUILD without jack.pc, so exercising that path needs
-          # the dev package. No D-Bus or OpenSSL - MPRIS is mpris-server on zbus
+          # the dev package. No D-Bus or OpenSSL - nothing uses D-Bus
           # and TLS is rustls, so neither libdbus-1-dev nor libssl-dev has
           # anything to satisfy (`cargo tree --workspace --all-features` resolves
           # no dbus-sys and no openssl-sys on either linux target).

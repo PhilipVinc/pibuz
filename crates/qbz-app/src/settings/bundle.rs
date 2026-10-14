@@ -581,6 +581,7 @@ const AUDIO_NO_EFFECT: &[&str] = &[
     "sync_audio_on_startup",
     "limit_quality_to_device",
     "preferred_sample_rate",
+    "reserve_dac_while_running",
 ];
 const NO_EFFECT_WHY: &str = "no effect in pibuz (desktop audio setting)";
 const AUDIO_INTENT_FLAGS: &[&str] = &[
@@ -588,7 +589,6 @@ const AUDIO_INTENT_FLAGS: &[&str] = &[
     "dac_passthrough",
     "pw_force_bitperfect",
     "skip_sink_switch",
-    "reserve_dac_while_running",
 ];
 const AUDIO_NEVER_CACHES: &[&str] = &["device_max_sample_rate", "device_sample_rate_limits"];
 
@@ -925,7 +925,6 @@ fn intent_flag_current(current: &AudioSettings, flag: &str) -> bool {
         "dac_passthrough" => current.dac_passthrough,
         "pw_force_bitperfect" => current.pw_force_bitperfect,
         "skip_sink_switch" => current.skip_sink_switch,
-        "reserve_dac_while_running" => current.reserve_dac_while_running,
         _ => false,
     }
 }
@@ -1119,7 +1118,6 @@ fn apply_audio_writes(data_root: &Path, writes: &[(&str, &Value)]) -> Result<(),
             "dac_passthrough" => store.set_dac_passthrough(as_bool(value))?,
             "pw_force_bitperfect" => store.set_pw_force_bitperfect(as_bool(value))?,
             "skip_sink_switch" => store.set_skip_sink_switch(as_bool(value))?,
-            "reserve_dac_while_running" => store.set_reserve_dac_while_running(as_bool(value))?,
             "stream_first_track" => store.set_stream_first_track(as_bool(value))?,
             "stream_buffer_seconds" => {
                 store.set_stream_buffer_seconds(value.as_u64().unwrap_or(2) as u8)?

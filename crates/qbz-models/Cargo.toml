@@ -21,17 +21,8 @@ log = { workspace = true }
 toml = "0.9"
 libc = "0.2"
 
-# Error handling
-
 # Time
 chrono = { workspace = true }
-
-# Correct file:// URI building for media-controls art (ArtworkRef::to_mpris_url)
-url = "2"
-# Percent-encoding the Plex transcode `url=`/token params (plex_thumb_url),
-# matching the Tauri frontend's buildPlexArtworkUrl. Same crate used across
-# qbz-slint / qbz-media-controls / qbz-integrations.
-urlencoding = "2"
 
 [lints]
 workspace = true

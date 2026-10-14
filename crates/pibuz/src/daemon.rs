@@ -164,18 +164,6 @@ pub async fn run(roots: ProfileRoots, cfg: PibuzConfig, warns: Vec<String>) -> R
         None => None,
     };
 
-    // 10d. MPRIS media controls (CONSOLE): publish org.mpris.MediaPlayer2 so a
-    //      KDE/GNOME media widget, a plasmoid, or hardware media keys drive the
-    //      daemon with no custom client. The inbound callback holds a
-    //      Weak<AppRuntime> (never pins the runtime), so it too sits outside the
-    //      #521 ordering; None on a headless box / when QBZD_MPRIS disables it.
-    let mpris = crate::mpris::spawn(
-        &booted.runtime,
-        roots.clone(),
-        booted.bus.subscribe(),
-        tokio::runtime::Handle::current(),
-    );
-
     // 11. HTTP serve (02 §3) on the already-bound socket. `ApiState` carries a
     //     second audio store (a path; every read goes to the file) for the status
     //     audio block, the tokio handle for the async queue read, and the opt-in
@@ -260,11 +248,6 @@ pub async fn run(roots: ProfileRoots, cfg: PibuzConfig, warns: Vec<String>) -> R
     if let Some(hooks) = hooks {
         hooks.abort();
         let _ = hooks.await;
-    }
-    // Tear down MPRIS: abort its updater and drop the D-Bus handle. Its inbound
-    // callback held only a Weak<AppRuntime>, so this is order-free too.
-    if let Some(mpris) = mpris {
-        mpris.shutdown().await;
     }
     // The background auth-retry task also holds an Arc<AppRuntime> clone — abort
     // AND join it so its Arc is dropped before `drop(booted)`; otherwise the
@@ -422,7 +405,7 @@ fn build_driver_deps(
 
 /// Fresh shared state.
 fn new_shared(cfg: &PibuzConfig) -> Arc<Mutex<DaemonShared>> {
-    let _ = cfg; // reserved: premute/mpris defaults wire in with later tasks.
+    let _ = cfg; // reserved: premute defaults wire in with later tasks.
     Arc::new(Mutex::new(DaemonShared {
         last_errors: LatchedErrors::default(),
         driver_last_tick: None,
@@ -748,7 +731,6 @@ mod tests {
         reload_only.normalization_enabled = !base.normalization_enabled;
         reload_only.normalization_target_lufs = -18.0;
         reload_only.pw_force_bitperfect = !base.pw_force_bitperfect;
-        reload_only.reserve_dac_while_running = !base.reserve_dac_while_running;
         assert!(!audio_routing_changed(&base, &reload_only));
     }
 }

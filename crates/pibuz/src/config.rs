@@ -11,7 +11,6 @@ pub struct PibuzConfig {
     pub data_root: Option<String>, // container override; cache root derived
     pub server: ServerCfg,
     pub log: LogCfg,
-    pub mpris: MprisCfg, // documented now, inert in P0 (01 §11)
 }
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(default)]
@@ -29,11 +28,6 @@ pub struct ServerCfg {
 #[serde(default)]
 pub struct LogCfg {
     pub level: String,
-}
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(default)]
-pub struct MprisCfg {
-    pub enabled: bool,
 }
 
 impl Default for ServerCfg {
@@ -54,11 +48,6 @@ impl Default for LogCfg {
         }
     }
 }
-impl Default for MprisCfg {
-    fn default() -> Self {
-        Self { enabled: true }
-    }
-}
 impl Default for PibuzConfig {
     fn default() -> Self {
         Self {
@@ -66,7 +55,6 @@ impl Default for PibuzConfig {
             data_root: None,
             server: Default::default(),
             log: Default::default(),
-            mpris: Default::default(),
         }
     }
 }
@@ -80,7 +68,6 @@ const KNOWN: &[(&str, &str)] = &[
     ("server", "port"),
     ("server", "token"),
     ("log", "level"),
-    ("mpris", "enabled"),
 ];
 
 impl PibuzConfig {
@@ -133,7 +120,6 @@ mod tests {
         assert_eq!(c.server.bind, "0.0.0.0");
         assert_eq!(c.server.port, 8182);
         assert_eq!(c.log.level, "info");
-        assert!(c.mpris.enabled);
         assert!(warns.is_empty());
     }
     #[test]

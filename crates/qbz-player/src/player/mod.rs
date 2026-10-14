@@ -119,7 +119,7 @@ enum AudioCommand {
     /// Reinitialize audio device (releases and re-acquires)
     ReinitDevice { device_name: Option<String> },
     /// Release the output device WITHOUT reopening it: drops the active
-    /// stream (freeing an exclusive ALSA `hw:` grab + its D-Bus reservation)
+    /// stream (freeing an exclusive ALSA `hw:` grab)
     /// and un-suspends / un-forces anything QBZ parked, so PipeWire can
     /// reclaim a device QBZ was holding. User-triggered from settings.
     ReleaseDevice,
@@ -7323,7 +7323,7 @@ impl Player {
     pub fn set_volume(&self, volume: f32) -> Result<(), String> {
         let clamped = volume.clamp(0.0, 1.0);
 
-        // Skip if volume is already at this value (prevents MPRIS/PipeWire feedback loop)
+        // Skip if volume is already at this value (prevents a PipeWire feedback loop)
         let current = self.state.volume();
         if (clamped - current).abs() < 0.001 {
             return Ok(());
@@ -7376,8 +7376,7 @@ impl Player {
     }
 
     /// Release the output device without reopening it. Drops the active
-    /// stream — freeing an exclusive ALSA `hw:` grab and its D-Bus
-    /// reservation — and un-suspends / un-forces anything QBZ parked, so
+    /// stream — freeing an exclusive ALSA `hw:` grab — and un-suspends / un-forces anything QBZ parked, so
     /// PipeWire/WirePlumber can reclaim a device QBZ was holding (e.g. a DAC
     /// left invisible to other apps after bit-perfect ALSA Direct). Pair
     /// with a device re-enumeration in the UI to surface a freed or

@@ -189,12 +189,6 @@ pub struct AudioSettings {
     /// Preserves external routing (JACK, qjackctl, Reaper).
     /// Mutually exclusive with dac_passthrough.
     pub skip_sink_switch: bool,
-    /// When true, hold a per-process ALSA device reservation (Lifetime B) for the
-    /// configured output device while QBZ is running, so other PulseAudio/PipeWire
-    /// clients won't grab the DAC and break exclusive playback. Off by default.
-    /// See `crate::device_reservation` for the protocol and the lifetime model.
-    #[serde(default)]
-    pub reserve_dac_while_running: bool,
 }
 
 /// Perceptual by default: it is what every other player on the host does, and a
@@ -274,7 +268,6 @@ impl Default for AudioSettings {
             gapless_enabled: true, // On by default — works for same-format tracks on all backends
             pw_force_bitperfect: false, // Off by default — experimental PipeWire feature
             skip_sink_switch: false, // Off by default — only for JACK/DAW routing setups
-            reserve_dac_while_running: false, // Off by default — opt-in DAC reservation (Lifetime B)
         }
     }
 }
@@ -442,13 +435,6 @@ impl AudioSettingsStore {
 
     pub fn set_skip_sink_switch(&self, enabled: bool) -> Result<(), String> {
         self.update(|s| s.skip_sink_switch = enabled)
-    }
-
-    /// Persist the `reserve_dac_while_running` flag (Lifetime B from the
-    /// ALSA exclusive-hardening design spec). Applying the change to the live
-    /// `DeviceReservation` guard is the caller's responsibility.
-    pub fn set_reserve_dac_while_running(&self, enabled: bool) -> Result<(), String> {
-        self.update(|s| s.reserve_dac_while_running = enabled)
     }
 
     pub fn set_pw_force_bitperfect(&self, enabled: bool) -> Result<(), String> {
@@ -634,7 +620,6 @@ mod legacy {
             "gapless_enabled" => flag(&mut s.gapless_enabled),
             "pw_force_bitperfect" => flag(&mut s.pw_force_bitperfect),
             "skip_sink_switch" => flag(&mut s.skip_sink_switch),
-            "reserve_dac_while_running" => flag(&mut s.reserve_dac_while_running),
             _ => {}
         }
     }
@@ -686,7 +671,6 @@ mod tests {
         assert_eq!(settings.alsa_plugin, Some(AlsaPlugin::Hw));
         assert!(settings.gapless_enabled);
         assert!(!settings.skip_sink_switch);
-        assert!(!settings.reserve_dac_while_running);
     }
 
     #[test]
@@ -701,7 +685,6 @@ mod tests {
         assert_eq!(settings.backend_type, Some(AudioBackendType::SystemDefault));
         assert_eq!(settings.alsa_plugin, Some(AlsaPlugin::Hw));
         assert!(settings.gapless_enabled);
-        assert!(!settings.reserve_dac_while_running);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -794,9 +777,6 @@ mod tests {
         {
             let store = AudioSettingsStore::new_at(&dir).expect("open store");
             store
-                .set_reserve_dac_while_running(true)
-                .expect("set reserve flag");
-            store
                 .set_skip_sink_switch(true)
                 .expect("set skip sink switch");
         }
@@ -804,41 +784,10 @@ mod tests {
         let reopened = AudioSettingsStore::new_at(&dir).expect("reopen store");
         let settings = reopened.get_settings().expect("get settings");
 
-        assert!(settings.reserve_dac_while_running);
         assert!(settings.skip_sink_switch);
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[test]
-    fn deserializes_legacy_json_without_reserve_dac_field() {
-        let legacy = r#"{
-            "output_device": null,
-            "exclusive_mode": false,
-            "dac_passthrough": false,
-            "preferred_sample_rate": null,
-            "backend_type": null,
-            "alsa_plugin": null,
-            "alsa_hardware_volume": false,
-            "stream_first_track": false,
-            "stream_buffer_seconds": 3,
-            "streaming_only": false,
-            "limit_quality_to_device": false,
-            "device_max_sample_rate": null,
-            "normalization_enabled": false,
-            "normalization_target_lufs": -14.0,
-            "gapless_enabled": true,
-            "pw_force_bitperfect": false,
-            "sync_audio_on_startup": false,
-            "quality_fallback_behavior": "ask",
-            "skip_sink_switch": false,
-            "allow_quality_fallback": false
-        }"#;
-
-        let settings: AudioSettings =
-            serde_json::from_str(legacy).expect("legacy JSON should deserialize");
-
-        assert!(!settings.reserve_dac_while_running);
-    }
     /// An `audio_settings.db` as an older pibuz left it: only some of the
     /// columns later versions added, in WAL mode.
     #[cfg(feature = "sqlite-migrate")]

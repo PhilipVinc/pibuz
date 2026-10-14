@@ -33,8 +33,8 @@ OUT="$REPO/dist/pibuz-aarch64-linux"
 #
 # Five packages this used to carry are NOT needed, each checked by removing it
 # and rebuilding the crate that would have wanted it: libssl-dev (TLS is
-# rustls, nothing resolves openssl-sys), libdbus-1-dev (MPRIS is mpris-server
-# on zbus, pure Rust), clang/libclang-dev (nothing runs bindgen), and cmake
+# rustls, nothing resolves openssl-sys), libdbus-1-dev (nothing uses
+# D-Bus), clang/libclang-dev (nothing runs bindgen), and cmake
 # (aws-lc-sys builds its C with cc on this target).
 #
 # libjack-jackd2-dev went with them once the JACK backend became the off-by-
