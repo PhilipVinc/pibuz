@@ -28,6 +28,26 @@ tags on `main`.
   the session over the LAN. A connection that drops and comes back still
   reclaims the slot it held, as the official client does.
 
+- **Settings live in one file: `settings.toml` in the data root.** It has a
+  section per CLI domain (`[audio]`, `[playback]`, `[qconnect]`, `[hooks]`) and
+  replaces `audio_settings.db`, `qconnect_settings.db` and `daemon_prefs.json`.
+  Each old file is folded in the first time its settings are read, then
+  deleted. The Connect device id comes across, so phones still know the box.
+  Writes are locked and atomic, so `settings set` and the daemon can write at
+  once, and a file that does not parse is never overwritten. If `[audio]` does
+  not parse the daemon refuses to start, naming the file and line, rather than
+  playing with default output settings. **Downgrading after this release loses
+  settings**: an older pibuz finds no `.db` files and starts as a new Connect
+  device. Reading the old SQLite files is the `sqlite-migrate` feature, on by
+  default, and the only reason a default build still contains SQLite.
+- **The loudness cache is a text file, `loudness_cache.tsv`.** It replaces
+  `loudness_cache.db`, which is deleted rather than migrated, so tracks are
+  measured again on their next play. It only matters with normalization on.
+- **Faster to build from source.** A cold `cargo build --release` does
+  roughly a third less work: the TUI, D-Bus, `regex`, unused codecs and the
+  desktop settings code are gone (see Removed), and seldom-run dependencies
+  build at a lower optimization level.
+
 ### Fixed
 
 - **A track that fails to load is reported to the session as a playback
@@ -69,6 +89,25 @@ tags on `main`.
   it were the track. The log says so:
   `[QConnect] Track N: playing Qobuz's 30s preview from 0s`. A resume after a
   track has ended is now ignored instead of restarting a spent stream.
+
+### Removed
+
+- **`pibuz setup`, the terminal UI.** Every setting it offered is a `pibuz
+  settings set` key.
+- **MPRIS and the PipeWire DAC reservation, and with them D-Bus.** Both were
+  desktop integrations: a media widget and media keys, and a handshake asking a
+  desktop sound server to release the DAC. `audio.reserve_dac_while_running`,
+  pibuz.toml's `[mpris]` table and the `QBZD_MPRIS` variable are gone too.
+- **`pibuz settings export --from desktop`.** It read the desktop app's own
+  stores. Bundles exported by the desktop app still import.
+- **Settings that changed nothing.** `playback.autoplay`,
+  `playback.persist_session`, `playback.resume_playback_position` and
+  `playback.mpris` were never read. `settings set` still accepts them, prints
+  a warning and exits 0, because moOde sends three of them; they will be
+  refused once it stops. A bundle that carries one of these, or one of the
+  desktop audio settings pibuz never used, lists it as skipped.
+- **Codecs other than FLAC and MP3.** Qobuz serves nothing else.
+
 
 ## 2.6.0 — 2026-10-11
 
