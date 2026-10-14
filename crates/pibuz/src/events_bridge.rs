@@ -37,7 +37,7 @@ const FALLBACK_POLL: Duration = Duration::from_secs(2);
 /// * `PositionUpdated` on every wake while playing (~2 s cadence, the
 ///   progress feed for SSE clients),
 /// * `VolumeChanged` on a volume change.
-pub fn spawn(
+pub(crate) fn spawn(
     runtime: &Runtime,
     bus: broadcast::Sender<CoreEvent>,
     edge: Arc<Notify>,

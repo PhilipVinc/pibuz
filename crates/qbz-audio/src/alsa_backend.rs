@@ -150,7 +150,10 @@ fn is_known_pcm_id(name: &str) -> bool {
 fn get_supported_sample_rates(device: &rodio::cpal::Device) -> Option<Vec<u32>> {
     use rodio::cpal::traits::DeviceTrait;
 
-    #[allow(clippy::disallowed_methods)]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "only card-backed PCM ids reach this (build_cpal_device_map)"
+    )]
     let configs = device.supported_output_configs().ok()?;
     let configs_vec: Vec<_> = configs.collect();
 
@@ -1327,7 +1330,10 @@ impl AudioBackend for AlsaBackend {
         let mut found_matching = !probe_safe;
         if probe_safe {
             // PROBE. Guarded by the `probe_safe` check two lines up.
-            #[allow(clippy::disallowed_methods)]
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "probe-safe: guarded by the probe_safe check above"
+            )]
             let supported_configs = device
                 .supported_output_configs()
                 .map_err(|e| format!("Failed to get supported configs: {}", e))?;
@@ -1409,7 +1415,10 @@ impl AudioBackend for AlsaBackend {
         // PROBE (rodio asks the device for its default config). Safe because
         // `must_not_reach_rodio` turned the named config PCMs away at the top
         // of this function.
-        #[allow(clippy::disallowed_methods)]
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "named config PCMs are refused at the top (must_not_reach_rodio)"
+        )]
         let mixer_sink = DeviceSinkBuilder::from_device(device)
             .map_err(|e| {
                 if config.exclusive_mode {

@@ -14,11 +14,11 @@
 //! `[qconnect]` section of the data root's settings.toml.
 
 pub(crate) mod engine;
-pub mod pairing;
+pub(crate) mod pairing;
 pub(crate) mod publish;
 pub(crate) mod remote_stream;
 pub(crate) mod report;
-pub mod session;
+pub(crate) mod session;
 pub(crate) mod sink;
 pub(crate) mod transport;
 
@@ -178,7 +178,7 @@ impl DaemonQconnectService {
     /// Establish the QConnect session. Gated on an initialized API client (the
     /// qws/createToken discovery needs it). Idempotent: a second call while a
     /// runtime is alive (or a connect is in flight) is a no-op.
-    pub async fn connect(&self) -> Result<(), String> {
+    pub(crate) async fn connect(&self) -> Result<(), String> {
         let _ops = self.ops.lock().await;
         self.connect_locked().await
     }
@@ -356,7 +356,7 @@ impl DaemonQconnectService {
     /// Tear the QConnect session down. Always forces Off. Aborts AND joins the
     /// event loop so its `Arc<AppRuntime>` clone drops before the daemon's
     /// shutdown releases the audio device (#521 ordering).
-    pub async fn disconnect(&self) -> Result<(), String> {
+    pub(crate) async fn disconnect(&self) -> Result<(), String> {
         let _ops = self.ops.lock().await;
         self.disconnect_locked().await
     }
@@ -559,11 +559,11 @@ pub(crate) struct QconnectHandle {
 pub(crate) struct QconnectControl(Arc<DaemonQconnectService>);
 
 impl QconnectControl {
-    pub async fn connect(&self) -> Result<(), String> {
+    pub(crate) async fn connect(&self) -> Result<(), String> {
         self.0.connect().await
     }
 
-    pub async fn disconnect(&self) -> Result<(), String> {
+    pub(crate) async fn disconnect(&self) -> Result<(), String> {
         // Operator intent (`pibuz qconnect disable`): drop any handed-over
         // pairing credentials, so a later enable does not silently re-join
         // the last LAN caster's session. Abort any in-flight takeover FIRST
@@ -653,7 +653,7 @@ impl QconnectHandle {
 /// data root's settings.toml, decides auto-connect from the persisted startup
 /// mode (`QconnectStartupMode::auto_connects`), latches the initial status,
 /// and, when enabled, spawns the connect-on-Ready retry task.
-pub fn start(
+pub(crate) fn start(
     runtime: Runtime,
     shared: SharedState,
     roots: &ProfileRoots,

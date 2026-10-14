@@ -173,7 +173,7 @@ pub(crate) struct FakeEngine {
 }
 
 impl FakeEngine {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             player: StdMutex::new(FakePlayer {
                 volume: 0.5,
@@ -824,7 +824,7 @@ impl VirtualController {
     }
 
     /// Move the volume slider.
-    pub async fn set_volume(&self, pct: i32) {
+    pub(crate) async fn set_volume(&self, pct: i32) {
         self.harness
             .step(&format!("volume {pct}"), |_| {
                 vec![renderer_command(
@@ -882,7 +882,7 @@ impl VirtualController {
 
     /// The cloud states where the session is: this track, at this position,
     /// playing. The authoritative frame that follows a takeback.
-    pub async fn resume_at(&self, track_id: u64, position_ms: u64) {
+    pub(crate) async fn resume_at(&self, track_id: u64, position_ms: u64) {
         let item = self.mint_item(track_id);
         self.harness
             .step(&format!("resume {track_id} at {position_ms}ms"), |_| {
@@ -963,7 +963,7 @@ impl VirtualController {
 
     /// Tap shuffle. The cloud owns the resulting ORDER and sends it separately;
     /// this frame carries the flag alone.
-    pub async fn set_shuffle(&self, shuffle_mode: bool) {
+    pub(crate) async fn set_shuffle(&self, shuffle_mode: bool) {
         self.harness
             .step(&format!("shuffle {shuffle_mode}"), |_| {
                 vec![renderer_command(
@@ -1206,7 +1206,7 @@ pub(crate) struct ControllerHarness {
 }
 
 impl ControllerHarness {
-    pub async fn new() -> Self {
+    pub(crate) async fn new() -> Self {
         let transport = Arc::new(InMemoryWsTransport::new());
         let engine = Arc::new(FakeEngine::new());
         let sync_state = Arc::new(Mutex::new(QconnectRemoteSyncState::default()));

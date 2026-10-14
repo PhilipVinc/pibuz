@@ -18,7 +18,7 @@ impl DaemonAdapter {
     /// Build the adapter and return an initial subscriber. Callers that only
     /// need a producing handle can `drop` the receiver and later `subscribe()`
     /// via [`DaemonAdapter::sender`].
-    pub fn new() -> (Self, broadcast::Receiver<CoreEvent>) {
+    pub(crate) fn new() -> (Self, broadcast::Receiver<CoreEvent>) {
         // CoreEvent is Clone (qbz-models/src/events.rs); 256 slots absorbs a
         // burst of position ticks before a slow subscriber sees Lagged.
         let (tx, rx) = broadcast::channel(256);

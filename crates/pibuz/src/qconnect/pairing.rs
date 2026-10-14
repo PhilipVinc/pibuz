@@ -230,7 +230,7 @@ impl PairingHandle {
 /// mDNS failure is non-fatal (the listener still serves for apps that probe by
 /// IP, and boot must not die on a flaky avahi/Bonjour) — bind failure is an
 /// error because the advertised surface would point at nothing.
-pub fn spawn(
+pub(crate) fn spawn(
     port: u16,
     friendly_name: &str,
     service: Arc<DaemonQconnectService>,

@@ -75,19 +75,19 @@ impl Quality {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserSession {
     pub user_auth_token: String,
-    pub user_id: u64,
-    pub email: String,
-    pub display_name: String,
-    pub subscription_label: String,
+    pub(crate) user_id: u64,
+    pub(crate) email: String,
+    pub(crate) display_name: String,
+    pub(crate) subscription_label: String,
     #[serde(default)]
-    pub subscription_valid_until: Option<String>,
+    pub(crate) subscription_valid_until: Option<String>,
     /// Account territory (ISO 3166-1 alpha-2, e.g. "FR") from the login
     /// response. `serde(default)` keeps sessions serialized without it loadable.
     #[serde(default)]
-    pub country_code: Option<String>,
+    pub(crate) country_code: Option<String>,
     /// Account language (ISO 639-1, e.g. "fr") from the login response.
     #[serde(default)]
-    pub language_code: Option<String>,
+    pub(crate) language_code: Option<String>,
 }
 
 // ============ Stream Types ============

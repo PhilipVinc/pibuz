@@ -237,7 +237,7 @@ fn render_removed(v: &Value) -> String {
 /// now-playing track). The API's own default (`true` when the field is
 /// OMITTED) never applies here — this CLI always sends the field
 /// explicitly. Exit: 0 · 1 · 3.
-pub async fn clear(host: Option<String>, roots: &ProfileRoots, keep_current: bool) -> i32 {
+pub(crate) async fn clear(host: Option<String>, roots: &ProfileRoots, keep_current: bool) -> i32 {
     let client = ApiClient::new(host, roots);
     let body = serde_json::json!({"keep_current": keep_current});
     match client.post("/api/queue/clear", body).await {

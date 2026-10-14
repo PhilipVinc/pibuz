@@ -98,7 +98,7 @@ pub(crate) async fn play(host: Option<String>, roots: &ProfileRoots) -> i32 {
     transport_state(host, roots, "/api/playback/play").await
 }
 
-pub async fn pause(host: Option<String>, roots: &ProfileRoots) -> i32 {
+pub(crate) async fn pause(host: Option<String>, roots: &ProfileRoots) -> i32 {
     transport_state(host, roots, "/api/playback/pause").await
 }
 
@@ -106,7 +106,7 @@ pub(crate) async fn toggle(host: Option<String>, roots: &ProfileRoots) -> i32 {
     transport_state(host, roots, "/api/playback/toggle").await
 }
 
-pub async fn stop(host: Option<String>, roots: &ProfileRoots) -> i32 {
+pub(crate) async fn stop(host: Option<String>, roots: &ProfileRoots) -> i32 {
     transport_state(host, roots, "/api/playback/stop").await
 }
 
@@ -147,7 +147,7 @@ fn render_advance(v: &Value) -> String {
     format!("-> {artist} – {title}")
 }
 
-pub async fn next(host: Option<String>, roots: &ProfileRoots) -> i32 {
+pub(crate) async fn next(host: Option<String>, roots: &ProfileRoots) -> i32 {
     transport_advance(host, roots, "/api/playback/next").await
 }
 
@@ -212,7 +212,7 @@ pub(crate) fn seek_body(arg: SeekArg) -> Value {
 /// `pibuz seek <POS|+N|-N|mm:ss>` — human `at 1:30 / 9:41` (note the
 /// spaced slash, unlike `now`'s unspaced `3:12/9:41`). Exit:
 /// 0 · 1 · 2 (local parse failure) · 3 · 5.
-pub async fn seek(host: Option<String>, roots: &ProfileRoots, arg: String) -> i32 {
+pub(crate) async fn seek(host: Option<String>, roots: &ProfileRoots, arg: String) -> i32 {
     let parsed = match parse_seek_arg(&arg) {
         Ok(a) => a,
         Err(msg) => {
@@ -297,7 +297,7 @@ pub(crate) fn volume_body(arg: VolumeArg) -> Value {
 /// /api/now-playing`, extracting `{volume, muted}` (no dedicated read route).
 /// With an argument: `POST /api/playback/volume`. Exit:
 /// 0 · 1 · 2 (local parse failure) · 3 · 5.
-pub async fn volume(
+pub(crate) async fn volume(
     host: Option<String>,
     roots: &ProfileRoots,
     value: Option<String>,

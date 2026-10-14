@@ -5,7 +5,11 @@ use crate::cli::client::ApiClient;
 use crate::paths::ProfileRoots;
 
 /// `pibuz shuffle [on|off|toggle]` (bare = toggle).
-pub async fn shuffle(host: Option<String>, mode: Option<String>, roots: &ProfileRoots) -> i32 {
+pub(crate) async fn shuffle(
+    host: Option<String>,
+    mode: Option<String>,
+    roots: &ProfileRoots,
+) -> i32 {
     let m = mode.unwrap_or_else(|| "toggle".to_string());
     let client = ApiClient::new(host, roots);
     match client
@@ -25,7 +29,7 @@ pub async fn shuffle(host: Option<String>, mode: Option<String>, roots: &Profile
 }
 
 /// `pibuz repeat <off|all|one>`.
-pub async fn repeat(host: Option<String>, mode: String, roots: &ProfileRoots) -> i32 {
+pub(crate) async fn repeat(host: Option<String>, mode: String, roots: &ProfileRoots) -> i32 {
     let client = ApiClient::new(host, roots);
     match client
         .post("/api/playback/repeat", serde_json::json!({ "mode": mode }))

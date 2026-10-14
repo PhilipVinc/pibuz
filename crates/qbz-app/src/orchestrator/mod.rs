@@ -39,7 +39,7 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
     ///
     /// The Player must be created by the caller with appropriate audio settings.
     /// QbzCore orchestrates playback through this player.
-    pub(crate) fn new(adapter: A, player: Player) -> Self {
+    pub fn new(adapter: A, player: Player) -> Self {
         Self {
             adapter: Arc::new(adapter),
             client: Arc::new(RwLock::new(None)),
@@ -56,7 +56,7 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
     /// core still finishes initialization so queue manager and player remain
     /// usable. API calls will then return `CoreError::NotInitialized` until the
     /// client is rebuilt with tokens.
-    pub(crate) async fn init(&self) -> Result<(), CoreError> {
+    pub async fn init(&self) -> Result<(), CoreError> {
         let mut initialized = self.initialized.write().await;
         if *initialized {
             return Ok(());
@@ -324,7 +324,7 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
     }
 
     /// Advance to next track in queue
-    pub(crate) async fn next_track(&self) -> Option<QueueTrack> {
+    pub async fn next_track(&self) -> Option<QueueTrack> {
         let queue = self.queue.write().await;
         let track = queue.next();
         self.emit(CoreEvent::QueueUpdated {
@@ -346,7 +346,7 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
     }
 
     /// Get multiple upcoming tracks without advancing (for prefetching)
-    pub(crate) async fn peek_upcoming(&self, count: usize) -> Vec<QueueTrack> {
+    pub async fn peek_upcoming(&self, count: usize) -> Vec<QueueTrack> {
         let queue = self.queue.read().await;
         queue.peek_upcoming(count)
     }
@@ -368,7 +368,7 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
     /// One-shot consume: if `finished_track_id` matches the marker, clear it and
     /// return true (the auto-advance driver then halts instead of advancing).
     /// Only the natural end-of-track path may call this — never a manual skip.
-    pub(crate) async fn consume_stop_after_if(&self, finished_track_id: u64) -> bool {
+    pub async fn consume_stop_after_if(&self, finished_track_id: u64) -> bool {
         self.queue
             .write()
             .await

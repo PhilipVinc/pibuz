@@ -177,7 +177,7 @@ impl JackStream {
     }
 
     /// Total underrun events since open (diagnostic).
-    #[allow(dead_code)]
+    #[allow(dead_code, reason = "a diagnostic nothing reads yet")]
     pub fn underruns(&self) -> u64 {
         self.underruns.load(Ordering::Relaxed)
     }

@@ -172,7 +172,7 @@ impl BufferingLatch {
 
     /// Clear the latch for `track_id`. Ignores a stale clear for a track that
     /// has already been superseded.
-    pub fn finish(&self, track_id: u64) {
+    pub(crate) fn finish(&self, track_id: u64) {
         if let Ok(mut guard) = self.current.lock() {
             if guard.as_ref().map(|b| b.track_id) == Some(track_id) {
                 *guard = None;
@@ -327,7 +327,7 @@ const STALLED_CLOCK_GRACE: std::time::Duration = std::time::Duration::from_secs(
 const STALLED_CLOCK_SLACK_MS: u64 = 2_000;
 
 impl DaemonRendererEngine {
-    pub fn new(
+    pub(crate) fn new(
         runtime: Arc<AppRuntime<DaemonAdapter>>,
         volume_mode: VolumeMode,
         buffering: Arc<BufferingLatch>,

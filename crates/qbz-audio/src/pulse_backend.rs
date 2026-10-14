@@ -13,7 +13,7 @@ pub(crate) struct PulseBackend {
 }
 
 impl PulseBackend {
-    pub fn new() -> BackendResult<Self> {
+    pub(crate) fn new() -> BackendResult<Self> {
         Ok(Self {
             inner: PipeWireBackend::new()?,
         })

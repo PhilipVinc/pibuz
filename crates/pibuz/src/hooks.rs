@@ -43,7 +43,7 @@ pub(crate) fn script(roots: &ProfileRoots) -> Option<PathBuf> {
 /// Spawn the hook dispatcher. Holds no `Arc<AppRuntime>` (only the script path
 /// and the bus receiver), so it sits outside the #521 audio-release ordering —
 /// the caller aborts it for a clean shutdown.
-pub fn spawn(script: PathBuf, mut rx: broadcast::Receiver<CoreEvent>) -> JoinHandle<()> {
+pub(crate) fn spawn(script: PathBuf, mut rx: broadcast::Receiver<CoreEvent>) -> JoinHandle<()> {
     use broadcast::error::RecvError;
     tokio::spawn(async move {
         let mut gate = StopSettle::default();

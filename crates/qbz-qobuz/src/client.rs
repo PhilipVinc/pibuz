@@ -829,11 +829,7 @@ impl QobuzClient {
     // === Authenticated endpoints ===
 
     /// Get stream URL for a track (requires auth + signature)
-    pub(crate) async fn get_stream_url(
-        &self,
-        track_id: u64,
-        quality: Quality,
-    ) -> Result<StreamUrl> {
+    pub async fn get_stream_url(&self, track_id: u64, quality: Quality) -> Result<StreamUrl> {
         // Back off before the network if the 403 breaker is open (issue #637).
         self.forbidden_guard()?;
         log::info!(

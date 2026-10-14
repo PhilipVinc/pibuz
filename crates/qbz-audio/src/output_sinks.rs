@@ -101,7 +101,10 @@ pub fn list_output_sinks() -> Result<Vec<OutputSinkInfo>, String> {
                 Some("not probed (plugin PCM)".to_string())
             } else {
                 // PROBE. Guarded by the `is_probe_safe_pcm_id` arm above.
-                #[allow(clippy::disallowed_methods)]
+                #[allow(
+                    clippy::disallowed_methods,
+                    reason = "probe-safe: guarded by the is_probe_safe_pcm_id arm above"
+                )]
                 let probed = device.supported_output_configs().ok();
                 Some(
                     probed

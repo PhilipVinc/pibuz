@@ -134,6 +134,7 @@ fn ensure_rtprio_rlimit(wanted: u32) -> Option<String> {
     // SAFETY: `getrlimit` writes a plain C struct of two integers into the
     // pointer we own; all-zero is a valid starting value for it.
     let mut lim: libc::rlimit = unsafe { std::mem::zeroed() };
+    // SAFETY: `lim` is a live local of the struct type getrlimit fills.
     if unsafe { libc::getrlimit(libc::RLIMIT_RTPRIO, &mut lim) } != 0 {
         return Some(format!(
             "cannot read RLIMIT_RTPRIO: {}",

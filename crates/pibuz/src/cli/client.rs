@@ -133,7 +133,7 @@ pub(crate) struct ApiClient {
 
 impl ApiClient {
     /// Discover the target + token and build the client.
-    pub fn new(host: Option<String>, roots: &ProfileRoots) -> Self {
+    pub(crate) fn new(host: Option<String>, roots: &ProfileRoots) -> Self {
         let target = resolve_host(host);
         let token = resolve_token(&target, roots);
         let client = reqwest::Client::builder()
@@ -156,11 +156,11 @@ impl ApiClient {
     }
 
     /// Whether the target is the local daemon (governs the linger check).
-    pub fn is_local(&self) -> bool {
+    pub(crate) fn is_local(&self) -> bool {
         self.is_local
     }
 
-    pub async fn get(&self, path: &str) -> Result<Value, CliError> {
+    pub(crate) async fn get(&self, path: &str) -> Result<Value, CliError> {
         let req = self.bearer(self.client.get(format!("{}{}", self.base, path)));
         self.send(req).await
     }
@@ -250,11 +250,6 @@ fn error_from_envelope(v: &Value) -> CliError {
         .to_string();
     match code {
         "not_found" => CliError::NotFound(message),
-        // The verbatim DSD blocks are frozen client-side copy, not the
-        // server's short envelope message — swap them in so `pibuz seek`/
-        // `volume`/`mute` print the exact documented multi-line text.
-        "volume_fixed_dsd" => CliError::Device(crate::cli::copy::volume_fixed_dsd()),
-        "seek_unsupported_dsd" => CliError::Device(crate::cli::copy::seek_unsupported_dsd()),
         "audio_unavailable" | "device_error" => CliError::Device(message),
         _ => CliError::Runtime(message),
     }
@@ -277,7 +272,7 @@ mod tests {
     fn error_envelope_maps_code_to_exit() {
         let nf = serde_json::json!({"error": {"code": "not_found", "message": "no"}});
         assert_eq!(error_from_envelope(&nf).exit_code(), 6);
-        let dev = serde_json::json!({"error": {"code": "volume_fixed_dsd", "message": "no"}});
+        let dev = serde_json::json!({"error": {"code": "device_error", "message": "no"}});
         assert_eq!(error_from_envelope(&dev).exit_code(), 5);
         // origin_forbidden / invalid_token / unknown all fall to 1.
         let origin = serde_json::json!({"error": {"code": "origin_forbidden", "message": "no"}});

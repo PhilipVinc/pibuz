@@ -488,7 +488,7 @@ impl FormatRegime {
     ///
     /// The distinction a report of a silent VU meter turns on: on a raw card
     /// the driver decided, behind a plug we did.
-    pub fn why(self) -> &'static str {
+    pub(crate) fn why(self) -> &'static str {
         match self {
             FormatRegime::Probe => {
                 "raw card, so the driver refusing a format is what moved us down the list"
@@ -597,20 +597,16 @@ pub(crate) fn ring_fill_pct(avail_frames: usize, buffer_frames: usize) -> Option
 /// Below this the ring is one scheduling delay away from an xrun.
 // Consumed by the ALSA write loop, which only exists on Linux; elsewhere these
 // are here for the tests.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const RING_FILL_WARN_PCT: u8 = 25;
 
 /// At most one ring-fill line per this many milliseconds.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const RING_FILL_LOG_EVERY_MS: u64 = 2_000;
 
 /// When the last ring-fill line went out, process-relative. `0` for never.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 static RING_FILL_LOGGED_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Milliseconds since the first call. A monotonic stamp small enough for an
 /// atomic and immune to the wall clock being stepped.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn process_millis() -> u64 {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     // 1 ms floor so a stamp taken immediately is never mistaken for "never".
@@ -627,7 +623,6 @@ fn process_millis() -> u64 {
 /// Rate limited because the interesting event lasts many chunks and the writer
 /// runs ~20 times a second: without this a single dip writes hundreds of lines
 /// and the log becomes the disk contention it is trying to measure.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn should_log_ring_fill(pct: u8, last_logged_ms: u64, now_ms: u64, every_ms: u64) -> bool {
     pct < RING_FILL_WARN_PCT
         && (last_logged_ms == 0 || now_ms.saturating_sub(last_logged_ms) >= every_ms)
@@ -776,8 +771,6 @@ pub struct AlsaDirectStream {
     pcm: Arc<Mutex<PCM>>,
     /// Conversion buffers reused across `write_f32` calls (see [`ConvScratch`]).
     scratch: Mutex<ConvScratch>,
-    #[allow(dead_code)]
-    is_playing: Arc<AtomicBool>,
     sample_rate: u32,
     channels: u16,
     format: Format,
@@ -801,7 +794,7 @@ pub struct AlsaDirectStream {
 /// hard error at runtime. The fields mirror the real struct's shape and are
 /// deliberately never read.
 #[cfg(not(target_os = "linux"))]
-#[allow(dead_code)]
+#[allow(dead_code, reason = "a compile-only stub; its fields are never read")]
 pub struct AlsaDirectStream {
     sample_rate: u32,
     channels: u16,
@@ -938,7 +931,7 @@ impl AlsaDirectStream {
         Ok(Self {
             pcm: Arc::new(Mutex::new(pcm)),
             scratch: Mutex::new(ConvScratch::default()),
-            is_playing: Arc::new(AtomicBool::new(false)),
+
             sample_rate,
             channels,
             format: selected_format,
@@ -2057,7 +2050,10 @@ mod stop_pad_tests {
     #[test]
     // Asserting on a constant is the point: this is a guard rail that fails
     // the build if STOP_PAD_MS is ever retuned out of its safe range.
-    #[allow(clippy::assertions_on_constants)]
+    #[allow(
+        clippy::assertions_on_constants,
+        reason = "a build-time guard on STOP_PAD_MS"
+    )]
     fn the_pad_fits_inside_the_shortest_ring_a_host_can_ask_for() {
         // `alsa_buffer_ms` clamps to 50 ms at the low end. The pad is written
         // in steps as space frees, so it completes either way — but it should

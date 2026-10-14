@@ -209,7 +209,7 @@ pub(crate) fn remove(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>
 /// `POST /api/queue/clear`. Body `{"keep_current": bool}` (default `true`
 /// when the field is absent — the CLI always sends it explicitly, see
 /// `cli/queue.rs::clear`).
-pub fn clear(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
+pub(crate) fn clear(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
     let keep_current = body
         .get("keep_current")
         .and_then(|v| v.as_bool())

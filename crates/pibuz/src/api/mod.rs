@@ -17,7 +17,7 @@
 pub(crate) mod play;
 pub(crate) mod playback;
 pub(crate) mod queue;
-pub mod settings;
+pub(crate) mod settings;
 pub(crate) mod sse;
 pub(crate) mod status;
 

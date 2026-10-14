@@ -32,7 +32,11 @@ use crate::events::CoreEvent;
 // on anything written here: it marks each method `#[must_use]` and returns a
 // boxed future, which is must_use already. `unknown_lints` because toolchains
 // before 1.99 do not know the name.
-#[allow(unknown_lints, clippy::double_must_use)]
+#[allow(
+    unknown_lints,
+    clippy::double_must_use,
+    reason = "fires on #[async_trait]'s generated code, not on this trait"
+)]
 #[async_trait]
 pub trait FrontendAdapter: Send + Sync {
     /// Called when the core emits an event.

@@ -23,25 +23,6 @@ pub(crate) fn linger_off(user: &str) -> String {
     )
 }
 
-/// Volume fixed under DSD-direct — exit 5. Consumed by
-/// `error_from_envelope` (cli/client.rs) for the `volume_fixed_dsd` code, so
-/// the `volume`/`mute` verbs print this exact block instead of the server's
-/// short envelope message.
-pub(crate) fn volume_fixed_dsd() -> String {
-    "error: volume is fixed in DSD-direct mode (bit-perfect passthrough)
-  → to get software volume, set DSD mode to \"convert\":  pibuz setup  (Audio screen)"
-        .to_string()
-}
-
-/// Seek unsupported under DSD-direct — exit 5. Mirrors `volume_fixed_dsd`'s
-/// structure and wording.
-/// Consumed by `error_from_envelope` for the `seek_unsupported_dsd` code.
-pub(crate) fn seek_unsupported_dsd() -> String {
-    "error: seek is unsupported in DSD-direct mode (bit-perfect passthrough)
-  → to seek, set DSD mode to \"convert\":  pibuz setup  (Audio screen)"
-        .to_string()
-}
-
 /// Foreign occupant on the control port that is NOT pibuz — printed by the daemon
 /// at boot step 5. `port` is interpolated.
 pub(crate) fn port_in_use(port: u16) -> String {

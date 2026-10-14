@@ -40,16 +40,11 @@ impl Drop for PwNodeEnvGuard {
     }
 }
 
-pub struct PipeWireBackend {
-    #[allow(dead_code)]
-    host: rodio::cpal::Host,
-}
+pub struct PipeWireBackend;
 
 impl PipeWireBackend {
     pub fn new() -> BackendResult<Self> {
-        Ok(Self {
-            host: rodio::cpal::default_host(),
-        })
+        Ok(Self)
     }
 
     /// Reset PipeWire clock.force-rate and clock.force-quantum to 0.
@@ -783,7 +778,10 @@ impl AudioBackend for PipeWireBackend {
         // PROBE. Safe because `device` here is the sound-server PCM this
         // function selected by score just above — `pipewire` or `pulse`, both
         // probe-safe — never a PCM from the user's config tree.
-        #[allow(clippy::disallowed_methods)]
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "the pipewire/pulse server PCM chosen above, which is probe-safe"
+        )]
         let supported_configs = device
             .supported_output_configs()
             .map_err(|e| format!("Failed to get supported configs: {}", e))?;
@@ -857,7 +855,10 @@ impl AudioBackend for PipeWireBackend {
         //
         // PROBE (rodio reads the device's default config). Same device as
         // above: the `pipewire`/`pulse` server PCM, not a config-tree chain.
-        #[allow(clippy::disallowed_methods)]
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "the same pipewire/pulse server PCM, not a config-tree chain"
+        )]
         let mixer_sink = DeviceSinkBuilder::from_device(device)
             .map_err(|e| format!("Failed to create device sink builder: {}", e))?
             .with_supported_config(&supported_config)

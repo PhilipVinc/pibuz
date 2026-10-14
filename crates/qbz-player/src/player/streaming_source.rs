@@ -1501,7 +1501,7 @@ pub struct BufferWriter {
     shared: Arc<SharedBuffer>,
     /// Shared by every clone; the buffer learns the feeder is gone when the
     /// last one drops. Never read, only dropped.
-    #[allow(dead_code)] // held for its Drop, which is the whole point
+    #[allow(dead_code, reason = "held for its Drop, which is the whole point")]
     alive: Arc<FeederAlive>,
 }
 

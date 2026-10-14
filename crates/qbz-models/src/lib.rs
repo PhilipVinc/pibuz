@@ -29,7 +29,6 @@
 //! ```
 
 pub(crate) mod events;
-pub mod lenient;
 pub(crate) mod playback;
 pub mod settings_file;
 pub mod system_capabilities;

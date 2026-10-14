@@ -357,7 +357,7 @@ pub(crate) fn resolve_local_identity() -> qconnect_app::LocalIdentity {
 // reporting a write that never happened.
 // ---------------------------------------------------------------------------
 
-pub use qconnect_settings::DEFAULT_PAIRING_PORT;
+pub(crate) use qconnect_settings::DEFAULT_PAIRING_PORT;
 
 /// Load the persisted custom device name. None when unset or blank.
 pub(crate) fn load_device_name_at(root: &Path) -> Option<String> {

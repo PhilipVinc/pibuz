@@ -313,9 +313,18 @@ What was deliberately NOT built, after an adversarial review of the design:
 Run `cargo fmt --all`; the tree is rustfmt-clean and CI checks it.
 
 For clippy, prefer fixing over silencing. When a lint is genuinely wrong for the
-code, allow it **at the item**, with the reason in a comment beside it — not with
-a blanket module allow. Two lints are allowed workspace-wide in the root
-`Cargo.toml` `[workspace.lints.clippy]`, each with its rationale.
+code, allow it **at the item**, with the reason in the attribute itself —
+`#[allow(clippy::x, reason = "...")]` — not with a blanket module allow.
+`allow_attributes_without_reason` enforces the `reason`. Two clippy lints are
+allowed workspace-wide in the root `Cargo.toml`, each with its rationale.
+
+The workspace also turns on, as warnings that CI's `-D warnings` makes errors:
+
+- `undocumented_unsafe_blocks`: every `unsafe` block has a `// SAFETY:` comment
+  directly above it saying why it is sound.
+- `unreachable_pub`: a `pub` item no other crate can reach must say
+  `pub(crate)`, so the dead-code lint can see it (see "Visibility" above).
+- `unsafe_op_in_unsafe_fn`, `dbg_macro`, `todo`, `unimplemented`.
 
 ### VERIFY ON LINUX — this is not optional
 

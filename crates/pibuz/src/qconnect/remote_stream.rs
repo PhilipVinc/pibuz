@@ -412,7 +412,6 @@ enum BodyEnd {
 ///   handled: the write head is re-pointed at byte 0 and the stream
 ///   degrades to the old sequential behavior, rather than filling the
 ///   buffer with bytes attributed to the wrong offsets.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn download_and_stream_remote_track(
     url: &str,
     refresh_url: Option<UrlRefresher>,

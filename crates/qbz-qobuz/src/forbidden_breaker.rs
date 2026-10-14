@@ -51,7 +51,7 @@ impl Default for ForbiddenBreaker {
 }
 
 impl ForbiddenBreaker {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             inner: Mutex::new(Inner {
                 consecutive: 0,

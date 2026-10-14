@@ -166,7 +166,6 @@ fn parse_selector(body: &Value) -> Result<Selector, (String, String)> {
 
 /// Resolve the selector to catalog tracks + optional (context_kind, context_id)
 /// provenance. A single track carries no container provenance (None).
-#[allow(clippy::type_complexity)]
 fn fetch_tracks(
     state: &ApiState,
     selector: &Selector,

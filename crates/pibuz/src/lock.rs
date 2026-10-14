@@ -32,6 +32,8 @@ impl InstanceLock {
             .write(true)
             .open(&path)
             .map_err(|e| LockError::Io(e.to_string()))?;
+        // SAFETY: flock on a descriptor `file` owns and keeps open; no memory
+        // is passed.
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc != 0 {
             let mut pid = String::new();

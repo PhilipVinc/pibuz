@@ -918,7 +918,7 @@ pub(crate) fn show(json: bool, roots: &ProfileRoots) -> i32 {
 /// [`SetError`]). Writes always succeed locally before any daemon contact is
 /// attempted; daemon-down prints `changes apply when the daemon starts`
 /// instead of failing.
-pub fn set(roots: &ProfileRoots, key: &str, value: &str) -> i32 {
+pub(crate) fn set(roots: &ProfileRoots, key: &str, value: &str) -> i32 {
     if IGNORED_KEYS.contains(&key) {
         eprintln!(
             "warning: {key} has no effect in pibuz and is ignored; a future release will refuse it"
@@ -961,7 +961,7 @@ pub(crate) fn qconnect_enable(roots: &ProfileRoots) -> i32 {
     let name = qconnect_kv::resolve_qconnect_friendly_name(
         qconnect_kv::load_device_name_at(root).as_deref(),
     );
-    println!("qconnect enabled — device \"{name}\" will appear in the Qobuz app once logged in");
+    println!("qconnect enabled — device \"{name}\" will appear in the Qobuz app on this network");
     0
 }
 
@@ -996,18 +996,18 @@ pub(crate) fn qconnect_name(roots: &ProfileRoots, name: &str) -> i32 {
     0
 }
 
-/// `pibuz config path`. Process roots + the credential file + the
+/// `pibuz config path`. Process roots, the settings file, and the
 /// (conventional, not necessarily installed) systemd user unit path. No
 /// `--json`.
 pub(crate) fn config_path(roots: &ProfileRoots) -> i32 {
-    println!("config : {}", roots.config.display());
-    println!("data   : {}", roots.data.display());
-    println!("cache  : {}", roots.cache.display());
+    println!("config   : {}", roots.config.display());
+    println!("data     : {}", roots.data.display());
+    println!("cache    : {}", roots.cache.display());
     println!(
-        "cred   : {}",
-        roots.config.join(".qbz-oauth-token").display()
+        "settings : {}",
+        qbz_models::settings_file::path(&roots.data).display()
     );
-    println!("unit   : {}", unit_path().display());
+    println!("unit     : {}", unit_path().display());
     0
 }
 
@@ -1096,7 +1096,7 @@ fn present_keys(path: &Path) -> std::collections::HashSet<String> {
 
 /// `pibuz settings export [FILE] [--include-auth]`. Reads the daemon profile
 /// and writes ONE versioned JSON bundle at 0600. Exit: 0 · 1.
-pub fn export(roots: &ProfileRoots, file: Option<String>, include_auth: bool) -> i32 {
+pub(crate) fn export(roots: &ProfileRoots, file: Option<String>, include_auth: bool) -> i32 {
     let paths = ProfilePaths {
         config_root: roots.config.clone(),
         data_root: roots.data.clone(),

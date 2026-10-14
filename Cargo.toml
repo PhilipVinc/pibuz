@@ -24,7 +24,26 @@ license = "MIT"
 repository = "https://github.com/PhilipVinc/pibuz"
 
 # Lints applied to every crate (each member opts in with `[lints] workspace = true`).
+# CI runs clippy with `-D warnings`, so every "warn" here fails the build.
+[workspace.lints.rust]
+# Edition 2024's default: an unsafe operation inside an `unsafe fn` still needs
+# its own `unsafe {}` block, and so its own SAFETY comment.
+unsafe_op_in_unsafe_fn = "warn"
+# A `pub` item no other crate can reach should say `pub(crate)`. Only then does
+# the dead-code lint see it, which `pub` hides (see CLAUDE.md, "Visibility").
+unreachable_pub = "warn"
+
 [workspace.lints.clippy]
+# Every `unsafe` block says why it is sound, in a `// SAFETY:` comment.
+undocumented_unsafe_blocks = "warn"
+# Every `allow` says why, in its own `reason = "..."`: the reason travels with
+# the exemption instead of living in a comment that can drift away from it.
+allow_attributes_without_reason = "warn"
+# Debugging leftovers.
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+
 # The wide functions are SQL row builders and playback-engine constructors:
 # one parameter per column / per shared handle. Grouping them into structs
 # would add a type per call site without making anything safer, and these

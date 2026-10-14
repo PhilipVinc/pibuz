@@ -2,7 +2,10 @@
 #[repr(i32)]
 // Variant names mirror the protobuf wire enum verbatim; renaming them to
 // please the lint would break the generated mapping.
-#[allow(clippy::enum_variant_names)]
+#[allow(
+    clippy::enum_variant_names,
+    reason = "variant names mirror the protobuf wire enum"
+)]
 pub(crate) enum QConnectMessageType {
     MessageTypePlaybackError = 2,
     MessageTypeRndrSrvrJoinSession = 21,

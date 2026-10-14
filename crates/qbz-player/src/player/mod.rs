@@ -590,7 +590,6 @@ fn seek_in_memory(
     Some(Box::new(source))
 }
 
-#[allow(clippy::too_many_arguments)]
 /// How far into a track the gapless prefetch may arm.
 ///
 /// Not a lead time — the prefetch now runs beside playback rather than racing
@@ -1158,7 +1157,10 @@ fn create_output_stream_with_config(
         log::info!("Device is a plugin PCM — not probing its rates, opening at {sample_rate}Hz");
     } else {
         // PROBE. Guarded by the `probe_safe` check above.
-        #[allow(clippy::disallowed_methods)]
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "probe-safe: guarded by the probe_safe check above"
+        )]
         let supported_configs = device
             .supported_output_configs()
             .map_err(|e| format!("Failed to get supported configs: {}", e))?;
@@ -1214,7 +1216,10 @@ fn create_output_stream_with_config(
     // PROBE (rodio reads the device's default config). Safe because the
     // legacy path that feeds this function refuses named config PCMs before
     // resolving a device — see `must_not_reach_rodio` in `init_device`.
-    #[allow(clippy::disallowed_methods)]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "named config PCMs are refused before this (must_not_reach_rodio)"
+    )]
     match DeviceSinkBuilder::from_device(device) {
         Ok(builder) => {
             // rodio's default error callback only eprintln!s a live stream
@@ -1325,7 +1330,14 @@ impl StreamType {
 }
 
 fn apply_engine_volume(
-    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] stream_opt: &Option<StreamType>,
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(
+            unused_variables,
+            reason = "only the macOS hardware-volume path reads it"
+        )
+    )]
+    stream_opt: &Option<StreamType>,
     engine: &PlaybackEngine,
     volume: f32,
     external: bool,
@@ -2316,7 +2328,10 @@ impl Player {
                     return true;
                 }
                 // PROBE. Guarded by the early return directly above.
-                #[allow(clippy::disallowed_methods)]
+                #[allow(
+                    clippy::disallowed_methods,
+                    reason = "probe-safe: guarded by the early return above"
+                )]
                 let configs = d.supported_output_configs();
                 configs.map(|c| c.count() > 0).unwrap_or(false)
             };
@@ -2455,7 +2470,10 @@ impl Player {
                 // PROBE (rodio reads the device's default config). Safe
                 // because the named-config-PCM rejection above means `device`
                 // is either a card-backed PCM or the host default.
-                #[allow(clippy::disallowed_methods)]
+                #[allow(
+                    clippy::disallowed_methods,
+                    reason = "named config PCMs are refused above; this is a card or the host default"
+                )]
                 let opened =
                     DeviceSinkBuilder::from_device(device).and_then(|b| b.open_sink_or_fallback());
                 match opened {
@@ -6449,7 +6467,6 @@ impl Player {
     /// * The track is no longer resident at the end, so it cannot be handed to
     ///   the in-memory cache from the buffer. It is staged to L2 as it goes
     ///   past instead, which is what [`DiskTee`] is for.
-    #[allow(clippy::too_many_arguments)] // one feeder's whole context; a struct would only rename it
     async fn cmaf_stream_segments(
         mut source: cmaf_fetch::CmafSource,
         refresh: Option<cmaf_fetch::CmafRefresher>,
@@ -6910,7 +6927,6 @@ impl Player {
     /// `min_window_bytes` is a floor under the buffer's window, for a feeder
     /// that pushes in units bigger than a chunk — pass a few times that unit,
     /// or 0 when the unit is small enough not to matter.
-    #[allow(clippy::too_many_arguments)]
     pub fn play_streaming_dynamic(
         &self,
         track_id: u64,
@@ -6943,7 +6959,6 @@ impl Player {
     /// `play_track`'s CMAF path, which already holds a generation token; a
     /// mid-intent bump here would invalidate a strictly newer play that
     /// started in the meantime).
-    #[allow(clippy::too_many_arguments)]
     fn apply_play_streaming_dynamic(
         &self,
         track_id: u64,

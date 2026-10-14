@@ -4,8 +4,6 @@
 //! Mode and hardware volume on macOS using the coreaudio-rs safe wrappers.
 //! There is no integer mode and no IO proc: playback itself goes through CPAL.
 
-#![cfg_attr(target_os = "macos", allow(deprecated))]
-
 #[cfg(target_os = "macos")]
 use coreaudio::audio_unit::macos_helpers;
 #[cfg(target_os = "macos")]
@@ -13,7 +11,7 @@ use coreaudio::Error;
 #[cfg(target_os = "macos")]
 use objc2_core_audio::{
     kAudioDevicePropertyNominalSampleRate, kAudioDevicePropertyVolumeScalar,
-    kAudioObjectPropertyElementMaster, kAudioObjectPropertyScopeGlobal,
+    kAudioObjectPropertyElementMain, kAudioObjectPropertyScopeGlobal,
     kAudioObjectPropertyScopeOutput, AudioObjectGetPropertyData, AudioObjectHasProperty,
     AudioObjectPropertyAddress, AudioObjectSetPropertyData,
 };
@@ -99,11 +97,14 @@ pub(crate) fn set_nominal_sample_rate(
 /// Get the current nominal sample rate of a CoreAudio device.
 #[cfg(target_os = "macos")]
 pub fn get_nominal_sample_rate(device_id: AudioDeviceID) -> Result<u32, String> {
+    // SAFETY: every pointer handed to AudioObjectGetPropertyData points at a
+    // local that outlives the call, and `data_size` is `rate`'s size, so
+    // CoreAudio writes at most that many bytes.
     unsafe {
         let property_address = AudioObjectPropertyAddress {
             mSelector: kAudioDevicePropertyNominalSampleRate,
             mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMaster,
+            mElement: kAudioObjectPropertyElementMain,
         };
         let mut rate = 0.0_f64;
         let data_size = mem::size_of::<f64>() as u32;
@@ -229,13 +230,14 @@ pub(crate) fn set_hog_mode(device_id: AudioDeviceID, enabled: bool) -> Result<()
 /// Tries master output first, then common stereo channel elements.
 #[cfg(target_os = "macos")]
 pub(crate) fn get_hardware_volume(device_id: AudioDeviceID) -> Result<f32, String> {
-    for element in [kAudioObjectPropertyElementMaster, 1, 2] {
+    for element in [kAudioObjectPropertyElementMain, 1, 2] {
         let property_address = AudioObjectPropertyAddress {
             mSelector: kAudioDevicePropertyVolumeScalar,
             mScope: kAudioObjectPropertyScopeOutput,
             mElement: element,
         };
 
+        // SAFETY: `property_address` is a live local for the whole call.
         let has_property =
             unsafe { AudioObjectHasProperty(device_id, NonNull::from(&property_address)) };
         if !has_property {
@@ -244,6 +246,9 @@ pub(crate) fn get_hardware_volume(device_id: AudioDeviceID) -> Result<f32, Strin
 
         let mut value = 0.0_f32;
         let data_size = mem::size_of::<f32>() as u32;
+        // SAFETY: the address, size and output pointers point at locals that
+        // outlive the call, and `data_size` is `value`'s size, so CoreAudio
+        // writes at most that many bytes.
         let status = unsafe {
             AudioObjectGetPropertyData(
                 device_id,
@@ -274,13 +279,14 @@ pub fn set_hardware_volume(device_id: AudioDeviceID, volume: f32) -> Result<(), 
     let mut last_error = None;
     let mut channel_success = false;
 
-    for element in [kAudioObjectPropertyElementMaster, 1, 2] {
+    for element in [kAudioObjectPropertyElementMain, 1, 2] {
         let property_address = AudioObjectPropertyAddress {
             mSelector: kAudioDevicePropertyVolumeScalar,
             mScope: kAudioObjectPropertyScopeOutput,
             mElement: element,
         };
 
+        // SAFETY: `property_address` is a live local for the whole call.
         let has_property =
             unsafe { AudioObjectHasProperty(device_id, NonNull::from(&property_address)) };
         if !has_property {
@@ -288,6 +294,8 @@ pub fn set_hardware_volume(device_id: AudioDeviceID, volume: f32) -> Result<(), 
         }
 
         let mut value = clamped;
+        // SAFETY: `value` is a live f32 and the size passed is exactly its
+        // size; CoreAudio only reads it.
         let status = unsafe {
             AudioObjectSetPropertyData(
                 device_id,
@@ -306,7 +314,7 @@ pub fn set_hardware_volume(device_id: AudioDeviceID, volume: f32) -> Result<(), 
                 element,
                 clamped * 100.0
             );
-            if element == kAudioObjectPropertyElementMaster {
+            if element == kAudioObjectPropertyElementMain {
                 return Ok(());
             }
             channel_success = true;

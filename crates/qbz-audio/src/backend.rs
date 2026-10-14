@@ -463,7 +463,7 @@ pub(crate) struct CpalDefaultBackend {
 }
 
 impl CpalDefaultBackend {
-    pub fn new() -> BackendResult<Self> {
+    pub(crate) fn new() -> BackendResult<Self> {
         Ok(Self {
             host: rodio::cpal::default_host(),
         })
@@ -619,7 +619,10 @@ impl AudioBackend for CpalDefaultBackend {
 
         // PROBE (rodio reads the device's default config). Safe because
         // `must_not_reach_rodio` turned the named config PCMs away above.
-        #[allow(clippy::disallowed_methods)]
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "named config PCMs are refused above (must_not_reach_rodio)"
+        )]
         let builder = DeviceSinkBuilder::from_device(device)
             .map_err(|e| format!("Failed to create device sink builder: {}", e))?;
 
@@ -736,7 +739,10 @@ impl CpalDefaultBackend {
                 Self::shared_mode_nominal_stream_config(&device, effective_device_name);
 
             // PROBE. macOS-only path: CoreAudio, no libasound, no assert.
-            #[allow(clippy::disallowed_methods)]
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "macOS only: CoreAudio, no libasound assert"
+            )]
             let builder = DeviceSinkBuilder::from_device(device)
                 .map_err(|e| format!("Failed to create device sink builder: {}", e))?;
 
@@ -810,14 +816,20 @@ impl CpalDefaultBackend {
     ) -> Option<rodio::cpal::SupportedStreamConfig> {
         let nominal_rate = Self::current_macos_nominal_rate(effective_device_name)?;
         // PROBE x2. macOS-only fn: CoreAudio, no libasound, no assert.
-        #[allow(clippy::disallowed_methods)]
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "macOS only: CoreAudio, no libasound assert"
+        )]
         let default_config = device.default_output_config().ok()?;
         let default_rate = default_config.sample_rate();
         if nominal_rate == default_rate {
             return None;
         }
 
-        #[allow(clippy::disallowed_methods)]
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "macOS only: CoreAudio, no libasound assert"
+        )]
         let supported_configs: Vec<_> = device.supported_output_configs().ok()?.collect();
         let matching_config = supported_configs
             .iter()

@@ -69,7 +69,7 @@ pub(crate) struct DaemonEventSink {
 const JOIN_VOLUME_ASSERT_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl DaemonEventSink {
-    pub fn new(
+    pub(crate) fn new(
         engine: DaemonRendererEngine,
         sync_state: Arc<Mutex<QconnectRemoteSyncState>>,
         shared: Arc<std::sync::Mutex<crate::state::DaemonShared>>,

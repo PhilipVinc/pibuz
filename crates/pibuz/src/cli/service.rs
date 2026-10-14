@@ -17,7 +17,7 @@ use std::process::Command;
 /// `pibuz service [INIT] [--user U] [--bin PATH] [--system]`. Prints the unit to
 /// stdout (pipe/redirect it into place); install steps go to stderr so stdout
 /// stays clean. Exit 0, or 2 on an unknown/undetectable init.
-pub fn service(
+pub(crate) fn service(
     init: Option<String>,
     user: Option<String>,
     bin: Option<String>,

@@ -89,7 +89,7 @@ pub(crate) fn play(state: &ApiState) -> Response<Cursor<Vec<u8>>> {
 /// `POST /api/playback/pause`. Never cold-starts; exit set is
 /// 0 · 1 · 3 (no 5) so a `Player::pause` channel failure is
 /// [`runtime_error`], not a 503 `audio_unavailable`.
-pub fn pause(state: &ApiState) -> Response<Cursor<Vec<u8>>> {
+pub(crate) fn pause(state: &ApiState) -> Response<Cursor<Vec<u8>>> {
     match state.runtime.core().pause() {
         Ok(()) => json(200, serde_json::json!({"state": "paused"})),
         Err(e) => runtime_error(&e.to_string()),
@@ -125,7 +125,7 @@ pub(crate) fn toggle(state: &ApiState) -> Response<Cursor<Vec<u8>>> {
 
 /// `POST /api/playback/stop`. Never cold-starts; same exit-set
 /// reasoning as `pause`.
-pub fn stop(state: &ApiState) -> Response<Cursor<Vec<u8>>> {
+pub(crate) fn stop(state: &ApiState) -> Response<Cursor<Vec<u8>>> {
     match state.runtime.core().stop() {
         Ok(()) => json(200, serde_json::json!({"state": "stopped"})),
         Err(e) => runtime_error(&e.to_string()),
@@ -133,12 +133,12 @@ pub fn stop(state: &ApiState) -> Response<Cursor<Vec<u8>>> {
 }
 
 /// `POST /api/playback/next`.
-pub fn next(state: &ApiState) -> Response<Cursor<Vec<u8>>> {
+pub(crate) fn next(state: &ApiState) -> Response<Cursor<Vec<u8>>> {
     advance(state, true)
 }
 
 /// `POST /api/playback/previous`.
-pub fn previous(state: &ApiState) -> Response<Cursor<Vec<u8>>> {
+pub(crate) fn previous(state: &ApiState) -> Response<Cursor<Vec<u8>>> {
     advance(state, false)
 }
 
@@ -148,7 +148,7 @@ pub fn previous(state: &ApiState) -> Response<Cursor<Vec<u8>>> {
 /// live re-read, since `seek` only sends an async command to the audio
 /// thread; the clamp is deterministic so the "post-state" is knowable
 /// synchronously.
-pub fn seek(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
+pub(crate) fn seek(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
     let player = state.runtime.core().player();
     let ev = player.get_playback_event();
     let target: u64 = if let Some(pos) = body.get("position").and_then(|v| v.as_u64()) {
@@ -181,7 +181,7 @@ pub fn seek(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
 /// `{"volume": F}` (absolute 0.0-1.0), `{"delta": F}` (additive), or
 /// `{"mute": "on"|"off"|"toggle"}` (also `pibuz mute`'s route — no dedicated
 /// route).
-pub fn volume(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
+pub(crate) fn volume(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
     let player = state.runtime.core().player();
     let live = player.get_playback_event().volume;
 
@@ -225,7 +225,7 @@ pub fn volume(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
 /// (default `toggle`). Returns the resulting shuffle state. No auth — a
 /// queue-mode toggle touches no Qobuz session; state also surfaces in
 /// `/api/status` and `/api/now-playing`.
-pub fn shuffle(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
+pub(crate) fn shuffle(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
     let mode = body
         .get("mode")
         .and_then(|v| v.as_str())
@@ -254,7 +254,7 @@ pub fn shuffle(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
 
 /// `POST /api/playback/repeat`. Body `{"mode": "off"|"all"|"one"}`.
 /// No auth. Returns the applied mode.
-pub fn repeat(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
+pub(crate) fn repeat(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>> {
     let mode = body.get("mode").and_then(|v| v.as_str()).unwrap_or("");
     let rm = match mode {
         "off" => qbz_models::RepeatMode::Off,

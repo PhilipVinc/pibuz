@@ -32,7 +32,10 @@ type BoxedSampleIter = Box<dyn Iterator<Item = f32> + Send>;
 /// one that was seeked or resumed. It has to travel WITH the source rather than
 /// being a property of the engine, because a gapless hand-off queues the next
 /// track (offset 0) while a seeked one (offset 166 s, say) is still playing.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "only the Linux ALSA writer path uses this")
+)]
 pub(crate) struct QueuedSource {
     iter: BoxedSampleIter,
     start_frame: u64,
@@ -44,12 +47,12 @@ pub(crate) struct QueuedSource {
 static PCM_RING_MS: AtomicU32 = AtomicU32::new(0);
 
 /// Set the decoded-ring depth in ms; `0` restores the profile default.
-pub fn set_pcm_ring_ms(ms: u32) {
+pub(super) fn set_pcm_ring_ms(ms: u32) {
     PCM_RING_MS.store(ms, Ordering::Relaxed);
 }
 
 /// Configured decoded-ring depth in ms; `0` when it is the profile's to choose.
-pub fn pcm_ring_ms() -> u32 {
+pub(super) fn pcm_ring_ms() -> u32 {
     PCM_RING_MS.load(Ordering::Relaxed)
 }
 
@@ -62,7 +65,10 @@ pub(crate) struct SourceQueue<S> {
 }
 
 impl<S> SourceQueue<S> {
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "only the Linux ALSA writer path uses this")
+    )]
     fn new() -> Self {
         Self {
             queue: Mutex::new(VecDeque::new()),
@@ -104,7 +110,10 @@ pub(crate) enum PlaybackEngine {
     /// Rodio-based (PipeWire, Pulse, ALSA via CPAL)
     Rodio { sink: RodioPlayer },
     /// Direct ALSA (hw: devices, bit-perfect) with gapless source queue
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "only the Linux ALSA writer path uses this")
+    )]
     AlsaDirect {
         /// The output, behind a trait so the engine can be driven against a
         /// virtual device in a test. See `qbz_audio::audio_out`.
@@ -162,7 +171,10 @@ impl PlaybackEngine {
 
     /// Create ALSA Direct engine with gapless source queue.
     /// Spawns a single writer thread that lives for the engine's lifetime.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "only the Linux ALSA writer path uses this")
+    )]
     pub(crate) fn new_alsa_direct(stream: Arc<dyn AudioOut>, hardware_volume: bool) -> Self {
         let is_playing = Arc::new(AtomicBool::new(false));
         let should_stop = Arc::new(AtomicBool::new(false));
@@ -415,7 +427,7 @@ impl PlaybackEngine {
     }
 
     /// Pause
-    pub fn pause(&self) {
+    pub(super) fn pause(&self) {
         match self {
             Self::Rodio { sink } => sink.pause(),
             Self::AlsaDirect { is_playing, .. } => {
@@ -433,7 +445,7 @@ impl PlaybackEngine {
     /// Stop playback and release resources.
     /// For ALSA Direct, signals the writer thread and waits for it to exit.
     /// The Drop impl handles the same cleanup if stop() is not called explicitly.
-    pub fn stop(mut self) {
+    pub(super) fn stop(mut self) {
         self.stop_inner();
     }
 
@@ -543,7 +555,7 @@ impl PlaybackEngine {
     /// itself puts every useful listening level in the bottom tenth of the
     /// travel. The hardware-mixer path passes it through untouched — an ALSA
     /// mixer applies the card's own dB mapping.
-    pub fn set_volume(&self, volume: f32) {
+    pub(super) fn set_volume(&self, volume: f32) {
         let software_gain = qbz_audio::volume_curve::gain_for(volume);
         match self {
             Self::Rodio { sink } => sink.set_volume(software_gain),
@@ -708,7 +720,10 @@ impl PlaybackEngine {
 /// With the keep-alive off, each caller keeps the cadence it always had —
 /// `when_off` — so turning the feature off changes nothing about how the
 /// writer idles.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "only the Linux ALSA writer path uses this")
+)]
 fn keepalive_poll_interval(depth_ms: u32, when_off: Duration) -> Duration {
     if depth_ms == 0 {
         return when_off;
@@ -717,12 +732,18 @@ fn keepalive_poll_interval(depth_ms: u32, when_off: Duration) -> Duration {
 }
 
 /// The two gates on the keep-alive, named so they can be tested.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "only the Linux ALSA writer path uses this")
+)]
 fn would_keep_alive(primed: bool, depth_ms: u32) -> bool {
     primed && depth_ms > 0
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "only the Linux ALSA writer path uses this")
+)]
 /// Hold a floor of silence under an idle PCM, if the host asked for it.
 ///
 /// `primed` says whether this stream has already played something. It gates
@@ -777,7 +798,10 @@ fn keep_dac_awake(stream: &Arc<dyn AudioOut>, cancel: &Arc<AtomicBool>, primed: 
 /// It bears no relation to the ALSA period — that was the OLD writer's problem,
 /// when one thread did both jobs and a 8192-frame decode block was 1.5x the
 /// whole hardware ring at 44.1 kHz. This thread has no deadline at all.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "only the Linux ALSA writer path uses this")
+)]
 const DECODE_BLOCK_FRAMES: usize = 4096;
 
 /// How long the decoder waits for room before looking again.
@@ -786,7 +810,10 @@ const DECODE_BLOCK_FRAMES: usize = 4096;
 /// takes. This bounds the cost of a missed notification — `RingLink::notify_space`
 /// deliberately does not take the lock, because the writer is real-time — and
 /// gives the thread a regular chance to notice `should_stop`.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "only the Linux ALSA writer path uses this")
+)]
 const DECODER_SPACE_WAIT: Duration = Duration::from_millis(50);
 
 /// How long the writer sleeps when the decoded ring has run dry.
@@ -794,7 +821,10 @@ const DECODER_SPACE_WAIT: Duration = Duration::from_millis(50);
 /// Only reached when the decoder is behind, which is the failure the ring
 /// exists to prevent — so by the time this runs, a few milliseconds are not
 /// what is going wrong.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "only the Linux ALSA writer path uses this")
+)]
 const WRITER_STARVED_SLEEP: Duration = Duration::from_millis(2);
 
 /// How long an empty ring must stay empty before the writer concludes that
@@ -805,11 +835,17 @@ const WRITER_STARVED_SLEEP: Duration = Duration::from_millis(2);
 /// tracks, short tails and a resume with little buffered all land here. Long
 /// enough not to fire on a decoder that is merely a moment behind; short enough
 /// that nobody notices it before a track begins.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "only the Linux ALSA writer path uses this")
+)]
 const WRITER_START_ON_IDLE: Duration = Duration::from_millis(120);
 
 /// Absolute ceiling on waiting for the ring to prime before starting anyway.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "only the Linux ALSA writer path uses this")
+)]
 const WRITER_PRIME_DEADLINE: Duration = Duration::from_secs(3);
 
 /// Decode sources into the ring. Ordinary priority, and free to block.
@@ -822,7 +858,10 @@ const WRITER_PRIME_DEADLINE: Duration = Duration::from_secs(3);
 ///
 /// Holds NO `Arc<AlsaDirectStream>`, and that is a safety property rather than
 /// an accident of what it needs — see the comment in `new_alsa_direct`.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "only the Linux ALSA writer path uses this")
+)]
 fn alsa_decoder_thread(
     mut producer: HeapProd<f32>,
     link: Arc<RingLink>,
@@ -957,8 +996,10 @@ fn alsa_decoder_thread(
 /// convert, hand to ALSA. That is what makes it safe to run this thread at
 /// `SCHED_FIFO` (see `qbz_audio::rt`), and it is why nothing which can wait may
 /// ever be added to it.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-#[allow(clippy::too_many_arguments)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "only the Linux ALSA writer path uses this")
+)]
 fn alsa_writer_thread(
     mut consumer: HeapCons<f32>,
     stream: Arc<dyn AudioOut>,

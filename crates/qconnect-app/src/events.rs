@@ -76,7 +76,11 @@ pub enum QconnectAppEvent {
 
 // clippy 1.99 `double_must_use` fires on `#[async_trait]`'s output, not on
 // this code; see `qbz_models::FrontendAdapter`.
-#[allow(unknown_lints, clippy::double_must_use)]
+#[allow(
+    unknown_lints,
+    clippy::double_must_use,
+    reason = "fires on #[async_trait]'s generated code, not on this trait"
+)]
 #[async_trait]
 pub trait QconnectEventSink: Send + Sync {
     async fn on_event(&self, event: QconnectAppEvent);

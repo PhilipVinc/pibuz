@@ -178,6 +178,7 @@ fn a_refused_second_start_leaves_the_live_log_alone() {
         .open(root.join("pibuz.lock"))
         .unwrap();
     assert_eq!(
+        // SAFETY: flock on a descriptor `lock` owns and keeps open.
         unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
         0,
         "the test plays the live daemon by holding its lock"

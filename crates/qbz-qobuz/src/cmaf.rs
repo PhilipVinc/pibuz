@@ -234,7 +234,7 @@ pub(crate) struct ArcSlab {
 impl ArcSlab {
     /// A slab of exactly `capacity` bytes, ready to be filled.
     pub(crate) fn with_capacity(capacity: usize) -> Self {
-        // ZEROED rather than uninitialised on purpose: every byte is then a
+        // SAFETY: ZEROED rather than uninitialised on purpose: every byte is a
         // valid `u8` the moment the allocation exists, so `assume_init` is
         // sound however much of the slab the download goes on to write, and a
         // short download is caught by `into_arc` rather than by UB. For a
@@ -644,6 +644,8 @@ fn start_writeback(writer: &std::io::BufWriter<std::fs::File>, offset: usize, le
     let offset = offset + qbz_cmaf::SEAL_HEADER_LEN as usize;
     // Best effort throughout: a kernel or filesystem that refuses these leaves
     // the write correct, just less considerate.
+    // SAFETY: a plain syscall on a descriptor `writer` owns; the range is only
+    // advice to the kernel and no memory is passed.
     unsafe {
         libc::sync_file_range(
             writer.get_ref().as_raw_fd(),
@@ -663,6 +665,8 @@ fn finish_writeback(writer: &std::io::BufWriter<std::fs::File>, offset: usize, l
     }
     let offset = offset + qbz_cmaf::SEAL_HEADER_LEN as usize;
     let fd = writer.get_ref().as_raw_fd();
+    // SAFETY: plain syscalls on a descriptor `writer` owns; the ranges are only
+    // advice to the kernel and no memory is passed.
     unsafe {
         libc::sync_file_range(
             fd,

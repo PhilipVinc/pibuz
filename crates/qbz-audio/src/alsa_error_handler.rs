@@ -56,13 +56,12 @@ pub fn install_once() {
         // ignores the varargs is ABI-compatible on every platform we
         // target (System V AMD64, AArch64 AAPCS, Windows x64 — all let
         // the callee leave extra-register/stack args untouched).
-        //
+        type VariadicHandler = alsa_sys::snd_lib_error_handler_t;
         // SAFETY:
         //  - `snd_lib_error_set_handler` is process-global; gated by Once.
         //  - The transmute narrows the declared type but preserves the
         //    prefix argument list; we read the fixed args and never touch
         //    the varargs, so the convention difference is benign.
-        type VariadicHandler = alsa_sys::snd_lib_error_handler_t;
         unsafe {
             let as_variadic: VariadicHandler =
                 std::mem::transmute::<*const (), VariadicHandler>(handler as *const ());
