@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{FromArgMatches, Parser, Subcommand};
 
 mod adapter;
 mod api;
@@ -138,6 +138,64 @@ enum Cmd {
     Completions {
         shell: clap_complete::Shell,
     },
+}
+
+/// The top-level help lists the commands in these sections, in this order,
+/// instead of clap's single "Commands:" list (clap 4 allows one subcommand
+/// heading per command). Every visible subcommand must appear exactly once;
+/// a test holds that.
+const HELP_SECTIONS: &[(&str, &[&str])] = &[
+    (
+        "Pibuz",
+        &[
+            "run", "status", "ping", "watch", "settings", "qconnect", "config", "service",
+            "version", "help",
+        ],
+    ),
+    ("Queue", &["queue", "shuffle", "repeat"]),
+    (
+        "Music control",
+        &[
+            "now", "play", "pause", "toggle", "stop", "next", "prev", "seek", "volume", "mute",
+        ],
+    ),
+];
+
+/// `Cli::command()` with the top-level help grouped by `HELP_SECTIONS`.
+fn command_with_sections() -> clap::Command {
+    use clap::CommandFactory;
+    let mut cmd = Cli::command();
+    cmd.build(); // materialises the auto-generated `help` subcommand
+    let styles = cmd.get_styles();
+    let (header, literal) = (*styles.get_header(), *styles.get_literal());
+    let width = cmd
+        .get_subcommands()
+        .filter(|s| !s.is_hide_set())
+        .map(|s| s.get_name().len())
+        .max()
+        .unwrap_or(0);
+    let mut sections = String::new();
+    for (title, names) in HELP_SECTIONS {
+        sections += &format!("{header}{title} commands:{header:#}\n");
+        for name in *names {
+            let about = cmd
+                .find_subcommand(name)
+                .and_then(|s| s.get_about())
+                .map(|a| a.to_string())
+                .unwrap_or_default();
+            sections += &format!("  {literal}{name}{literal:#}");
+            if !about.is_empty() {
+                let pad = width - name.len() + 2;
+                sections += &format!("{:pad$}{about}", "");
+            }
+            sections.push('\n');
+        }
+        sections.push('\n');
+    }
+    cmd.help_template(format!(
+        "{{about-with-newline}}\n{{usage-heading}} {{usage}}\n\n{sections}\
+         {header}Options:{header:#}\n{{options}}"
+    ))
 }
 
 #[derive(Subcommand)]
@@ -310,7 +368,8 @@ async fn main() {
     // Install the rustls process-level `CryptoProvider`
     qbz_app::ensure_crypto_provider();
 
-    let cli = Cli::parse();
+    let cli =
+        Cli::from_arg_matches(&command_with_sections().get_matches()).unwrap_or_else(|e| e.exit());
     let code = match cli.cmd {
         Cmd::Version { json } => {
             if json {
@@ -485,4 +544,26 @@ fn login_roots() -> paths::ProfileRoots {
         .ok()
         .and_then(|(c, _)| c.data_root);
     paths::ProfileRoots::resolve(None, data_root.as_deref().map(std::path::Path::new))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn help_sections_list_every_visible_command_once() {
+        let cmd = command_with_sections();
+        let mut listed: Vec<&str> = HELP_SECTIONS
+            .iter()
+            .flat_map(|(_, n)| n.iter().copied())
+            .collect();
+        let mut visible: Vec<&str> = cmd
+            .get_subcommands()
+            .filter(|s| !s.is_hide_set())
+            .map(|s| s.get_name())
+            .collect();
+        listed.sort_unstable();
+        visible.sort_unstable();
+        assert_eq!(listed, visible);
+    }
 }
