@@ -45,6 +45,17 @@ tags on `main`.
   of one. The player now remembers the depth Qobuz served each track at, and
   accepts a copy that is already the best there is. The record is in memory,
   so after a restart a disk-cached 16-bit track is fetched again once.
+- **A DAC that stops answering no longer plays the queue through in
+  silence.** When a USB DAC stopped responding mid-track (seen after a moOde
+  restart), ALSA kept accepting audio and throwing it away, so a six-minute
+  track went by in about 25 seconds, reported as playing, and the queue moved
+  on to the next track the same way. The daemon now notices within about a
+  quarter of a second that audio is going out faster than the DAC's clock can
+  play it. It closes the device, reopens it, and carries on from where the
+  sound stopped, which is what brought the DAC back on the Pi. If it fails
+  again within 30 seconds, playback stops at that point with an error instead
+  of moving through the queue. An output write that fails outright is handled
+  the same way, rather than being taken for the end of the track.
 
 ## 2.7.2 — 2026-10-27
 
