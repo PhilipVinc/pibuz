@@ -240,12 +240,18 @@ pub fn plan_tick(
     //    previous position was within 2 s of the (current) duration. Uses the
     //    live `ev.duration` guard + previous `last.position` exactly as the
     //    desktop's `duration > 0 && seen_position + 2 >= duration`.
+    //
+    //    OR this tick's position is AT the duration: the player parks it there
+    //    only when the engine has run dry, never on a pause. That is how a file
+    //    shorter than the duration it was announced with still ends — a Qobuz
+    //    preview stops at 30 s of a 267 s track, and without this the queue
+    //    stood still on a "paused" track that had nothing left to play.
     let track_ended = last.is_playing
         && !ev.is_playing
         && last.track_id != 0
         && (ev.track_id == 0 || ev.track_id == last.track_id)
         && ev.duration > 0
-        && last.position + 2 >= ev.duration;
+        && (last.position + 2 >= ev.duration || ev.position >= ev.duration);
 
     // 6. QConnect report edge (playback.rs:4648-4673): report on a track/play
     //    transition OR the ~2 s periodic cadence while playing. Runs regardless
@@ -812,6 +818,38 @@ mod tests {
         );
         assert!(a.contains(&DriverAction::AdvanceAndPlay));
         assert!(a.contains(&DriverAction::ReportEdge)); // play-state edge
+    }
+
+    /// The audio ran out before the duration the track was announced with: a
+    /// 30 s Qobuz preview played as a 267 s track, on the Pi on 2026-10-13. The
+    /// last playing tick saw 29 s, nowhere near 267 — but the player only
+    /// parks the position AT the duration when the engine has run dry, so that
+    /// is the end of the track whatever the previous tick said. Before this the
+    /// queue never moved: the phone showed a paused 267 s track forever.
+    #[test]
+    fn an_end_short_of_the_declared_duration_still_advances() {
+        let s = DriverState::after(&ev(1, true, 29, 267));
+        let a = plan_tick(
+            &s,
+            &ev(1, false, 267, 267),
+            &q(1, &[(2, true)], "off", None),
+            None,
+        );
+        assert!(a.contains(&DriverAction::AdvanceAndPlay));
+    }
+
+    /// The other side of the rule above: a pause mid-track leaves the position
+    /// where it was, and must not be mistaken for an early end.
+    #[test]
+    fn a_pause_short_of_the_declared_duration_does_not_advance() {
+        let s = DriverState::after(&ev(1, true, 29, 267));
+        let a = plan_tick(
+            &s,
+            &ev(1, false, 29, 267),
+            &q(1, &[(2, true)], "off", None),
+            None,
+        );
+        assert!(!a.contains(&DriverAction::AdvanceAndPlay));
     }
 
     /// A finished track's bytes are released at the transition rather than left

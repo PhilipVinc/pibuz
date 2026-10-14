@@ -127,6 +127,11 @@ pub enum PlaybackEngine {
         link: Arc<RingLink>,
         /// Signals that the writer thread has consumed a source and moved to next
         source_transition: Arc<AtomicBool>,
+        /// Set by the writer when it acts on the end of the stream, cleared by
+        /// the next `append`. `play()` reads it: a finished engine has spent its
+        /// one end-of-stream marker, so resuming it would "play" an empty ring
+        /// that nothing will ever report the end of again.
+        finished: Arc<AtomicBool>,
         hardware_volume: bool,
         /// Software volume for the writer thread, as f32 bits — the same
         /// idiom `SharedState::volume` and the normalization `gain_atomic`
@@ -168,6 +173,7 @@ impl PlaybackEngine {
         let source_transition = Arc::new(AtomicBool::new(false));
         let volume = Arc::new(AtomicU32::new(1.0f32.to_bits()));
         let link = Arc::new(RingLink::new());
+        let finished = Arc::new(AtomicBool::new(false));
 
         let channels = stream.channels();
         let capacity_frames = qbz_audio::pcm_ring::ring_capacity_frames(
@@ -218,12 +224,14 @@ impl PlaybackEngine {
             let link_c = link.clone();
             let transition_c = source_transition.clone();
             let volume_c = volume.clone();
+            let finished_c = finished.clone();
             thread::spawn(move || {
                 alsa_writer_thread(
                     consumer,
                     stream_c,
                     link_c,
                     playing_c,
+                    finished_c,
                     stop_c,
                     pos_c,
                     transition_c,
@@ -243,6 +251,7 @@ impl PlaybackEngine {
             writer_thread: Some(writer),
             link,
             source_transition,
+            finished,
             hardware_volume,
             volume,
         }
@@ -312,8 +321,13 @@ impl PlaybackEngine {
                 position_frames,
                 source_queue,
                 source_transition,
+                finished,
                 ..
             } => {
+                // Cleared here rather than only at the writer's next
+                // `TrackStart`: a `play()` straight after this append must not
+                // find the previous stream's end and refuse.
+                finished.store(false, Ordering::SeqCst);
                 let is_first = source_queue.is_empty() && !is_playing.load(Ordering::SeqCst);
 
                 // Seconds to frames here, where the stream's rate is at hand;
@@ -374,18 +388,35 @@ impl PlaybackEngine {
         }
     }
 
-    /// Play (unpause)
-    pub fn play(&self) {
+    /// Play (unpause). Returns whether the engine is now playing: `false` when
+    /// the stream has already ended, which a resume cannot undo — only a new
+    /// `append` can.
+    pub fn play(&self) -> bool {
         match self {
-            Self::Rodio { sink } => sink.play(),
-            Self::AlsaDirect { is_playing, .. } => {
+            Self::Rodio { sink } => {
+                sink.play();
+                true
+            }
+            Self::AlsaDirect {
+                is_playing,
+                finished,
+                ..
+            } => {
+                if finished.load(Ordering::SeqCst) {
+                    log::info!(
+                        "[ALSA Direct Engine] Resume after the end of the stream: nothing left to play"
+                    );
+                    return false;
+                }
                 log::info!("[ALSA Direct Engine] Resume requested");
                 is_playing.store(true, Ordering::SeqCst);
+                true
             }
             #[cfg(target_os = "linux")]
             Self::Jack { is_playing, .. } => {
                 log::info!("[JACK Engine] Resume requested");
                 is_playing.store(true, Ordering::SeqCst);
+                true
             }
         }
     }
@@ -939,6 +970,7 @@ fn alsa_writer_thread(
     stream: Arc<dyn AudioOut>,
     link: Arc<RingLink>,
     is_playing: Arc<AtomicBool>,
+    finished: Arc<AtomicBool>,
     should_stop: Arc<AtomicBool>,
     position_frames: Arc<AtomicU64>,
     source_transition: Arc<AtomicBool>,
@@ -1183,6 +1215,7 @@ fn alsa_writer_thread(
                     segment_position = 0;
                     position_frames.store(offset_frames, Ordering::SeqCst);
                     finished_reported = false;
+                    finished.store(false, Ordering::SeqCst);
                     if first_track_seen {
                         log::info!("[ALSA Direct Engine] Gapless transition to the next source");
                         source_transition.store(true, Ordering::SeqCst);
@@ -1226,6 +1259,7 @@ fn alsa_writer_thread(
                     } else if let Err(e) = stream.drain() {
                         log::warn!("[ALSA Direct Engine] Drain failed: {e}");
                     }
+                    finished.store(true, Ordering::SeqCst);
                     is_playing.store(false, Ordering::SeqCst);
                     was_playing = false;
                 }
@@ -1915,6 +1949,34 @@ mod engine_behaviour_tests {
         assert!(
             wait_for("the engine to go empty", || engine.empty()),
             "the engine never reported the end of the queue"
+        );
+        engine.stop();
+    }
+
+    /// A resume that arrives after the end must not put the engine back to
+    /// "playing" with nothing left to play.
+    ///
+    /// Seen on the Pi on 2026-10-13: a 30 s Qobuz preview ran out, and the
+    /// controller's next SetState (still saying PLAYING) became a `play()` on
+    /// the finished engine. Its one end-of-stream marker was already spent, so
+    /// nothing would ever report the end again: the writer popped an empty ring
+    /// every 2 ms ("ran DRY 247x" twice a second) and `/api/status` said
+    /// `playing`, position frozen, until the daemon was restarted.
+    #[test]
+    fn a_resume_after_the_end_leaves_the_engine_idle() {
+        let out = device();
+        let mut engine = PlaybackEngine::new_alsa_direct(out.clone(), false);
+        engine.append(tone(1.0, 0.25), 0).expect("append");
+        assert!(
+            wait_for("the engine to go empty", || engine.empty()),
+            "the track never finished"
+        );
+
+        engine.play();
+
+        assert!(
+            wait_for("the engine to be idle again", || engine.empty()),
+            "a resume after the end left the engine playing an empty ring"
         );
         engine.stop();
     }

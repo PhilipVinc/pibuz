@@ -58,6 +58,17 @@ tags on `main`.
   envelope's own `error` field was never decoded, so any error the server
   sent there vanished without a trace. It is now logged as
   `[QConnect] Server error <code>: <message>`.
+- **A track Qobuz only offers as a 30 s preview plays as one.** For a track
+  the account cannot stream (a purchase-only album, say), Qobuz hands out a
+  30 s sample instead of the file. The daemon played it against the
+  catalogue's full length, so the controller's progress bar ran on past the
+  end, the track never advanced, and a resume from the phone afterwards
+  wedged the player in "playing" with nothing coming out. The preview is now
+  reported at its real length, a start offset past it starts from the top,
+  it ends like any other track, and it is never written to the cache as if
+  it were the track. The log says so:
+  `[QConnect] Track N: playing Qobuz's 30s preview from 0s`. A resume after a
+  track has ended is now ignored instead of restarting a spent stream.
 
 ## 2.6.0 — 2026-10-11
 

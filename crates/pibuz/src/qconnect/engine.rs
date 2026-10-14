@@ -592,6 +592,23 @@ impl QconnectRendererEngine for DaemonRendererEngine {
             .await
             .map_err(|err| format!("resolve stream url for remote track {track_id}: {err}"))?;
 
+        // A track this account cannot stream comes back as a 30 s preview, and
+        // is played as what it is: a 30 s track. From here on `duration_secs`
+        // is the FILE's length — the latch, the player's clock, and so every
+        // report the controller draws its progress bar from — and an offset
+        // past the end of the preview starts it from the top.
+        let duration_secs = stream_url.playable_duration_secs(duration_secs);
+        let start_position_secs = if stream_url.sample && start_position_secs >= duration_secs {
+            0
+        } else {
+            start_position_secs
+        };
+        if stream_url.sample {
+            log::info!(
+                "[QConnect] Track {track_id}: playing Qobuz's {duration_secs}s preview from {start_position_secs}s"
+            );
+        }
+
         // Stop the previous track's download before starting the next one (see
         // `current_feeder`) — AFTER the resolve above, deliberately.
         //
@@ -647,6 +664,9 @@ impl QconnectRendererEngine for DaemonRendererEngine {
             start_position_secs,
             &stream_url.url,
             Some(refresh_url),
+            // Never stage a preview on the card: the cache is keyed by track
+            // id, and the next cast would replay it as the track.
+            !stream_url.sample,
             "QConnect",
         )
         .await;

@@ -94,6 +94,7 @@ pub async fn stream_remote_track_into_player(
     start_position_secs: u64,
     url: &str,
     refresh_url: Option<UrlRefresher>,
+    cacheable: bool,
     log_tag: &str,
 ) -> Result<tokio::task::JoinHandle<()>, String> {
     let stream_info = probe_remote_stream_info(url).await?;
@@ -109,8 +110,13 @@ pub async fn stream_remote_track_into_player(
     );
 
     // The L2 cache to stage this track into as it streams, if settings allow
-    // and it is not already there.
-    let disk_cache = player.disk_cache_for_streaming(track_id);
+    // and it is not already there, and if the caller says the file IS the
+    // track (a preview is not).
+    let disk_cache = if cacheable {
+        player.disk_cache_for_streaming(track_id)
+    } else {
+        None
+    };
 
     let writer = player
         .play_streaming_dynamic(
