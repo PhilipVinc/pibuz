@@ -33,7 +33,9 @@ rand = "0.9"
 symphonia = { workspace = true }
 
 # Audio playback
-rodio = { version = "0.22", features = ["symphonia-all"] }
+# Output (cpal) and the FLAC/MP3 decoders, nothing else: no recording, no
+# dither noise, no MP4/Vorbis/WAV.
+rodio = { version = "0.22", default-features = false, features = ["playback", "flac", "mp3"] }
 
 # HTTP client for streaming
 reqwest = { workspace = true }
@@ -46,3 +48,7 @@ workspace = true
 [dev-dependencies]
 # The CDN client needs a process-level CryptoProvider; `cmaf_fetch` tests build one.
 rustls = { version = "0.23", features = ["aws_lc_rs"] }
+# The decoder tests synthesize a WAV ramp (streaming_source::ramp_wav). Test
+# builds only: release builds decode FLAC and MP3 and nothing else.
+symphonia = { workspace = true, features = ["wav", "pcm"] }
+rodio = { version = "0.22", default-features = false, features = ["playback", "flac", "mp3", "wav"] }

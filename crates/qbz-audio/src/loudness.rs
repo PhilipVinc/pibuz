@@ -67,11 +67,7 @@ pub fn extract_replaygain(data: &[u8]) -> Option<ReplayGainData> {
     let source = Box::new(CursorMediaSource::new(data.to_vec())) as Box<dyn MediaSource>;
     let mss = MediaSourceStream::new(source, Default::default());
 
-    let mut hint = Hint::new();
-    // Help Symphonia detect isomp4/m4a
-    if data.len() >= 12 && &data[4..8] == b"ftyp" {
-        hint.with_extension("m4a");
-    }
+    let hint = Hint::new();
 
     let format_opts = FormatOptions {
         enable_gapless: true,

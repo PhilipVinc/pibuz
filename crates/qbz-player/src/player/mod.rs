@@ -283,8 +283,7 @@ fn decode_with_symphonia(data: &TrackBytes) -> Result<SamplesBuffer, String> {
     let source = Box::new(CursorMediaSource::new(data.clone())) as Box<dyn MediaSource>;
     let mss = MediaSourceStream::new(source, Default::default());
 
-    let mut hint = Hint::new();
-    hint.with_extension("m4a");
+    let hint = Hint::new();
 
     let format_opts = FormatOptions {
         enable_gapless: true,
@@ -353,14 +352,6 @@ fn decode_with_symphonia(data: &TrackBytes) -> Result<SamplesBuffer, String> {
     ))
 }
 
-fn is_isomp4(data: &[u8]) -> bool {
-    if data.len() < 12 {
-        return false;
-    }
-
-    &data[4..8] == b"ftyp"
-}
-
 /// Audio metadata extracted from file headers, without a full decode.
 struct AudioMetadata {
     sample_rate: u32,
@@ -369,17 +360,14 @@ struct AudioMetadata {
 }
 
 fn extract_audio_metadata_full(data: &TrackBytes) -> Result<AudioMetadata, String> {
-    // For non-isomp4 files (FLAC, etc.), try symphonia directly to get all metadata
+    // Try symphonia directly to get all metadata
     // Symphonia gives us bits_per_sample which rodio doesn't expose
 
     // Use symphonia probe for codec params (no decode needed)
     let source = Box::new(CursorMediaSource::new(data.clone())) as Box<dyn MediaSource>;
     let mss = MediaSourceStream::new(source, Default::default());
 
-    let mut hint = Hint::new();
-    if is_isomp4(data) {
-        hint.with_extension("m4a");
-    }
+    let hint = Hint::new();
 
     let format_opts = FormatOptions {
         enable_gapless: true,
@@ -1122,13 +1110,6 @@ fn read_tag_head(file: &qbz_cache::CachedFile) -> Option<TrackBytes> {
 }
 
 fn decode_with_fallback(data: &TrackBytes) -> Result<Box<dyn Source<Item = f32> + Send>, String> {
-    if is_isomp4(data) {
-        return decode_with_symphonia(data).map(|samples| {
-            log::info!("Decoded audio using symphonia fallback (isomp4)");
-            Box::new(samples) as Box<dyn Source<Item = f32> + Send>
-        });
-    }
-
     let primary = panic::catch_unwind(AssertUnwindSafe(|| {
         Decoder::new(BufReader::new(Cursor::new(data.clone())))
     }));
@@ -1136,30 +1117,13 @@ fn decode_with_fallback(data: &TrackBytes) -> Result<Box<dyn Source<Item = f32> 
     match primary {
         Ok(Ok(decoder)) => return Ok(Box::new(decoder)),
         Ok(Err(err)) => {
-            log::warn!("Primary decode failed, attempting mp4 fallback: {}", err);
+            log::warn!(
+                "Primary decode failed, attempting symphonia fallback: {}",
+                err
+            );
         }
         Err(_) => {
-            log::warn!("Primary decode panicked, attempting mp4 fallback");
-        }
-    }
-
-    // Try mp4 fallback (rodio 0.22 removed Mp4Type hint)
-    {
-        let attempt = panic::catch_unwind(AssertUnwindSafe(|| {
-            Decoder::new_mp4(BufReader::new(Cursor::new(data.clone())))
-        }));
-
-        match attempt {
-            Ok(Ok(decoder)) => {
-                log::info!("Decoded audio using mp4 fallback");
-                return Ok(Box::new(decoder));
-            }
-            Ok(Err(err)) => {
-                log::warn!("mp4 fallback failed: {}", err);
-            }
-            Err(_) => {
-                log::warn!("mp4 fallback panicked");
-            }
+            log::warn!("Primary decode panicked, attempting symphonia fallback");
         }
     }
 

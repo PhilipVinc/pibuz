@@ -17,7 +17,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 
 # Audio playback (f32 pipeline is now upstream in rodio 0.22)
-rodio = { version = "0.22", features = ["symphonia-all"] }
+# Output (cpal) and the FLAC/MP3 decoders, nothing else: no recording, no
+# dither noise, no MP4/Vorbis/WAV.
+rodio = { version = "0.22", default-features = false, features = ["playback", "flac", "mp3"] }
 
 # Audio analysis
 symphonia = { workspace = true }
