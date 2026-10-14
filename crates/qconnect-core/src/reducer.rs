@@ -369,33 +369,6 @@ fn insertion_index(items: &[QueueItem], insert_after: Option<u64>) -> usize {
         .unwrap_or(items.len())
 }
 
-pub fn build_shuffle_order(count: usize, seed: u64, pivot_index: Option<usize>) -> Vec<usize> {
-    let mut order: Vec<usize> = (0..count).collect();
-    if count <= 1 {
-        return order;
-    }
-
-    let mut rng = if seed == 0 {
-        0x9e37_79b9_7f4a_7c15
-    } else {
-        seed
-    };
-
-    for idx in (1..count).rev() {
-        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
-        let swap_idx = (rng % ((idx + 1) as u64)) as usize;
-        order.swap(idx, swap_idx);
-    }
-
-    if let Some(pivot) = pivot_index.filter(|value| *value < count) {
-        if let Some(pos) = order.iter().position(|value| *value == pivot) {
-            order.rotate_left(pos);
-        }
-    }
-
-    order
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

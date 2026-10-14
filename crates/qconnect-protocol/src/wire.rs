@@ -52,10 +52,6 @@ pub fn parse_inbound_event(envelope: InboundEnvelope) -> Result<QueueServerEvent
     })
 }
 
-pub fn encode_outbound_json(envelope: &OutboundEnvelope) -> Result<Vec<u8>, ProtocolError> {
-    Ok(serde_json::to_vec(envelope)?)
-}
-
 pub fn encode_outbound_payload_bytes(
     envelope: &OutboundEnvelope,
 ) -> Result<Vec<u8>, ProtocolError> {

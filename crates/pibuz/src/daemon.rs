@@ -22,7 +22,6 @@ use crate::state::{DaemonShared, LatchedErrors, QconnectStatus};
 /// tasks: T4 spawns the playback driver on `runtime` + `shared`, T6 serves
 /// `bus` over HTTP/SSE, T9/T10 wire QConnect. Held alive by [`run`] through the
 /// signal park so the core stays up.
-#[allow(dead_code)] // fields are the seam later tasks (T6/T9/T10) read.
 pub struct BootedRuntime {
     pub runtime: Arc<AppRuntime<DaemonAdapter>>,
     pub shared: Arc<Mutex<DaemonShared>>,
@@ -619,7 +618,7 @@ pub(crate) async fn reload_qconnect(state: &crate::api::ApiState) {
     let db = state.roots.data.join("qconnect_settings.db");
     qc.refresh_device_name(&db).await;
     let mode = crate::qconnect::transport::load_startup_mode_at(&db);
-    let should_connect = qconnect_app::compute_effective_startup(mode, None, None);
+    let should_connect = mode.auto_connects();
     if should_connect {
         if let Err(e) = qc.connect().await {
             log::info!("[reload] qconnect connect deferred: {e}");

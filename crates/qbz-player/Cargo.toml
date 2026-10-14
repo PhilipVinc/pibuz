@@ -22,15 +22,9 @@ serde = { workspace = true }
 
 # Async
 tokio = { workspace = true }
-async-trait = { workspace = true }
-futures-util = { workspace = true }
-tokio-stream = { workspace = true }
 
 # Logging
 log = { workspace = true }
-
-# Error handling
-thiserror = { workspace = true }
 
 # Random (for shuffle)
 rand = "0.9"

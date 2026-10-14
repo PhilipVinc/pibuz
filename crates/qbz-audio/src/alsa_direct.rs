@@ -791,9 +791,6 @@ pub struct AlsaDirectStream {
     /// request, and the writer sizes its work quantum from these.
     buffer_frames: Frames,
     period_frames: Frames,
-    /// True when ALSA's plug layer is rate-converting under us, i.e. this
-    /// stream is NOT bit-perfect. See [`Self::is_bit_perfect`].
-    resampled: bool,
     /// The last frame handed to the device, kept so a stop can ramp down from
     /// it instead of stepping to zero. `channels` long once anything has been
     /// written. See [`Self::fade_out_and_pad`].
@@ -990,7 +987,6 @@ impl AlsaDirectStream {
             format: selected_format,
             buffer_frames,
             period_frames,
-            resampled,
             last_frame: Mutex::new(Vec::new()),
             device_id: device_id.to_string(),
             mixer_device: None,
@@ -1109,166 +1105,6 @@ impl AlsaDirectStream {
         );
 
         Ok((format, buffer_frames, period_frames))
-    }
-
-    /// Write audio samples to ALSA (auto-converts from i16 based on detected format)
-    pub fn write(&self, samples_i16: &[i16]) -> Result<(), String> {
-        let pcm = self.pcm.lock().unwrap();
-        let frames = samples_i16.len() / self.channels as usize;
-
-        match self.format {
-            Format::FloatLE => {
-                // Convert i16 to f32
-                let samples_f32: Vec<f32> =
-                    samples_i16.iter().map(|&s| s as f32 / 32768.0).collect();
-
-                let io = pcm
-                    .io_f32()
-                    .map_err(|e| format!("Failed to get PCM I/O: {}", e))?;
-
-                match io.writei(&samples_f32) {
-                    Ok(written) => {
-                        if written != frames {
-                            log::warn!(
-                                "[ALSA Direct] Partial write: {} / {} frames",
-                                written,
-                                frames
-                            );
-                        }
-                        Ok(())
-                    }
-                    Err(e) => {
-                        if let Err(msg) = recover_write_error(&pcm, e.errno(), "") {
-                            Err(msg)
-                        } else {
-                            Ok(())
-                        }
-                    }
-                }
-            }
-            Format::S32LE => {
-                // Convert i16 to i32 (bit-perfect: shift left 16 bits)
-                let samples_i32: Vec<i32> = samples_i16.iter().map(|&s| (s as i32) << 16).collect();
-
-                let io = pcm
-                    .io_i32()
-                    .map_err(|e| format!("Failed to get PCM I/O: {}", e))?;
-
-                match io.writei(&samples_i32) {
-                    Ok(written) => {
-                        if written != frames {
-                            log::warn!(
-                                "[ALSA Direct] Partial write: {} / {} frames",
-                                written,
-                                frames
-                            );
-                        }
-                        Ok(())
-                    }
-                    Err(e) => {
-                        if let Err(msg) = recover_write_error(&pcm, e.errno(), "") {
-                            Err(msg)
-                        } else {
-                            Ok(())
-                        }
-                    }
-                }
-            }
-            Format::S16LE => {
-                // Direct write (no conversion needed)
-                let io = pcm
-                    .io_i16()
-                    .map_err(|e| format!("Failed to get PCM I/O: {}", e))?;
-
-                match io.writei(samples_i16) {
-                    Ok(written) => {
-                        if written != frames {
-                            log::warn!(
-                                "[ALSA Direct] Partial write: {} / {} frames",
-                                written,
-                                frames
-                            );
-                        }
-                        Ok(())
-                    }
-                    Err(e) => {
-                        if let Err(msg) = recover_write_error(&pcm, e.errno(), "") {
-                            Err(msg)
-                        } else {
-                            Ok(())
-                        }
-                    }
-                }
-            }
-            Format::S243LE => {
-                // S24_3LE: 24-bit packed in 3 bytes, little-endian
-                // Required by SMSL-class USB DACs (TAS1020B chip)
-                // Convert i16 → i24: shift left 8 bits, then pack into 3 bytes
-                let mut bytes: Vec<u8> = Vec::with_capacity(samples_i16.len() * 3);
-
-                for &sample in samples_i16 {
-                    // Convert i16 to i24 (lossless: zeros in lower 8 bits)
-                    let s24 = (sample as i32) << 8;
-                    // Pack as 3 bytes in little-endian order
-                    bytes.push((s24 & 0xFF) as u8); // LSB
-                    bytes.push(((s24 >> 8) & 0xFF) as u8); // Middle
-                    bytes.push(((s24 >> 16) & 0xFF) as u8); // MSB (sign-extended)
-                }
-
-                // Use raw byte I/O for 3-byte packed format
-                let io = pcm.io_bytes();
-
-                match io.writei(&bytes) {
-                    Ok(written) => {
-                        if written != frames {
-                            log::warn!(
-                                "[ALSA Direct] Partial write: {} / {} frames (S24_3LE)",
-                                written,
-                                frames
-                            );
-                        }
-                        Ok(())
-                    }
-                    Err(e) => {
-                        if let Err(msg) = recover_write_error(&pcm, e.errno(), "(S24_3LE)") {
-                            Err(msg)
-                        } else {
-                            Ok(())
-                        }
-                    }
-                }
-            }
-            Format::S24LE => {
-                // S24LE: 24-bit in 32-bit container (padded)
-                // Convert i16 → i32, shift left 16 bits (same as S32LE for i16 source)
-                let samples_i32: Vec<i32> = samples_i16.iter().map(|&s| (s as i32) << 16).collect();
-
-                let io = pcm
-                    .io_i32()
-                    .map_err(|e| format!("Failed to get PCM I/O: {}", e))?;
-
-                match io.writei(&samples_i32) {
-                    Ok(written) => {
-                        if written != frames {
-                            log::warn!(
-                                "[ALSA Direct] Partial write: {} / {} frames",
-                                written,
-                                frames
-                            );
-                        }
-                        Ok(())
-                    }
-                    Err(e) => {
-                        if let Err(msg) = recover_write_error(&pcm, e.errno(), "") {
-                            Err(msg)
-                        } else {
-                            Ok(())
-                        }
-                    }
-                }
-            }
-            _ => Err(format!("Unsupported format: {:?}", self.format)),
-        }
     }
 
     /// Write f32 audio samples to ALSA (converts to hardware format with full precision)
@@ -1413,15 +1249,6 @@ impl AlsaDirectStream {
 
     pub fn period_frames(&self) -> usize {
         self.period_frames.max(0) as usize
-    }
-
-    /// False when ALSA's plug layer is rate-converting under this stream.
-    ///
-    /// Only ever false for a non-`hw:` output that could not deliver the
-    /// track's rate; see the two-attempt configuration in [`Self::new`]. The
-    /// renderer should not claim bit-perfect output when this is false.
-    pub fn is_bit_perfect(&self) -> bool {
-        !self.resampled
     }
 
     /// Top the ring up to `target_ms` of SILENCE, so the clock keeps running
@@ -1892,11 +1719,6 @@ impl AlsaDirectStream {
         self.channels
     }
 
-    /// Get device ID
-    pub fn device_id(&self) -> &str {
-        &self.device_id
-    }
-
     /// Name the ALSA control device holding the DAC's mixer, when it is not the
     /// one the output device names.
     ///
@@ -2012,21 +1834,9 @@ impl AlsaDirectStream {
         Err("ALSA Direct is only available on Linux".to_string())
     }
 
-    pub fn write(&self, _samples: &[i16]) -> Result<(), String> {
-        Err("ALSA Direct is only available on Linux".to_string())
-    }
-
     pub fn write_f32(
         &self,
         _samples: &[f32],
-        _cancel: &std::sync::atomic::AtomicBool,
-    ) -> Result<usize, String> {
-        Err("ALSA Direct is only available on Linux".to_string())
-    }
-
-    pub fn write_dop_i32(
-        &self,
-        _samples: &[i32],
         _cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<usize, String> {
         Err("ALSA Direct is only available on Linux".to_string())
@@ -2042,10 +1852,6 @@ impl AlsaDirectStream {
 
     pub fn delay_frames(&self) -> usize {
         0
-    }
-
-    pub fn is_bit_perfect(&self) -> bool {
-        false
     }
 
     pub fn start_if_prepared(&self) -> Result<(), String> {

@@ -296,14 +296,13 @@ impl PlaybackEngine {
     /// which only releases once the clock passes the offset that was seeked to.
     /// Report frames-since-this-source-started and a seek leaves the controller
     /// spinning, its clock frozen, on a track that is audibly playing.
-    pub fn append<S>(&mut self, source: S, start_offset_secs: u64) -> Result<(), String>
+    pub fn append<S>(&mut self, source: S, start_offset_secs: u64)
     where
         S: Source<Item = f32> + Send + 'static,
     {
         match self {
             Self::Rodio { sink } => {
                 sink.append(source);
-                Ok(())
             }
             Self::AlsaDirect {
                 stream,
@@ -334,8 +333,6 @@ impl PlaybackEngine {
                 } else {
                     log::info!("[ALSA Direct Engine] Source queued for gapless transition");
                 }
-
-                Ok(())
             }
             #[cfg(target_os = "linux")]
             Self::Jack {
@@ -369,7 +366,6 @@ impl PlaybackEngine {
                 } else {
                     log::info!("[JACK Engine] Source queued for gapless transition");
                 }
-                Ok(())
             }
         }
     }
@@ -1697,7 +1693,7 @@ mod engine_behaviour_tests {
         const SEEK_TO: u64 = 166;
         let out = device();
         let mut engine = PlaybackEngine::new_alsa_direct(out.clone(), false);
-        engine.append(tone(3.0, 0.25), SEEK_TO).expect("append");
+        engine.append(tone(3.0, 0.25), SEEK_TO);
 
         assert!(
             wait_for("the position to pass the seek offset", || {
@@ -1737,7 +1733,7 @@ mod engine_behaviour_tests {
         const SEEK_TO: u64 = 166;
         let out = device();
         let mut engine = PlaybackEngine::new_alsa_direct(out.clone(), false);
-        engine.append(tone(3.0, 0.25), SEEK_TO).expect("append");
+        engine.append(tone(3.0, 0.25), SEEK_TO);
 
         assert!(wait_for("playback to start", || out.frames_played() > 0));
         // Sample repeatedly across the start of playback: a clock that began at
@@ -1761,7 +1757,7 @@ mod engine_behaviour_tests {
     fn a_source_played_from_the_start_reports_from_zero() {
         let out = device();
         let mut engine = PlaybackEngine::new_alsa_direct(out.clone(), false);
-        engine.append(tone(2.0, 0.25), 0).expect("append");
+        engine.append(tone(2.0, 0.25), 0);
 
         assert!(wait_for("playback to start", || out.frames_played() > 0));
         assert!(
@@ -1780,8 +1776,8 @@ mod engine_behaviour_tests {
         let mut engine = PlaybackEngine::new_alsa_direct(out.clone(), false);
         // Two adjacent tracks at different amplitudes, so the join is findable
         // in the tape.
-        engine.append(tone(0.5, 0.25), 0).expect("first");
-        engine.append(tone(0.5, 0.75), 0).expect("second");
+        engine.append(tone(0.5, 0.25), 0);
+        engine.append(tone(0.5, 0.75), 0);
 
         assert!(
             wait_for("the transition to be signalled", || engine
@@ -1829,7 +1825,7 @@ mod engine_behaviour_tests {
         let secs = track_frames as f32 / RATE as f32;
 
         let mut engine = PlaybackEngine::new_alsa_direct(out.clone(), false);
-        engine.append(tone(secs, 0.25), 0).expect("append");
+        engine.append(tone(secs, 0.25), 0);
 
         assert!(
             wait_for("the short track to finish", || engine.empty()),
@@ -1856,7 +1852,7 @@ mod engine_behaviour_tests {
     fn a_pause_gives_back_what_the_device_had_not_played() {
         let out = device();
         let mut engine = PlaybackEngine::new_alsa_direct(out.clone(), false);
-        engine.append(tone(3.0, 0.25), 0).expect("append");
+        engine.append(tone(3.0, 0.25), 0);
 
         assert!(wait_for("playback to start", || out.frames_played() > 0));
         let before = engine.position_secs().expect("a position");
@@ -1894,7 +1890,7 @@ mod engine_behaviour_tests {
         // 10x, not the usual 100x — this test counts underruns; see `device_at`.
         let out = device_at(10.0);
         let mut engine = PlaybackEngine::new_alsa_direct(out.clone(), false);
-        engine.append(tone(1.0, 0.25), 0).expect("append");
+        engine.append(tone(1.0, 0.25), 0);
 
         // Sampled MID-TRACK, not at the end. The tail running out is an
         // underrun by any definition — real ALSA reaches XRun there too, and
@@ -1927,7 +1923,7 @@ mod engine_behaviour_tests {
         for (name, pause_first) in [("while playing", false), ("while paused", true)] {
             let out = device();
             let mut engine = PlaybackEngine::new_alsa_direct(out.clone(), false);
-            engine.append(tone(5.0, 0.25), 0).expect("append");
+            engine.append(tone(5.0, 0.25), 0);
             assert!(wait_for("playback to start", || out.frames_played() > 0));
             if pause_first {
                 engine.pause();
@@ -1956,7 +1952,7 @@ mod engine_behaviour_tests {
         out.record();
         let mut engine = PlaybackEngine::new_alsa_direct(out.clone(), false);
         configure(&engine);
-        engine.append(tone(0.3, 0.25), 0).expect("append");
+        engine.append(tone(0.3, 0.25), 0);
         assert!(wait_for("the tone to finish", || engine.empty()));
         engine.stop();
         audio_in(&out.recorded())

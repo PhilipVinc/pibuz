@@ -48,8 +48,8 @@ use symphonia::default::{get_codecs, get_probe};
 use playback_engine::PlaybackEngine;
 use qbz_audio::{
     calculate_gain_factor, db_to_linear, extract_replaygain, AnalyzerMessage, AnalyzerTap,
-    AudioBackendType, AudioDiagnostic, AudioSettings, BackendConfig, BackendManager,
-    BitPerfectMode, DiagnosticSource, DynamicAmplify, LoudnessAnalyzer, LoudnessCache,
+    AudioBackendType, AudioSettings, BackendConfig, BackendManager, BitPerfectMode, DynamicAmplify,
+    LoudnessAnalyzer, LoudnessCache,
 };
 use qbz_cache::TrackBytes;
 use qbz_models::Quality;
@@ -1609,7 +1609,6 @@ fn compute_needs_new_stream(
 }
 
 /// Try to create output stream using the backend system (if configured)
-/// Returns None if backend system is not configured (backend_type = None)
 ///
 /// For ALSA backend with hw: devices, may return AlsaDirect instead of Rodio stream.
 fn try_init_stream_with_backend(
@@ -1617,7 +1616,7 @@ fn try_init_stream_with_backend(
     sample_rate: u32,
     channels: u16,
     state: &SharedState,
-) -> Option<Result<StreamType, String>> {
+) -> Result<StreamType, String> {
     // A None backend_type means "Auto" / unset. Resolve it to SystemDefault on
     // every platform instead of returning None — returning None made the caller
     // fall through to the legacy CPAL path, which forced the track rate onto the
@@ -1641,7 +1640,7 @@ fn try_init_stream_with_backend(
         Ok(b) => b,
         Err(e) => {
             log::error!("Failed to create backend {:?}: {}", backend_type, e);
-            return Some(Err(e));
+            return Err(e);
         }
     };
 
@@ -1649,7 +1648,7 @@ fn try_init_stream_with_backend(
     if !backend.is_available() {
         let msg = format!("Backend {:?} is not available on this system", backend_type);
         log::error!("{}", msg);
-        return Some(Err(msg));
+        return Err(msg);
     }
 
     // Build backend config
@@ -1683,12 +1682,12 @@ fn try_init_stream_with_backend(
                     .downcast_ref::<qbz_audio::alsa_backend::AlsaBackend>()
                 {
                     if let Some(result) = alsa_backend.try_create_direct_stream(&config) {
-                        return Some(result.map(|(stream, mode)| {
+                        return result.map(|(stream, mode)| {
                             log::info!("ALSA Direct stream created with mode: {:?}", mode);
                             state.set_bit_perfect_mode(Some(mode));
                             state.set_output_sample_rate(stream.sample_rate());
                             StreamType::AlsaDirect(Arc::new(stream))
-                        }));
+                        });
                     }
                 }
             }
@@ -1703,9 +1702,9 @@ fn try_init_stream_with_backend(
             Ok(stream) => {
                 state.set_bit_perfect_mode(Some(qbz_audio::BitPerfectMode::Disabled));
                 state.set_output_sample_rate(stream.sample_rate());
-                return Some(Ok(StreamType::Jack(Arc::new(stream))));
+                return Ok(StreamType::Jack(Arc::new(stream)));
             }
-            Err(e) => return Some(Err(format!("JACK backend unavailable: {e}"))),
+            Err(e) => return Err(format!("JACK backend unavailable: {e}")),
         }
     }
 
@@ -1732,11 +1731,11 @@ fn try_init_stream_with_backend(
             };
             #[cfg(not(target_os = "macos"))]
             let stream = StreamType::rodio(mixer_sink);
-            Some(Ok(stream))
+            Ok(stream)
         }
         Err(e) => {
             log::error!("Backend stream creation failed: {}", e);
-            Some(Err(e))
+            Err(e)
         }
     }
 }
@@ -2271,8 +2270,6 @@ pub struct Player {
     pub state: SharedState,
     /// Audio settings (exclusive mode, DAC passthrough, etc.)
     audio_settings: Arc<Mutex<AudioSettings>>,
-    /// Bit-depth diagnostic capture (always available, zero-cost when idle)
-    pub diagnostic: AudioDiagnostic,
     /// Two-level playback cache (L1 memory + optional L2 disk). A track is
     /// cached after its first play so replays start instantly.
     audio_cache: Arc<qbz_cache::AudioCache>,
@@ -2280,7 +2277,7 @@ pub struct Player {
 
 impl Default for Player {
     fn default() -> Self {
-        Self::new(None, AudioSettings::default(), AudioDiagnostic::new(), None)
+        Self::new(None, AudioSettings::default(), None)
     }
 }
 
@@ -2295,7 +2292,6 @@ impl Player {
     pub fn new(
         device_name: Option<String>,
         audio_settings: AudioSettings,
-        diagnostic: AudioDiagnostic,
         data_root: Option<std::path::PathBuf>,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<AudioCommand>();
@@ -2310,9 +2306,6 @@ impl Player {
         // Clone settings for thread
         let settings = Arc::new(Mutex::new(audio_settings.clone()));
         let thread_settings = settings.clone();
-
-        // Clone the diagnostic for the audio thread
-        let thread_diagnostic = diagnostic.clone();
 
         // Where the loudness cache belongs, moved into the thread that opens it.
         let thread_data_root = data_root;
@@ -2335,21 +2328,17 @@ impl Player {
             let _analyzer_handle = LoudnessAnalyzer::spawn(analyzer_rx, loudness_cache.clone());
             let analyzer_enabled = Arc::new(AtomicBool::new(false));
 
-            // Helper to wrap a source with diagnostic capture and normalization
+            // Helper to wrap a source with normalization
             // Pipeline order (normalization ON):
-            //   Diagnostic (raw) → AnalyzerTap → DynamicAmplify → Visualizer
+            //   AnalyzerTap → DynamicAmplify
             // Pipeline order (normalization OFF — bit-perfect):
-            //   Diagnostic (raw) → Visualizer
+            //   the decoded source, untouched
             let wrap_source = |source: Box<dyn Source<Item = f32> + Send>,
                                normalization_gain: Option<f32>,
                                gain_atomic: Option<Arc<AtomicU32>>,
                                analyzer_tx: &SyncSender<AnalyzerMessage>,
                                analyzer_enabled: &Arc<AtomicBool>|
              -> Box<dyn Source<Item = f32> + Send> {
-                // Diagnostic tap (innermost — captures raw decoded samples)
-                let source: Box<dyn Source<Item = f32> + Send> =
-                    Box::new(DiagnosticSource::new(source, thread_diagnostic.clone()));
-
                 // Normalization: dynamic (Phase 2) > static (Phase 1 fallback) > none (bit-perfect)
                 let source: Box<dyn Source<Item = f32> + Send> =
                     if let Some(gain_atomic) = gain_atomic {
@@ -2414,7 +2403,7 @@ impl Player {
                         );
                         match try_init_stream_with_backend(&settings, sample_rate, channels, state)
                         {
-                            Some(Ok(stream_type)) => {
+                            Ok(stream_type) => {
                                 // Set device name from settings for backend system
                                 let device_name = settings
                                     .output_device
@@ -2424,7 +2413,7 @@ impl Player {
                                 state.set_current_device(Some(device_name));
                                 return Some(stream_type);
                             }
-                            Some(Err(e)) => {
+                            Err(e) => {
                                 // On macOS, the backend path is the only one that
                                 // understands CoreAudio ownership and nominal-rate
                                 // validation. Falling through to legacy CPAL can
@@ -2459,9 +2448,6 @@ impl Player {
                                     "Backend system init failed: {}, falling back to legacy",
                                     e
                                 );
-                            }
-                            None => {
-                                // Backend not configured, continue to legacy path
                             }
                         }
                     }
@@ -2699,12 +2685,13 @@ impl Player {
                                     using_coreaudio_exclusive
                                 );
 
-                                // Legacy CPAL path for Play, shared by the
-                                // "backend not configured" and "backend init failed"
-                                // arms below (#591/#592 follow-up — same shape as the
-                                // streaming handler). Uses the track's native
+                                // Legacy CPAL path for Play, taken when the backend
+                                // init fails (#591/#592 follow-up — same shape as the
+                                // streaming handler). Not on macOS, where the backend
+                                // path is authoritative. Uses the track's native
                                 // rate/channels unchanged — no resampling is
                                 // introduced here.
+                                #[cfg(not(target_os = "macos"))]
                                 let legacy_stream = || -> Result<StreamType, String> {
                                     // Get the audio device via CPAL
                                     let device = if let Some(ref name) = *current_device_name {
@@ -2768,7 +2755,7 @@ impl Player {
                                         channels,
                                         &thread_state,
                                     ) {
-                                        Some(Ok(stream)) => {
+                                        Ok(stream) => {
                                             // Backend system handled it - set device name from settings
                                             let device_name = settings
                                                 .output_device
@@ -2786,13 +2773,13 @@ impl Player {
                                         // surface the failure unchanged — see init_device
                                         // for the rationale.
                                         #[cfg(target_os = "macos")]
-                                        Some(Err(e)) => Err(e),
+                                        Err(e) => Err(e),
                                         // Linux/other: a backend init failure must not
                                         // dead-end the Play (#591/#592 follow-up). Fall
                                         // back to the legacy CPAL path immediately, same
                                         // as the streaming handler and init_device do.
                                         #[cfg(not(target_os = "macos"))]
-                                        Some(Err(e))
+                                        Err(e)
                                             if !may_fall_back_to_legacy(
                                                 settings.output_device.as_deref(),
                                                 &e,
@@ -2801,16 +2788,11 @@ impl Player {
                                             Err(e)
                                         }
                                         #[cfg(not(target_os = "macos"))]
-                                        Some(Err(e)) => {
+                                        Err(e) => {
                                             log::warn!(
                                                 "Backend system init failed for Play: {}, falling back to legacy",
                                                 e
                                             );
-                                            legacy_stream()
-                                        }
-                                        None => {
-                                            // Backend system not configured, use legacy CPAL path
-                                            log::info!("Backend system not configured, using legacy CPAL path");
                                             legacy_stream()
                                         }
                                     }
@@ -3150,7 +3132,7 @@ impl Player {
                             *current_gain_atomic = gain_atomic.clone();
                             thread_state.set_normalization_gain(normalization);
 
-                            // Wrap source with diagnostic capture and normalization
+                            // Wrap source with normalization
                             let source = wrap_source(
                                 source,
                                 normalization,
@@ -3160,17 +3142,7 @@ impl Player {
                             );
                             // The offset the caller asked for, not 0. See
                             // `AudioCommand::Play::start_position_secs`.
-                            if let Err(e) = engine.append(source, start_position_secs) {
-                                fail_play(
-                                    &thread_state,
-                                    current_audio_data,
-                                    current_audio_file,
-                                    current_streaming_source,
-                                    (track_id, start_position_secs, duration_secs),
-                                    format!("Failed to append source to engine: {e}"),
-                                );
-                                return;
-                            }
+                            engine.append(source, start_position_secs);
 
                             thread_state.is_playing.store(true, Ordering::SeqCst);
                             thread_state
@@ -3288,10 +3260,12 @@ impl Player {
                                     std::thread::sleep(Duration::from_millis(50));
                                 }
 
-                                // Legacy CPAL path for streaming, shared by the
-                                // "backend not configured" and "backend init failed"
-                                // arms below. Uses the track's native rate/channels
-                                // unchanged — no resampling is introduced here.
+                                // Legacy CPAL path for streaming, taken when the
+                                // backend init fails. Not on macOS, where the backend
+                                // path is authoritative. Uses the track's native
+                                // rate/channels unchanged — no resampling is
+                                // introduced here.
+                                #[cfg(not(target_os = "macos"))]
                                 let legacy_stream = || -> Result<StreamType, String> {
                                     let device = if let Some(ref name) = *current_device_name {
                                         host.output_devices()
@@ -3335,7 +3309,7 @@ impl Player {
                                         channels,
                                         &thread_state,
                                     ) {
-                                        Some(Ok(stream)) => {
+                                        Ok(stream) => {
                                             // Set device name from settings for backend system
                                             let device_name = settings
                                                 .output_device
@@ -3353,14 +3327,14 @@ impl Player {
                                         // surface the failure unchanged — see init_device
                                         // for the rationale.
                                         #[cfg(target_os = "macos")]
-                                        Some(Err(e)) => Err(e),
+                                        Err(e) => Err(e),
                                         // Linux/other: a backend init failure must not
                                         // leave the track never-starting (#591/#592 — the
                                         // 45s loading watchdog was the only exit). Fall
                                         // back to the legacy CPAL path immediately, same
                                         // as the Play/Resume paths do via init_device.
                                         #[cfg(not(target_os = "macos"))]
-                                        Some(Err(e))
+                                        Err(e)
                                             if !may_fall_back_to_legacy(
                                                 settings.output_device.as_deref(),
                                                 &e,
@@ -3369,15 +3343,11 @@ impl Player {
                                             Err(e)
                                         }
                                         #[cfg(not(target_os = "macos"))]
-                                        Some(Err(e)) => {
+                                        Err(e) => {
                                             log::warn!(
                                                 "Backend system init failed for streaming: {}, falling back to legacy",
                                                 e
                                             );
-                                            legacy_stream()
-                                        }
-                                        None => {
-                                            log::info!("Backend system not configured, using legacy CPAL path");
                                             legacy_stream()
                                         }
                                     }
@@ -3853,7 +3823,7 @@ impl Player {
                                 );
                             }
 
-                            // Wrap source with diagnostic capture and normalization
+                            // Wrap source with normalization
                             let source_to_play = wrap_source(
                                 source_to_play,
                                 normalization,
@@ -3861,10 +3831,7 @@ impl Player {
                                 &analyzer_tx,
                                 &analyzer_enabled,
                             );
-                            if let Err(e) = engine.append(source_to_play, start_position_secs) {
-                                log::error!("Failed to append streaming source to engine: {}", e);
-                                return;
-                            }
+                            engine.append(source_to_play, start_position_secs);
 
                             thread_state.is_playing.store(true, Ordering::SeqCst);
                             thread_state
@@ -4259,7 +4226,7 @@ impl Player {
                                         }
                                     };
 
-                                // Wrap source with diagnostic capture and normalization
+                                // Wrap source with normalization
                                 // Reuse the gain + atomic from the original Play
                                 let skipped_source = wrap_source(
                                     skipped_source,
@@ -4268,10 +4235,7 @@ impl Player {
                                     &analyzer_tx,
                                     &analyzer_enabled,
                                 );
-                                if let Err(e) = engine.append(skipped_source, resume_pos) {
-                                    fail(format!("failed to append the source: {e}"));
-                                    return;
-                                }
+                                engine.append(skipped_source, resume_pos);
                                 thread_state.start_playback_timer(resume_pos);
                                 thread_state.is_playing.store(true, Ordering::SeqCst);
                                 *current_engine = Some(engine);
@@ -4692,7 +4656,7 @@ impl Player {
                             // Send Reset to analyzer (seek invalidates accumulated samples)
                             let _ = analyzer_tx.try_send(AnalyzerMessage::Reset);
 
-                            // Wrap source with diagnostic capture and normalization
+                            // Wrap source with normalization
                             // Reuse the gain + atomic from the current track
                             let skipped_source = wrap_source(
                                 skipped_source,
@@ -4701,13 +4665,7 @@ impl Player {
                                 &analyzer_tx,
                                 &analyzer_enabled,
                             );
-                            if let Err(e) = engine.append(skipped_source, position_secs) {
-                                seek_abort(
-                                    &thread_state,
-                                    &format!("append source for seek failed: {e}"),
-                                );
-                                return;
-                            }
+                            engine.append(skipped_source, position_secs);
 
                             let was_playing = thread_state.is_playing.load(Ordering::SeqCst);
                             if !was_playing {
@@ -4965,15 +4923,7 @@ impl Player {
                             // holds its current source (NOT empty), so a
                             // paused session is never resumed by this.
                             let engine_was_empty = engine.empty();
-                            if let Err(e) = engine.append(source, 0) {
-                                log::error!(
-                                    "Gapless: failed to append track {} to engine: {}",
-                                    track_id,
-                                    e
-                                );
-                                thread_state.set_gapless_ready(false);
-                                return;
-                            }
+                            engine.append(source, 0);
                             if engine_was_empty && !thread_state.is_playing.load(Ordering::SeqCst) {
                                 log::info!(
                                     "Gapless: PlayNext landed after track finished — resuming playback-state tracking"
@@ -5667,7 +5617,6 @@ impl Player {
             tx,
             state,
             audio_settings: settings,
-            diagnostic,
             audio_cache,
         }
     }
@@ -6174,9 +6123,7 @@ impl Player {
         // other door.
         let choose = self.destination_chooser(track_id, "PREFETCH");
         let result: Result<Option<TrackBytes>, String> =
-            match qbz_qobuz::cmaf::download_full_sized(client, track_id, quality, None, choose)
-                .await
-            {
+            match qbz_qobuz::cmaf::download_full_sized(client, track_id, quality, choose).await {
                 // Already the allocation the cache will share — assembled there
                 // segment by segment, so the track is never resident twice.
                 Ok(qbz_qobuz::DownloadedTrack::Memory(data)) => Ok(Some(data)),
@@ -6482,7 +6429,7 @@ impl Player {
         // audibly, twice, measured mid-write.
         let choose = self.destination_chooser(track_id, "GAPLESS");
 
-        match qbz_qobuz::cmaf::download_full_sized(client, track_id, quality, None, choose).await {
+        match qbz_qobuz::cmaf::download_full_sized(client, track_id, quality, choose).await {
             Ok(qbz_qobuz::DownloadedTrack::File(_)) => {
                 return match self.audio_cache.get_playback_cache().and_then(|c| {
                     c.commit_write(track_id)
@@ -8561,7 +8508,7 @@ mod play_offset_tests {
 
 #[cfg(test)]
 mod cached_play_duration_tests {
-    use super::{AudioCommand, AudioDiagnostic, AudioSettings, Player, SharedState};
+    use super::{AudioCommand, AudioSettings, Player, SharedState};
     use crate::player::streaming_source::tests::{ramp_wav, temp_wav};
     use qbz_models::Quality;
     use std::sync::mpsc::{self, Receiver};
@@ -8578,7 +8525,6 @@ mod cached_play_duration_tests {
             tx,
             state: SharedState::new(),
             audio_settings: Arc::new(Mutex::new(AudioSettings::default())),
-            diagnostic: AudioDiagnostic::new(),
             audio_cache: Arc::new(qbz_cache::AudioCache::new(16 * 1024 * 1024)),
         };
         (player, rx)

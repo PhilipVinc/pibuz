@@ -16,7 +16,6 @@
 //! TLS is transport encryption only; the decoded audio bytes are identical, so
 //! bit-perfect is unaffected. (If the Qobuz streaming CDN ever presents a cert
 //! rustls rejects, add `native-tls` to pibuz's reqwest features.)
-#![allow(dead_code)]
 
 use std::sync::Arc;
 
@@ -205,6 +204,7 @@ impl BufferingLatch {
     /// loading at 0 needed the clock to reach a full 1 s before it counted as
     /// audible, so the controller kept a spinner up for a second of music it
     /// was already playing.
+    #[cfg(test)]
     pub fn in_flight(&self, player_track_id: u64, position_ms: u64) -> Option<(u64, u64, u64)> {
         self.in_flight_with_state(player_track_id, position_ms, true)
     }

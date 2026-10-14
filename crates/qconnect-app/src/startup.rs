@@ -38,24 +38,16 @@ impl QconnectStartupMode {
             _ => None,
         }
     }
-}
 
-/// Decide whether QConnect should auto-connect at startup.
-///
-/// CLI override (when present) wins over the persisted mode.
-/// `last_known` is only consulted when mode == RememberLast.
-pub fn compute_effective_startup(
-    mode: QconnectStartupMode,
-    cli_override: Option<bool>,
-    last_known: Option<bool>,
-) -> bool {
-    if let Some(v) = cli_override {
-        return v;
-    }
-    match mode {
-        QconnectStartupMode::Off => false,
-        QconnectStartupMode::On => true,
-        QconnectStartupMode::RememberLast => last_known.unwrap_or(false),
+    /// Whether QConnect should auto-connect at startup in this mode.
+    ///
+    /// `RememberLast` is still accepted, because a stored value has to keep
+    /// parsing, but nothing records the last state, so it resolves to off.
+    pub fn auto_connects(self) -> bool {
+        match self {
+            QconnectStartupMode::On => true,
+            QconnectStartupMode::Off | QconnectStartupMode::RememberLast => false,
+        }
     }
 }
 
@@ -86,81 +78,9 @@ mod tests {
     }
 
     #[test]
-    fn cli_override_true_wins_over_mode() {
-        assert!(compute_effective_startup(
-            QconnectStartupMode::Off,
-            Some(true),
-            None
-        ));
-        assert!(compute_effective_startup(
-            QconnectStartupMode::Off,
-            Some(true),
-            Some(false)
-        ));
-    }
-
-    #[test]
-    fn cli_override_false_wins_over_mode() {
-        assert!(!compute_effective_startup(
-            QconnectStartupMode::On,
-            Some(false),
-            None
-        ));
-        assert!(!compute_effective_startup(
-            QconnectStartupMode::RememberLast,
-            Some(false),
-            Some(true)
-        ));
-    }
-
-    #[test]
-    fn mode_off_with_no_cli_returns_false() {
-        assert!(!compute_effective_startup(
-            QconnectStartupMode::Off,
-            None,
-            None
-        ));
-        assert!(!compute_effective_startup(
-            QconnectStartupMode::Off,
-            None,
-            Some(true)
-        ));
-    }
-
-    #[test]
-    fn mode_on_with_no_cli_returns_true() {
-        assert!(compute_effective_startup(
-            QconnectStartupMode::On,
-            None,
-            None
-        ));
-        assert!(compute_effective_startup(
-            QconnectStartupMode::On,
-            None,
-            Some(false)
-        ));
-    }
-
-    #[test]
-    fn mode_remember_last_uses_last_known() {
-        assert!(compute_effective_startup(
-            QconnectStartupMode::RememberLast,
-            None,
-            Some(true)
-        ));
-        assert!(!compute_effective_startup(
-            QconnectStartupMode::RememberLast,
-            None,
-            Some(false)
-        ));
-    }
-
-    #[test]
-    fn mode_remember_last_defaults_off_when_no_history() {
-        assert!(!compute_effective_startup(
-            QconnectStartupMode::RememberLast,
-            None,
-            None
-        ));
+    fn only_on_auto_connects() {
+        assert!(QconnectStartupMode::On.auto_connects());
+        assert!(!QconnectStartupMode::Off.auto_connects());
+        assert!(!QconnectStartupMode::RememberLast.auto_connects());
     }
 }

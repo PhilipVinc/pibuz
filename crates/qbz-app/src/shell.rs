@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use qbz_audio::{AudioDiagnostic, AudioSettings};
+use qbz_audio::AudioSettings;
 use qbz_core::{FrontendAdapter, QbzCore};
 use qbz_player::Player;
 
@@ -27,8 +27,7 @@ impl<A: FrontendAdapter + Send + Sync + 'static> AppRuntime<A> {
         audio_settings: AudioSettings,
         data_root: Option<std::path::PathBuf>,
     ) -> Self {
-        let diagnostic = AudioDiagnostic::new();
-        let player = Player::new(device_name, audio_settings, diagnostic, data_root);
+        let player = Player::new(device_name, audio_settings, data_root);
         let core = QbzCore::new(adapter, player);
         Self {
             core: Arc::new(core),

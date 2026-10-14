@@ -91,6 +91,7 @@ where
         }
     }
 
+    #[cfg(test)]
     pub fn state_handle(&self) -> Arc<Mutex<QconnectRuntimeState>> {
         Arc::clone(&self.state)
     }

@@ -54,10 +54,6 @@ impl PendingActionSlot {
         self.current.as_ref()
     }
 
-    pub fn current_mut(&mut self) -> Option<&mut PendingQueueAction> {
-        self.current.as_mut()
-    }
-
     pub fn correlate(&self, event_action_uuid: Option<&str>) -> PendingCorrelation {
         let Some(pending) = &self.current else {
             return PendingCorrelation::NoPending;

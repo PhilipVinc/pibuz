@@ -30,8 +30,8 @@ use std::time::Duration;
 use qbz_app::shell::AppRuntime;
 use qbz_models::CoreEvent;
 use qconnect_app::{
-    compute_effective_startup, QconnectApp, QconnectAppEvent, QconnectEventSink,
-    QconnectLifecycleState, QconnectRemoteSyncState, QconnectSessionState, SessionLoopHost,
+    QconnectApp, QconnectAppEvent, QconnectEventSink, QconnectLifecycleState,
+    QconnectRemoteSyncState, QconnectSessionState, SessionLoopHost,
 };
 use qconnect_transport_ws::{NativeWsTransport, WsTransportConfig};
 use tokio::sync::{broadcast, Mutex};
@@ -54,7 +54,6 @@ pub(crate) struct DaemonQconnectRuntime {
     pub app: Arc<DaemonQconnectApp>,
     /// Re-latched by `bootstrap_after_reconnect` on a credential re-resolve;
     /// consumed by the full-reconnect path (T10) + status/endpoint reporting.
-    #[allow(dead_code)]
     pub config: WsTransportConfig,
     pub event_loop: JoinHandle<()>,
     pub sync_state: Arc<Mutex<QconnectRemoteSyncState>>,
@@ -69,7 +68,6 @@ pub(crate) struct DaemonQconnectRuntime {
 pub(crate) struct DaemonQconnectInner {
     pub runtime: Option<DaemonQconnectRuntime>,
     /// Latched connect/loop error; surfaced by `pibuz status` QConnect block (T11).
-    #[allow(dead_code)]
     pub last_error: Option<String>,
     pub lifecycle_state: QconnectLifecycleState,
     /// Last local queue ids this session pushed to the cloud (the publish.rs
@@ -148,7 +146,6 @@ pub struct DaemonQconnectService {
     inner: Arc<Mutex<DaemonQconnectInner>>,
     runtime: Runtime,
     shared: SharedState,
-    #[allow(dead_code)] // T11 (settings reload) re-reads the KV through this path.
     settings_db: PathBuf,
     custom_device_name: Arc<tokio::sync::RwLock<Option<String>>>,
     /// Tokens handed over by a Qobuz app via the local pairing surface
@@ -603,18 +600,6 @@ impl QconnectControl {
 }
 
 impl QconnectHandle {
-    /// Connect on demand (T11 `pibuz qconnect enable`).
-    #[allow(dead_code)]
-    pub async fn connect(&self) -> Result<(), String> {
-        self.service.connect().await
-    }
-
-    /// Disconnect on demand (T11 `pibuz qconnect disable`).
-    #[allow(dead_code)]
-    pub async fn disconnect(&self) -> Result<(), String> {
-        self.service.disconnect().await
-    }
-
     /// A cheap, `Clone`-able handle onto the running service — what
     /// `daemon.rs`'s `POST /api/settings/reload` route holds (via an
     /// `Arc<OnceLock<QconnectControl>>` populated right after `start()`
@@ -670,7 +655,7 @@ impl QconnectHandle {
 
 /// Boot step 12: wire QConnect. Mints the daemon's OWN device identity in the
 /// daemon-root KV, decides auto-connect from the persisted startup mode
-/// (`cli_override = None`, `last_known = None` — P0), latches the initial status,
+/// (`QconnectStartupMode::auto_connects`), latches the initial status,
 /// and, when enabled, spawns the connect-on-Ready retry task.
 pub fn start(
     runtime: Runtime,
@@ -686,12 +671,11 @@ pub fn start(
     // cast path reads `playback.quality` from here (upstream#693).
     transport::init_data_root(roots.data.clone());
 
-    // Effective startup decision (Ready-state only). `cli_override` stays None: a
-    // `Some` would permanently shadow the KV store that `pibuz qconnect
-    // enable|disable` (T11) + the TUI (T13) write, making both dead controls.
-    // `last_known` is None in P0 (RememberLast resolves to off).
+    // Effective startup decision (Ready-state only), from the KV store that
+    // `pibuz qconnect enable|disable` and the TUI write. `remember_last`
+    // resolves to off.
     let mode = transport::load_startup_mode_at(&settings_db);
-    let should_auto_connect = compute_effective_startup(mode, None, None);
+    let should_auto_connect = mode.auto_connects();
     let custom_name = transport::load_device_name_at(&settings_db);
     let effective_name = transport::resolve_qconnect_friendly_name(custom_name.as_deref());
 

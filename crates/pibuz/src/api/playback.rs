@@ -90,7 +90,7 @@ pub fn play(state: &ApiState) -> Response<Cursor<Vec<u8>>> {
 
 /// `POST /api/playback/pause` (02 §3.3.6). Never cold-starts; exit set is
 /// 0 · 1 · 3 (no 5, §2.2) so a `Player::pause` channel failure is
-/// [`runtime_error`], not [`device_error`].
+/// [`runtime_error`], not a 503 `audio_unavailable`.
 pub fn pause(state: &ApiState) -> Response<Cursor<Vec<u8>>> {
     match state.runtime.core().pause() {
         Ok(()) => json(200, serde_json::json!({"state": "paused"})),
@@ -101,7 +101,7 @@ pub fn pause(state: &ApiState) -> Response<Cursor<Vec<u8>>> {
 /// `POST /api/playback/toggle` (02 §3.3.7). Mirrors the desktop's
 /// `toggle_play_pause`: playing -> pause; paused-with-loaded-audio -> resume;
 /// nothing loaded -> cold-start (same gate as `play`). Exit 5 is reserved for
-/// the cold-start branch (`cold_start`'s own [`device_error`]) — the
+/// the cold-start branch (`cold_start`'s own 503 `audio_unavailable`) — the
 /// pause/resume branches use [`runtime_error`] like plain `pause`/`stop`.
 pub fn toggle(state: &ApiState) -> Response<Cursor<Vec<u8>>> {
     let player = state.runtime.core().player();
@@ -459,22 +459,6 @@ fn repeat_str(mode: qbz_models::RepeatMode) -> String {
         qbz_models::RepeatMode::One => "one",
     }
     .to_string()
-}
-
-/// 503 `audio_unavailable` — the frozen taxonomy's device/audio bucket
-/// (02 §3.1.3), exit 5. Reserved for GENUINE audio/device conditions: the
-/// cold-start's `play_track_resolved` failure (no device / stream resolve
-/// failed). Each route's documented exit set (02 §2.2) decides which one
-/// applies — `pause`/`stop`/plain `seek`/`volume`/`next`/`prev` never list
-/// exit 5, so their `Player`/`QbzCore` command failures use
-/// [`runtime_error`] instead.
-///
-/// Currently unconstructed: the cold-start path builds its 503 through
-/// `err_json` inline. Kept because the taxonomy is frozen, the CLI still
-/// maps this code, and two doc comments link to it.
-#[allow(dead_code)]
-fn device_error(message: &str) -> Response<Cursor<Vec<u8>>> {
-    err_json(503, "audio_unavailable", message, "check: pibuz status")
 }
 
 #[cfg(test)]

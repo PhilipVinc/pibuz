@@ -63,41 +63,20 @@ pub const P0_ROUTES: &[(&str, &str)] = &[
     ("POST", "/api/settings/reload"),
 ];
 
-/// The P1 route table (02 §3.4) — the content-verb surface. SAME HARD RULE as
-/// P0 (§3.1.4): a route exists only iff a shipped CLI/TUI client calls it, and
-/// this table grows one row per verb+route pair in the SAME change as the verb.
-/// Row 19 (this change): `GET /api/search` — caller: `pibuz search`. The
+/// The P1 route table — the CLI's verbs beyond plain transport. SAME HARD RULE
+/// as P0: a route exists only iff a shipped CLI client calls it, and this table
+/// grows one row per verb+route pair in the SAME change as the verb. Every row
+/// is served: by `route`, or for `/api/events` by the serving loop. The
 /// `p1_route_table_grows_only_with_a_shipped_caller` test pins the count and
-/// forbids overlap with P0, so the 68-routes failure shape cannot creep in
-/// through the P1 door either.
+/// forbids overlap with P0.
 pub const P1_ROUTES: &[(&str, &str)] = &[
-    ("GET", "/api/search"),
     ("POST", "/api/play"),
-    ("GET", "/api/album"),
-    ("GET", "/api/artist"),
-    ("GET", "/api/similar"),
-    ("GET", "/api/suggest"),
-    ("GET", "/api/discover"),
-    ("GET", "/api/lyrics"),
-    ("POST", "/api/radio"),
-    ("POST", "/api/reco/playlist"),
     ("POST", "/api/playback/shuffle"),
     ("POST", "/api/playback/repeat"),
     ("POST", "/api/queue/move"),
     ("POST", "/api/queue/jump"),
     ("POST", "/api/queue/stop-after"),
-    ("GET", "/api/favorites"),
-    ("POST", "/api/favorites/add"),
-    ("POST", "/api/favorites/remove"),
-    ("GET", "/api/playlists"),
-    ("GET", "/api/playlist"),
-    ("POST", "/api/playlist/create"),
-    ("POST", "/api/playlist/update"),
-    ("POST", "/api/playlist/delete"),
-    ("POST", "/api/playlist/tracks/add"),
-    ("POST", "/api/playlist/tracks/remove"),
     ("GET", "/api/events"),
-    ("GET", "/api/artwork/current"),
 ];
 
 /// A socket bound at boot step 5, not yet serving. Wraps the tiny_http server
@@ -535,33 +514,11 @@ mod tests {
 
     #[test]
     fn p1_route_table_grows_only_with_a_shipped_caller() {
-        // 02-cli-and-api.md §3.4 — each P1 route lands with its CLI verb (the
-        // §3.1.4 HARD RULE, applied to the content-verb door). Row 19:
-        // GET /api/search — caller: `pibuz search`. Count is pinned so a route
+        // Each P1 route lands with its CLI verb. Count is pinned so a route
         // with no caller cannot creep in; P1 must never overlap P0.
-        assert_eq!(P1_ROUTES.len(), 27);
+        assert_eq!(P1_ROUTES.len(), 7);
         assert!(P1_ROUTES.contains(&("GET", "/api/events"))); // caller: `pibuz watch`
-        assert!(P1_ROUTES.contains(&("GET", "/api/artwork/current"))); // caller: `pibuz art`
-        assert!(P1_ROUTES.contains(&("GET", "/api/discover")));
-        assert!(P1_ROUTES.contains(&("GET", "/api/lyrics")));
-        assert!(P1_ROUTES.contains(&("POST", "/api/reco/playlist")));
-        assert!(P1_ROUTES.contains(&("GET", "/api/favorites")));
-        assert!(P1_ROUTES.contains(&("POST", "/api/favorites/add")));
-        assert!(P1_ROUTES.contains(&("POST", "/api/favorites/remove")));
-        assert!(P1_ROUTES.contains(&("GET", "/api/playlists")));
-        assert!(P1_ROUTES.contains(&("GET", "/api/playlist")));
-        assert!(P1_ROUTES.contains(&("POST", "/api/playlist/create")));
-        assert!(P1_ROUTES.contains(&("POST", "/api/playlist/update")));
-        assert!(P1_ROUTES.contains(&("POST", "/api/playlist/delete")));
-        assert!(P1_ROUTES.contains(&("POST", "/api/playlist/tracks/add")));
-        assert!(P1_ROUTES.contains(&("POST", "/api/playlist/tracks/remove")));
-        assert!(P1_ROUTES.contains(&("GET", "/api/search")));
         assert!(P1_ROUTES.contains(&("POST", "/api/play")));
-        assert!(P1_ROUTES.contains(&("GET", "/api/album")));
-        assert!(P1_ROUTES.contains(&("GET", "/api/artist")));
-        assert!(P1_ROUTES.contains(&("GET", "/api/similar")));
-        assert!(P1_ROUTES.contains(&("GET", "/api/suggest")));
-        assert!(P1_ROUTES.contains(&("POST", "/api/radio")));
         assert!(P1_ROUTES.contains(&("POST", "/api/playback/shuffle")));
         assert!(P1_ROUTES.contains(&("POST", "/api/playback/repeat")));
         assert!(P1_ROUTES.contains(&("POST", "/api/queue/move")));
