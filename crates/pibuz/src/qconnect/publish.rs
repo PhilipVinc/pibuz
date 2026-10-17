@@ -367,6 +367,15 @@ mod tests {
         assert!(!volume_report_is_redundant(25, Some(40), true));
     }
 
+    /// Issue #4: mute from the box at 40, then unmute. The mute goes out as a
+    /// level of 0 and the cloud's echo of it says 0 (the decoder reads its
+    /// missing level as the default), so the unmute back to 40 is news.
+    #[test]
+    fn an_unmute_from_the_box_is_reported_after_its_mute() {
+        assert!(!volume_report_is_redundant(0, Some(40), false));
+        assert!(!volume_report_is_redundant(40, Some(0), false));
+    }
+
     #[test]
     fn an_unknown_controller_view_is_reported() {
         assert!(!volume_report_is_redundant(25, None, false));

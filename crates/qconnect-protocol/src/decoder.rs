@@ -920,6 +920,9 @@ fn map_active_renderer_changed(
     })
 }
 
+/// An absent `volume` is 0, not "unknown": the cloud leaves a default-valued
+/// field off the wire, so the echo of a renderer reporting 0 carries no level
+/// (issue #4). Unlike `SetActive`, nothing sends this as a pending placeholder.
 fn map_ctrl_volume_changed(
     payload: CtrlVolumeChangedMessage,
 ) -> Result<QueueServerEvent, ProtocolError> {
@@ -929,7 +932,7 @@ fn map_ctrl_volume_changed(
         queue_version: None,
         payload: json!({
             "renderer_id": payload.renderer_id,
-            "volume": payload.volume
+            "volume": payload.volume.unwrap_or(0)
         }),
     })
 }
@@ -947,6 +950,8 @@ fn map_ctrl_loop_mode_set(
     })
 }
 
+/// An absent `value` is an unmute, for the same reason as
+/// [`map_ctrl_volume_changed`]: `false` is the default and goes unsent.
 fn map_ctrl_volume_muted(
     payload: CtrlVolumeMutedMessage,
 ) -> Result<QueueServerEvent, ProtocolError> {
@@ -956,7 +961,7 @@ fn map_ctrl_volume_muted(
         queue_version: None,
         payload: json!({
             "renderer_id": payload.renderer_id,
-            "value": payload.value
+            "value": payload.value.unwrap_or(false)
         }),
     })
 }
@@ -1122,8 +1127,9 @@ mod tests {
     use prost::Message;
 
     use crate::queue_command_proto::{
-        PlaybackErrorMessage, QConnectMessage, QConnectMessageType, QConnectMessages, QueueTrack,
-        QueueTrackWithContext, QueueTracksAddedMessage, QueueTracksLoadedMessage, QueueVersionRef,
+        CtrlVolumeChangedMessage, CtrlVolumeMutedMessage, PlaybackErrorMessage, QConnectMessage,
+        QConnectMessageType, QConnectMessages, QueueTrack, QueueTrackWithContext,
+        QueueTracksAddedMessage, QueueTracksLoadedMessage, QueueVersionRef,
         RendererMuteVolumeMessage, RendererSetActiveMessage, RendererSetStateMessage,
     };
     use crate::ErrorType;
@@ -1231,6 +1237,74 @@ mod tests {
             assert_eq!(parsed.len(), 1, "active={active}");
             assert_eq!(parsed[0].payload["active"], active, "active={active}");
         }
+    }
+
+    fn decode_one_queue_event(message: QConnectMessage) -> serde_json::Value {
+        let batch = QConnectMessages {
+            messages_time: None,
+            messages_id: None,
+            messages: vec![message],
+        };
+        let events = decode_queue_server_events(&batch.encode_to_vec()).expect("batch decodes");
+        assert_eq!(events.len(), 1);
+        events[0].payload.clone()
+    }
+
+    /// The cloud leaves a field at its default off the wire, so the echo of a
+    /// renderer reporting volume 0 carries no volume at all (issue #4: a mute
+    /// from the box, carried out as a level of 0, came back as
+    /// `"volume": null`). Read as "unknown", the echo was dropped and the
+    /// session kept the pre-mute level, so the unmute back to that level
+    /// looked already reported and never went out.
+    #[test]
+    fn a_volume_echo_without_a_level_is_a_level_of_zero() {
+        let payload = decode_one_queue_event(QConnectMessage {
+            message_type: Some(QConnectMessageType::MessageTypeSrvrCtrlVolumeChanged as i32),
+            srvr_ctrl_volume_changed: Some(CtrlVolumeChangedMessage {
+                renderer_id: Some(3),
+                volume: None,
+            }),
+            ..Default::default()
+        });
+        assert_eq!(payload["renderer_id"], 3);
+        assert_eq!(payload["volume"], 0);
+
+        let payload = decode_one_queue_event(QConnectMessage {
+            message_type: Some(QConnectMessageType::MessageTypeSrvrCtrlVolumeChanged as i32),
+            srvr_ctrl_volume_changed: Some(CtrlVolumeChangedMessage {
+                renderer_id: Some(3),
+                volume: Some(40),
+            }),
+            ..Default::default()
+        });
+        assert_eq!(payload["volume"], 40);
+    }
+
+    /// Same omission for the mute flag: unmuting from the app echoes back as
+    /// `"value": null`. Read as "unknown", the session kept `muted: true` after
+    /// the unmute.
+    #[test]
+    fn a_mute_echo_without_a_value_is_an_unmute() {
+        let payload = decode_one_queue_event(QConnectMessage {
+            message_type: Some(QConnectMessageType::MessageTypeSrvrCtrlVolumeMuted as i32),
+            srvr_ctrl_volume_muted: Some(CtrlVolumeMutedMessage {
+                renderer_id: Some(3),
+                value: None,
+            }),
+            ..Default::default()
+        });
+        assert_eq!(payload["renderer_id"], 3);
+        assert_eq!(payload["value"], false);
+
+        let payload = decode_one_queue_event(QConnectMessage {
+            message_type: Some(QConnectMessageType::MessageTypeSrvrCtrlVolumeMuted as i32),
+            srvr_ctrl_volume_muted: Some(CtrlVolumeMutedMessage {
+                renderer_id: Some(3),
+                value: Some(true),
+            }),
+            ..Default::default()
+        });
+        assert_eq!(payload["value"], true);
     }
 
     #[test]
