@@ -349,9 +349,22 @@ impl DaemonRendererEngine {
     ///
     /// One place, because the join report and the join-time re-assertion must
     /// not be able to disagree about it.
+    ///
+    /// The NOMINAL level: while muted the player sits at 0, and the controller
+    /// must keep showing the level an unmute brings back.
     pub(crate) fn reported_volume_pct(&self) -> i32 {
+        let live = self.core().get_playback_state().volume;
         self.volume_mode
-            .reported_volume_pct(self.core().get_playback_state().volume)
+            .reported_volume_pct(crate::mute::current(&self.shared).nominal(live))
+    }
+
+    /// Whether the daemon is muted, box-side or by the controller.
+    pub(crate) fn is_muted(&self) -> bool {
+        crate::mute::current(&self.shared).is_muted()
+    }
+
+    fn set_player_volume(&self, level: f32) -> Result<(), String> {
+        self.core().set_volume(level).map_err(|err| err.to_string())
     }
 
     /// Abort the previous track's feeder (no-op when none). The dropped
@@ -440,9 +453,31 @@ impl QconnectRendererEngine for DaemonRendererEngine {
             );
             return Ok(());
         }
-        self.core()
-            .set_volume(fraction)
-            .map_err(|err| err.to_string())
+        // A level from the controller ends a box-side mute, as one from the
+        // box does (`crate::mute`).
+        crate::mute::change(
+            &self.shared,
+            |level| self.set_player_volume(level),
+            |mute| mute.take_level(fraction),
+        )
+        .map(|_| ())
+    }
+    fn set_muted(&self, muted: bool) -> Result<(), String> {
+        // Same gate as `set_volume`: in `Locked` the player stays at unity and
+        // a controller's mute, like its level, is acknowledged and ignored.
+        if !self.volume_mode.applies_remote_volume() {
+            log::info!(
+                "[QConnect] volume_mode=locked: ignoring remote mute({muted}); player stays at 100%"
+            );
+            return Ok(());
+        }
+        let live = self.core().get_playback_state().volume;
+        crate::mute::change(
+            &self.shared,
+            |level| self.set_player_volume(level),
+            |mute| mute.set(muted, live),
+        )
+        .map(|_| ())
     }
     fn get_playback_state(&self) -> PlaybackState {
         self.core().get_playback_state()

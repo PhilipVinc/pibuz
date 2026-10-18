@@ -223,7 +223,7 @@ fn assemble_live(state: &super::ApiState) -> StatusDoc {
             s.last_errors.clone(),
             s.qconnect.clone(),
             s.driver_last_tick.map(|t| t.elapsed().as_millis() as u64),
-            s.muted,
+            s.mute.is_muted(),
             s.started_at.elapsed().as_secs(),
             s.network_online(),
         ),

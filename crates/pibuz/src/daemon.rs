@@ -383,8 +383,7 @@ fn new_shared(cfg: &PibuzConfig) -> Arc<Mutex<DaemonShared>> {
     Arc::new(Mutex::new(DaemonShared {
         last_errors: LatchedErrors::default(),
         driver_last_tick: None,
-        muted: false,
-        premute_volume: 1.0,
+        mute: crate::mute::Mute::default(),
         started_at: std::time::Instant::now(),
         startup_warnings: 0,
         qconnect: QconnectStatus::default(),

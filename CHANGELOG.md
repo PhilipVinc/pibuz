@@ -3,6 +3,23 @@
 Notable changes per release. Versions are plain semver; releases are `vX.Y.Z`
 tags on `main`.
 
+## 2.7.1 — unreleased
+
+### Fixed
+
+- **A mute on the box now shows in the Qobuz app as a mute, and so does its
+  unmute** (#4). `POST /api/playback/volume {"mute": ...}` used to reach the
+  app as a volume of 0, dragging its slider to the bottom, and the unmute
+  was never reported, so the app stayed at 0 while the box played. It is now
+  sent as the app's own mute message, the slider keeps the level, and the
+  cloud's echoes of a 0 level or an unmute — which arrive with the field left
+  out — are read as such instead of being dropped.
+- **The box and the app share one mute.** A mute from the app is the daemon's
+  mute too: `/api/status` reports it, and the box can unmute it. A level set
+  from the app ends a box-side mute, as one set on the box already did, and a
+  cast no longer unmutes a muted box by applying `qconnect.initial_volume` —
+  that becomes the level the unmute restores.
+
 ## 2.7.0 — 2026-10-15
 
 ### Changed

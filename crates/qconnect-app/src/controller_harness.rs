@@ -86,6 +86,9 @@ pub(crate) enum EngineCall {
     SetVolume {
         pct: i32,
     },
+    SetMuted {
+        muted: bool,
+    },
     StartStream {
         track_id: u64,
         start_secs: u64,
@@ -137,6 +140,9 @@ struct FakePlayer {
     duration_ms: u64,
     loaded_audio: bool,
     volume: f32,
+    /// Muted, and the level the unmute restores — the engine owns that, as
+    /// pibuz's does.
+    muted: Option<f32>,
     /// The queue as the player really holds it, ids and all.
     ///
     /// Storing the real tracks rather than regenerating placeholders is not a
@@ -367,6 +373,23 @@ impl QconnectRendererEngine for FakeEngine {
             pct: (fraction * 100.0).round() as i32,
         });
         self.player.lock().expect("fake player").volume = fraction;
+        Ok(())
+    }
+
+    fn set_muted(&self, muted: bool) -> Result<(), String> {
+        self.record(EngineCall::SetMuted { muted });
+        let mut player = self.player.lock().expect("fake player");
+        match (muted, player.muted) {
+            (true, None) => {
+                player.muted = Some(player.volume);
+                player.volume = 0.0;
+            }
+            (false, Some(level)) => {
+                player.muted = None;
+                player.volume = level;
+            }
+            _ => {}
+        }
         Ok(())
     }
 

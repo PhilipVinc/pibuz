@@ -12,8 +12,8 @@ pub(crate) struct DaemonShared {
     // one Arc<Mutex<...>> shared by driver + API
     pub(crate) last_errors: LatchedErrors,
     pub(crate) driver_last_tick: Option<std::time::Instant>,
-    pub muted: bool,
-    pub(crate) premute_volume: f32,
+    /// The daemon's one mute, box and controller alike — see `crate::mute`.
+    pub(crate) mute: crate::mute::Mute,
     pub(crate) started_at: std::time::Instant,
     pub(crate) startup_warnings: u32,
     pub qconnect: QconnectStatus,
@@ -139,8 +139,7 @@ mod tests {
         let shared = DaemonShared {
             last_errors: LatchedErrors::default(),
             driver_last_tick: None,
-            muted: false,
-            premute_volume: 1.0,
+            mute: crate::mute::Mute::default(),
             started_at: std::time::Instant::now(),
             startup_warnings: 0,
             qconnect: QconnectStatus::default(),
@@ -155,8 +154,7 @@ mod tests {
         let mut shared = DaemonShared {
             last_errors: LatchedErrors::default(),
             driver_last_tick: None,
-            muted: false,
-            premute_volume: 1.0,
+            mute: crate::mute::Mute::default(),
             started_at: std::time::Instant::now(),
             startup_warnings: 0,
             qconnect: QconnectStatus::default(),
@@ -183,8 +181,7 @@ mod tests {
         let shared = DaemonShared {
             last_errors: LatchedErrors::default(),
             driver_last_tick: None,
-            muted: false,
-            premute_volume: 1.0,
+            mute: crate::mute::Mute::default(),
             started_at: std::time::Instant::now(),
             startup_warnings: 0,
             qconnect: QconnectStatus::default(),

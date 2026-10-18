@@ -9,6 +9,7 @@ mod daemon_nudge;
 mod events_bridge;
 mod hooks;
 mod lock;
+mod mute;
 mod paths;
 mod qconnect;
 mod state;

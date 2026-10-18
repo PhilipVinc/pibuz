@@ -116,6 +116,7 @@ impl SessionLoopHost for DaemonSessionLoopHost {
             &self.app,
             &self.sync_state,
             &self.runtime,
+            &self.shared,
             self.volume_mode, // 100 in Locked, real otherwise
             self.initial_volume,
             &session_uuid,
@@ -240,6 +241,7 @@ pub(crate) async fn deferred_renderer_join(
     app: &Arc<DaemonQconnectApp>,
     sync_state: &Arc<Mutex<QconnectRemoteSyncState>>,
     runtime: &Runtime,
+    shared: &std::sync::Mutex<DaemonShared>,
     volume_mode: VolumeMode,    // join-time volume report policy
     initial_volume: Option<u8>, // join-time volume safety (qconnect.initial_volume)
     session_uuid: &str,
@@ -386,7 +388,18 @@ pub(crate) async fn deferred_renderer_join(
                 "[QConnect] Join-time volume: {}% (qconnect.initial_volume)",
                 (fraction * 100.0).round() as u32
             );
-            if let Err(err) = runtime.core().set_volume(fraction) {
+            // While the box is muted this only changes what the unmute brings
+            // back: a cast must not unmute it.
+            if let Err(err) = crate::mute::change(
+                shared,
+                |level| {
+                    runtime
+                        .core()
+                        .set_volume(level)
+                        .map_err(|err| err.to_string())
+                },
+                |mute| mute.set_level_quietly(fraction),
+            ) {
                 log::warn!("[QConnect] Could not apply the join-time volume: {err}");
             }
         }
@@ -405,8 +418,11 @@ pub(crate) async fn deferred_renderer_join(
     // `get_playback_state().volume` is a 0.0-1.0 fraction; the wire wants a
     // 0-100 percent. The volume MODE decides — `Software`/`External` report
     // the real percent, `Locked` reports 100 fixed (no software attenuation
-    // on the bit-perfect path).
-    let volume_pct = volume_mode.reported_volume_pct(runtime.core().get_playback_state().volume);
+    // on the bit-perfect path). The NOMINAL level: muted, the player is at 0
+    // and the controller must keep showing the level an unmute restores.
+    let volume_pct = volume_mode.reported_volume_pct(
+        crate::mute::current(shared).nominal(runtime.core().get_playback_state().volume),
+    );
     let volume_report = RendererReport::new(
         RendererReportType::RndrSrvrVolumeChanged,
         Uuid::new_v4().to_string(),

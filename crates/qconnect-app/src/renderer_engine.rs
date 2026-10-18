@@ -39,6 +39,11 @@ pub trait QconnectRendererEngine: Send + Sync {
     fn seek(&self, position_secs: u64) -> Result<(), String>;
     /// Volume as a 0.0–1.0 fraction (caller normalizes via `normalize_volume_to_fraction`).
     fn set_volume(&self, fraction: f32) -> Result<(), String>;
+    /// Mute or unmute. The engine owns what an unmute restores: a host whose
+    /// own side can mute too (pibuz's box) must keep ONE mute both change, or
+    /// neither side can undo the other's and the controller is told a level of
+    /// 0 for a mute it never saw.
+    fn set_muted(&self, muted: bool) -> Result<(), String>;
     /// Fresh, synchronous snapshot of the audio thread (track_id/position/...).
     /// MUST NOT be cached/stale — the echo filter and the #387 seek-diff gate
     /// depend on its freshness.

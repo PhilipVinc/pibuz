@@ -229,7 +229,7 @@ pub(crate) fn spawn_queue_cloud_publish(
     })
 }
 
-/// Tell the controller about a volume change that did not come from it.
+/// Tell the controller about a volume or mute change that did not come from it.
 ///
 /// A controller's own `SetVolume` is reported back by the shared renderer
 /// (`QconnectApp`'s SetVolume echo); nothing reported a change made HERE — an
@@ -238,13 +238,20 @@ pub(crate) fn spawn_queue_cloud_publish(
 /// the whole point of the POST (issue #3): the level lives with whoever owns
 /// the DAC, and this is how the phone learns it.
 ///
+/// A mute goes out as a mute (`VOLUME_MUTED`), the message the controller's
+/// own mute produces, and the level reported is the NOMINAL one — the level
+/// the unmute brings back. Reporting a box-side mute as a level of 0 dragged
+/// the phone's slider to the bottom, and the unmute was then lost (issue #4).
+///
 /// Echo-safe the same way the queue publish is: the cloud's current view of
-/// OUR volume (`session_renderer_states`, updated from every
-/// `CTRL_VOLUME_CHANGED` it sends) is compared first, so a level that came from
-/// the controller — or that we already reported — goes nowhere.
+/// OUR volume and mute (`session_renderer_states`, updated from every
+/// `CTRL_VOLUME_CHANGED` / `CTRL_VOLUME_MUTED` it sends) is compared first, so
+/// a change that came from the controller — or that we already reported —
+/// goes nowhere.
 pub(crate) async fn publish_local_volume_if_changed(
     inner: &Arc<Mutex<DaemonQconnectInner>>,
     runtime: &Arc<AppRuntime<DaemonAdapter>>,
+    shared: &super::SharedState,
 ) {
     let (app, sync_state, volume_mode) = {
         let guard = inner.lock().await;
@@ -257,8 +264,10 @@ pub(crate) async fn publish_local_volume_if_changed(
             None => return,
         }
     };
-    let ours = volume_mode.reported_volume_pct(runtime.core().get_playback_state().volume);
-    {
+    let mute = crate::mute::current(shared);
+    let live = runtime.core().get_playback_state().volume;
+    let ours = volume_mode.reported_volume_pct(mute.nominal(live));
+    let catch_up = {
         let state = sync_state.lock().await;
         if !is_local_renderer_active(&state.session) {
             return;
@@ -267,33 +276,64 @@ pub(crate) async fn publish_local_volume_if_changed(
             .session
             .local_renderer_id
             .and_then(|id| state.session_renderer_states.get(&id));
-        let theirs = renderer.and_then(|renderer| renderer.volume);
-        let muted = renderer.and_then(|renderer| renderer.muted) == Some(true);
-        if volume_report_is_redundant(ours, theirs, muted) {
-            return;
+        volume_catch_up(
+            ours,
+            mute.is_muted(),
+            renderer.and_then(|renderer| renderer.volume),
+            renderer.and_then(|renderer| renderer.muted),
+        )
+    };
+    let version = app.queue_state_snapshot().await.version;
+    if let Some(muted) = catch_up.muted {
+        log::info!(
+            "[QConnect] Reporting {} (changed locally)",
+            if muted { "mute" } else { "unmute" }
+        );
+        let report = RendererReport::new(
+            RendererReportType::RndrSrvrVolumeMuted,
+            Uuid::new_v4().to_string(),
+            version,
+            json!({ "value": muted }),
+        );
+        if let Err(err) = app.send_renderer_report_command(report).await {
+            log::warn!("[QConnect] Failed to report a local mute change: {err}");
         }
     }
-    log::info!("[QConnect] Reporting volume {ours}% (changed locally)");
-    let report = RendererReport::new(
-        RendererReportType::RndrSrvrVolumeChanged,
-        Uuid::new_v4().to_string(),
-        app.queue_state_snapshot().await.version,
-        json!({ "volume": ours }),
-    );
-    if let Err(err) = app.send_renderer_report_command(report).await {
-        log::warn!("[QConnect] Failed to report a local volume change: {err}");
+    if let Some(level) = catch_up.level {
+        log::info!("[QConnect] Reporting volume {level}% (changed locally)");
+        let report = RendererReport::new(
+            RendererReportType::RndrSrvrVolumeChanged,
+            Uuid::new_v4().to_string(),
+            version,
+            json!({ "volume": level }),
+        );
+        if let Err(err) = app.send_renderer_report_command(report).await {
+            log::warn!("[QConnect] Failed to report a local volume change: {err}");
+        }
     }
 }
 
-/// Whether the controller already shows `ours`. An unknown view (`None`) is
-/// NOT redundant: the controller has told us nothing, so tell it.
-///
-/// A mute is the controller's too: it arrives as `MuteVolume`, which the
-/// player carries out as a level of 0 while the cloud keeps the pre-mute level
-/// and a `muted` flag. Reporting that 0 as a volume would drag the phone's
-/// slider to the bottom, and unmuting would then report the old level back.
-fn volume_report_is_redundant(ours: i32, theirs: Option<i32>, muted: bool) -> bool {
-    theirs == Some(ours) || (muted && ours == 0)
+/// What the controller has to be told to show what we are doing: our mute
+/// flag and our NOMINAL level, each only where its view (`theirs_*`, the
+/// cloud's echoes) differs. An unknown level (`None`) is reported — the
+/// controller has told us nothing, so tell it. An unknown mute reads as
+/// unmuted, the cloud's own default, so an unmuted renderer says nothing.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct VolumeCatchUp {
+    muted: Option<bool>,
+    level: Option<i32>,
+}
+
+fn volume_catch_up(
+    ours_level: i32,
+    ours_muted: bool,
+    theirs_level: Option<i32>,
+    theirs_muted: Option<bool>,
+) -> VolumeCatchUp {
+    VolumeCatchUp {
+        muted: (theirs_muted.unwrap_or(false) != ours_muted).then_some(ours_muted),
+        level: (theirs_level != Some(ours_level)).then_some(ours_level),
+    }
 }
 
 /// The volume-publish subscriber: coalesces `CoreEvent::VolumeChanged` bursts
@@ -303,6 +343,7 @@ fn volume_report_is_redundant(ours: i32, theirs: Option<i32>, muted: bool) -> bo
 pub(crate) fn spawn_volume_cloud_publish(
     inner: Arc<Mutex<DaemonQconnectInner>>,
     runtime: Arc<AppRuntime<DaemonAdapter>>,
+    shared: super::SharedState,
     mut rx: broadcast::Receiver<CoreEvent>,
 ) -> JoinHandle<()> {
     use tokio::sync::broadcast::error::RecvError;
@@ -323,14 +364,14 @@ pub(crate) fn spawn_volume_cloud_publish(
                     r = rx.recv() => if let Err(RecvError::Closed) = r { return },
                 }
             }
-            publish_local_volume_if_changed(&inner, &runtime).await;
+            publish_local_volume_if_changed(&inner, &runtime, &shared).await;
         }
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::volume_report_is_redundant;
+    use super::{volume_catch_up, VolumeCatchUp};
 
     #[test]
     fn a_loop_mode_goes_out_only_when_the_session_shows_another() {
@@ -347,37 +388,65 @@ mod tests {
         assert_eq!(publish(RepeatMode::One, None), None);
     }
 
-    #[test]
-    fn a_level_the_controller_already_shows_is_not_reported_again() {
-        // The controller's own SetVolume lands here too (the player emits
-        // VolumeChanged for it); the cloud's echo has already told us it
-        // shows that level, so a report would be a duplicate.
-        assert!(volume_report_is_redundant(40, Some(40), false));
+    fn catch_up(muted: Option<bool>, level: Option<i32>) -> VolumeCatchUp {
+        VolumeCatchUp { muted, level }
     }
 
     #[test]
-    fn a_local_change_is_reported() {
-        assert!(!volume_report_is_redundant(25, Some(40), false));
+    fn what_the_controller_already_shows_is_not_reported_again() {
+        // The controller's own SetVolume or mute lands here too (the player
+        // emits VolumeChanged for it); the cloud's echo has already told us
+        // it shows that, so a report would be a duplicate.
+        assert_eq!(
+            volume_catch_up(40, false, Some(40), Some(false)),
+            catch_up(None, None)
+        );
+        assert_eq!(
+            volume_catch_up(40, true, Some(40), Some(true)),
+            catch_up(None, None)
+        );
     }
 
     #[test]
-    fn the_controllers_own_mute_is_not_reported_as_a_level_of_zero() {
-        assert!(volume_report_is_redundant(0, Some(40), true));
-        // But a level changed here while muted is still news.
-        assert!(!volume_report_is_redundant(25, Some(40), true));
+    fn a_local_level_change_is_reported() {
+        assert_eq!(
+            volume_catch_up(25, false, Some(40), Some(false)),
+            catch_up(None, Some(25))
+        );
     }
 
-    /// Issue #4: mute from the box at 40, then unmute. The mute goes out as a
-    /// level of 0 and the cloud's echo of it says 0 (the decoder reads its
-    /// missing level as the default), so the unmute back to 40 is news.
+    /// Issue #4: mute from the box at 40, then unmute. Both go out as mutes,
+    /// and the level — nominal, so 40 throughout — never moves the slider.
     #[test]
-    fn an_unmute_from_the_box_is_reported_after_its_mute() {
-        assert!(!volume_report_is_redundant(0, Some(40), false));
-        assert!(!volume_report_is_redundant(40, Some(0), false));
+    fn a_mute_from_the_box_is_reported_as_a_mute_and_so_is_its_unmute() {
+        assert_eq!(
+            volume_catch_up(40, true, Some(40), Some(false)),
+            catch_up(Some(true), None)
+        );
+        assert_eq!(
+            volume_catch_up(40, false, Some(40), Some(true)),
+            catch_up(Some(false), None)
+        );
     }
 
     #[test]
-    fn an_unknown_controller_view_is_reported() {
-        assert!(!volume_report_is_redundant(25, None, false));
+    fn a_level_changed_while_muted_is_still_news() {
+        assert_eq!(
+            volume_catch_up(25, true, Some(40), Some(true)),
+            catch_up(None, Some(25))
+        );
+    }
+
+    #[test]
+    fn an_unknown_controller_view() {
+        // An unknown level is reported; an unknown mute reads as unmuted.
+        assert_eq!(
+            volume_catch_up(25, false, None, None),
+            catch_up(None, Some(25))
+        );
+        assert_eq!(
+            volume_catch_up(25, true, Some(25), None),
+            catch_up(Some(true), None)
+        );
     }
 }

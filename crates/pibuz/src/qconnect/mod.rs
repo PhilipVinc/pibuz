@@ -789,6 +789,7 @@ pub(crate) fn start(
     let volume_publish_task = Some(publish::spawn_volume_cloud_publish(
         Arc::clone(&service.inner),
         Arc::clone(&service.runtime),
+        Arc::clone(&service.shared),
         core_events.resubscribe(),
     ));
     let publish_task = Some(publish::spawn_queue_cloud_publish(

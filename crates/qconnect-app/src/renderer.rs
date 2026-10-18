@@ -650,11 +650,7 @@ pub async fn apply_renderer_command(
             }
         }
         RendererCommand::MuteVolume { value } => {
-            if *value {
-                engine.set_volume(0.0)?;
-            } else if let Some(resolved) = renderer_state.volume {
-                engine.set_volume(normalize_volume_to_fraction(resolved))?;
-            }
+            engine.set_muted(*value)?;
         }
         RendererCommand::SetLoopMode { loop_mode } => {
             let resolved_loop_mode = renderer_state.loop_mode.unwrap_or(*loop_mode);
@@ -1179,6 +1175,7 @@ mod tests {
         stops: u32,
         seeks: Vec<u64>,
         set_volumes: Vec<f32>,
+        set_muteds: Vec<bool>,
         set_repeat_modes: u32,
         set_shuffles: Vec<bool>,
         set_shuffle_flags: Vec<bool>,
@@ -1245,6 +1242,10 @@ mod tests {
         }
         fn set_volume(&self, fraction: f32) -> Result<(), String> {
             self.calls().set_volumes.push(fraction);
+            Ok(())
+        }
+        fn set_muted(&self, muted: bool) -> Result<(), String> {
+            self.calls().set_muteds.push(muted);
             Ok(())
         }
         fn get_playback_state(&self) -> PlaybackState {

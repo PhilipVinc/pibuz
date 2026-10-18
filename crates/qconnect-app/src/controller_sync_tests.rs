@@ -636,21 +636,28 @@ async fn muting_and_unmuting_round_trips_the_level() {
     harness.controller().set_volume(70).await;
 
     harness.controller().set_muted(true).await;
-    assert!(
-        harness
-            .engine_calls()
-            .contains(&EngineCall::SetVolume { pct: 0 }),
-        "mute must silence the player; timeline:\n{}",
+    assert_eq!(
+        harness.engine_calls().last(),
+        Some(&EngineCall::SetMuted { muted: true }),
+        "mute must reach the engine as a mute, not as a level of 0 — the host \
+         has its own mute to keep in step; timeline:\n{}",
         harness.rendered_timeline()
     );
+    assert_eq!(harness.engine().snapshot().volume, 0.0, "mute must silence");
     assert_eq!(harness.view().muted, Some(true));
+    assert_eq!(harness.view().volume, Some(70), "the slider stays put");
 
     harness.controller().set_muted(false).await;
     assert_eq!(
         harness.engine_calls().last(),
-        Some(&EngineCall::SetVolume { pct: 70 }),
-        "unmute must restore the level the controller still shows; timeline:\n{}",
+        Some(&EngineCall::SetMuted { muted: false }),
+        "timeline:\n{}",
         harness.rendered_timeline()
+    );
+    assert_eq!(
+        harness.engine().snapshot().volume,
+        0.7,
+        "unmute must restore the level the controller still shows"
     );
     assert_eq!(harness.view().muted, Some(false));
     harness.assert_invariants();

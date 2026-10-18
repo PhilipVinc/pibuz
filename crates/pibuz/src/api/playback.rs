@@ -14,10 +14,10 @@
 // playback went with the local-library code, and Qobuz serves PCM only, so
 // there is no state left for it to guard.
 //
-// Mute is daemon-owned state in `DaemonShared.{muted, premute_volume}`, with
-// stash-then-zero / restore semantics.
+// Mute is daemon-owned state, `crate::mute`, with stash-then-zero / restore
+// semantics — the same state a controller's mute changes.
 // The reported `playback.volume` is always the NOMINAL (pre-mute) level, both
-// muted and unmuted: `premute_volume` when muted, the live player volume
+// muted and unmuted: the stashed level when muted, the live player volume
 // otherwise. This is what makes `now`'s and `mute`'s human lines ("vol 80%",
 // "muted (was 80%)") trivial reads of one JSON field.
 use std::io::Cursor;
@@ -189,7 +189,7 @@ pub(crate) fn volume(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>
         return apply_mute(state, live, mute_arg);
     }
 
-    let (muted_before, nominal_before) = nominal_volume(state, live);
+    let (_, nominal_before) = nominal_volume(state, live);
     let target = if let Some(v) = body.get("volume").and_then(|v| v.as_f64()) {
         (v as f32).clamp(0.0, 1.0)
     } else if let Some(d) = body.get("delta").and_then(|v| v.as_f64()) {
@@ -204,20 +204,18 @@ pub(crate) fn volume(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>
     };
 
     // An explicit non-zero target clears an active mute.
-    let mut muted_after = muted_before;
-    if target > 0.0 && muted_before {
-        if let Ok(mut s) = state.shared.lock() {
-            s.muted = false;
-        }
-        muted_after = false;
-    }
-    if let Err(e) = state.runtime.core().set_volume(target) {
-        return runtime_error(&e.to_string());
-    }
+    let mute = match crate::mute::change(
+        &state.shared,
+        |level| set_player_volume(state, level),
+        |mute| mute.take_level(target),
+    ) {
+        Ok(mute) => mute,
+        Err(e) => return runtime_error(&e),
+    };
     state.events_edge.notify_one();
     json(
         200,
-        serde_json::json!({"volume": canon_volume(target), "muted": muted_after}),
+        serde_json::json!({"volume": canon_volume(target), "muted": mute.is_muted()}),
     )
 }
 
@@ -275,14 +273,14 @@ pub(crate) fn repeat(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>
 
 // ============================ internals ============================
 
-/// `{"mute": "on"|"off"|"toggle"}` — stash-then-zero / restore against
-/// `DaemonShared`. `live` is the player's volume BEFORE this call (the value
-/// to stash on a fresh mute).
+/// `{"mute": "on"|"off"|"toggle"}` — stash-then-zero / restore, through
+/// `crate::mute`. `live` is the player's volume BEFORE this call (the value to
+/// stash on a fresh mute).
 fn apply_mute(state: &ApiState, live: f32, arg: &str) -> Response<Cursor<Vec<u8>>> {
     let mute_on = match arg {
         "on" => true,
         "off" => false,
-        "toggle" => !state.shared.lock().map(|s| s.muted).unwrap_or(false),
+        "toggle" => !crate::mute::current(&state.shared).is_muted(),
         other => {
             return err_json(
                 400,
@@ -293,54 +291,30 @@ fn apply_mute(state: &ApiState, live: f32, arg: &str) -> Response<Cursor<Vec<u8>
         }
     };
 
-    let mut guard = match state.shared.lock() {
-        Ok(g) => g,
-        Err(_) => {
-            return err_json(
-                500,
-                "internal",
-                "daemon state lock poisoned",
-                "restart pibuz",
-            )
-        }
+    // Already in the requested state is a no-op that still reports the
+    // current nominal level.
+    let mute = match crate::mute::change(
+        &state.shared,
+        |level| set_player_volume(state, level),
+        |mute| mute.set(mute_on, live),
+    ) {
+        Ok(mute) => mute,
+        Err(e) => return runtime_error(&e),
     };
-
-    // Fallback for a never-set / zero premute level: 0.7, so a mute taken at
-    // volume 0 still restores to something audible on unmute.
-    let (nominal, set_result) = if mute_on && !guard.muted {
-        let stash = if live > 0.0 { live } else { 0.7 };
-        guard.premute_volume = stash;
-        guard.muted = true;
-        (stash, state.runtime.core().set_volume(0.0))
-    } else if !mute_on && guard.muted {
-        let restored = if guard.premute_volume > 0.0 {
-            guard.premute_volume
-        } else {
-            0.7
-        };
-        guard.muted = false;
-        (restored, state.runtime.core().set_volume(restored))
-    } else {
-        // Already in the requested state — a no-op that still reports the
-        // current nominal level.
-        let nominal = if guard.muted {
-            guard.premute_volume
-        } else {
-            live
-        };
-        (nominal, Ok(()))
-    };
-    let muted_now = guard.muted;
-    drop(guard);
-
-    if let Err(e) = set_result {
-        return runtime_error(&e.to_string());
-    }
     state.events_edge.notify_one();
     json(
         200,
-        serde_json::json!({"volume": canon_volume(nominal), "muted": muted_now}),
+        serde_json::json!({"volume": canon_volume(mute.nominal(live)), "muted": mute.is_muted()}),
     )
+}
+
+/// The player's level, as `crate::mute::change` wants it set.
+fn set_player_volume(state: &ApiState, level: f32) -> Result<(), String> {
+    state
+        .runtime
+        .core()
+        .set_volume(level)
+        .map_err(|e| e.to_string())
 }
 
 /// `next`/`previous`: SPAWN
@@ -437,15 +411,13 @@ fn runtime_error(message: &str) -> Response<Cursor<Vec<u8>>> {
 }
 
 /// The NOMINAL volume (what `now`/`volume`/`mute` all report): the live
-/// player volume, EXCEPT while muted, where it's the stashed `premute_volume`
+/// player volume, EXCEPT while muted, where it's the stashed pre-mute level
 /// — the player's real output is 0.0 while muted, but the reported level
 /// stays at what the user set it to, so `vol 80%` keeps reading `80%` through
 /// a mute/unmute cycle. Returns `(muted, nominal)`.
 fn nominal_volume(state: &ApiState, live: f32) -> (bool, f32) {
-    match state.shared.lock() {
-        Ok(s) => (s.muted, if s.muted { s.premute_volume } else { live }),
-        Err(_) => (false, live),
-    }
+    let mute = crate::mute::current(&state.shared);
+    (mute.is_muted(), mute.nominal(live))
 }
 
 fn repeat_str(mode: qbz_models::RepeatMode) -> String {

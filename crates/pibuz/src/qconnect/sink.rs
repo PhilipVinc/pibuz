@@ -138,6 +138,19 @@ impl DaemonEventSink {
         if let Err(err) = app.send_renderer_report_command(report).await {
             log::warn!("[QConnect] Failed to report volume: {err}");
         }
+        // And the mute, whichever way it stands: the level just reported is
+        // the nominal one, and a controller that last saw us muted (or never
+        // saw the box mute) would otherwise show the wrong half of it.
+        let muted = self.engine.is_muted();
+        let report = RendererReport::new(
+            RendererReportType::RndrSrvrVolumeMuted,
+            Uuid::new_v4().to_string(),
+            app.queue_state_snapshot().await.version,
+            serde_json::json!({ "value": muted }),
+        );
+        if let Err(err) = app.send_renderer_report_command(report).await {
+            log::warn!("[QConnect] Failed to report mute: {err}");
+        }
     }
 
     /// `qconnect.initial_volume`: defend the join-time volume, once.
