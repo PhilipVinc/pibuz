@@ -39,13 +39,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # rustup rather than apt's rustc: matches rust-toolchain.toml (floating
 # stable) and the workflow's dtolnay/rust-toolchain@stable.
+#
+# WITH the components rust-toolchain.toml lists. Without them every container
+# run asked rustup to add clippy and rustfmt, which also syncs the channel, and
+# rustup's rename of the toolchain directory fails on the container's overlay
+# filesystem ("Invalid cross-device link"): no build at all once a new stable
+# was out, and no clippy for the Linux check in CLAUDE.md even before that.
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH=/usr/local/cargo/bin:$PATH
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
       | sh -s -- -y --no-modify-path --profile minimal \
                  --default-toolchain "${RUST_TOOLCHAIN}" \
- && rustc -vV && cargo -V
+                 --component rustfmt,clippy \
+ && rustc -vV && cargo -V && cargo clippy -V && rustfmt -V
 
 # /target is a named volume (see the script): keeping the target dir OFF the
 # virtiofs bind mount is what keeps this fast, and keeps container artifacts
