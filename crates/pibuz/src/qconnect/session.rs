@@ -145,6 +145,11 @@ impl SessionLoopHost for DaemonSessionLoopHost {
                 guard.runtime = None;
             }
         }
+        if !idle_retry_active {
+            // `disconnect` will find no runtime to tear down, so the fill-in
+            // the sink spawned has to go here (#521).
+            self.sink.stop_queue_fill_in().await;
+        }
         if let Ok(mut s) = self.shared.lock() {
             s.latch_qconnect_session_down("exhausted");
             // Reconnect-exhausted is a real network-class failure —

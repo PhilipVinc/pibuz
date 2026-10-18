@@ -1424,3 +1424,383 @@ async fn a_load_that_fails_to_resolve_is_handed_to_the_host_by_track() {
     );
     harness.assert_invariants();
 }
+
+// ======================================================== a whole library
+
+/// A favourites library played from "Tracks": the queue the controller pushes
+/// is the entire library, in order.
+fn library(len: u64) -> Vec<u64> {
+    (1..=len).map(|n| 700_000 + n).collect()
+}
+
+/// The library in issue #5.
+const LIBRARY_LEN: u64 = 2_000;
+
+/// What one `track/getList` call can answer.
+const ONE_ROUND_TRIP: usize = 50;
+
+/// Tapping a track in a 2,000-track library starts it after one catalog round
+/// trip, not forty.
+///
+/// The renderer used to look up every track in a pushed queue before it would
+/// play anything: forty `track/getList` calls in a row, about 20 s on a Pi 3B,
+/// and all of it again on every tap, every skip and every autoplay top-up.
+/// Whatever the phone sent meanwhile queued up behind it and landed at once at
+/// the end (issue #5). Playing needs the tracks around the cursor, no more.
+#[tokio::test]
+async fn tapping_a_track_in_a_whole_library_looks_up_only_the_tracks_around_it() {
+    let harness = ControllerHarness::new().await;
+    harness.become_active_renderer().await;
+    let library = library(LIBRARY_LEN);
+
+    harness
+        .controller()
+        .push_queue_and_play(&library, 1_500)
+        .await;
+
+    let fetched = harness.engine().catalog_fetches();
+    assert!(
+        fetched.len() <= ONE_ROUND_TRIP,
+        "one tap looked up {} tracks; timeline:\n{}",
+        fetched.len(),
+        harness.rendered_timeline()
+    );
+    assert_eq!(harness.engine().snapshot().track_id, library[1_500]);
+    let (queue, cursor) = harness.player_queue();
+    assert_eq!(queue, library, "the player must hold the whole library");
+    assert_eq!(cursor, Some(library[1_500]));
+    // What plays now and what plays next have their details: the title the
+    // moOde overlay shows, the length the progress bar draws.
+    let tracks = harness.engine().queue_tracks();
+    for index in [1_500, 1_501] {
+        assert_eq!(
+            tracks[index].title,
+            format!("track {}", library[index]),
+            "queue position {index} has no details"
+        );
+    }
+    harness.assert_player_queue_matches_the_cloud();
+    harness.assert_invariants();
+}
+
+/// A second tap in the same library looks up nothing the renderer already has.
+///
+/// The app pushes the whole library again for every tap, and the cloud
+/// re-announces it for every autoplay top-up; the tracks in it have not
+/// changed. Asking the catalog about them again is what made every gesture
+/// cost the same twenty seconds as the first.
+#[tokio::test]
+async fn a_second_tap_in_the_same_library_looks_up_nothing_twice() {
+    let harness = ControllerHarness::new().await;
+    harness.become_active_renderer().await;
+    let library = library(LIBRARY_LEN);
+    harness
+        .controller()
+        .push_queue_and_play(&library, 1_500)
+        .await;
+    harness.let_the_load_windows_expire();
+
+    harness
+        .controller()
+        .push_queue_and_play(&library, 1_510)
+        .await;
+
+    let fetched = harness.engine().catalog_fetches();
+    let mut seen = std::collections::HashSet::new();
+    let again: Vec<u64> = fetched
+        .iter()
+        .copied()
+        .filter(|id| !seen.insert(*id))
+        .collect();
+    assert!(
+        again.is_empty(),
+        "looked up {} tracks a second time; timeline:\n{}",
+        again.len(),
+        harness.rendered_timeline()
+    );
+    assert_eq!(harness.engine().snapshot().track_id, library[1_510]);
+    assert_eq!(harness.player_queue().1, Some(library[1_510]));
+    harness.assert_invariants();
+}
+
+/// Tracks the catalog has withdrawn keep their places in the player's queue.
+///
+/// They used to be dropped. The player then held 1,992 of the cloud's 2,000
+/// tracks, so every position past the first gap named a different track than
+/// the cloud's — and the daemon's queue publisher, seeing a queue that was not
+/// the cloud's, pushed it BACK as a new queue starting at track 0. In issue
+/// #5's log that is `Pushed local queue to Connect (1992 tracks, start=0)`:
+/// the phone jumps to the top of the library, and the cloud answers with yet
+/// another queue to look up.
+///
+/// Kept in place, they are marked unplayable, so the player's own advance
+/// skips them the way it skips any track it cannot stream.
+#[tokio::test]
+async fn withdrawn_tracks_keep_their_places_in_the_queue() {
+    let harness = ControllerHarness::new().await;
+    harness.become_active_renderer().await;
+    let library = library(LIBRARY_LEN);
+    let withdrawn = [library[1_495], library[1_502]];
+    harness.engine().withdraw(&withdrawn);
+
+    harness
+        .controller()
+        .push_queue_and_play(&library, 1_500)
+        .await;
+
+    harness.assert_player_queue_matches_the_cloud();
+    assert_eq!(harness.player_queue().1, Some(library[1_500]));
+    let tracks = harness.engine().queue_tracks();
+    for index in [1_495, 1_502] {
+        assert!(
+            !tracks[index].streamable,
+            "withdrawn track at {index} must be marked unplayable"
+        );
+    }
+    assert!(tracks[1_501].streamable);
+    harness.assert_invariants();
+}
+
+/// The rest of the library fills in behind playback, and moves nothing.
+///
+/// Every position is in the player's queue from the first tap, but only the
+/// tracks near the cursor have titles; the rest are looked up in the
+/// background. That has to leave the listener alone: no reload, no cursor
+/// move, no queue rebuilt under a cursor that has moved on meanwhile. Each
+/// track is looked up once, and withdrawn ones end up marked unplayable.
+#[tokio::test]
+async fn the_rest_of_the_library_fills_in_behind_playback_and_moves_nothing() {
+    let harness = ControllerHarness::new().await;
+    harness.become_active_renderer().await;
+    let library = library(LIBRARY_LEN);
+    let withdrawn = [library[10], library[1_990]];
+    harness.engine().withdraw(&withdrawn);
+    harness
+        .controller()
+        .push_queue_and_play(&library, 1_500)
+        .await;
+    harness.let_the_load_windows_expire();
+    // The listener skips ahead before the fill-in gets anywhere.
+    harness
+        .controller()
+        .tap_next_track(library[1_501], Some(library[1_502]))
+        .await;
+    let calls_before = harness.engine_calls().len();
+
+    harness.let_the_queue_fill_in().await;
+
+    let during: Vec<EngineCall> = harness
+        .engine_calls()
+        .into_iter()
+        .skip(calls_before)
+        .collect();
+    assert!(
+        during.is_empty(),
+        "the fill-in must not touch playback or the queue's order; it did {during:?}"
+    );
+    assert_eq!(harness.engine().snapshot().track_id, library[1_501]);
+    assert_eq!(harness.player_queue().1, Some(library[1_501]));
+    let tracks = harness.engine().queue_tracks();
+    for (index, track) in tracks.iter().enumerate() {
+        if withdrawn.contains(&track.id) {
+            assert!(
+                !track.streamable,
+                "withdrawn track at {index} still playable"
+            );
+        } else {
+            assert_eq!(
+                track.title,
+                format!("track {}", library[index]),
+                "queue position {index} never got its details"
+            );
+        }
+    }
+    // A withdrawn track is asked about twice by design: `track/getList` leaves
+    // it out, and `track/get` is asked why.
+    let fetched = harness.engine().catalog_fetches();
+    let mut seen = std::collections::HashSet::new();
+    let twice = fetched
+        .iter()
+        .filter(|id| !withdrawn.contains(id) && !seen.insert(**id))
+        .count();
+    assert_eq!(twice, 0, "{twice} tracks were looked up twice");
+    harness.assert_player_queue_matches_the_cloud();
+    harness.assert_invariants();
+}
+
+/// A newer queue stops the old queue's fill-in where it stands.
+///
+/// Tapping into a different library while the first one is still filling in
+/// must not leave forty calls' worth of lookups running for a queue nobody is
+/// playing — on a Pi they compete with the stream for the one network link.
+#[tokio::test]
+async fn a_newer_queue_stops_the_old_queues_fill_in() {
+    let harness = ControllerHarness::new().await;
+    harness.become_active_renderer().await;
+    let first = library(LIBRARY_LEN);
+    let second: Vec<u64> = library(LIBRARY_LEN).iter().map(|id| id + 100_000).collect();
+    harness.controller().push_queue_and_play(&first, 0).await;
+    harness.let_the_load_windows_expire();
+    harness.controller().push_queue_and_play(&second, 0).await;
+
+    harness.let_the_queue_fill_in().await;
+
+    let fetched = harness.engine().catalog_fetches();
+    let of_the_first = fetched.iter().filter(|id| first.contains(id)).count();
+    assert!(
+        of_the_first <= ONE_ROUND_TRIP,
+        "{of_the_first} tracks of the replaced queue were looked up"
+    );
+    let tracks = harness.engine().queue_tracks();
+    assert_eq!(harness.player_queue().0, second);
+    assert!(
+        tracks
+            .iter()
+            .all(|track| track.title == format!("track {}", track.id)),
+        "the queue that replaced it must still fill in"
+    );
+    harness.assert_invariants();
+}
+
+/// A track the cloud names far from the cursor gets its details when it loads.
+///
+/// The fill-in works outward from the cursor, so a jump across the library
+/// (a tap on a track further down the same list, without a new push) can land
+/// on an entry that is still a bare id. The load looks the track up anyway,
+/// for its length; that answer fills the entry too, so the overlay is not left
+/// without a title until the fill-in gets there.
+#[tokio::test]
+async fn a_track_named_far_from_the_cursor_gets_its_details_when_it_loads() {
+    let harness = ControllerHarness::new().await;
+    harness.become_active_renderer().await;
+    let library = library(LIBRARY_LEN);
+    harness.controller().push_queue_and_play(&library, 0).await;
+    harness.let_the_load_windows_expire();
+
+    harness
+        .controller()
+        .tap_next_track(library[1_000], Some(library[1_001]))
+        .await;
+
+    assert_eq!(harness.engine().snapshot().track_id, library[1_000]);
+    assert_eq!(harness.player_queue().1, Some(library[1_000]));
+    assert_eq!(
+        harness.engine().queue_tracks()[1_000].title,
+        format!("track {}", library[1_000])
+    );
+    harness.assert_player_queue_matches_the_cloud();
+    harness.assert_invariants();
+}
+
+/// Whether every entry of the player's queue has the details the catalog
+/// gives it, i.e. the fill-in is done. Withdrawn tracks are exempt.
+fn every_track_has_its_details(harness: &ControllerHarness, withdrawn: &[u64]) -> bool {
+    harness
+        .engine()
+        .queue_tracks()
+        .iter()
+        .filter(|track| !withdrawn.contains(&track.id))
+        .all(|track| track.title == format!("track {}", track.id) && track.streamable)
+}
+
+/// A call that fails during the fill-in is tried again until the library has
+/// its details.
+///
+/// The fill-in used to give up at the first failed call. Every track it had
+/// not reached stayed a bare id: the player's own advance then started them
+/// with no title for the overlay or the hooks, and without the flag that says
+/// the catalog will not stream them.
+#[tokio::test(start_paused = true)]
+async fn a_wifi_blip_during_the_fill_in_is_retried_until_the_library_fills_in() {
+    let harness = ControllerHarness::new().await;
+    harness.become_active_renderer().await;
+    let library = library(LIBRARY_LEN);
+    harness.controller().push_queue_and_play(&library, 0).await;
+    harness.engine().fail_the_next_track_lists(3);
+
+    harness.let_the_queue_fill_in().await;
+
+    assert!(
+        every_track_has_its_details(&harness, &[]),
+        "the fill-in gave up with tracks still bare"
+    );
+    harness.assert_invariants();
+}
+
+/// A failed lookup around the cursor still puts the queue in, and the tapped
+/// track still plays.
+///
+/// The push is recorded as applied before the lookup runs. Bailing out on the
+/// lookup left the PREVIOUS queue in the player, an identical re-push skipped
+/// as a duplicate, and the queue publisher free to push the old queue back
+/// over the cloud's. An id is all a load needs.
+#[tokio::test]
+async fn a_failed_lookup_around_the_cursor_still_installs_the_queue() {
+    let harness = ControllerHarness::new().await;
+    harness.become_active_renderer().await;
+    let library = library(LIBRARY_LEN);
+    harness.engine().fail_the_next_track_lists(1);
+
+    harness
+        .controller()
+        .push_queue_and_play(&library, 1_500)
+        .await;
+
+    harness.assert_player_queue_matches_the_cloud();
+    assert_eq!(harness.player_queue().1, Some(library[1_500]));
+    assert_eq!(harness.engine().snapshot().track_id, library[1_500]);
+    harness.let_the_queue_fill_in().await;
+    assert!(every_track_has_its_details(&harness, &[]));
+    harness.assert_invariants();
+}
+
+/// A network error is not taken for a withdrawn track.
+///
+/// `track/get` is asked about whatever `track/getList` left out, and a failed
+/// call used to be recorded as "withdrawn" for the rest of the session: the
+/// track was marked unplayable and the player's own advance skipped it.
+#[tokio::test(start_paused = true)]
+async fn a_network_error_is_not_taken_for_a_withdrawn_track() {
+    let harness = ControllerHarness::new().await;
+    harness.become_active_renderer().await;
+    let library = library(LIBRARY_LEN);
+    harness.engine().leave_out_of_lists(&[library[1_505]]);
+    harness.engine().fail_the_next_track_gets(1);
+
+    harness
+        .controller()
+        .push_queue_and_play(&library, 1_500)
+        .await;
+
+    assert!(
+        harness.engine().queue_tracks()[1_505].streamable,
+        "a failed call marked the track unplayable"
+    );
+    harness.let_the_queue_fill_in().await;
+    assert!(every_track_has_its_details(&harness, &[]));
+    harness.assert_invariants();
+}
+
+/// An identical push leaves the running fill-in alone.
+///
+/// The cloud re-announces the same queue on reconnects and on unrelated
+/// edits. That is not a new queue, so it starts no fill-in of its own, and it
+/// must not cancel the one already running either, or the queue stays bare.
+#[tokio::test]
+async fn an_identical_push_leaves_the_running_fill_in_alone() {
+    let harness = ControllerHarness::new().await;
+    harness.become_active_renderer().await;
+    let library = library(LIBRARY_LEN);
+    let items = harness.controller().push_queue(&library, 0).await;
+    harness.controller().tap_track(&items, 0).await;
+    harness.let_the_load_windows_expire();
+
+    harness.controller().announce_queue(&items, 0).await;
+    harness.let_the_queue_fill_in().await;
+
+    assert!(
+        every_track_has_its_details(&harness, &[]),
+        "the re-announcement cancelled the fill-in"
+    );
+    harness.assert_invariants();
+}

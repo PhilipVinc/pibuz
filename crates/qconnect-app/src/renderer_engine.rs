@@ -82,9 +82,20 @@ pub trait QconnectRendererEngine: Send + Sync {
     );
     async fn clear_queue(&self, keep_current: bool);
     async fn play_index(&self, index: usize) -> Option<QueueTrack>;
+    /// Replace the details of the queue entries whose ids match `tracks`, IN
+    /// PLACE: order, cursor and shuffle stay exactly as they are. This is how
+    /// the tracks of a large queue that were installed as bare ids get their
+    /// titles and lengths later; replacing the queue to do it would reset a
+    /// cursor that has moved on meanwhile.
+    async fn fill_in_queue_tracks(&self, tracks: Vec<QueueTrack>);
 
     // ---- catalog (async) ----
-    async fn get_track(&self, track_id: u64) -> Result<Track, String>;
+    /// `Ok(None)` when the catalog answers that it does not have the track (a
+    /// withdrawn release), as distinct from `Err`, a call that failed and may
+    /// succeed if asked again. The renderer keeps a withdrawn track in its
+    /// queue as unplayable for the whole session, so it must never take a
+    /// network error for one.
+    async fn get_track(&self, track_id: u64) -> Result<Option<Track>, String>;
     async fn get_tracks_batch(&self, track_ids: &[u64]) -> Result<Vec<Track>, String>;
 
     // ---- protected audio seam, behind one high-level method ----

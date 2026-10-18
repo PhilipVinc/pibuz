@@ -159,16 +159,6 @@ pub fn resolve_queue_item_ids_from_queue_state(
     (None, None, None)
 }
 
-pub(crate) fn dedupe_track_ids(queue_state: &QConnectQueueState) -> Vec<u64> {
-    let mut unique = Vec::with_capacity(queue_state.queue_items.len());
-    for item in &queue_state.queue_items {
-        if !unique.contains(&item.track_id) {
-            unique.push(item.track_id);
-        }
-    }
-    unique
-}
-
 pub(crate) fn resolve_remote_start_index(
     queue_state: &QConnectQueueState,
     renderer_queue_item_id: Option<u64>,

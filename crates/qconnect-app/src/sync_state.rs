@@ -19,6 +19,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
+use qbz_models::QueueTrack;
 use qconnect_core::{QConnectQueueState, QConnectRendererState};
 
 use crate::session::{
@@ -39,6 +40,17 @@ pub struct QconnectRemoteSyncState {
     pub(crate) last_renderer_max_audio_quality: Option<i32>,
     pub(crate) last_materialized_start_index: Option<usize>,
     pub(crate) last_materialized_core_shuffle_order: Option<Vec<usize>>,
+    /// What the catalog said about the tracks of the current queue: a track's
+    /// details, or `None` for one it no longer has. Only the tracks around the
+    /// cursor are looked up before a pushed queue is installed, and the rest
+    /// in the background (issue #5); this is what lets the next push of the
+    /// same tracks — every tap re-pushes the whole library — skip the catalog.
+    /// Pruned to the pushed queue on every materialization, so it never holds
+    /// more than one queue's worth.
+    pub(crate) known_tracks: HashMap<u64, Option<QueueTrack>>,
+    /// Bumped by every materialization. A background fill-in carries the value
+    /// it was planned under, and stops once a newer queue has been installed.
+    pub(crate) queue_fill_generation: u64,
     pub(crate) last_reported_file_audio_quality: Option<QconnectFileAudioQualitySnapshot>,
     /// Last reported device (DAC output) audio quality: (sampling_rate, bit_depth, nb_channels).
     /// Used to dedup outbound RndrSrvrDeviceAudioQualityChanged(27) reports.

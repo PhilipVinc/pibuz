@@ -176,6 +176,27 @@ pub(crate) struct FakeEngine {
     calls: StdMutex<Vec<EngineCall>>,
     /// Seconds reported for every synthetic catalog track.
     track_duration_secs: u64,
+    catalog: StdMutex<FakeCatalog>,
+}
+
+/// The Qobuz catalog, as far as the renderer asks it about tracks.
+#[derive(Debug, Default)]
+struct FakeCatalog {
+    /// Every track id whose details the orchestration asked for, batched or
+    /// one at a time, in order. This is the cost of a gesture on a Pi: each 50
+    /// of them is a round trip, and a 2,000-track library asked for whole took
+    /// twenty seconds a tap (issue #5).
+    fetches: Vec<u64>,
+    /// Tracks the catalog no longer has. `track/getList` leaves them out of
+    /// its answer and `track/get` answers 404, as Qobuz does for a withdrawn
+    /// release that is still sitting in someone's favourites.
+    withdrawn: Vec<u64>,
+    /// Tracks `track/getList` leaves out but `track/get` still serves.
+    left_out_of_lists: Vec<u64>,
+    /// How many of the next `track/getList` calls fail on the network.
+    failing_lists: usize,
+    /// How many of the next `track/get` calls fail on the network.
+    failing_gets: usize,
 }
 
 impl FakeEngine {
@@ -187,7 +208,44 @@ impl FakeEngine {
             }),
             calls: StdMutex::new(Vec::new()),
             track_duration_secs: 240,
+            catalog: StdMutex::new(FakeCatalog::default()),
         }
+    }
+
+    fn catalog(&self) -> std::sync::MutexGuard<'_, FakeCatalog> {
+        self.catalog.lock().expect("fake catalog")
+    }
+
+    /// Every track id the catalog has been asked about so far.
+    pub(crate) fn catalog_fetches(&self) -> Vec<u64> {
+        self.catalog().fetches.clone()
+    }
+
+    /// The catalog no longer has these tracks.
+    pub(crate) fn withdraw(&self, track_ids: &[u64]) {
+        self.catalog().withdrawn.extend_from_slice(track_ids);
+    }
+
+    /// `track/getList` leaves these out; `track/get` still serves them.
+    pub(crate) fn leave_out_of_lists(&self, track_ids: &[u64]) {
+        self.catalog()
+            .left_out_of_lists
+            .extend_from_slice(track_ids);
+    }
+
+    /// The next `count` `track/getList` calls fail, as on a Wi-Fi blip.
+    pub(crate) fn fail_the_next_track_lists(&self, count: usize) {
+        self.catalog().failing_lists = count;
+    }
+
+    /// The next `count` `track/get` calls fail, as on a Wi-Fi blip.
+    pub(crate) fn fail_the_next_track_gets(&self, count: usize) {
+        self.catalog().failing_gets = count;
+    }
+
+    /// The queue as the player holds it, details and all.
+    pub(crate) fn queue_tracks(&self) -> Vec<QueueTrack> {
+        self.player.lock().expect("fake player").queue.clone()
     }
 
     pub(crate) fn calls(&self) -> Vec<EngineCall> {
@@ -333,6 +391,9 @@ impl FakeEngine {
             "id": id,
             "title": format!("track {id}"),
             "duration": self.track_duration_secs,
+            // As the catalog answers for anything it still serves; a
+            // withdrawn track is not answered at all.
+            "streamable": true,
         }))
         .expect("synthetic track")
     }
@@ -470,12 +531,45 @@ impl QconnectRendererEngine for FakeEngine {
         None
     }
 
-    async fn get_track(&self, track_id: u64) -> Result<Track, String> {
-        Ok(self.mock_track(track_id))
+    async fn fill_in_queue_tracks(&self, tracks: Vec<QueueTrack>) {
+        // `QueueManager::fill_in_tracks`: same id AND same source.
+        let mut player = self.player.lock().expect("fake player");
+        for details in tracks {
+            for entry in player
+                .queue
+                .iter_mut()
+                .filter(|entry| entry.id == details.id && entry.source == details.source)
+            {
+                *entry = details.clone();
+            }
+        }
+    }
+
+    async fn get_track(&self, track_id: u64) -> Result<Option<Track>, String> {
+        let mut catalog = self.catalog();
+        catalog.fetches.push(track_id);
+        if catalog.failing_gets > 0 {
+            catalog.failing_gets -= 1;
+            return Err("error sending request for url (track/get)".to_string());
+        }
+        if catalog.withdrawn.contains(&track_id) {
+            return Ok(None);
+        }
+        Ok(Some(self.mock_track(track_id)))
     }
 
     async fn get_tracks_batch(&self, track_ids: &[u64]) -> Result<Vec<Track>, String> {
-        Ok(track_ids.iter().map(|&id| self.mock_track(id)).collect())
+        let mut catalog = self.catalog();
+        catalog.fetches.extend_from_slice(track_ids);
+        if catalog.failing_lists > 0 {
+            catalog.failing_lists -= 1;
+            return Err("error sending request for url (track/getList)".to_string());
+        }
+        Ok(track_ids
+            .iter()
+            .filter(|id| !catalog.withdrawn.contains(id) && !catalog.left_out_of_lists.contains(id))
+            .map(|&id| self.mock_track(id))
+            .collect())
     }
 
     async fn start_track_stream(
@@ -537,6 +631,11 @@ pub(crate) struct HarnessSink {
     engine: Arc<FakeEngine>,
     sync_state: Arc<Mutex<QconnectRemoteSyncState>>,
     events: Arc<StdMutex<Vec<QconnectAppEvent>>>,
+    /// The background fill-ins materialization handed back, in order. The
+    /// daemon spawns each one; here they wait for
+    /// [`ControllerHarness::let_the_queue_fill_in`], so a case decides what
+    /// happens before they run.
+    fill_ins: Arc<StdMutex<Vec<crate::renderer::QueueFillIn>>>,
 }
 
 #[async_trait]
@@ -553,12 +652,15 @@ impl QconnectEventSink for HarnessSink {
                     let mut sync_state = self.sync_state.lock().await;
                     sync_state.last_remote_queue_state = Some(queue_state.clone());
                 }
-                let _ = crate::renderer::materialize_remote_queue(
+                if let Some(fill_in) = crate::renderer::materialize_remote_queue(
                     self.engine.as_ref(),
                     &self.sync_state,
                     queue_state,
                 )
-                .await;
+                .await
+                {
+                    self.fill_ins.lock().expect("fill-ins").push(fill_in);
+                }
             }
             QconnectAppEvent::RendererCommandApplied { command, state } => {
                 let _ = crate::renderer::apply_renderer_command(
@@ -770,7 +872,7 @@ impl VirtualController {
         let ids: Vec<u64> = items.iter().map(|item| item.track_id).collect();
         self.harness
             .step(
-                &format!("push queue {ids:?} select {selected}"),
+                &format!("push queue {} select {selected}", describe_ids(&ids)),
                 move |_| {
                     vec![queue_event(
                         "MESSAGE_TYPE_SRVR_CTRL_QUEUE_TRACKS_LOADED",
@@ -1098,6 +1200,17 @@ fn fresh_release_items(track_ids: &[u64]) -> Vec<QueueItem> {
         .collect()
 }
 
+/// A list of track ids short enough to read in a timeline: in full for an
+/// album, first and last for a whole library.
+fn describe_ids(ids: &[u64]) -> String {
+    match ids {
+        [first, .., last] if ids.len() > 8 => {
+            format!("[{first} .. {last}] ({} tracks)", ids.len())
+        }
+        _ => format!("{ids:?}"),
+    }
+}
+
 fn queue_item_json(item: &QueueItem) -> Value {
     json!({
         "track_context_uuid": item.track_context_uuid,
@@ -1118,6 +1231,7 @@ struct HarnessInner {
     cloud: Arc<FakeCloud>,
     timeline: StdMutex<Vec<Step>>,
     engine_calls_drained: StdMutex<usize>,
+    fill_ins: Arc<StdMutex<Vec<crate::renderer::QueueFillIn>>>,
 }
 
 impl HarnessInner {
@@ -1249,10 +1363,12 @@ impl ControllerHarness {
         let transport = Arc::new(InMemoryWsTransport::new());
         let engine = Arc::new(FakeEngine::new());
         let sync_state = Arc::new(Mutex::new(QconnectRemoteSyncState::default()));
+        let fill_ins = Arc::new(StdMutex::new(Vec::new()));
         let sink = Arc::new(HarnessSink {
             engine: Arc::clone(&engine),
             sync_state: Arc::clone(&sync_state),
             events: Arc::new(StdMutex::new(Vec::new())),
+            fill_ins: Arc::clone(&fill_ins),
         });
         let app = Arc::new(QconnectApp::new(
             Arc::clone(&transport),
@@ -1292,6 +1408,7 @@ impl ControllerHarness {
             cloud,
             timeline: StdMutex::new(Vec::new()),
             engine_calls_drained: StdMutex::new(0),
+            fill_ins,
         });
 
         // The connect itself puts nothing on the wire worth folding, but drain
@@ -1517,14 +1634,42 @@ impl ControllerHarness {
         let Some(step) = timeline.last() else {
             panic!("no steps recorded");
         };
-        assert_eq!(
-            step.player_queue,
-            step.cloud_queue,
-            "the player holds {:?} while the cloud holds {:?}; timeline:\n{}",
-            step.player_queue,
-            step.cloud_queue,
-            render_timeline(&timeline),
-        );
+        if step.player_queue != step.cloud_queue {
+            let first_difference = step
+                .player_queue
+                .iter()
+                .zip(&step.cloud_queue)
+                .position(|(player, cloud)| player != cloud);
+            panic!(
+                "the player holds {} while the cloud holds {}, first differing at {:?}; timeline:\n{}",
+                describe_ids(&step.player_queue),
+                describe_ids(&step.cloud_queue),
+                first_difference,
+                render_timeline(&timeline),
+            );
+        }
+    }
+
+    /// The background fill-ins the pushes so far handed back run, oldest
+    /// first, as the daemon's spawned tasks would — except that here nothing
+    /// else happens while they do, unless the case makes it happen first.
+    pub(crate) async fn let_the_queue_fill_in(&self) {
+        let fill_ins: Vec<_> = self
+            .inner
+            .fill_ins
+            .lock()
+            .expect("fill-ins")
+            .drain(..)
+            .collect();
+        for fill_in in fill_ins {
+            crate::renderer::fill_in_remote_queue(
+                self.inner.engine.as_ref(),
+                &self.inner.sync_state,
+                fill_in,
+            )
+            .await;
+        }
+        self.inner.settle("the queue fills in").await;
     }
 
     pub(crate) async fn queue_snapshot(&self) -> QConnectQueueState {

@@ -33,8 +33,8 @@ pub(crate) type DaemonQconnectApp = QconnectApp<NativeWsTransport, DaemonEventSi
 
 pub(crate) struct DaemonEventSink {
     /// Renderer seam — forwards the `qconnect_app::renderer` orchestration onto
-    /// `runtime.core()` + the protected player.
-    engine: DaemonRendererEngine,
+    /// `runtime.core()` + the protected player. Shared with the queue fill-in.
+    engine: Arc<DaemonRendererEngine>,
     /// THE shared remote-sync accumulator (one Mutex, shared with `QconnectApp`).
     sync_state: Arc<Mutex<QconnectRemoteSyncState>>,
     /// Daemon status latch, so `/api/status` can say whether the SESSION still
@@ -58,6 +58,12 @@ pub(crate) struct DaemonEventSink {
     /// defended once since. See `assert_join_volume`.
     became_active_at: std::sync::Mutex<Option<std::time::Instant>>,
     join_volume_asserted: std::sync::atomic::AtomicBool,
+    /// The background lookup of the rest of the last queue the cloud pushed
+    /// (`qconnect_app::renderer::fill_in_remote_queue`, issue #5). One at a
+    /// time: a newer queue's replaces it. It holds the engine, and through it
+    /// the `Arc<AppRuntime>`, so a teardown must abort AND join it (#521) —
+    /// see [`Self::stop_queue_fill_in`].
+    queue_fill_in: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// How long after taking the render a controller's volume still counts as its
@@ -75,13 +81,45 @@ impl DaemonEventSink {
         shared: Arc<std::sync::Mutex<crate::state::DaemonShared>>,
     ) -> Self {
         Self {
-            engine,
+            engine: Arc::new(engine),
             sync_state,
             shared,
             app: Arc::new(OnceLock::new()),
             last_peer_active: std::sync::atomic::AtomicBool::new(false),
             became_active_at: std::sync::Mutex::new(None),
             join_volume_asserted: std::sync::atomic::AtomicBool::new(false),
+            queue_fill_in: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Look up the rest of a just-installed queue in the background, replacing
+    /// any fill-in still running for the previous one. The previous one is
+    /// joined, not just aborted, so there is only ever one task for
+    /// `stop_queue_fill_in` to account for.
+    async fn start_queue_fill_in(&self, fill_in: qconnect_app::renderer::QueueFillIn) {
+        self.stop_queue_fill_in().await;
+        let engine = Arc::clone(&self.engine);
+        let sync_state = Arc::clone(&self.sync_state);
+        let task = tokio::spawn(async move {
+            qconnect_app::renderer::fill_in_remote_queue(engine.as_ref(), &sync_state, fill_in)
+                .await;
+        });
+        if let Ok(mut slot) = self.queue_fill_in.lock() {
+            *slot = Some(task);
+        }
+    }
+
+    /// Abort and join the queue fill-in, so its `Arc<AppRuntime>` clone is gone
+    /// before the session is (#521 ordering).
+    pub(crate) async fn stop_queue_fill_in(&self) {
+        let task = self
+            .queue_fill_in
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        if let Some(task) = task {
+            task.abort();
+            let _ = task.await;
         }
     }
 
@@ -265,7 +303,8 @@ impl DaemonEventSink {
 
         if let Some(loop_mode) = outcome.apply_loop_mode {
             if let Err(err) =
-                qconnect_app::renderer::apply_remote_loop_mode(&self.engine, loop_mode).await
+                qconnect_app::renderer::apply_remote_loop_mode(self.engine.as_ref(), loop_mode)
+                    .await
             {
                 log::warn!("[QConnect] Failed to apply remote loop mode: {err}");
             }
@@ -384,7 +423,8 @@ impl DaemonEventSink {
         };
 
         if let Err(err) =
-            qconnect_app::renderer::align_queue_cursor(&self.engine, current_track.track_id).await
+            qconnect_app::renderer::align_queue_cursor(self.engine.as_ref(), current_track.track_id)
+                .await
         {
             log::warn!("[QConnect] Failed to sync peer renderer cursor into engine: {err}");
         }
@@ -432,14 +472,14 @@ impl QconnectEventSink for DaemonEventSink {
                     let mut sync_state = self.sync_state.lock().await;
                     sync_state.last_remote_queue_state = Some(queue_state.clone());
                 }
-                if let Err(err) = qconnect_app::renderer::materialize_remote_queue(
-                    &self.engine,
+                if let Some(fill_in) = qconnect_app::renderer::materialize_remote_queue(
+                    self.engine.as_ref(),
                     &self.sync_state,
                     queue_state,
                 )
                 .await
                 {
-                    log::warn!("[QConnect] Failed to materialize remote queue: {err}");
+                    self.start_queue_fill_in(fill_in).await;
                 }
             }
             QconnectAppEvent::RendererCommandApplied { command, state } => {
@@ -457,7 +497,7 @@ impl QconnectEventSink for DaemonEventSink {
                 }
                 let sets_active = matches!(command, RendererCommand::SetActive { .. });
                 if let Err(err) = qconnect_app::renderer::apply_renderer_command(
-                    &self.engine,
+                    self.engine.as_ref(),
                     &self.sync_state,
                     command,
                     state,

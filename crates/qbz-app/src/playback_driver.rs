@@ -8,8 +8,7 @@
 // Split of concerns:
 //   * `plan_tick`      — side-effect-free: (state, event, queue, error) → actions
 //   * `advance_state`  — the pure state-update rule the shell applies each tick
-//   * `next_playable`  — bounded unstreamable skip-walk, capped at
-//                        `MAX_OFFLINE_SKIPS`
+//   * `next_playable`  — the unstreamable skip-walk, bounded by the queue
 //   * `run_driver`     — the 450 ms IO shell that reads the player, calls
 //                        `plan_tick`, and executes the resulting actions
 //   * `advance_and_play` — the full advance ritual (skip-walk → play →
@@ -30,9 +29,6 @@ const TICK_MS: u64 = 450;
 
 /// QConnect report cadence while playing: every ~4 ticks ≈ 2 s.
 const QCONNECT_REPORT_EVERY_N_TICKS: u64 = 4;
-
-/// Bounded skip-walk ceiling for unavailable tracks (issue #467).
-const MAX_OFFLINE_SKIPS: usize = 5;
 
 /// A side effect the shell must perform this tick. Produced by [`plan_tick`],
 /// executed by [`run_driver`].
@@ -155,19 +151,20 @@ pub(crate) fn gapless_fetch_still_wanted(armed_against: u64, now_playing: u64) -
     armed_against != 0 && armed_against == now_playing
 }
 
-/// Bounded skip-walk to the first streamable upcoming track. Returns
-/// `(index, track_id)` of the first `playable == true` entry within `max_walk`
-/// steps, or `None` when none is found inside the bound (never walks forever).
-pub(crate) fn next_playable(upcoming: &[(u64, bool)], max_walk: usize) -> Option<(usize, u64)> {
-    for (i, &(id, playable)) in upcoming.iter().enumerate() {
-        if i >= max_walk {
-            break;
-        }
-        if playable {
-            return Some((i, id));
-        }
-    }
-    None
+/// Skip-walk to the first streamable upcoming track. Returns `(index,
+/// track_id)` of the first `playable == true` entry, or `None` when the rest of
+/// the queue has none.
+///
+/// Bounded by the queue and nothing else. Stepping over an unstreamable entry
+/// costs nothing — the flag is known before any fetch — and a Connect queue
+/// keeps the catalog's withdrawn tracks in their places (issue #5), so a
+/// withdrawn album is a dozen in a row. A cap of five took that for the end.
+pub(crate) fn next_playable(upcoming: &[(u64, bool)]) -> Option<(usize, u64)> {
+    upcoming
+        .iter()
+        .enumerate()
+        .find(|(_, &(_, playable))| playable)
+        .map(|(i, &(id, _))| (i, id))
 }
 
 /// The pure per-tick decision. Side-effect-free: given the carried state, the
@@ -266,7 +263,7 @@ pub(crate) fn plan_tick(
                 // other advance is done with them.
                 actions.push(DriverAction::ReleaseCachedTrack(last.track_id));
             }
-        } else if next_playable(&queue.upcoming, MAX_OFFLINE_SKIPS).is_some() {
+        } else if next_playable(&queue.upcoming).is_some() {
             actions.push(DriverAction::AdvanceAndPlay);
             actions.push(DriverAction::ReleaseCachedTrack(last.track_id));
         } else {
@@ -617,8 +614,9 @@ fn repeat_after_manual_skip(mode: RepeatMode) -> Option<RepeatMode> {
 
 /// The FULL advance ritual, reused verbatim by the CLI next/prev routes:
 /// bounded skip-walk to the next (or previous) playable track → play it → warm
-/// the successors for gapless. Never a bare cursor move. The skip-walk is
-/// capped at `MAX_OFFLINE_SKIPS`; `next_track()`/`previous_track()` are the
+/// the successors for gapless. Never a bare cursor move. The skip-walk takes
+/// at most one lap of the queue (repeat-all wraps, so an all-unplayable queue
+/// would otherwise go round forever); `next_track()`/`previous_track()` are the
 /// atomic cursor movers — `forward` selects which one, so `pibuz next` and
 /// `pibuz prev` share this one ritual instead of duplicating the play →
 /// prefetch tail.
@@ -628,6 +626,7 @@ pub(crate) async fn advance_and_play<A: FrontendAdapter + Send + Sync + 'static>
     forward: bool,
 ) -> Result<Option<QueueTrack>, String> {
     let core = runtime.core();
+    let lap = core.get_queue_state().await.total_tracks;
     let mut skips = 0usize;
     let next = loop {
         let step = if forward {
@@ -645,10 +644,10 @@ pub(crate) async fn advance_and_play<A: FrontendAdapter + Send + Sync + 'static>
         }
         skips += 1;
         log::info!(
-            "[pibuz] driver: skipping unavailable track {} ({skips}/{MAX_OFFLINE_SKIPS})",
+            "[pibuz] driver: skipping unavailable track {} ({skips} in a row)",
             track.id
         );
-        if skips >= MAX_OFFLINE_SKIPS {
+        if skips >= lap {
             let _ = core.stop();
             break None;
         }
@@ -960,14 +959,36 @@ mod tests {
         assert!(a.contains(&DriverAction::QueueFinished));
     }
 
+    /// A run of withdrawn tracks is stepped over, however long it is.
+    ///
+    /// A Connect queue keeps the tracks the catalog has withdrawn in their
+    /// places, marked unplayable, so its positions stay the cloud's (issue #5).
+    /// A whole withdrawn album in a library sorted by album is a dozen of them
+    /// in a row. A walk capped at five took that for the end of the queue:
+    /// playback stopped and the queue rewound to its first track.
+    #[test]
+    fn a_withdrawn_album_mid_queue_is_skipped_not_taken_for_the_end() {
+        let s = DriverState::after(&ev(1, true, 580, 581));
+        let mut upcoming: Vec<(u64, bool)> = (2..14).map(|id| (id, false)).collect();
+        upcoming.push((14, true));
+        let a = plan_tick(
+            &s,
+            &ev(1, false, 581, 581),
+            &q(1, &upcoming, "off", None),
+            None,
+        );
+        assert!(a.contains(&DriverAction::AdvanceAndPlay), "{a:?}");
+        assert!(!a.contains(&DriverAction::QueueFinished), "{a:?}");
+    }
+
     #[test]
     fn skip_walk_bounds() {
         assert_eq!(
-            next_playable(&[(2, false), (3, false), (4, true)], 50),
+            next_playable(&[(2, false), (3, false), (4, true)]),
             Some((2, 4))
         );
         let all_bad: Vec<(u64, bool)> = (0..60).map(|i| (i, false)).collect();
-        assert_eq!(next_playable(&all_bad, 50), None); // bounded — never walks forever
+        assert_eq!(next_playable(&all_bad), None); // bounded — never walks forever
     }
 
     #[test]

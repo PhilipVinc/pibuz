@@ -236,6 +236,18 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
         .await;
     }
 
+    /// Fill details into queue entries by track id, leaving order, cursor and
+    /// shuffle alone — see `QueueManager::fill_in_tracks`.
+    ///
+    /// Emits nothing. `QueueUpdated` says the queue CHANGED, and its one
+    /// subscriber in the daemon, the Connect queue publisher, cares about ids
+    /// and order alone, which a fill-in never touches. Emitting it for each of
+    /// a large queue's forty lookups kept restarting the publisher's debounce,
+    /// holding back a real edit made meanwhile until the fill-in was done.
+    pub async fn fill_in_queue_tracks(&self, tracks: Vec<QueueTrack>) {
+        self.queue.write().await.fill_in_tracks(tracks);
+    }
+
     /// Remove a track by index
     pub async fn remove_track(&self, index: usize) -> Option<QueueTrack> {
         let queue = self.queue.write().await;

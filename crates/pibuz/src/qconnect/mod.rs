@@ -58,6 +58,9 @@ pub(crate) struct DaemonQconnectRuntime {
     pub(crate) sync_state: Arc<Mutex<QconnectRemoteSyncState>>,
     /// This session's volume policy, for the volume publish (publish.rs).
     pub volume_mode: engine::VolumeMode,
+    /// The session's event sink, held so teardown can stop the queue fill-in
+    /// it spawns.
+    pub(crate) sink: Arc<DaemonEventSink>,
 }
 
 /// Connect-flow state. `pub(crate)` fields so `session::DaemonSessionLoopHost`
@@ -333,6 +336,7 @@ impl DaemonQconnectService {
                 event_loop,
                 sync_state,
                 volume_mode,
+                sink,
             });
         }
 
@@ -384,6 +388,9 @@ impl DaemonQconnectService {
             }
             runtime.event_loop.abort();
             let _ = runtime.event_loop.await;
+            // After the loop, which is what starts fill-ins: none can begin once
+            // this one is stopped.
+            runtime.sink.stop_queue_fill_in().await;
         }
 
         if let Ok(mut s) = self.shared.lock() {

@@ -7,7 +7,7 @@
 //! - Repeat modes (off, all, one)
 //! - Play history for going back
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
 use qbz_models::{QueueState, QueueTrack, RepeatMode};
@@ -783,6 +783,33 @@ impl QueueManager {
         (state.tracks.clone(), state.current_index)
     }
 
+    /// Replace every entry with the same id AND the same `source` as one of
+    /// `tracks` with it, in place: order, cursor, shuffle and history are
+    /// untouched. For details that arrive after the queue went in (QConnect
+    /// installs a large queue as bare ids and looks the rest up in the
+    /// background). Returns how many entries changed.
+    ///
+    /// The source keeps a late answer to the queue it was for: when something
+    /// else has replaced the queue meanwhile — an album played through the API
+    /// — its entries for the same track carry their own source and context,
+    /// and are not this answer's to overwrite.
+    pub fn fill_in_tracks(&self, tracks: Vec<QueueTrack>) -> usize {
+        let details: HashMap<u64, QueueTrack> =
+            tracks.into_iter().map(|track| (track.id, track)).collect();
+        let mut state = self.state.lock().unwrap();
+        let mut filled = 0;
+        for entry in &mut state.tracks {
+            if let Some(track) = details
+                .get(&entry.id)
+                .filter(|track| track.source == entry.source)
+            {
+                *entry = track.clone();
+                filled += 1;
+            }
+        }
+        filled
+    }
+
     /// Get the full queue state without the upcoming/history caps applied by
     /// `get_state()`. Used by clients that paginate the upcoming list (the
     /// HTTP API's queue listing) and need the complete history.
@@ -1010,6 +1037,61 @@ mod tests {
             context_kind: None,
             context_id: None,
         }
+    }
+
+    /// Details filled in later replace the bare entries by id and move nothing:
+    /// the cursor, the shuffle order and what plays next all stay put.
+    #[test]
+    fn filling_in_details_moves_nothing() {
+        let queue = QueueManager::new();
+        let bare = |id| QueueTrack {
+            title: String::new(),
+            ..create_test_track(id)
+        };
+        let tracks: Vec<QueueTrack> = (1..=5).map(bare).collect();
+        queue.set_queue_with_order(tracks, Some(0), true, Some(vec![0, 3, 1, 4, 2]));
+        queue.next();
+        let before = queue.get_all_tracks().1;
+
+        let filled = queue.fill_in_tracks(vec![create_test_track(2), create_test_track(9)]);
+
+        assert_eq!(filled, 1, "only the queued track is filled in");
+        let (tracks, index) = queue.get_all_tracks();
+        assert_eq!(index, before);
+        assert_eq!(tracks[1].title, "Track 2");
+        assert!(tracks[0].title.is_empty());
+        assert_eq!(
+            queue
+                .peek_upcoming(3)
+                .iter()
+                .map(|t| t.id)
+                .collect::<Vec<_>>(),
+            vec![2, 5, 3],
+            "the shuffle order survives"
+        );
+    }
+
+    /// A late answer for a queue that has since been replaced leaves the new
+    /// queue's entries alone, even for the same track: they came from
+    /// somewhere else and carry their own source.
+    #[test]
+    fn filling_in_leaves_entries_from_another_source_alone() {
+        let queue = QueueManager::new();
+        let from_the_api = QueueTrack {
+            context_kind: Some("album".to_string()),
+            ..create_test_track(2)
+        };
+        queue.set_queue(vec![from_the_api], Some(0));
+
+        let late = QueueTrack {
+            source: Some("qobuz_connect_remote".to_string()),
+            title: "From the old queue".to_string(),
+            ..create_test_track(2)
+        };
+        assert_eq!(queue.fill_in_tracks(vec![late]), 0);
+        let (tracks, _) = queue.get_all_tracks();
+        assert_eq!(tracks[0].title, "Track 2");
+        assert_eq!(tracks[0].context_kind.as_deref(), Some("album"));
     }
 
     #[test]

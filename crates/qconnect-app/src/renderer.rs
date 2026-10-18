@@ -5,7 +5,7 @@
 //! filtering), written against [`QconnectRendererEngine`]. The load-dedup
 //! predicates live here alongside the orchestration that consumes them.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -14,9 +14,7 @@ use qbz_player::PlaybackState;
 use qconnect_core::QueueItem;
 use tokio::sync::Mutex;
 
-use crate::queue_resolution::{
-    dedupe_track_ids, resolve_core_shuffle_order, resolve_remote_start_index,
-};
+use crate::queue_resolution::{resolve_core_shuffle_order, resolve_remote_start_index};
 use crate::renderer_engine::QconnectRendererEngine;
 use crate::session::{cap_quality, quality_from_max_audio_quality};
 use crate::{QConnectQueueState, QConnectRendererState, QconnectRemoteSyncState, RendererCommand};
@@ -240,11 +238,7 @@ pub(crate) async fn ensure_remote_track_loaded(
         quality_from_max_audio_quality(max_audio_quality),
         engine.local_max_quality(),
     );
-    let duration_secs = engine
-        .get_track(track_id)
-        .await
-        .map(|track| u64::from(track.duration))
-        .unwrap_or(0);
+    let duration_secs = track_duration_secs(engine, sync_state, track_id).await;
     engine
         .start_track_stream(track_id, quality, duration_secs, start_position_secs)
         .await
@@ -299,11 +293,7 @@ pub(crate) async fn force_remote_track_stream(
         quality_from_max_audio_quality(max_audio_quality),
         engine.local_max_quality(),
     );
-    let duration_secs = engine
-        .get_track(track_id)
-        .await
-        .map(|track| u64::from(track.duration))
-        .unwrap_or(0);
+    let duration_secs = track_duration_secs(engine, sync_state, track_id).await;
     engine
         .start_track_stream(track_id, quality, duration_secs, start_position_secs)
         .await
@@ -809,11 +799,22 @@ async fn sync_remote_shuffle_projection(
         return Ok(false);
     }
 
-    let (tracks, _) = engine.get_all_queue_tracks().await;
+    let (mut tracks, _) = engine.get_all_queue_tracks().await;
     if tracks.len() != queue_state.queue_items.len() || tracks.is_empty() {
         return Ok(false);
     }
 
+    // Held until the queue is back in, and the entries refreshed from it first:
+    // a background fill-in may have filled some of them in since the read
+    // above, and reinstalling what was read would put them back bare.
+    let mut state = sync_state.lock().await;
+    for track in &mut tracks {
+        if let Some(known) = state.known_tracks.get(&track.id) {
+            *track = known
+                .clone()
+                .unwrap_or_else(|| placeholder_queue_track(track.id, false));
+        }
+    }
     engine
         .set_queue_with_order(
             tracks,
@@ -823,17 +824,21 @@ async fn sync_remote_shuffle_projection(
         )
         .await;
 
-    let mut state = sync_state.lock().await;
     state.last_materialized_start_index = Some(start_index);
     state.last_materialized_core_shuffle_order = core_shuffle_order;
     Ok(true)
 }
 
+/// Install the queue the cloud pushed into the player.
+///
+/// Returns what is left to look up in the background, if anything: hand it to
+/// [`fill_in_remote_queue`]. Dropping it only leaves those tracks without
+/// titles until a load or the next push looks them up.
 pub async fn materialize_remote_queue(
     engine: &impl QconnectRendererEngine,
     sync_state: &Arc<Mutex<QconnectRemoteSyncState>>,
     queue_state: &QConnectQueueState,
-) -> Result<(), String> {
+) -> Option<QueueFillIn> {
     let (
         renderer_queue_item_id,
         renderer_track_id,
@@ -842,6 +847,7 @@ pub async fn materialize_remote_queue(
         renderer_playing_state,
         renderer_max_audio_quality,
         should_skip,
+        fill_generation,
     ) = {
         let mut state = sync_state.lock().await;
         if !queue_state_needs_materialization(state.last_applied_queue_state.as_ref(), queue_state)
@@ -854,9 +860,22 @@ pub async fn materialize_remote_queue(
                 state.last_renderer_playing_state,
                 state.last_renderer_max_audio_quality,
                 true,
+                state.queue_fill_generation,
             )
         } else {
             state.last_applied_queue_state = Some(queue_state.clone());
+            // A new queue: any fill-in still running is for the old one, and
+            // what the catalog said about tracks no longer queued is dead
+            // weight.
+            state.queue_fill_generation = state.queue_fill_generation.wrapping_add(1);
+            let queued: HashSet<u64> = queue_state
+                .queue_items
+                .iter()
+                .map(|item| item.track_id)
+                .collect();
+            state
+                .known_tracks
+                .retain(|track_id, _| queued.contains(track_id));
             (
                 state.last_renderer_queue_item_id,
                 state.last_renderer_track_id,
@@ -865,6 +884,7 @@ pub async fn materialize_remote_queue(
                 state.last_renderer_playing_state,
                 state.last_renderer_max_audio_quality,
                 false,
+                state.queue_fill_generation,
             )
         }
     };
@@ -875,7 +895,7 @@ pub async fn materialize_remote_queue(
             queue_state.version.major,
             queue_state.version.minor
         );
-        return Ok(());
+        return None;
     }
 
     log::info!(
@@ -897,45 +917,7 @@ pub async fn materialize_remote_queue(
         let mut state = sync_state.lock().await;
         state.last_materialized_start_index = None;
         state.last_materialized_core_shuffle_order = None;
-        return Ok(());
-    }
-
-    let unique_track_ids = dedupe_track_ids(queue_state);
-    let fetched_tracks = engine
-        .get_tracks_batch(&unique_track_ids)
-        .await
-        .map_err(|err| format!("fetch tracks batch for remote queue: {err}"))?;
-
-    let mut tracks_by_id = HashMap::with_capacity(fetched_tracks.len());
-    for track in fetched_tracks {
-        tracks_by_id.insert(track.id, model_track_to_core_queue_track(&track));
-    }
-
-    let mut queue_tracks = Vec::with_capacity(queue_state.queue_items.len());
-    for item in &queue_state.queue_items {
-        if let Some(queue_track) = tracks_by_id.get(&item.track_id) {
-            queue_tracks.push(queue_track.clone());
-            continue;
-        }
-
-        match engine.get_track(item.track_id).await {
-            Ok(track) => {
-                let mapped = model_track_to_core_queue_track(&track);
-                tracks_by_id.insert(item.track_id, mapped.clone());
-                queue_tracks.push(mapped);
-            }
-            Err(err) => {
-                log::warn!(
-                    "[QConnect] Unable to hydrate remote queue track {}: {}",
-                    item.track_id,
-                    err
-                );
-            }
-        }
-    }
-
-    if queue_tracks.is_empty() {
-        return Err("remote queue materialization produced zero playable tracks".to_string());
+        return None;
     }
 
     // Resolve start index from remote state first, then from the local playback
@@ -974,7 +956,7 @@ pub async fn materialize_remote_queue(
                 .position(|item| item.track_id == track_id)
         });
     }
-    if start_index.is_none() && !queue_tracks.is_empty() {
+    if start_index.is_none() {
         start_index = Some(0);
     }
     let core_shuffle_order = resolve_core_shuffle_order(
@@ -993,9 +975,64 @@ pub async fn materialize_remote_queue(
     // from the order the cloud is about to authorize. Defer the engine
     // shuffle activation until the authoritative order is present.
     let effective_shuffle_enabled = queue_state.shuffle_mode && core_shuffle_order.is_some();
+
+    // Every position goes into the player's queue, but only the tracks around
+    // the cursor are looked up before it does: one `track/getList` call instead
+    // of one per fifty tracks, which for a whole favourites library was twenty
+    // seconds on a Pi 3B per tap (issue #5). The rest go in as bare ids — an id
+    // is all a load needs — and `fill_in_remote_queue` looks them up after.
+    //
+    // A track the catalog no longer has KEEPS its place, marked unplayable.
+    // Dropping it shifted every later position off the cloud's, and the daemon
+    // then pushed its shorter queue back to the cloud as a new one.
+    let play_order = play_order(
+        queue_state.queue_items.len(),
+        start_index.unwrap_or(0),
+        core_shuffle_order.as_deref(),
+    );
+    let around_cursor = {
+        let window = play_order
+            .iter()
+            .take(LOOKUP_AHEAD + 1)
+            .chain(play_order.iter().rev().take(LOOKUP_BEHIND))
+            .map(|&index| queue_state.queue_items[index].track_id);
+        let state = sync_state.lock().await;
+        unknown_track_ids(&state.known_tracks, window)
+    };
+    // A failed lookup does not stop the queue going in: an id is all a load
+    // needs, and this push is already recorded as applied, so returning here
+    // would leave the PREVIOUS queue in the player, an identical re-push
+    // skipped as a duplicate, and the queue publisher pushing the old queue
+    // back over the cloud's. The fill-in retries what this left unknown.
+    if !around_cursor.is_empty() {
+        match look_up_tracks(engine, &around_cursor).await {
+            Ok(looked_up) => sync_state.lock().await.known_tracks.extend(looked_up),
+            Err(err) => log::warn!(
+                "[QConnect] materialize_remote_queue: looking up the tracks around the cursor failed, installing them bare: {err}"
+            ),
+        }
+    }
+    let (queue_tracks, still_unknown) = {
+        let state = sync_state.lock().await;
+        let queue_tracks: Vec<QueueTrack> = queue_state
+            .queue_items
+            .iter()
+            .map(|item| queue_track_from_known(&state.known_tracks, item.track_id))
+            .collect();
+        let still_unknown = unknown_track_ids(
+            &state.known_tracks,
+            play_order
+                .iter()
+                .map(|&index| queue_state.queue_items[index].track_id),
+        );
+        (queue_tracks, still_unknown)
+    };
+
     log::info!(
-        "[QConnect] materialize_remote_queue: setting queue with {} tracks, start_index={:?}, local_track_id={:?}, remote_shuffle_mode={}, shuffle_order_present={}, engine_shuffle_enabled={}",
+        "[QConnect] materialize_remote_queue: setting queue with {} tracks ({} looked up now, {} left for the fill-in), start_index={:?}, local_track_id={:?}, remote_shuffle_mode={}, shuffle_order_present={}, engine_shuffle_enabled={}",
         queue_tracks.len(),
+        around_cursor.len(),
+        still_unknown.len(),
         start_index,
         current_playback_track_id,
         queue_state.shuffle_mode,
@@ -1115,18 +1152,310 @@ pub async fn materialize_remote_queue(
             // A freshly selected track starts at its beginning — the same rule
             // `frame_position_ms` applies to a frame that names a track and no
             // position.
-            ensure_remote_track_loaded(
+            // A failed start leaves the queue installed all the same, so its
+            // fill-in below still has to happen.
+            if let Err(err) = ensure_remote_track_loaded(
                 engine,
                 sync_state,
                 target_track_id,
                 renderer_max_audio_quality,
                 0,
             )
-            .await?;
+            .await
+            {
+                log::warn!(
+                    "[QConnect] materialize_remote_queue: starting queue position {index} failed: {err}"
+                );
+            }
         }
     }
 
-    Ok(())
+    (!still_unknown.is_empty()).then_some(QueueFillIn {
+        generation: fill_generation,
+        track_ids: still_unknown,
+    })
+}
+
+/// How many tracks past the cursor, in play order, a pushed queue looks up
+/// before it is installed. With [`LOOKUP_BEHIND`] and the cursor itself that
+/// is one `track/getList` call: enough for the next forty tracks to start
+/// with their titles, and for the background fill-in to stay well ahead.
+const LOOKUP_AHEAD: usize = 40;
+
+/// How many tracks before the cursor are looked up with it, for "previous".
+const LOOKUP_BEHIND: usize = 9;
+
+/// The most ids one `track/getList` call answers.
+const LOOKUP_CHUNK: usize = 50;
+
+/// The tracks of an installed queue that went in as bare ids, in the order
+/// playback will reach them: what [`materialize_remote_queue`] leaves for
+/// [`fill_in_remote_queue`] to look up in the background.
+#[derive(Debug)]
+pub struct QueueFillIn {
+    generation: u64,
+    track_ids: Vec<u64>,
+}
+
+/// How long the fill-in waits before going round again for what a failed call
+/// left unknown: these in turn, then the last one for every retry after it.
+const FILL_IN_RETRY_DELAYS: [Duration; 4] = [
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+    Duration::from_secs(60),
+];
+
+/// Look up the rest of a queue [`materialize_remote_queue`] installed, one
+/// `track/getList` call at a time, and fill each answer into the player's
+/// queue in place.
+///
+/// Meant to run off the event path: a 2,000-track library is forty calls,
+/// twenty seconds on a Pi 3B, and nothing about playing waits for it — every
+/// position is already in the queue, and the tracks near the cursor already
+/// have their details. It stops as soon as a newer queue is installed (that
+/// one comes with its own fill-in).
+///
+/// A failed call does not end it. What it leaves unknown is tried again after
+/// a pause, for as long as this queue stands: the player's own advance walks
+/// into these entries with nothing but an id, so one dropped call during a
+/// Wi-Fi blip would otherwise leave every later track without a title, and
+/// without the flag that says the catalog will not stream it.
+pub async fn fill_in_remote_queue(
+    engine: &impl QconnectRendererEngine,
+    sync_state: &Arc<Mutex<QconnectRemoteSyncState>>,
+    fill_in: QueueFillIn,
+) {
+    let started = Instant::now();
+    let mut looked_up_count = 0usize;
+    let mut retries = 0usize;
+    let mut pending = fill_in.track_ids;
+    loop {
+        let mut failure = None;
+        for chunk in pending.chunks(LOOKUP_CHUNK) {
+            let wanted = {
+                let state = sync_state.lock().await;
+                if state.queue_fill_generation != fill_in.generation {
+                    log::info!(
+                        "[QConnect] queue fill-in: a newer queue replaced this one after {looked_up_count} tracks"
+                    );
+                    return;
+                }
+                // A load can have looked one of these up meanwhile.
+                unknown_track_ids(&state.known_tracks, chunk.iter().copied())
+            };
+            if wanted.is_empty() {
+                continue;
+            }
+            let looked_up = match look_up_tracks(engine, &wanted).await {
+                Ok(looked_up) => looked_up,
+                Err(err) => {
+                    failure = Some(err);
+                    break;
+                }
+            };
+            // Held across the fill, and checked again: a newer queue may have
+            // been installed while the catalog answered, and a shuffle
+            // projection must not reinstall these entries bare between the two
+            // writes (see `sync_remote_shuffle_projection`). The answer is
+            // dropped rather than cached: the newer queue may already have gone
+            // in with these entries bare, and the cache saying otherwise would
+            // keep its own fill-in from ever filling them.
+            let mut state = sync_state.lock().await;
+            if state.queue_fill_generation != fill_in.generation {
+                return;
+            }
+            let tracks = looked_up
+                .iter()
+                .map(|(track_id, track)| {
+                    track
+                        .clone()
+                        .unwrap_or_else(|| placeholder_queue_track(*track_id, false))
+                })
+                .collect();
+            looked_up_count += looked_up.len();
+            state.known_tracks.extend(looked_up);
+            engine.fill_in_queue_tracks(tracks).await;
+        }
+        // Still unknown: whatever a failed `track/getList` and the chunks after
+        // it held, and any track whose own `track/get` failed.
+        pending = {
+            let state = sync_state.lock().await;
+            if state.queue_fill_generation != fill_in.generation {
+                return;
+            }
+            unknown_track_ids(&state.known_tracks, pending.into_iter())
+        };
+        if pending.is_empty() {
+            break;
+        }
+        let delay = FILL_IN_RETRY_DELAYS[retries.min(FILL_IN_RETRY_DELAYS.len() - 1)];
+        let message = format!(
+            "[QConnect] queue fill-in: {} tracks still to look up ({}); trying again in {}s",
+            pending.len(),
+            failure.as_deref().unwrap_or("some lookups failed"),
+            delay.as_secs()
+        );
+        // Once, loudly; an outage that lasts would otherwise put a warning in
+        // the log every minute for as long as it does.
+        if retries == 0 {
+            log::warn!("{message}");
+        } else {
+            log::debug!("{message}");
+        }
+        retries += 1;
+        tokio::time::sleep(delay).await;
+    }
+    log::info!(
+        "[QConnect] queue fill-in: looked up {looked_up_count} tracks in {:.1}s",
+        started.elapsed().as_secs_f64()
+    );
+}
+
+/// Every position of a queue of `len`, in the order playback reaches them from
+/// `start`: the cloud's shuffle order when there is one, the queue's own
+/// otherwise, wrapping at the end as repeat-all does.
+fn play_order(len: usize, start: usize, shuffle_order: Option<&[usize]>) -> Vec<usize> {
+    let order: Vec<usize> = match shuffle_order {
+        Some(order) if order.len() == len => order.to_vec(),
+        _ => (0..len).collect(),
+    };
+    let from = order.iter().position(|&index| index == start).unwrap_or(0);
+    order[from..]
+        .iter()
+        .chain(&order[..from])
+        .copied()
+        .collect()
+}
+
+/// The ids among `track_ids` the catalog has not been asked about yet, once
+/// each, in the order given.
+fn unknown_track_ids(
+    known: &HashMap<u64, Option<QueueTrack>>,
+    track_ids: impl Iterator<Item = u64>,
+) -> Vec<u64> {
+    let mut seen = HashSet::new();
+    track_ids
+        .filter(|track_id| !known.contains_key(track_id) && seen.insert(*track_id))
+        .collect()
+}
+
+/// Ask the catalog about `track_ids`, at most one `track/getList` call's worth,
+/// and say what it answered: the track's details, or `None` for one it no
+/// longer has. A track whose own `track/get` failed is left out — not known
+/// either way — so the fill-in asks again rather than marking it withdrawn.
+async fn look_up_tracks(
+    engine: &impl QconnectRendererEngine,
+    track_ids: &[u64],
+) -> Result<Vec<(u64, Option<QueueTrack>)>, String> {
+    let mut answered: HashMap<u64, QueueTrack> = engine
+        .get_tracks_batch(track_ids)
+        .await?
+        .iter()
+        .map(|track| (track.id, model_track_to_core_queue_track(track)))
+        .collect();
+    let mut looked_up = Vec::with_capacity(track_ids.len());
+    for &track_id in track_ids {
+        if let Some(track) = answered.remove(&track_id) {
+            looked_up.push((track_id, Some(track)));
+            continue;
+        }
+        // `track/getList` leaves out what it will not serve; `track/get` says
+        // why, and occasionally serves it after all.
+        match engine.get_track(track_id).await {
+            Ok(Some(track)) => looked_up.push((track_id, Some(queue_track_for(track_id, &track)))),
+            Ok(None) => {
+                log::info!("[QConnect] Remote queue track {track_id} is no longer available");
+                looked_up.push((track_id, None));
+            }
+            Err(err) => {
+                log::warn!("[QConnect] Unable to hydrate remote queue track {track_id}: {err}");
+            }
+        }
+    }
+    Ok(looked_up)
+}
+
+/// `track`'s queue entry, under the id it was ASKED for. The queue's ids are
+/// the cloud's, and an entry the catalog answered under another id would match
+/// neither the cloud's queue nor the in-place fill.
+fn queue_track_for(track_id: u64, track: &Track) -> QueueTrack {
+    QueueTrack {
+        id: track_id,
+        ..model_track_to_core_queue_track(track)
+    }
+}
+
+/// The queue entry for `track_id`, from what the catalog has said about it.
+fn queue_track_from_known(known: &HashMap<u64, Option<QueueTrack>>, track_id: u64) -> QueueTrack {
+    match known.get(&track_id) {
+        Some(Some(track)) => track.clone(),
+        Some(None) => placeholder_queue_track(track_id, false),
+        None => placeholder_queue_track(track_id, true),
+    }
+}
+
+/// A queue entry with no details: a track not looked up yet, which holds its
+/// place until the fill-in replaces it, or (`streamable: false`) one the
+/// catalog no longer has, which keeps its place so every later position still
+/// matches the cloud's and the player's own advance skips it.
+fn placeholder_queue_track(track_id: u64, streamable: bool) -> QueueTrack {
+    QueueTrack {
+        id: track_id,
+        title: String::new(),
+        version: None,
+        artist: String::new(),
+        album: String::new(),
+        album_version: None,
+        duration_secs: 0,
+        artwork_url: None,
+        hires: false,
+        bit_depth: None,
+        sample_rate: None,
+        is_local: false,
+        album_id: None,
+        artist_id: None,
+        streamable,
+        source: Some(QCONNECT_REMOTE_QUEUE_SOURCE.to_string()),
+        parental_warning: false,
+        source_item_id_hint: None,
+        context_kind: None,
+        context_id: None,
+    }
+}
+
+/// The length of `track_id` for a load, from what the catalog said when the
+/// queue was installed, or asked now. An answer asked for now is filled into
+/// the queue as well, so a track the cloud names before the fill-in reaches it
+/// still gets its title on screen.
+async fn track_duration_secs(
+    engine: &impl QconnectRendererEngine,
+    sync_state: &Arc<Mutex<QconnectRemoteSyncState>>,
+    track_id: u64,
+) -> u64 {
+    match sync_state.lock().await.known_tracks.get(&track_id) {
+        Some(Some(track)) => return track.duration_secs,
+        // Withdrawn: the load will say so, and asking again would not help.
+        Some(None) => return 0,
+        None => {}
+    }
+    let (details, duration_secs) = match engine.get_track(track_id).await {
+        Ok(Some(track)) => (
+            Some(queue_track_for(track_id, &track)),
+            u64::from(track.duration),
+        ),
+        Ok(None) => (None, 0),
+        Err(_) => return 0,
+    };
+    // Held across the fill for the same reason `fill_in_remote_queue` holds it.
+    let mut state = sync_state.lock().await;
+    state.known_tracks.insert(track_id, details.clone());
+    engine
+        .fill_in_queue_tracks(vec![
+            details.unwrap_or_else(|| placeholder_queue_track(track_id, false))
+        ])
+        .await;
+    duration_secs
 }
 
 pub async fn align_queue_cursor(
@@ -1156,7 +1485,8 @@ pub async fn align_queue_cursor(
     let track = engine
         .get_track(track_id)
         .await
-        .map_err(|err| format!("fetch current remote track {track_id}: {err}"))?;
+        .map_err(|err| format!("fetch current remote track {track_id}: {err}"))?
+        .ok_or_else(|| format!("current remote track {track_id} is no longer available"))?;
     let queue_track = model_track_to_core_queue_track(&track);
     engine.set_queue(vec![queue_track], Some(0)).await;
     Ok(())
@@ -1211,6 +1541,10 @@ mod tests {
         clear_queues: Vec<bool>,
         play_indexes: Vec<usize>,
         get_tracks_batch: u32,
+        /// Every id handed to `get_tracks_batch`, in order.
+        looked_up: Vec<u64>,
+        /// Every id handed to `fill_in_queue_tracks`, in order.
+        filled_in: Vec<u64>,
         start_track_streams: Vec<u64>,
         start_positions: Vec<u64>,
         start_qualities: Vec<Quality>,
@@ -1225,6 +1559,9 @@ mod tests {
         loaded_audio: bool,
         /// This renderer's configured ceiling; `None` = uncapped.
         local_max_quality: Option<Quality>,
+        /// Runs inside every `get_tracks_batch`, while the catalog is "answering":
+        /// how a case makes something happen in the middle of a lookup.
+        during_lookup: Option<Box<dyn Fn() + Send + Sync>>,
     }
 
     impl MockEngine {
@@ -1236,6 +1573,7 @@ mod tests {
                 queue_index: None,
                 loaded_audio: false,
                 local_max_quality: None,
+                during_lookup: None,
             }
         }
 
@@ -1314,11 +1652,22 @@ mod tests {
             self.calls().play_indexes.push(index);
             None
         }
-        async fn get_track(&self, track_id: u64) -> Result<Track, String> {
-            Ok(mock_track(track_id))
+        async fn fill_in_queue_tracks(&self, tracks: Vec<QueueTrack>) {
+            self.calls()
+                .filled_in
+                .extend(tracks.iter().map(|track| track.id));
+        }
+        async fn get_track(&self, track_id: u64) -> Result<Option<Track>, String> {
+            Ok(Some(mock_track(track_id)))
         }
         async fn get_tracks_batch(&self, track_ids: &[u64]) -> Result<Vec<Track>, String> {
-            self.calls().get_tracks_batch += 1;
+            let mut calls = self.calls();
+            calls.get_tracks_batch += 1;
+            calls.looked_up.extend_from_slice(track_ids);
+            drop(calls);
+            if let Some(during_lookup) = &self.during_lookup {
+                during_lookup();
+            }
             Ok(track_ids.iter().map(|&id| mock_track(id)).collect())
         }
         async fn start_track_stream(
@@ -2176,7 +2525,7 @@ mod tests {
         let items = vec![qi(10, 0), qi(11, 1)];
 
         let q1 = queue_state(QueueVersion::new(1, 0), items.clone(), true, None);
-        materialize_remote_queue(&engine, &sync, &q1).await.unwrap();
+        materialize_remote_queue(&engine, &sync, &q1).await;
         {
             let calls = engine.calls();
             assert_eq!(calls.set_queue_with_order.len(), 1);
@@ -2187,7 +2536,7 @@ mod tests {
         }
 
         let q2 = queue_state(QueueVersion::new(1, 1), items, true, Some(vec![1, 0]));
-        materialize_remote_queue(&engine, &sync, &q2).await.unwrap();
+        materialize_remote_queue(&engine, &sync, &q2).await;
         {
             let calls = engine.calls();
             assert_eq!(calls.set_queue_with_order.len(), 2);
@@ -2221,9 +2570,7 @@ mod tests {
         let items: Vec<QueueItem> = (0..13).map(|i| qi(410609157 + i, i)).collect();
         let pushed = pushed_queue_state(QueueVersion::new(4, 1), items, 12);
 
-        materialize_remote_queue(&engine, &sync, &pushed)
-            .await
-            .unwrap();
+        materialize_remote_queue(&engine, &sync, &pushed).await;
 
         assert_eq!(
             sync.lock().await.last_materialized_start_index,
@@ -2257,9 +2604,7 @@ mod tests {
         let items: Vec<QueueItem> = (0..13).map(|i| qi(410609157 + i, i)).collect();
         let pushed = pushed_queue_state(QueueVersion::new(4, 1), items, 12);
 
-        materialize_remote_queue(&engine, &sync, &pushed)
-            .await
-            .unwrap();
+        materialize_remote_queue(&engine, &sync, &pushed).await;
 
         assert_eq!(sync.lock().await.last_materialized_start_index, Some(12));
         assert!(
@@ -2294,9 +2639,7 @@ mod tests {
             None,
         );
 
-        materialize_remote_queue(&engine, &sync, &replacement)
-            .await
-            .unwrap();
+        materialize_remote_queue(&engine, &sync, &replacement).await;
 
         assert_eq!(
             engine.calls().start_track_streams,
@@ -2325,9 +2668,7 @@ mod tests {
             None,
         );
 
-        materialize_remote_queue(&engine, &sync, &handoff)
-            .await
-            .unwrap();
+        materialize_remote_queue(&engine, &sync, &handoff).await;
 
         assert!(
             engine.calls().start_track_streams.is_empty(),
@@ -2355,9 +2696,7 @@ mod tests {
             1, // the position the peer was playing
         );
 
-        materialize_remote_queue(&engine, &sync, &cast)
-            .await
-            .unwrap();
+        materialize_remote_queue(&engine, &sync, &cast).await;
 
         assert!(
             engine.calls().start_track_streams.is_empty(),
@@ -2385,9 +2724,7 @@ mod tests {
         let items: Vec<QueueItem> = (0..13).map(|i| qi(410609157 + i, i)).collect();
         let plain = queue_state(QueueVersion::new(4, 1), items, false, None);
 
-        materialize_remote_queue(&engine, &sync, &plain)
-            .await
-            .unwrap();
+        materialize_remote_queue(&engine, &sync, &plain).await;
 
         assert_eq!(sync.lock().await.last_materialized_start_index, Some(1));
         assert!(engine.calls().start_track_streams.is_empty());
@@ -2506,5 +2843,97 @@ mod tests {
             vec![118],
             "takeback load must resume at the cloud position (118s), not 0"
         );
+    }
+
+    #[test]
+    fn play_order_starts_at_the_cursor_and_wraps() {
+        assert_eq!(play_order(5, 2, None), vec![2, 3, 4, 0, 1]);
+        assert_eq!(
+            play_order(5, 3, Some(&[4, 3, 0, 2, 1])),
+            vec![3, 0, 2, 1, 4]
+        );
+        // An order that does not cover the queue is not one to follow.
+        assert_eq!(play_order(4, 1, Some(&[0, 1])), vec![1, 2, 3, 0]);
+    }
+
+    /// With shuffle on, the tracks looked up before the queue goes in are the
+    /// ones the CLOUD'S order plays next, not the neighbours in the list: the
+    /// point of looking up a window is that what plays next has its details.
+    #[tokio::test]
+    async fn materialize_looks_up_the_tracks_the_shuffle_order_plays_next() {
+        let engine = MockEngine::new();
+        let sync = sync();
+        let len: u64 = 200;
+        let items: Vec<QueueItem> = (0..len).map(|n| qi(1_000 + n, n)).collect();
+        // Reversed: after position 100 come 99, 98, ...
+        let order: Vec<usize> = (0..len as usize).rev().collect();
+        let mut pushed = queue_state(QueueVersion::new(1, 0), items, true, Some(order));
+        pushed.selected_queue_position = Some(100);
+
+        let fill_in = materialize_remote_queue(&engine, &sync, &pushed).await;
+
+        let looked_up = engine.calls().looked_up.clone();
+        assert_eq!(looked_up.len(), LOOKUP_CHUNK);
+        for step in 0..=LOOKUP_AHEAD as u64 {
+            assert!(
+                looked_up.contains(&(1_100 - step)),
+                "position {} plays {step} tracks after the cursor and was not looked up",
+                100 - step
+            );
+        }
+        // "Previous" from here, in the same order: positions 101..=109.
+        for position in 101..=(100 + LOOKUP_BEHIND as u64) {
+            assert!(
+                looked_up.contains(&(1_000 + position)),
+                "position {position} is just behind the cursor in play order and was not looked up"
+            );
+        }
+        assert!(
+            !looked_up.contains(&1_150),
+            "a list neighbour, far off in play order"
+        );
+        let fill_in = fill_in.expect("150 tracks are left to fill in");
+        assert_eq!(fill_in.track_ids.len(), len as usize - LOOKUP_CHUNK);
+        assert_eq!(
+            fill_in.track_ids[0],
+            1_100 - LOOKUP_AHEAD as u64 - 1,
+            "the fill-in carries on where the window stopped, in play order"
+        );
+    }
+
+    /// A fill-in whose queue is replaced while the catalog is answering drops
+    /// the answer: it fills nothing into the player and caches nothing. The
+    /// newer queue may already have gone in with those entries bare, and a
+    /// cache that said otherwise would keep its own fill-in from ever filling
+    /// them.
+    #[tokio::test]
+    async fn a_fill_in_whose_queue_is_replaced_mid_lookup_fills_nothing() {
+        let sync = sync();
+        let items: Vec<QueueItem> = (0..120).map(|n| qi(2_000 + n, n)).collect();
+        let pushed = queue_state(QueueVersion::new(1, 0), items, false, None);
+        let fill_in = materialize_remote_queue(&MockEngine::new(), &sync, &pushed)
+            .await
+            .expect("70 tracks are left to fill in");
+        let known_before = sync.lock().await.known_tracks.len();
+
+        let replaced = Arc::clone(&sync);
+        let engine = MockEngine {
+            during_lookup: Some(Box::new(move || {
+                let mut state = replaced
+                    .try_lock()
+                    .expect("the fill-in holds no lock while the catalog answers");
+                state.queue_fill_generation += 1;
+            })),
+            ..MockEngine::new()
+        };
+        fill_in_remote_queue(&engine, &sync, fill_in).await;
+
+        assert!(engine.calls().looked_up.len() <= LOOKUP_CHUNK);
+        assert!(
+            engine.calls().filled_in.is_empty(),
+            "filled {:?} into a queue that was replaced",
+            engine.calls().filled_in
+        );
+        assert_eq!(sync.lock().await.known_tracks.len(), known_before);
     }
 }

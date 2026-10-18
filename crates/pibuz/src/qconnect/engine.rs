@@ -590,13 +590,20 @@ impl QconnectRendererEngine for DaemonRendererEngine {
     async fn play_index(&self, index: usize) -> Option<QueueTrack> {
         self.core().play_index(index).await
     }
+    async fn fill_in_queue_tracks(&self, tracks: Vec<QueueTrack>) {
+        self.core().fill_in_queue_tracks(tracks).await
+    }
 
     // ---- catalog (async) ----
-    async fn get_track(&self, track_id: u64) -> Result<Track, String> {
-        self.core()
-            .get_track(track_id)
-            .await
-            .map_err(|err| err.to_string())
+    async fn get_track(&self, track_id: u64) -> Result<Option<Track>, String> {
+        match self.core().get_track(track_id).await {
+            Ok(track) => Ok(Some(track)),
+            // The 404 `track/get` answers for a withdrawn release.
+            Err(qbz_app::orchestrator::CoreError::Api(qbz_qobuz::ApiError::TrackUnavailable(
+                _,
+            ))) => Ok(None),
+            Err(err) => Err(err.to_string()),
+        }
     }
     async fn get_tracks_batch(&self, track_ids: &[u64]) -> Result<Vec<Track>, String> {
         self.core()
