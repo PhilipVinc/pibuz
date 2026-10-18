@@ -192,6 +192,13 @@ fn frame_position_ms(
     }
 }
 
+/// The track in the engine played to its end and nothing followed: the audio
+/// thread stops the clock AT the duration and leaves the audio counted as
+/// loaded, with an empty engine behind it that no resume can restart.
+fn track_has_ended(state: &PlaybackState) -> bool {
+    !state.is_playing && state.duration > 0 && state.position >= state.duration
+}
+
 /// Load a remote track into the engine, deduped against echoed SetState frames.
 /// Records the attempt BEFORE dispatching the load (the audio thread updates
 /// `playback_state.track_id` only after the engine appends the source, so the
@@ -270,7 +277,10 @@ pub(crate) async fn force_remote_track_stream(
     start_position_secs: u64,
 ) -> Result<bool, String> {
     let playback_state = engine.get_playback_state();
-    if playback_state.track_id == track_id && engine.has_loaded_audio() {
+    if playback_state.track_id == track_id
+        && engine.has_loaded_audio()
+        && !track_has_ended(&playback_state)
+    {
         return Ok(false);
     }
 
@@ -475,12 +485,29 @@ pub async fn apply_renderer_command(
                         // track at its position first, exactly like the
                         // SetActive takeback path; the has_loaded_audio gate
                         // keeps echoes and live playback on the plain resume.
-                        let cold_engine = !engine.has_loaded_audio();
+                        //
+                        // A track that has RUN OUT is the same dead end with
+                        // its audio still counted as loaded: the engine is
+                        // empty and the audio thread ignores the resume
+                        // ("the track has already ended"). Only an explicit
+                        // play counts there — the cloud's echoes carry no
+                        // state and resolve to the cached PLAYING, and
+                        // reloading on those would replay the last track on
+                        // its own — and it plays from the top unless the
+                        // frame names a position: the cached one is where the
+                        // track ended.
+                        let ended = *playing_state == Some(PLAYING_STATE_PLAYING)
+                            && track_has_ended(&engine.get_playback_state());
+                        let cold_engine = !engine.has_loaded_audio() || ended;
                         let cold_track = projection_renderer_state.current_track.as_ref();
                         if cold_engine && cold_track.is_some() {
                             let track_id = cold_track.map(|t| t.track_id).unwrap_or(0);
-                            let start_position_secs =
-                                frame_position_ms.map(|ms| ms / 1000).unwrap_or(0);
+                            let start_ms = if ended {
+                                *current_position_ms
+                            } else {
+                                frame_position_ms
+                            };
+                            let start_position_secs = start_ms.map(|ms| ms / 1000).unwrap_or(0);
                             match force_remote_track_stream(
                                 engine,
                                 sync_state,

@@ -874,6 +874,58 @@ async fn a_resume_onto_torn_down_audio_reloads_instead_of_dying_quietly() {
     harness.assert_invariants();
 }
 
+/// The last track played to its end and the listener taps play. The player
+/// still holds that track's audio, so `has_loaded_audio` says yes, and a plain
+/// resume reaches an engine with nothing left in it: the audio thread logs
+/// "resume ignored, the track has already ended" and the tap is gone. Seen on
+/// the Pi after a cast onto a queue the phone had played out: play did
+/// nothing, until a track was tapped by hand.
+///
+/// Only a tap on PLAY may restart it. A frame with no playing state of its
+/// own — a seek — has one filled in from the last command, which is the
+/// PLAYING that started the track; restarting on that would start playback
+/// from a drag on a screen that shows the track paused at its end.
+#[tokio::test]
+async fn play_after_the_last_track_ran_out_starts_it_again() {
+    let harness = ControllerHarness::new().await;
+    harness.become_active_renderer().await;
+    harness.controller().push_queue_and_play(&TRACKS, 2).await;
+    harness.advance_playback(TRACK_DURATION_MS);
+    harness.the_track_runs_out();
+    harness.let_the_load_windows_expire();
+    harness.report_tick().await;
+
+    let before = harness.engine_calls().len();
+    harness.controller().drag_seek(60_000).await;
+    let seek: Vec<_> = harness.engine_calls().into_iter().skip(before).collect();
+    assert!(
+        !seek
+            .iter()
+            .any(|call| matches!(call, EngineCall::StartStream { .. })),
+        "a seek is not a play, yet the ended track restarted: {seek:?}\ntimeline:\n{}",
+        harness.rendered_timeline()
+    );
+    harness.the_track_runs_out();
+
+    let before = harness.engine_calls().len();
+    harness.controller().tap_play().await;
+    let after: Vec<_> = harness.engine_calls().into_iter().skip(before).collect();
+    assert!(
+        after.iter().any(|call| matches!(
+            call,
+            EngineCall::StartStream { track_id, start_secs: 0, .. } if *track_id == TRACKS[2]
+        )),
+        "play after the track ran out must start it again from the top; it did \
+         {after:?}\ntimeline:\n{}",
+        harness.rendered_timeline()
+    );
+    assert!(
+        harness.engine().snapshot().is_playing,
+        "and it must actually be playing afterwards"
+    );
+    harness.assert_invariants();
+}
+
 /// The cloud re-emitting a SetState WHILE THE LOAD IS STILL IN FLIGHT must not
 /// start a second stream.
 ///

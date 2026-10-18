@@ -249,6 +249,15 @@ impl FakeEngine {
         player.position_ms = 0;
     }
 
+    /// The track plays to its end with nothing after it: what the audio thread
+    /// leaves behind when the engine runs empty — not playing, the clock AT the
+    /// duration, and the audio still counted as loaded.
+    pub(crate) fn run_out(&self) {
+        let mut player = self.player.lock().expect("fake player");
+        player.playing = false;
+        player.position_ms = player.duration_ms;
+    }
+
     /// Move the playback clock forward, as the audio thread would.
     pub(crate) fn advance(&self, ms: u64) {
         let mut player = self.player.lock().expect("fake player");
@@ -343,7 +352,14 @@ impl QconnectRendererEngine for FakeEngine {
 
     fn resume(&self) -> Result<(), String> {
         self.record(EngineCall::Resume);
-        self.player.lock().expect("fake player").playing = true;
+        let mut player = self.player.lock().expect("fake player");
+        // The real audio thread ignores a resume once the track has run out
+        // ("resume ignored, the track has already ended"): the engine has
+        // nothing left to play, and the audio is still "loaded".
+        let ended = player.duration_ms > 0 && player.position_ms >= player.duration_ms;
+        if !ended {
+            player.playing = true;
+        }
         Ok(())
     }
 
@@ -1361,6 +1377,11 @@ impl ControllerHarness {
     /// Advance the playback clock, as the audio thread would.
     pub(crate) fn advance_playback(&self, ms: u64) {
         self.inner.engine.advance(ms);
+    }
+
+    /// The track plays to its end and nothing follows it.
+    pub(crate) fn the_track_runs_out(&self) {
+        self.inner.engine.run_out();
     }
 
     /// The player finishes a track and starts the next one on its own.
