@@ -290,6 +290,7 @@ pub(crate) async fn run_report_scheduler(
     inner: Arc<Mutex<super::DaemonQconnectInner>>,
     runtime: Arc<AppRuntime<DaemonAdapter>>,
     buffering: Arc<super::engine::BufferingLatch>,
+    shared: super::SharedState,
 ) {
     // The periodic floor. It tightens to LOADING_FLOOR while a stream is
     // filling, because the two things that end a load — audio becoming audible,
@@ -416,6 +417,27 @@ pub(crate) async fn run_report_scheduler(
             report_playback_error(&app, &sync_state, failed_track, error_type).await;
         }
 
+        // A played-out queue at rest on its first track (`queue_at_rest`, set
+        // by the driver's rewind): the player still names the track that
+        // ended, but the controller must show the first one, paused at 0:00,
+        // as the Qobuz apps do — so that play starts the queue again. Ends the
+        // moment anything plays or loads.
+        //
+        // Not keyed on `has_loaded_audio`: the driver's stop reaches the audio
+        // thread some 50 ms after the rewind, so the report it prompts still
+        // sees the ended track loaded.
+        let at_rest = queue_rest_state(&shared, ev.is_playing || in_flight.is_some());
+        let rested_on = if at_rest {
+            runtime
+                .core()
+                .get_queue_state()
+                .await
+                .current_track
+                .map(|track| (track.id, track.duration_secs))
+        } else {
+            None
+        };
+
         let decision = decide_report(
             PlayerSnapshot {
                 track_id: ev.track_id,
@@ -430,6 +452,19 @@ pub(crate) async fn run_report_scheduler(
             in_flight,
             awaiting_next,
         );
+        let decision = match rested_on {
+            Some((track_id, duration_secs)) => decide_report(
+                PlayerSnapshot {
+                    track_id,
+                    position_ms: 0,
+                    duration_secs,
+                    is_playing: false,
+                },
+                None,
+                false,
+            ),
+            None => decision,
+        };
         // `report_playback_state` wants MILLISECONDS; the duration is seconds.
         report_playback_state(
             &app,
@@ -442,6 +477,19 @@ pub(crate) async fn run_report_scheduler(
             decision.buffer_state,
         )
         .await;
+        // The cloud now shows the rested-on track; the renderer's cached view
+        // must too, or a state-only play cold-loads the track that ended.
+        if let Some((track_id, _)) = rested_on {
+            let item = app
+                .queue_state_snapshot()
+                .await
+                .queue_items
+                .into_iter()
+                .find(|item| item.track_id == track_id);
+            if let Some(item) = item {
+                app.update_renderer_current_track(item).await;
+            }
+        }
 
         // A state TRANSITION just went out (play/pause, a new track, buffering
         // starting or ending). Schedule a prompt follow-up rather than waiting
@@ -465,6 +513,18 @@ pub(crate) async fn run_report_scheduler(
             interval = period_from(floor);
         }
     }
+}
+
+/// Read the driver's "queue at rest" latch, ending it once something plays
+/// or starts loading: the listener has moved on.
+fn queue_rest_state(shared: &super::SharedState, something_is_happening: bool) -> bool {
+    let Ok(mut s) = shared.lock() else {
+        return false;
+    };
+    if something_is_happening {
+        s.queue_at_rest = false;
+    }
+    s.queue_at_rest
 }
 
 use qconnect_app::renderer::{PLAYING_STATE_PAUSED, PLAYING_STATE_PLAYING, PLAYING_STATE_STOPPED};

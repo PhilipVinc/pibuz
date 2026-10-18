@@ -980,6 +980,40 @@ async fn play_after_the_last_track_ran_out_starts_it_again() {
     harness.assert_invariants();
 }
 
+/// The queue plays out. The Qobuz apps put the FIRST track up, paused, so
+/// play starts the queue again — and so does the daemon now: it rewinds the
+/// cursor and reports that track at 0:00. A state-only play must then start
+/// it, not the track that ended: the cached current track only follows the
+/// cloud's commands, and the last command named the last track. Seen on the
+/// Pi: play after the end did nothing useful, and the phone took playback
+/// back to itself.
+#[tokio::test]
+async fn play_after_the_queue_played_out_starts_it_from_the_first_track() {
+    let harness = ControllerHarness::new().await;
+    harness.become_active_renderer().await;
+    harness.controller().push_queue_and_play(&TRACKS, 2).await;
+    harness.advance_playback(TRACK_DURATION_MS);
+    harness.let_the_load_windows_expire();
+    harness
+        .the_queue_plays_out_and_rests_on_its_first_track()
+        .await;
+
+    let before = harness.engine_calls().len();
+    harness.controller().tap_play().await;
+    let after: Vec<_> = harness.engine_calls().into_iter().skip(before).collect();
+    assert!(
+        after.iter().any(|call| matches!(
+            call,
+            EngineCall::StartStream { track_id, start_secs: 0, .. } if *track_id == TRACKS[0]
+        )),
+        "play on a played-out queue must start its first track from the top; it did \
+         {after:?}\ntimeline:\n{}",
+        harness.rendered_timeline()
+    );
+    assert!(harness.engine().snapshot().is_playing);
+    harness.assert_invariants();
+}
+
 /// The cloud re-emitting a SetState WHILE THE LOAD IS STILL IN FLIGHT must not
 /// start a second stream.
 ///

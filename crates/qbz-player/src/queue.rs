@@ -558,6 +558,32 @@ impl QueueManager {
         state.tracks.get(target).cloned().map(|t| (t, moved))
     }
 
+    /// Move the cursor back to the first track in play order — the shuffled
+    /// order when shuffle is on — without playing anything. This is where a
+    /// queue that has played out comes to rest: the Qobuz apps put the first
+    /// track up, paused, so play starts the queue again. Returns that track,
+    /// or `None` for an empty queue.
+    pub fn rewind(&self) -> Option<QueueTrack> {
+        let mut state = self.state.lock().unwrap();
+        let first = if state.shuffle {
+            *state.shuffle_order.first()?
+        } else {
+            0
+        };
+        let track = state.tracks.get(first).cloned()?;
+        if let Some(curr_idx) = state.current_index {
+            if curr_idx != first {
+                state.history.push_back(curr_idx);
+                while state.history.len() > 50 {
+                    state.history.pop_front();
+                }
+            }
+        }
+        state.current_index = Some(first);
+        state.shuffle_position = 0;
+        Some(track)
+    }
+
     /// Jump to a specific track by index
     pub fn play_index(&self, index: usize) -> Option<QueueTrack> {
         let mut state = self.state.lock().unwrap();
@@ -984,6 +1010,35 @@ mod tests {
             context_kind: None,
             context_id: None,
         }
+    }
+
+    #[test]
+    fn a_rewind_puts_the_first_track_up() {
+        let queue = QueueManager::new();
+        assert!(
+            queue.rewind().is_none(),
+            "an empty queue has nothing to rewind to"
+        );
+        for id in [123, 124, 125] {
+            queue.add_track(create_test_track(id));
+        }
+        queue.play_index(2);
+        assert_eq!(queue.rewind().map(|t| t.id), Some(123));
+        assert_eq!(queue.get_state().current_track.map(|t| t.id), Some(123));
+    }
+
+    #[test]
+    fn a_shuffled_rewind_puts_the_first_track_of_the_shuffle_up() {
+        let queue = QueueManager::new();
+        for id in [123, 124, 125] {
+            queue.add_track(create_test_track(id));
+        }
+        queue.set_shuffle(true);
+        let first_in_play_order = {
+            let state = queue.state.lock().unwrap();
+            state.tracks[state.shuffle_order[0]].id
+        };
+        assert_eq!(queue.rewind().map(|t| t.id), Some(first_in_play_order));
     }
 
     #[test]

@@ -385,6 +385,9 @@ pub struct DriverDeps {
     pub on_latch: Arc<dyn Fn(&str, String) + Send + Sync>,
     /// Called at the end of every tick (pibuz timestamps `driver_last_tick`).
     pub on_tick: Arc<dyn Fn() + Send + Sync>,
+    /// The queue played out and its cursor is back on the first track, with
+    /// nothing loaded (pibuz tells the Connect controller so).
+    pub on_queue_finished: Arc<dyn Fn() + Send + Sync>,
 }
 
 /// How long one audio-thread command may run before the driver calls it stuck.
@@ -538,6 +541,11 @@ pub async fn run_driver<A: FrontendAdapter + Send + Sync + 'static>(
                     if let Err(e) = core.stop() {
                         log::warn!("[pibuz] driver: stop on queue-finished failed: {e}");
                     }
+                    rewind_finished_queue(core).await;
+                    (deps.on_queue_finished)();
+                    // The stop's own edge may already have gone out naming the
+                    // track that just ended; tell the reporter the queue moved.
+                    (deps.on_edge)();
                 }
             }
         }
@@ -546,6 +554,19 @@ pub async fn run_driver<A: FrontendAdapter + Send + Sync + 'static>(
         (deps.on_tick)();
     }
     log::info!("[pibuz] driver: shutting down");
+}
+
+/// A queue that has played out comes to rest on its first track, paused —
+/// what the Qobuz apps do, so play starts the queue again instead of
+/// resuming the end of its last track. Only the cursor moves: nothing loads,
+/// and the audio device stays closed for whoever wants it next.
+async fn rewind_finished_queue<A: FrontendAdapter + Send + Sync + 'static>(core: &QbzCore<A>) {
+    if let Some(first) = core.rewind_queue().await {
+        log::info!(
+            "[pibuz] driver: back to the top of the queue, {} paused",
+            first.id
+        );
+    }
 }
 
 /// Run the advance ritual and log its outcome (queue-finished on `Ok(None)`, the
@@ -564,6 +585,7 @@ async fn advance_and_play_logged<A: FrontendAdapter + Send + Sync + 'static>(
             if let Err(e) = runtime.core().stop() {
                 log::warn!("[pibuz] driver: stop after empty advance failed: {e}");
             }
+            rewind_finished_queue(runtime.core()).await;
         }
         Err(e) => log::warn!("[pibuz] driver: advance failed: {e}"),
     }

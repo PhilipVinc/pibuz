@@ -325,6 +325,7 @@ fn build_driver_deps(
     bus: tokio::sync::broadcast::Sender<qbz_models::CoreEvent>,
 ) -> DriverDeps {
     let latch_shared = shared.clone();
+    let rest_shared = shared.clone();
     let tick_shared = shared;
     let report_notify_latch = report_notify.clone();
     let edge_notify_latch = edge_notify.clone();
@@ -374,6 +375,11 @@ fn build_driver_deps(
                 s.driver_last_tick = Some(std::time::Instant::now());
             }
         }),
+        on_queue_finished: Arc::new(move || {
+            if let Ok(mut s) = rest_shared.lock() {
+                s.queue_at_rest = true;
+            }
+        }),
     }
 }
 
@@ -384,6 +390,8 @@ fn new_shared(cfg: &PibuzConfig) -> Arc<Mutex<DaemonShared>> {
         last_errors: LatchedErrors::default(),
         driver_last_tick: None,
         mute: crate::mute::Mute::default(),
+        queue_at_rest: false,
+        volume_changed_here: false,
         started_at: std::time::Instant::now(),
         startup_warnings: 0,
         qconnect: QconnectStatus::default(),

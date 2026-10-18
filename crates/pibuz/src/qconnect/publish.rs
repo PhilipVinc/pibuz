@@ -243,16 +243,27 @@ pub(crate) fn spawn_queue_cloud_publish(
 /// the unmute brings back. Reporting a box-side mute as a level of 0 dragged
 /// the phone's slider to the bottom, and the unmute was then lost (issue #4).
 ///
-/// Echo-safe the same way the queue publish is: the cloud's current view of
-/// OUR volume and mute (`session_renderer_states`, updated from every
-/// `CTRL_VOLUME_CHANGED` / `CTRL_VOLUME_MUTED` it sends) is compared first, so
-/// a change that came from the controller — or that we already reported —
-/// goes nowhere.
+/// Only a change made HERE goes out (`DaemonShared::volume_changed_here`, set
+/// by the control API). Telling the two apart by comparing levels did not
+/// hold: mid-drag the cloud's echoes arrive behind the slider, an old one
+/// overwrites the view, and the controller's own latest step then looked
+/// like a local change and went back to it a second time. The cloud's view
+/// of OUR volume and mute (`session_renderer_states`) is still compared, so
+/// what it already shows is not sent again.
 pub(crate) async fn publish_local_volume_if_changed(
     inner: &Arc<Mutex<DaemonQconnectInner>>,
     runtime: &Arc<AppRuntime<DaemonAdapter>>,
     shared: &super::SharedState,
 ) {
+    // Consumed first, so a change made with no session to tell is not left to
+    // fire on the controller's next drag.
+    let changed_here = shared
+        .lock()
+        .map(|mut s| std::mem::take(&mut s.volume_changed_here))
+        .unwrap_or(false);
+    if !changed_here {
+        return;
+    }
     let (app, sync_state, volume_mode) = {
         let guard = inner.lock().await;
         match guard.runtime.as_ref() {

@@ -382,6 +382,16 @@ where
         state.renderer.current_duration_ms = Some(duration_ms);
     }
 
+    /// Publish a track this renderer moved to on its own, with nothing
+    /// loaded — a played-out queue coming to rest on its first track. The
+    /// cached current track otherwise only follows the cloud's commands, so
+    /// a later state-only play would cold-load the track that just ended
+    /// rather than the one the controller is now showing.
+    pub async fn update_renderer_current_track(&self, item: QueueItem) {
+        let mut state = self.state.lock().await;
+        state.renderer.current_track = Some(item);
+    }
+
     pub(crate) async fn handle_transport_event(
         &self,
         event: TransportEvent,

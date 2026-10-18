@@ -14,6 +14,14 @@ pub(crate) struct DaemonShared {
     pub(crate) driver_last_tick: Option<std::time::Instant>,
     /// The daemon's one mute, box and controller alike — see `crate::mute`.
     pub(crate) mute: crate::mute::Mute,
+    /// The queue played out and the driver put its first track up, paused,
+    /// with nothing loaded. The Connect report names that track until
+    /// something plays or loads (`qconnect::report`).
+    pub(crate) queue_at_rest: bool,
+    /// A volume or mute change was made on THIS side (the control API) and
+    /// the Connect controller has not been told yet. The volume publisher
+    /// consumes it; a change the controller made itself never sets it.
+    pub(crate) volume_changed_here: bool,
     pub(crate) started_at: std::time::Instant,
     pub(crate) startup_warnings: u32,
     pub qconnect: QconnectStatus,
@@ -140,6 +148,8 @@ mod tests {
             last_errors: LatchedErrors::default(),
             driver_last_tick: None,
             mute: crate::mute::Mute::default(),
+            queue_at_rest: false,
+            volume_changed_here: false,
             started_at: std::time::Instant::now(),
             startup_warnings: 0,
             qconnect: QconnectStatus::default(),
@@ -155,6 +165,8 @@ mod tests {
             last_errors: LatchedErrors::default(),
             driver_last_tick: None,
             mute: crate::mute::Mute::default(),
+            queue_at_rest: false,
+            volume_changed_here: false,
             started_at: std::time::Instant::now(),
             startup_warnings: 0,
             qconnect: QconnectStatus::default(),
@@ -182,6 +194,8 @@ mod tests {
             last_errors: LatchedErrors::default(),
             driver_last_tick: None,
             mute: crate::mute::Mute::default(),
+            queue_at_rest: false,
+            volume_changed_here: false,
             started_at: std::time::Instant::now(),
             startup_warnings: 0,
             qconnect: QconnectStatus::default(),

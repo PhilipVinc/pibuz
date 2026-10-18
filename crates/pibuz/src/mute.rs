@@ -170,6 +170,8 @@ mod tests {
             last_errors: crate::state::LatchedErrors::default(),
             driver_last_tick: None,
             mute: Mute::default(),
+            queue_at_rest: false,
+            volume_changed_here: false,
             started_at: std::time::Instant::now(),
             startup_warnings: 0,
             qconnect: crate::state::QconnectStatus::default(),

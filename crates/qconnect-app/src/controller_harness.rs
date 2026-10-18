@@ -1388,6 +1388,34 @@ impl ControllerHarness {
         self.inner.engine.run_out();
     }
 
+    /// The queue plays out and the daemon brings it to rest, as
+    /// `pibuz`'s driver and report loop do: the player is stopped (nothing
+    /// loaded, the ended track's id kept), the cursor goes back to the first
+    /// track, and that track at 0:00 is published as the renderer's own.
+    pub(crate) async fn the_queue_plays_out_and_rests_on_its_first_track(&self) {
+        {
+            let mut player = self.inner.engine.player.lock().expect("fake player");
+            player.playing = false;
+            player.loaded_audio = false;
+            player.position_ms = 0;
+            if !player.queue.is_empty() {
+                player.queue_index = Some(0);
+            }
+        }
+        let first = self
+            .inner
+            .app
+            .queue_state_snapshot()
+            .await
+            .queue_items
+            .first()
+            .cloned();
+        if let Some(first) = first {
+            self.inner.app.update_renderer_current_track(first).await;
+        }
+        self.inner.app.update_renderer_position(0).await;
+    }
+
     /// The level and mute the CLOUD shows for this renderer, as the host's own
     /// publisher reads it (`session_renderer_states`).
     pub(crate) async fn cloud_view_of_our_volume(&self) -> (Option<i32>, Option<bool>) {

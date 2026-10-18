@@ -212,6 +212,7 @@ pub(crate) fn volume(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>
         Ok((mute, _)) => mute,
         Err(e) => return runtime_error(&e),
     };
+    mark_volume_changed_here(state);
     state.events_edge.notify_one();
     json(
         200,
@@ -301,6 +302,7 @@ fn apply_mute(state: &ApiState, live: f32, arg: &str) -> Response<Cursor<Vec<u8>
         Ok(changed) => changed,
         Err(e) => return runtime_error(&e),
     };
+    mark_volume_changed_here(state);
     state.events_edge.notify_one();
     // `live` is the level BEFORE this call: after an unmute the player is at
     // the restored one, which is what `unmuted · vol 80%` has to say.
@@ -309,6 +311,14 @@ fn apply_mute(state: &ApiState, live: f32, arg: &str) -> Response<Cursor<Vec<u8>
         200,
         serde_json::json!({"volume": canon_volume(nominal), "muted": mute.is_muted()}),
     )
+}
+
+/// Tell the volume publisher this change was made here, so it reaches the
+/// Connect controller — see `DaemonShared::volume_changed_here`.
+fn mark_volume_changed_here(state: &ApiState) {
+    if let Ok(mut s) = state.shared.lock() {
+        s.volume_changed_here = true;
+    }
 }
 
 /// The player's level, as `crate::mute::change` wants it set.

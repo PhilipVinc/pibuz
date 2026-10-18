@@ -770,12 +770,14 @@ pub(crate) fn start(
     let scheduler_inner = Arc::clone(&service.inner);
     let scheduler_runtime = Arc::clone(&service.runtime);
     let scheduler_buffering = Arc::clone(&service.buffering);
+    let scheduler_shared = Arc::clone(&service.shared);
     let report_task = Some(tokio::spawn(async move {
         report::run_report_scheduler(
             report_notify,
             scheduler_inner,
             scheduler_runtime,
             scheduler_buffering,
+            scheduler_shared,
         )
         .await;
     }));

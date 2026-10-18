@@ -19,16 +19,18 @@ tags on `main`.
   from the app ends a box-side mute, as one set on the box already did, and a
   cast no longer unmutes a muted box by applying `qconnect.initial_volume` —
   that becomes the level the unmute restores.
-- **Play works after the queue has played out.** A track that ran to its end
-  still counted as loaded, so a play from the app was a resume the player
-  ignored ("the track has already ended") and nothing happened until a track
-  was tapped. It now starts the session's current track again, from the top.
+- **A queue that has played out comes to rest on its first track, paused**,
+  as it does in the Qobuz apps, so play starts the queue again. The box used
+  to stop on the last track and tell the app "paused at the end" of it, and
+  play then did nothing — the player ignored a resume of a track that had
+  already ended. Nothing is loaded at rest, so the audio device stays free.
 - **Dragging the volume slider no longer floods the cloud.** Every step of a
   drag was answered with its own volume report — 45 in three seconds — and
   once the cloud dropped the connection mid-drag (`Message gap too large`,
   back about 8 s later). A drag is now acknowledged at most every 250 ms, ending
   on the level it stopped at, and the box no longer re-reports the app's own
-  steps as changes of its own.
+  steps as changes of its own: only a volume or mute set on the box itself
+  goes out as one.
 
 ## 2.7.0 — 2026-10-15
 

@@ -260,6 +260,18 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
         success
     }
 
+    /// Put the first track of the queue up without playing it — see
+    /// `QueueManager::rewind`.
+    pub async fn rewind_queue(&self) -> Option<QueueTrack> {
+        let queue = self.queue.write().await;
+        let track = queue.rewind();
+        self.emit(CoreEvent::QueueUpdated {
+            state: queue.get_state(),
+        })
+        .await;
+        track
+    }
+
     /// Jump to a specific track by index
     pub async fn play_index(&self, index: usize) -> Option<QueueTrack> {
         let queue = self.queue.write().await;
