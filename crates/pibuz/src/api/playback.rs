@@ -209,7 +209,7 @@ pub(crate) fn volume(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>
         |level| set_player_volume(state, level),
         |mute| mute.take_level(target),
     ) {
-        Ok(mute) => mute,
+        Ok((mute, _)) => mute,
         Err(e) => return runtime_error(&e),
     };
     state.events_edge.notify_one();
@@ -293,18 +293,21 @@ fn apply_mute(state: &ApiState, live: f32, arg: &str) -> Response<Cursor<Vec<u8>
 
     // Already in the requested state is a no-op that still reports the
     // current nominal level.
-    let mute = match crate::mute::change(
+    let (mute, level) = match crate::mute::change(
         &state.shared,
         |level| set_player_volume(state, level),
         |mute| mute.set(mute_on, live),
     ) {
-        Ok(mute) => mute,
+        Ok(changed) => changed,
         Err(e) => return runtime_error(&e),
     };
     state.events_edge.notify_one();
+    // `live` is the level BEFORE this call: after an unmute the player is at
+    // the restored one, which is what `unmuted · vol 80%` has to say.
+    let nominal = mute.nominal(level.unwrap_or(live));
     json(
         200,
-        serde_json::json!({"volume": canon_volume(mute.nominal(live)), "muted": mute.is_muted()}),
+        serde_json::json!({"volume": canon_volume(nominal), "muted": mute.is_muted()}),
     )
 }
 

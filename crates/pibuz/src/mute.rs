@@ -98,7 +98,8 @@ impl Mute {
 /// Apply `change` to the daemon's mute and set the player to the level it asks
 /// for, holding the daemon lock across both: a mute from the box and an unmute
 /// from the controller racing each other must not leave the flag saying one
-/// thing and the player the other. Returns the mute as it now stands.
+/// thing and the player the other. Returns the mute as it now stands, and
+/// the level the player was set to, if `change` asked for one.
 ///
 /// On a failed `set_volume` the flag has still moved. That is the old
 /// behaviour of the box's mute, kept: the player's command channel is dead at
@@ -107,14 +108,15 @@ pub(crate) fn change(
     shared: &Mutex<DaemonShared>,
     set_volume: impl FnOnce(f32) -> Result<(), String>,
     change: impl FnOnce(&mut Mute) -> Option<f32>,
-) -> Result<Mute, String> {
+) -> Result<(Mute, Option<f32>), String> {
     let mut guard = shared
         .lock()
         .map_err(|_| "daemon state lock poisoned".to_string())?;
-    if let Some(level) = change(&mut guard.mute) {
+    let level = change(&mut guard.mute);
+    if let Some(level) = level {
         set_volume(level)?;
     }
-    Ok(guard.mute)
+    Ok((guard.mute, level))
 }
 
 /// The mute as it stands, or unmuted if the lock is poisoned.
@@ -161,6 +163,48 @@ mod tests {
         assert!(mute.is_muted());
         assert_eq!(mute.take_level(0.6), Some(0.6));
         assert!(!mute.is_muted());
+    }
+
+    fn shared() -> Mutex<DaemonShared> {
+        Mutex::new(DaemonShared {
+            last_errors: crate::state::LatchedErrors::default(),
+            driver_last_tick: None,
+            mute: Mute::default(),
+            started_at: std::time::Instant::now(),
+            startup_warnings: 0,
+            qconnect: crate::state::QconnectStatus::default(),
+            network_online: std::sync::atomic::AtomicBool::new(true),
+            bus: None,
+        })
+    }
+
+    /// The player is set to exactly the level the change asked for, and the
+    /// caller is told it: `unmuted · vol 0%` was the API reporting the level
+    /// from BEFORE the unmute.
+    #[test]
+    fn a_change_sets_the_player_and_says_what_it_set() {
+        let shared = shared();
+        let set = std::cell::Cell::new(None);
+        let player = |level| {
+            set.set(Some(level));
+            Ok(())
+        };
+
+        let (mute, level) = change(&shared, player, |m| m.set(true, 0.26)).unwrap();
+        assert!(mute.is_muted());
+        assert_eq!((level, set.get()), (Some(0.0), Some(0.0)));
+
+        let (mute, level) = change(&shared, player, |m| m.set(false, 0.0)).unwrap();
+        assert!(!mute.is_muted());
+        assert_eq!((level, set.get()), (Some(0.26), Some(0.26)));
+
+        set.set(None);
+        let (_, level) = change(&shared, player, |m| m.set(false, 0.26)).unwrap();
+        assert_eq!(
+            (level, set.get()),
+            (None, None),
+            "a no-op leaves the player alone"
+        );
     }
 
     #[test]
