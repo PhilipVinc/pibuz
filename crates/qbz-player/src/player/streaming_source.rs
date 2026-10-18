@@ -190,7 +190,7 @@ pub fn max_initial_buffer_bytes() -> usize {
 /// re-opens the body; the CMAF path re-enters at the segment holding the byte,
 /// which is the smallest unit it can decrypt. Landing up to one segment early
 /// is the price, and it is the same shape of overshoot as
-/// [`SEEK_LOOKBEHIND_BYTES`].
+/// [`SEEK_HEAD_START_BYTES`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamSeekMode {
     /// Bytes arrive in order from wherever the feeder started; reads ahead
@@ -231,22 +231,37 @@ const FORWARD_WAIT_BYTES: u64 = 2 * 1024 * 1024;
 /// downward from where it landed. Each probe behind the body's start would
 /// strand the next one in another hole: a measured 91s resume went 32.31 MB,
 /// 31.47 MB, 31.06 MB, 30.85 MB, four requests where two of them cost ~5 s of
-/// CDN time-to-first-byte. Starting the body a megabyte early puts the rest of
-/// the walk inside bytes we are about to hold anyway, and `FORWARD_WAIT_BYTES`
-/// covers the gap between the body's start and the probe that asked for it.
+/// CDN time-to-first-byte. Starting the body early puts the rest of the walk
+/// inside bytes we are about to hold anyway, and `FORWARD_WAIT_BYTES` covers
+/// the gap between the body's start and the probe that asked for it.
 ///
 /// That holds for the FIRST jump of a seek as much as for the walk after it.
-/// Opened exactly at its target, the jump left the bisection's next probe —
-/// 179 to 428 KB behind it, in three of eight seeks measured on a Pi — in a
+/// Opened exactly at its target, the jump left the bisection's next probe in a
 /// hole of its own: two cold opens, a 10.5 s seek where 5 s would have done.
-/// The megabyte costs about 0.3 s of download on that link. A CMAF feeder
-/// restarts at whole segments, so for it this can mean one segment earlier.
+/// Measured on a Pi over nine seeks, that next probe sat 179 KB, 199 KB,
+/// 428 KB and — on a 24/96 track — 1.04 MB behind the jump; a megabyte was
+/// therefore not enough, and 1.5 MB covers the worst with room. It costs
+/// about 0.4 s of download on that link. A CMAF feeder restarts at whole
+/// segments and picks the one holding the target (`FetchPlan::target`), so
+/// this does not move it.
 ///
 /// Kept below `FORWARD_WAIT_BYTES` so the reader waits for its own target
-/// rather than immediately asking again, and small enough that streaming
-/// through it costs a fraction of a second on any link that can carry
-/// hi-res.
-const SEEK_LOOKBEHIND_BYTES: u64 = 1024 * 1024;
+/// rather than immediately asking again, and below `SEEK_LOOKBEHIND_BYTES` so
+/// the window does not throw it away under the decoder's feet.
+const SEEK_HEAD_START_BYTES: u64 = 1536 * 1024;
+
+/// How much the window keeps behind the slowest reader.
+///
+/// MORE than the head start, deliberately. The decoder reads a frame or two
+/// at the point it landed before it probes behind it, so a window keeping
+/// exactly the head start had already slid past the body's start by then: the
+/// probe 1.04 MB behind a jump was trimmed and fetched again, a second cold
+/// open for bytes just downloaded (Pi, 2026-10-18).
+const SEEK_LOOKBEHIND_BYTES: u64 = 2 * 1024 * 1024;
+
+const _: () = assert!(
+    SEEK_HEAD_START_BYTES < FORWARD_WAIT_BYTES && SEEK_HEAD_START_BYTES < SEEK_LOOKBEHIND_BYTES
+);
 
 /// How much of the file's head the window may never discard.
 ///
@@ -702,7 +717,7 @@ impl BufferState {
 /// discarded the bytes it produced earlier, so a request for them is a real
 /// re-fetch and not a stale echo.
 /// A reader's range request: the byte it is waiting for, and where the body
-/// should start to serve it — up to `SEEK_LOOKBEHIND_BYTES` earlier.
+/// should start to serve it — up to `SEEK_HEAD_START_BYTES` earlier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RangeWanted {
     from: u64,
@@ -829,7 +844,7 @@ pub struct FetchPlan {
     /// dropout worth fixing and a background fetch nobody was waiting on.
     pub origin: PlanOrigin,
     /// The byte a waiting reader wants. `offset` starts up to
-    /// `SEEK_LOOKBEHIND_BYTES` before it, for the bisection that follows a
+    /// `SEEK_HEAD_START_BYTES` before it, for the bisection that follows a
     /// landing; a feeder that restarts at coarser boundaries than a byte (CMAF,
     /// at whole segments) chooses its boundary from this. Equal to `offset` on
     /// a plan nobody is waiting on.
@@ -1255,9 +1270,9 @@ impl BufferedMediaSource {
         // The decoder has landed somewhere new, and it bisects downward from
         // here for a frame boundary — so fetch from a little earlier and let
         // the rest of the walk land in buffered bytes, whichever way the
-        // reader jumped. See SEEK_LOOKBEHIND_BYTES.
+        // reader jumped. See SEEK_HEAD_START_BYTES.
         let walking_back = pos < state.range_start;
-        let fetch_from = pos.saturating_sub(SEEK_LOOKBEHIND_BYTES);
+        let fetch_from = pos.saturating_sub(SEEK_HEAD_START_BYTES);
         log::info!(
             "Streaming buffer: requesting range from byte {} for a {} probe at {pos} \
              (download head at {}, {} bytes held)",
@@ -2904,8 +2919,8 @@ pub(crate) mod tests {
             thread::sleep(Duration::from_millis(5));
         };
         // From a megabyte early, for the bisection that follows a landing
-        // (SEEK_LOOKBEHIND_BYTES), still naming the byte it is for.
-        let from = target - 1024 * 1024;
+        // (SEEK_HEAD_START_BYTES), still naming the byte it is for.
+        let from = target - SEEK_HEAD_START_BYTES;
         assert_eq!(plan.offset, from);
         assert_eq!(plan.target, target);
         assert_eq!(plan.range_header(), format!("bytes={from}-"));
@@ -2921,11 +2936,11 @@ pub(crate) mod tests {
         // back is well past that, but `HEADER_PIN_BYTES` is kept as its own
         // snapshot so a decoder reset can still find STREAMINFO.
         assert_eq!(source.head_bytes(), 1024);
-        // What IS held is the look-behind the window keeps behind the reader:
-        // the head start this body opened with, less what was read past.
+        // What IS held is this body: its head start and the four bytes read,
+        // all within the look-behind the window keeps.
         assert_eq!(
-            source.buffer_size(),
-            1024 * 1024,
+            source.buffer_size() as u64,
+            SEEK_HEAD_START_BYTES + 4,
             "the run at byte 0 is 32 MB behind the reader and is not held"
         );
     }
@@ -2998,6 +3013,69 @@ pub(crate) mod tests {
         assert_eq!(back.seek(SeekFrom::Start(34_584_000)).unwrap(), 34_584_000);
         assert_eq!(back.seek(SeekFrom::Start(34_374_679)).unwrap(), 34_374_679);
         assert!(writer.take_request().is_none());
+    }
+
+    #[test]
+    fn the_head_start_survives_the_decoder_reading_past_its_landing() {
+        // A seek to 1:23 of a 24/96 track on the Pi, 2026-10-18, after the
+        // first head start shipped. The jump to 32,242,240 opened a body a
+        // megabyte early, as intended; the decoder read a few KB at its
+        // landing, the window then kept only a megabyte behind it — less
+        // than the head start — and the next probe, 31,204,012, was trimmed
+        // away and fetched again: 5 s for bytes it had just downloaded. That
+        // step was 1.04 MB, the largest of the day; the others were 179-428 KB.
+        let config = StreamingConfig {
+            initial_buffer_bytes: 4,
+            window_bytes: 200 * 1024 * 1024,
+        };
+        let (source, writer) = BufferedMediaSource::new_seekable(config, Some(120_410_000));
+        feed(&writer, to_eof(0), &[9u8; 9_072_164]);
+
+        let mut reader = source.create_reader();
+        let handle = thread::spawn(move || {
+            let mut buf = vec![0u8; 20 * 1024];
+            reader.seek(SeekFrom::Start(32_242_240)).unwrap();
+            reader.read_exact(&mut buf).unwrap();
+            reader
+        });
+        let plan = loop {
+            if let Some(plan) = writer.take_request() {
+                break plan;
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
+        feed(
+            &writer,
+            plan,
+            &vec![7u8; (32_242_240 - plan.offset) as usize + 64 * 1024],
+        );
+        let mut reader = handle.join().unwrap();
+
+        // The probe blocks until its bytes are there, so it runs under a
+        // deadline: a regression here is a seek waiting on a fetch, which
+        // must fail the case rather than hang the suite.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let probe = thread::spawn(move || {
+            let mut buf = [0u8; 1];
+            let landed = reader
+                .seek(SeekFrom::Start(31_204_012))
+                .and_then(|at| reader.read_exact(&mut buf).map(|()| at));
+            let _ = done_tx.send(landed.map(|at| (at, buf[0])));
+        });
+        let served = done_rx.recv_timeout(Duration::from_secs(2));
+        let refetch = writer.take_request();
+        if served.is_err() {
+            source.abandon();
+        }
+        probe.join().unwrap();
+        assert!(
+            refetch.is_none(),
+            "the probe 1.04 MB behind the landing was trimmed and fetched again: {refetch:?}"
+        );
+        let (at, byte) = served
+            .expect("the probe never returned")
+            .expect("the probe failed");
+        assert_eq!((at, byte), (31_204_012, 7));
     }
 
     #[test]
@@ -3084,10 +3162,14 @@ pub(crate) mod tests {
             }
             thread::sleep(Duration::from_millis(5));
         };
-        assert_eq!(plan.offset, 52_037_582 - 1024 * 1024);
+        assert_eq!(plan.offset, 52_037_582 - SEEK_HEAD_START_BYTES);
         assert_eq!(source.primary_offset(), 52_037_582);
 
-        feed(&writer, plan, &[7u8; 1024 * 1024 + 64]);
+        feed(
+            &writer,
+            plan,
+            &vec![7u8; SEEK_HEAD_START_BYTES as usize + 64],
+        );
         assert_eq!(handle.join().unwrap(), 7);
         let mut back = source.create_reader();
         let mut buf = [0u8; 1];
@@ -3127,14 +3209,18 @@ pub(crate) mod tests {
             }
             thread::sleep(Duration::from_millis(5));
         };
-        // Fetched from a megabyte before the probe, not from the probe.
-        assert_eq!(plan.offset, 31_475_334 - 1024 * 1024);
+        // Fetched from before the probe, not from the probe.
+        assert_eq!(plan.offset, 31_475_334 - SEEK_HEAD_START_BYTES);
         // But the buffer-fill gate still measures from where playback is.
         assert_eq!(source.primary_offset(), 31_475_334);
 
         // Streaming that body through the probe covers the rest of the
         // walk, so nothing below it asks for the network again.
-        feed(&writer, plan, &[7u8; 1024 * 1024 + 64]);
+        feed(
+            &writer,
+            plan,
+            &vec![7u8; SEEK_HEAD_START_BYTES as usize + 64],
+        );
         assert_eq!(handle.join().unwrap(), 7);
         let mut back = source.create_reader();
         assert_eq!(back.seek(SeekFrom::Start(31_057_203)).unwrap(), 31_057_203);
@@ -3200,11 +3286,12 @@ pub(crate) mod tests {
         });
         thread::sleep(Duration::from_millis(50));
 
-        // Playback comes first: the feeder is sent to the probe (a
-        // lookbehind early, since it reads backwards) and runs to EOF, not
-        // to the bounded gap that starts at 1 MB.
+        // Playback comes first: the feeder is sent to the probe (a head
+        // start early, for the bisection) and runs to EOF, not to the
+        // bounded gap that starts at 1 MB.
         let plan = writer.next_plan().unwrap();
-        assert_eq!(plan.offset, 3 * MB);
+        let from = 4 * MB - SEEK_HEAD_START_BYTES;
+        assert_eq!(plan.offset, from);
         assert_eq!(plan.end, None, "the live body runs to EOF, not to a bound");
         assert_eq!(source.primary_offset(), 4 * MB);
         // The label the feeder logs, pinned at the one point where BOTH kinds
@@ -3216,12 +3303,16 @@ pub(crate) mod tests {
         // mislabel here would send that decision the wrong way with no symptom.
         assert_eq!(plan.origin, PlanOrigin::ReaderRequest);
         assert!(plan.origin.is_live_demand());
-        feed(&writer, plan, &[3u8; MB as usize + 16]);
+        feed(
+            &writer,
+            plan,
+            &vec![3u8; SEEK_HEAD_START_BYTES as usize + 16],
+        );
         handle.join().unwrap();
 
         // What is left of the hole is what backfill picks up next.
         let gap = writer.next_plan().unwrap();
-        assert_eq!((gap.offset, gap.end), (MB, Some(3 * MB)));
+        assert_eq!((gap.offset, gap.end), (MB, Some(from)));
         assert_eq!(gap.origin, PlanOrigin::GapFill);
         assert!(
             !gap.origin.is_live_demand(),

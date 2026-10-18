@@ -35,8 +35,10 @@ tags on `main`.
   twice.** The first fetch of a seek opened exactly at its estimated byte,
   and the decoder's search for a frame boundary then stepped back 179-428 KB
   into a gap that needed a second fetch: two ~5 s waits for a cold offset,
-  10.5 s for one seek on a Pi. Every fetch a seek opens now starts a
-  megabyte early, about 0.3 s of extra download.
+  10.5 s for one seek on a Pi. Every fetch a seek opens now starts 1.5 MB
+  early (the largest step measured was 1.04 MB, on a 24/96 track), and the
+  buffer keeps 2 MB behind playback so that head start is still there when
+  the decoder looks back for it. About 0.4 s of extra download per seek.
 
 ## 2.7.0 — 2026-10-15
 
