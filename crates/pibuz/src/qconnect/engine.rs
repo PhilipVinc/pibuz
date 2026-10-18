@@ -152,6 +152,14 @@ struct Buffering {
 /// seconds is ten ticks.
 const BACKWARD_SEEK_MIN_MS: u64 = 3_000;
 
+/// How far below its starting point the clock must be for a backward seek to
+/// have landed. For about a second after a seek completes, the audio clock
+/// still names the OLD source and the player re-anchors onto it in whole
+/// seconds, so the clock can sit up to a second below where the seek started
+/// without having moved at all (Pi, 2026-10-18: 179.3 s against 179.4 s).
+/// Under `BACKWARD_SEEK_MIN_MS`, so every seek this rule covers can satisfy it.
+const BACKWARD_SEEK_LANDED_MARGIN_MS: u64 = 1_500;
+
 /// A load that never becomes audible must not report BUFFERING forever.
 const BUFFERING_MAX: std::time::Duration = std::time::Duration::from_secs(90);
 
@@ -272,7 +280,7 @@ impl BufferingLatch {
         // come DOWN below where it stood, which only the landing does.
         let came_down = match b.clock_at_begin_ms {
             Some(clock) if clock > start_ms + BACKWARD_SEEK_MIN_MS => {
-                b.came_down |= on_track && position_ms < clock;
+                b.came_down |= on_track && position_ms + BACKWARD_SEEK_LANDED_MARGIN_MS < clock;
                 b.came_down
             }
             _ => true,
@@ -1087,6 +1095,24 @@ mod tests {
             None,
             "landed, and playing from there"
         );
+    }
+
+    #[test]
+    fn a_backward_seek_is_not_fooled_by_the_clock_dipping_at_the_old_position() {
+        // Pi, 2026-10-18, the build with the first version of this fix: 2:59
+        // back to 1:24. For about a second after "seeked to 84s" the audio
+        // clock still names the OLD source, and the player re-anchors onto it
+        // in whole seconds — 179 s + 301 ms, a hair BELOW the 179.4 s the seek
+        // started from. "Below where it started" took that for the landing and
+        // the phone was told "playing at 2:59" again.
+        let latch = BufferingLatch::default();
+        latch.begin_at_clock(9, 84, 231, 179_401);
+        assert_eq!(
+            latch.in_flight_with_state(9, 179_301, true),
+            Some((9, 84, 231)),
+            "a sub-second dip at the old position is not the landing"
+        );
+        assert_eq!(latch.in_flight_with_state(9, 84_003, true), None);
     }
 
     #[test]
