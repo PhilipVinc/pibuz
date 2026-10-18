@@ -136,7 +136,21 @@ struct Buffering {
     /// switched to it can still describe it.
     duration_secs: u64,
     since: std::time::Instant,
+    /// The player's clock on this same track when the load began — a seek's
+    /// starting point — or `None` when the player was on another track.
+    clock_at_begin_ms: Option<u64>,
+    /// The clock has been seen below `clock_at_begin_ms`: a backward seek has
+    /// landed. Latched, because the clock climbs back through it.
+    came_down: bool,
 }
+
+/// A seek back by less than this keeps the old "past the offset" arrival.
+/// The latch is only looked at on report ticks, ~300 ms apart while
+/// buffering, and after a short backward seek the clock is below its old
+/// value for only as long as the seek was long: a tick could miss the whole
+/// window and leave the controller spinning until `BUFFERING_MAX`. Three
+/// seconds is ten ticks.
+const BACKWARD_SEEK_MIN_MS: u64 = 3_000;
 
 /// A load that never becomes audible must not report BUFFERING forever.
 const BUFFERING_MAX: std::time::Duration = std::time::Duration::from_secs(90);
@@ -145,12 +159,36 @@ impl BufferingLatch {
     /// Mark `track_id` as buffering from `start_position_secs` (replacing any
     /// previous track).
     pub(crate) fn begin(&self, track_id: u64, start_position_secs: u64, duration_secs: u64) {
+        self.begin_with(track_id, start_position_secs, duration_secs, None);
+    }
+
+    /// [`begin`](Self::begin) for a move within the track the player is on,
+    /// from `clock_ms`: a seek, or a reload of the same track.
+    pub(crate) fn begin_at_clock(
+        &self,
+        track_id: u64,
+        start_position_secs: u64,
+        duration_secs: u64,
+        clock_ms: u64,
+    ) {
+        self.begin_with(track_id, start_position_secs, duration_secs, Some(clock_ms));
+    }
+
+    fn begin_with(
+        &self,
+        track_id: u64,
+        start_position_secs: u64,
+        duration_secs: u64,
+        clock_at_begin_ms: Option<u64>,
+    ) {
         if let Ok(mut guard) = self.current.lock() {
             *guard = Some(Buffering {
                 track_id,
                 start_position_secs,
                 duration_secs,
                 since: std::time::Instant::now(),
+                clock_at_begin_ms,
+                came_down: false,
             });
         }
     }
@@ -223,18 +261,31 @@ impl BufferingLatch {
         let Ok(mut guard) = self.current.lock() else {
             return None;
         };
-        let b = guard.as_ref()?;
+        let b = guard.as_mut()?;
         let on_track = player_track_id == b.track_id;
         let start_ms = b.start_position_secs.saturating_mul(1000);
+        // A seek BACKWARDS starts from a clock already past its target, and
+        // that clock runs on while the fetch is out: read as "past the offset"
+        // it was an arrival at once, and the phone was told it was playing at
+        // the old position over silence until the audio really came (Pi,
+        // 2026-10-18, 2:19 back to 0:57). It has arrived when the clock has
+        // come DOWN below where it stood, which only the landing does.
+        let came_down = match b.clock_at_begin_ms {
+            Some(clock) if clock > start_ms + BACKWARD_SEEK_MIN_MS => {
+                b.came_down |= on_track && position_ms < clock;
+                b.came_down
+            }
+            _ => true,
+        };
         // Audio flowed: the clock climbed past where the stream opened.
-        let audible = on_track && position_ms > start_ms;
+        let audible = on_track && position_ms > start_ms && came_down;
         // Or it arrived into a pause. A stopped clock can never climb past its
         // own offset, so without this a paused load reports BUFFERING until the
         // 90 s backstop — a spinner, and a suppressed position, on a session
         // that is doing exactly what it was told. `on_track` is what keeps this
         // off a cold load: until the new stream produces audio the player still
         // reports the OUTGOING track, so it never looks like arrival.
-        let arrived_paused = on_track && !is_playing && position_ms >= start_ms;
+        let arrived_paused = on_track && !is_playing && position_ms >= start_ms && came_down;
         if audible || arrived_paused || b.since.elapsed() > BUFFERING_MAX {
             *guard = None;
             return None;
@@ -253,7 +304,16 @@ impl BufferingLatch {
         // the offset instead of climbing through it. Say so by name, once per
         // load, because the symptom on its own points at the cloud or the
         // controller and costs an evening.
+        //
+        // Not while the clock is still the one the seek started from, running
+        // on: that is a seek waiting on its fetch (a cold CDN offset takes
+        // ~5 s), not a source-relative clock, and it fired on every slow
+        // forward seek.
+        let old_clock_running_on = b
+            .clock_at_begin_ms
+            .is_some_and(|clock| position_ms >= clock);
         if player_track_id == b.track_id
+            && !old_clock_running_on
             && b.since.elapsed() > STALLED_CLOCK_GRACE
             && position_ms + STALLED_CLOCK_SLACK_MS < b.start_position_secs.saturating_mul(1000)
         {
@@ -433,8 +493,11 @@ impl QconnectRendererEngine for DaemonRendererEngine {
         // is the whole of what can be said on the wire.
         let state = self.get_playback_state();
         if state.track_id != 0 {
+            // From where the clock stands now: a seek backwards starts past
+            // its own target (see `in_flight_with_state`).
+            let clock_ms = self.core().player().state.current_position_ms();
             self.buffering
-                .begin(state.track_id, position_secs, state.duration);
+                .begin_at_clock(state.track_id, position_secs, state.duration, clock_ms);
             self.report_notify.notify_one();
         }
         self.core()
@@ -999,6 +1062,68 @@ mod tests {
             Some((12, 139, 254)),
             "player empty after a hand-off: still the new track's load"
         );
+    }
+
+    #[test]
+    fn a_backward_seek_is_buffering_until_the_clock_comes_down() {
+        // Pi, 2026-10-18: a seek from 2:19 back to 0:57 of a 24/96 track. The
+        // fetch took 5 s, and the player's clock ran on from 139 s meanwhile —
+        // already past the 57 s target, so "past the offset" read as audible at
+        // once: the phone was told "playing at 2:20" over silence, then jumped
+        // to 0:57 when the audio really came.
+        let latch = BufferingLatch::default();
+        latch.begin_at_clock(9, 57, 187, 139_452);
+        assert_eq!(
+            latch.in_flight_with_state(9, 141_000, true),
+            Some((9, 57, 187)),
+            "the old clock running on is not an arrival"
+        );
+        assert_eq!(
+            latch.in_flight_with_state(9, 142_918, true),
+            Some((9, 57, 187))
+        );
+        assert_eq!(
+            latch.in_flight_with_state(9, 57_095, true),
+            None,
+            "landed, and playing from there"
+        );
+    }
+
+    #[test]
+    fn a_backward_seek_while_paused_arrives_where_it_lands() {
+        let latch = BufferingLatch::default();
+        latch.begin_at_clock(9, 57, 187, 139_000);
+        assert!(latch.in_flight_with_state(9, 139_000, false).is_some());
+        assert!(latch.in_flight_with_state(9, 57_000, false).is_none());
+    }
+
+    #[test]
+    fn a_backward_seek_stays_landed_once_its_clock_climbs_back_past_the_start() {
+        // Seen below where it started, the seek has landed — even if the next
+        // look finds the clock back above that point.
+        let latch = BufferingLatch::default();
+        latch.begin_at_clock(9, 135, 187, 139_000);
+        assert!(latch.in_flight_with_state(9, 135_000, true).is_some());
+        assert!(latch.in_flight_with_state(9, 139_500, true).is_none());
+    }
+
+    #[test]
+    fn a_short_backward_seek_keeps_the_old_arrival() {
+        // 2 s back: too short a window to be sure a report tick sees the clock
+        // under its old value, and missing it would spin for 90 s.
+        let latch = BufferingLatch::default();
+        latch.begin_at_clock(9, 137, 187, 139_000);
+        assert!(latch.in_flight_with_state(9, 139_300, true).is_none());
+    }
+
+    #[test]
+    fn a_forward_seek_still_arrives_past_its_offset() {
+        // The same Pi session, the seek before: 0:08 forward to 2:16. The
+        // clock running on from 8 s stays below the target, as it always has.
+        let latch = BufferingLatch::default();
+        latch.begin_at_clock(9, 136, 187, 8_000);
+        assert!(latch.in_flight_with_state(9, 13_118, true).is_some());
+        assert!(latch.in_flight_with_state(9, 136_154, true).is_none());
     }
 
     #[test]

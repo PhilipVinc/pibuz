@@ -39,6 +39,11 @@ tags on `main`.
   early (the largest step measured was 1.04 MB, on a 24/96 track), and the
   buffer keeps 2 MB behind playback so that head start is still there when
   the decoder looks back for it. About 0.4 s of extra download per seek.
+- **Seeking backwards shows the spinner while it loads.** The phone was told
+  the track was playing at the OLD position, its clock still running, until
+  the audio arrived and it jumped to where you seeked. A seek is now only
+  "arrived" once the clock has come back down; and the "clock is BELOW the
+  offset" error no longer fires on every slow forward seek.
 
 ## 2.7.0 — 2026-10-15
 
