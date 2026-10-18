@@ -259,6 +259,60 @@ async fn the_controllers_volume_reaches_the_player_and_is_reported_once() {
     harness.assert_invariants();
 }
 
+/// A slider drag: the controller sends a SetVolume per step, dozens a second,
+/// and each used to get its own VOLUME_CHANGED back — 45 in three seconds on
+/// the Pi, until the cloud answered "Message gap too large" and dropped the
+/// connection mid-drag. The drag is acknowledged at a pace now, and the level
+/// it ends on is the one the screen is left showing.
+#[tokio::test]
+async fn a_slider_drag_is_acknowledged_at_a_pace_and_ends_on_its_last_level() {
+    let harness = ControllerHarness::new().await;
+    harness.become_active_renderer().await;
+    harness.controller().push_queue_and_play(&TRACKS, 0).await;
+    harness.pace_volume_acks(std::time::Duration::from_millis(40));
+
+    for pct in (10..=40).rev() {
+        harness.controller().set_volume(pct).await;
+    }
+    harness.wait(std::time::Duration::from_millis(120)).await;
+
+    let acks: Vec<i64> = harness
+        .timeline()
+        .iter()
+        .flat_map(|step| step.reports.iter())
+        .filter(|(message_type, _)| message_type == "MESSAGE_TYPE_RNDR_SRVR_VOLUME_CHANGED")
+        .filter_map(|(_, payload)| payload.get("volume").and_then(|v| v.as_i64()))
+        .collect();
+    assert!(
+        acks.len() < 5,
+        "a 31-step drag went out as {} volume reports: {acks:?}",
+        acks.len()
+    );
+    assert_eq!(
+        acks.last(),
+        Some(&10),
+        "the last report must be where the drag ended"
+    );
+    assert_eq!(harness.view().volume, Some(10));
+    assert_eq!(
+        harness
+            .engine_calls()
+            .iter()
+            .rev()
+            .find_map(|call| match call {
+                EngineCall::SetVolume { pct } => Some(*pct),
+                _ => None,
+            }),
+        Some(10),
+        "every step still reaches the player; the last one must be 10"
+    );
+    // And the host's own publisher, which reports levels changed on ITS side,
+    // must see the controller's level as already shown — or, with the echoes a
+    // drag behind, it sent every step a second time as "changed locally".
+    assert_eq!(harness.cloud_view_of_our_volume().await.0, Some(10));
+    harness.assert_invariants();
+}
+
 /// A spinner must be retractable. The renderer reports BUFFERING while a stream
 /// fills; if the load then FAILS, the falling edge still has to go out or the
 /// controller spins forever on a load that already gave up.

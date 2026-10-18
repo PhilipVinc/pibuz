@@ -1,6 +1,6 @@
 use std::{
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::{Arc, Mutex as StdMutex},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use qconnect_core::{
@@ -49,6 +49,66 @@ where
     /// locks `state`). The session loop and the renderer orchestration both lock
     /// THIS one — one Mutex, not two.
     sync: Arc<Mutex<QconnectRemoteSyncState>>,
+    /// Paces the acknowledgements of a controller's volume commands; see
+    /// [`VolumeAckThrottle`].
+    volume_ack: Arc<StdMutex<VolumeAckThrottle>>,
+}
+
+/// How often a slider drag is acknowledged.
+///
+/// The controller sends a `SetVolume` per step of a drag — 45 of them in three
+/// seconds, measured, some in the same millisecond — and each used to be
+/// answered with its own `VOLUME_CHANGED`. Once, mid-drag, the cloud answered
+/// `Server error 1003: Message gap too large` and dropped the connection for
+/// eight seconds. So the first step is acknowledged at once, as before, and
+/// the rest of the drag at most once per interval, always with the latest
+/// level, the last one included.
+const VOLUME_ACK_INTERVAL: Duration = Duration::from_millis(250);
+
+#[derive(Debug)]
+struct VolumeAckThrottle {
+    interval: Duration,
+    last_sent: Option<Instant>,
+    /// A trailing ack is scheduled; it will carry whatever the level is then.
+    flush_armed: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum VolumeAck {
+    Now,
+    After(Duration),
+    AlreadyScheduled,
+}
+
+impl VolumeAckThrottle {
+    fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            last_sent: None,
+            flush_armed: false,
+        }
+    }
+
+    fn on_command(&mut self, now: Instant) -> VolumeAck {
+        if self.flush_armed {
+            return VolumeAck::AlreadyScheduled;
+        }
+        match self.last_sent {
+            Some(at) if now.duration_since(at) < self.interval => {
+                self.flush_armed = true;
+                VolumeAck::After(self.interval - now.duration_since(at))
+            }
+            _ => {
+                self.last_sent = Some(now);
+                VolumeAck::Now
+            }
+        }
+    }
+
+    fn on_flush(&mut self, now: Instant) {
+        self.flush_armed = false;
+        self.last_sent = Some(now);
+    }
 }
 
 impl<TTransport, TSink> Clone for QconnectApp<TTransport, TSink>
@@ -62,6 +122,7 @@ where
             sink: Arc::clone(&self.sink),
             state: Arc::clone(&self.state),
             sync: Arc::clone(&self.sync),
+            volume_ack: Arc::clone(&self.volume_ack),
         }
     }
 }
@@ -87,6 +148,17 @@ where
             sink,
             state: Arc::new(Mutex::new(QconnectRuntimeState::default())),
             sync,
+            volume_ack: Arc::new(StdMutex::new(VolumeAckThrottle::new(VOLUME_ACK_INTERVAL))),
+        }
+    }
+
+    /// Pace volume acks at `interval` instead of [`VOLUME_ACK_INTERVAL`]; zero
+    /// acknowledges every command at once. For the controller harness, whose
+    /// cases run in microseconds.
+    #[cfg(test)]
+    pub(crate) fn set_volume_ack_interval(&self, interval: Duration) {
+        if let Ok(mut throttle) = self.volume_ack.lock() {
+            throttle.interval = interval;
         }
     }
 
@@ -573,6 +645,30 @@ where
             self.sync.lock().await.session_loop_mode = Some(loop_mode);
         }
 
+        // The controller that sent a level or a mute is showing it. Record that
+        // as the cloud's view of us now, not when its echo lands — ~30 ms
+        // later, and mid-drag several steps behind. A host that publishes
+        // changes made on its own side compares against this view, and with it
+        // lagging every step of a drag looked like a local change and went out
+        // a second time.
+        let echoed = match &renderer_command {
+            RendererCommand::SetVolume { .. } => snapshot.volume.map(|level| (Some(level), None)),
+            RendererCommand::MuteVolume { value } => Some((None, Some(*value))),
+            _ => None,
+        };
+        if let Some((level, muted)) = echoed {
+            let mut sync = self.sync.lock().await;
+            if let Some(local_id) = sync.session.local_renderer_id {
+                let view = ensure_session_renderer_state(&mut sync, local_id);
+                if level.is_some() {
+                    view.volume = level;
+                }
+                if muted.is_some() {
+                    view.muted = muted;
+                }
+            }
+        }
+
         // Always update renderer state (for tracking next_track etc.)
         self.sink
             .on_event(QconnectAppEvent::RendererUpdated(snapshot.clone()))
@@ -741,15 +837,19 @@ where
             RendererCommand::SetVolume { volume, .. } => {
                 let resolved_volume = renderer.volume.or(*volume);
                 if let Some(resolved_volume) = resolved_volume {
-                    let report = RendererReport::new(
-                        RendererReportType::RndrSrvrVolumeChanged,
-                        self.next_action_uuid(),
-                        queue_version_ref,
-                        serde_json::json!({
-                            "volume": resolved_volume
-                        }),
-                    );
-                    self.send_renderer_report(report).await?;
+                    let ack = self
+                        .volume_ack
+                        .lock()
+                        .map(|mut throttle| throttle.on_command(Instant::now()))
+                        .unwrap_or(VolumeAck::Now);
+                    match ack {
+                        VolumeAck::Now => {
+                            self.send_volume_ack(resolved_volume, queue_version_ref)
+                                .await?
+                        }
+                        VolumeAck::After(delay) => self.spawn_volume_ack_flush(delay),
+                        VolumeAck::AlreadyScheduled => {}
+                    }
                 }
             }
             RendererCommand::MuteVolume { value } => {
@@ -780,6 +880,41 @@ where
         }
 
         Ok(())
+    }
+
+    async fn send_volume_ack(
+        &self,
+        volume: i32,
+        queue_version_ref: qconnect_core::QueueVersion,
+    ) -> Result<(), QconnectAppError> {
+        let report = RendererReport::new(
+            RendererReportType::RndrSrvrVolumeChanged,
+            self.next_action_uuid(),
+            queue_version_ref,
+            serde_json::json!({ "volume": volume }),
+        );
+        self.send_renderer_report(report).await
+    }
+
+    /// The trailing ack of a drag: the level as it stands when it fires.
+    /// Bounded like `spawn_pending_timeout_watch`, a fraction of a second.
+    fn spawn_volume_ack_flush(&self, delay: Duration) {
+        let app = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            if let Ok(mut throttle) = app.volume_ack.lock() {
+                throttle.on_flush(Instant::now());
+            }
+            let (volume, version) = {
+                let state = app.state.lock().await;
+                (state.renderer.volume, state.queue.version)
+            };
+            if let Some(volume) = volume {
+                if let Err(err) = app.send_volume_ack(volume, version).await {
+                    log::warn!("[QConnect] Failed to acknowledge the volume: {err}");
+                }
+            }
+        });
     }
 
     async fn send_renderer_report(&self, report: RendererReport) -> Result<(), QconnectAppError> {
@@ -2069,6 +2204,39 @@ mod tests {
     use tokio::sync::Mutex;
 
     use crate::{QconnectAppEvent, QconnectEventSink};
+
+    #[test]
+    fn a_volume_drag_is_acked_first_then_once_per_interval() {
+        use super::{VolumeAck, VolumeAckThrottle};
+        use std::time::{Duration, Instant};
+
+        let interval = Duration::from_millis(250);
+        let mut throttle = VolumeAckThrottle::new(interval);
+        let t0 = Instant::now();
+        assert_eq!(
+            throttle.on_command(t0),
+            VolumeAck::Now,
+            "a lone tap is acked at once"
+        );
+        let at = |ms| t0 + Duration::from_millis(ms);
+        assert_eq!(
+            throttle.on_command(at(40)),
+            VolumeAck::After(Duration::from_millis(210))
+        );
+        assert_eq!(throttle.on_command(at(80)), VolumeAck::AlreadyScheduled);
+        throttle.on_flush(at(250));
+        assert_eq!(
+            throttle.on_command(at(300)),
+            VolumeAck::After(Duration::from_millis(200)),
+            "the interval runs from the flush"
+        );
+        throttle.on_flush(at(500));
+        assert_eq!(
+            throttle.on_command(at(900)),
+            VolumeAck::Now,
+            "a pause resets it"
+        );
+    }
 
     use super::{queue_hashes_diverge, QconnectApp};
     use qconnect_core::QConnectQueueState;

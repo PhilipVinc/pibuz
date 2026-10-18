@@ -1259,6 +1259,10 @@ impl ControllerHarness {
             sink,
             Arc::clone(&sync_state),
         ));
+        // Acknowledge every volume command at once: the cases run in
+        // microseconds, and a paced ack would land after the step that caused
+        // it. `pace_volume_acks` turns pacing back on for the cases about it.
+        app.set_volume_ack_interval(Duration::ZERO);
         // The in-memory transport broadcasts on connect and fails when nobody is
         // listening, so subscribe BEFORE connecting and keep the receiver for the
         // life of the harness. Nothing reads it: the harness drives the app by
@@ -1382,6 +1386,33 @@ impl ControllerHarness {
     /// The track plays to its end and nothing follows it.
     pub(crate) fn the_track_runs_out(&self) {
         self.inner.engine.run_out();
+    }
+
+    /// The level and mute the CLOUD shows for this renderer, as the host's own
+    /// publisher reads it (`session_renderer_states`).
+    pub(crate) async fn cloud_view_of_our_volume(&self) -> (Option<i32>, Option<bool>) {
+        let state = self.inner.sync_state.lock().await;
+        state
+            .session
+            .local_renderer_id
+            .and_then(|id| state.session_renderer_states.get(&id))
+            .map(|view| (view.volume, view.muted))
+            .unwrap_or((None, None))
+    }
+
+    /// Acknowledge volume commands at most once per `interval`, as the daemon
+    /// does, instead of the harness default of every one at once.
+    pub(crate) fn pace_volume_acks(&self, interval: Duration) {
+        self.inner.app.set_volume_ack_interval(interval);
+    }
+
+    /// Let real time pass, then fold whatever the renderer sent meanwhile — a
+    /// paced ack — into the screen, as a step of its own.
+    pub(crate) async fn wait(&self, duration: Duration) {
+        tokio::time::sleep(duration).await;
+        self.inner
+            .settle(&format!("wait {}ms", duration.as_millis()))
+            .await;
     }
 
     /// The player finishes a track and starts the next one on its own.
