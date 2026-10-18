@@ -760,6 +760,7 @@ pub(crate) async fn download_and_stream_remote_track(
                                 // whatever it was serving: a reader waiting on
                                 // a gap-fill is still not waiting.
                                 origin: plan.origin.as_resumed(),
+                                target: plan.target.max(resume_from),
                             };
                             writer
                                 .begin_at(resumed.offset)

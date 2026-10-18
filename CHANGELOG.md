@@ -31,6 +31,12 @@ tags on `main`.
   on the level it stopped at, and the box no longer re-reports the app's own
   steps as changes of its own: only a volume or mute set on the box itself
   goes out as one.
+- **Seeks, and casts that start mid-track, wait for the CDN once instead of
+  twice.** The first fetch of a seek opened exactly at its estimated byte,
+  and the decoder's search for a frame boundary then stepped back 179-428 KB
+  into a gap that needed a second fetch: two ~5 s waits for a cold offset,
+  10.5 s for one seek on a Pi. Every fetch a seek opens now starts a
+  megabyte early, about 0.3 s of extra download.
 
 ## 2.7.0 — 2026-10-15
 

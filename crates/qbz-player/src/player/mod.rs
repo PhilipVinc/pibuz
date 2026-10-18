@@ -1046,10 +1046,10 @@ fn cmaf_take_request(
     let Some(next) = writer.take_request() else {
         return Ok(None);
     };
-    if map.resume_at(next.offset).first_segment == in_flight {
+    if map.resume_at(next.target).first_segment == in_flight {
         log::debug!(
             "[CMAF-STREAM] byte {} is inside segment {in_flight}, already being fetched",
-            next.offset
+            next.target
         );
         writer
             .begin_at(write_head)
@@ -6523,20 +6523,24 @@ impl Player {
         let start = Instant::now();
 
         'plans: loop {
-            let resume = map.resume_at(plan.offset);
+            // The segment holding the byte the reader WANTS, not the head start
+            // the buffer put before it: a segment boundary already lands the
+            // body up to a segment early, which covers the bisection after a
+            // seek the way the head start does for a byte-exact feeder.
+            let resume = map.resume_at(plan.target);
             // The write head goes where the SEGMENT begins, not where the
             // reader asked. Skipping this is the bug that fills a buffer with
             // bytes attributed to offsets they do not belong to.
             writer
                 .begin_at(resume.body_offset)
                 .map_err(|e| format!("re-point CMAF write head: {e}"))?;
-            if resume.body_offset != plan.offset {
+            if resume.body_offset != plan.target {
                 log::info!(
                     "[CMAF-STREAM] Track {track_id}: byte {} is in segment {}, resuming from byte {} ({} bytes early)",
-                    plan.offset,
+                    plan.target,
                     resume.first_segment,
                     resume.body_offset,
-                    plan.offset - resume.body_offset
+                    plan.target - resume.body_offset
                 );
             }
 

@@ -224,18 +224,23 @@ pub enum StreamSeekMode {
 /// stream hi-res at all.
 const FORWARD_WAIT_BYTES: u64 = 2 * 1024 * 1024;
 
-/// How far *before* the target a re-opened body starts when the reader is
-/// walking backwards.
+/// How far *before* the target a re-opened body starts.
 ///
-/// A probe behind the body we are already streaming can only be a decoder
-/// bisecting for a frame boundary — nothing else reads backwards into a
-/// region it just skipped. Symphonia's walk then continues downward, and
-/// each step would strand the next one in another hole: a measured 91s
-/// resume went 32.31 MB, 31.47 MB, 31.06 MB, 30.85 MB, four requests where
-/// two of them cost ~5 s of CDN time-to-first-byte. Starting the body a
-/// megabyte early puts the rest of the walk inside bytes we are about to
-/// hold anyway, and `FORWARD_WAIT_BYTES` covers the gap between the body's
-/// start and the probe that asked for it.
+/// Every re-open is a decoder landing somewhere new — a seek, a resume — and
+/// with no SEEKTABLE Symphonia then bisects for a frame boundary, probing
+/// downward from where it landed. Each probe behind the body's start would
+/// strand the next one in another hole: a measured 91s resume went 32.31 MB,
+/// 31.47 MB, 31.06 MB, 30.85 MB, four requests where two of them cost ~5 s of
+/// CDN time-to-first-byte. Starting the body a megabyte early puts the rest of
+/// the walk inside bytes we are about to hold anyway, and `FORWARD_WAIT_BYTES`
+/// covers the gap between the body's start and the probe that asked for it.
+///
+/// That holds for the FIRST jump of a seek as much as for the walk after it.
+/// Opened exactly at its target, the jump left the bisection's next probe —
+/// 179 to 428 KB behind it, in three of eight seeks measured on a Pi — in a
+/// hole of its own: two cold opens, a 10.5 s seek where 5 s would have done.
+/// The megabyte costs about 0.3 s of download on that link. A CMAF feeder
+/// restarts at whole segments, so for it this can mean one segment earlier.
 ///
 /// Kept below `FORWARD_WAIT_BYTES` so the reader waits for its own target
 /// rather than immediately asking again, and small enough that streaming
@@ -354,8 +359,8 @@ struct BufferState {
     /// buffered" means two seconds of what is about to play, not two
     /// seconds of a part of the track already behind us.
     primary_offset: u64,
-    /// Offset a reader wants the feeder to restart at, until it takes it.
-    pending_request: Option<u64>,
+    /// Where a reader wants the feeder to restart, until it takes it.
+    pending_request: Option<RangeWanted>,
     /// Whether the feeder can honor `pending_request` at all.
     seek_mode: StreamSeekMode,
     /// Live `BufferedMediaSource` handles. The feeder stops looking for
@@ -696,9 +701,21 @@ impl BufferState {
 /// progress gets it wrong in exactly the case that matters: a window has
 /// discarded the bytes it produced earlier, so a request for them is a real
 /// re-fetch and not a stale echo.
-fn take_unsatisfied(state: &mut BufferState) -> Option<u64> {
-    let offset = state.pending_request.take()?;
-    state.segment_at(offset).is_none().then_some(offset)
+/// A reader's range request: the byte it is waiting for, and where the body
+/// should start to serve it — up to `SEEK_LOOKBEHIND_BYTES` earlier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RangeWanted {
+    from: u64,
+    target: u64,
+}
+
+/// The pending request, unless the byte its reader waits for has landed
+/// meanwhile. Judged on the TARGET: the head start before it can be held while
+/// the target is not, and dropping the request then would leave the reader
+/// waiting on bytes nobody is fetching.
+fn take_unsatisfied(state: &mut BufferState) -> Option<RangeWanted> {
+    let wanted = state.pending_request.take()?;
+    state.segment_at(wanted.target).is_none().then_some(wanted)
 }
 
 /// See [`BufferedMediaSource::interrupt_when_superseded`].
@@ -811,6 +828,12 @@ pub struct FetchPlan {
     /// otherwise, and telling them apart is the whole difference between a
     /// dropout worth fixing and a background fetch nobody was waiting on.
     pub origin: PlanOrigin,
+    /// The byte a waiting reader wants. `offset` starts up to
+    /// `SEEK_LOOKBEHIND_BYTES` before it, for the bisection that follows a
+    /// landing; a feeder that restarts at coarser boundaries than a byte (CMAF,
+    /// at whole segments) chooses its boundary from this. Equal to `offset` on
+    /// a plan nobody is waiting on.
+    pub target: u64,
 }
 
 /// Where a [`FetchPlan`] came from.
@@ -1229,24 +1252,17 @@ impl BufferedMediaSource {
             }
             return;
         }
-        // Reading backwards into a region we skipped means the decoder is
-        // bisecting, and the walk carries on downward from here — so fetch
-        // from a little earlier and let the rest of it land in buffered
-        // bytes. See SEEK_LOOKBEHIND_BYTES.
+        // The decoder has landed somewhere new, and it bisects downward from
+        // here for a frame boundary — so fetch from a little earlier and let
+        // the rest of the walk land in buffered bytes, whichever way the
+        // reader jumped. See SEEK_LOOKBEHIND_BYTES.
         let walking_back = pos < state.range_start;
-        let fetch_from = if walking_back {
-            pos.saturating_sub(SEEK_LOOKBEHIND_BYTES)
-        } else {
-            pos
-        };
+        let fetch_from = pos.saturating_sub(SEEK_LOOKBEHIND_BYTES);
         log::info!(
-            "Streaming buffer: requesting range from byte {}{} (download head at {}, {} bytes held)",
+            "Streaming buffer: requesting range from byte {} for a {} probe at {pos} \
+             (download head at {}, {} bytes held)",
             fetch_from,
-            if walking_back {
-                format!(" for a backward probe at {pos}")
-            } else {
-                String::new()
-            },
+            if walking_back { "backward" } else { "forward" },
             state.write_pos,
             state.downloaded()
         );
@@ -1268,7 +1284,10 @@ impl BufferedMediaSource {
         // The reader was waiting at 148550456, 744 KB BEHIND that anchor, and
         // playback never recovered.
         state.reader_positions.insert(self.reader_id, pos);
-        state.pending_request = Some(fetch_from);
+        state.pending_request = Some(RangeWanted {
+            from: fetch_from,
+            target: pos,
+        });
         self.shared.wanted.notify_one();
         // A parked feeder is the one that must service this.
         self.shared.space.notify_one();
@@ -1625,6 +1644,7 @@ impl BufferWriter {
             offset: 0,
             end: None,
             origin: PlanOrigin::Initial,
+            target: 0,
         }
     }
 
@@ -1633,12 +1653,13 @@ impl BufferWriter {
     /// already registered as the write head, so readers stop asking.
     pub fn take_request(&self) -> Option<FetchPlan> {
         let mut state = self.shared.state.lock().ok()?;
-        let offset = take_unsatisfied(&mut state)?;
-        state.begin(offset);
+        let wanted = take_unsatisfied(&mut state)?;
+        state.begin(wanted.from);
         Some(FetchPlan {
-            offset,
+            offset: wanted.from,
             end: None,
             origin: PlanOrigin::ReaderRequest,
+            target: wanted.target,
         })
     }
 
@@ -1655,12 +1676,13 @@ impl BufferWriter {
         if state.readers == 0 || state.download_error.is_some() {
             return None;
         }
-        if let Some(offset) = take_unsatisfied(&mut state) {
-            state.begin(offset);
+        if let Some(wanted) = take_unsatisfied(&mut state) {
+            state.begin(wanted.from);
             return Some(FetchPlan {
-                offset,
+                offset: wanted.from,
                 end: None,
                 origin: PlanOrigin::ReaderRequest,
+                target: wanted.target,
             });
         }
         if state.seek_mode == StreamSeekMode::RangeRequests {
@@ -1670,6 +1692,7 @@ impl BufferWriter {
                     offset,
                     end,
                     origin: PlanOrigin::GapFill,
+                    target: offset,
                 });
             }
         }
@@ -1744,13 +1767,14 @@ impl BufferWriter {
                 if state.readers == 0 || state.download_error.is_some() {
                     return None;
                 }
-                if let Some(offset) = take_unsatisfied(&mut state) {
-                    state.begin(offset);
+                if let Some(wanted) = take_unsatisfied(&mut state) {
+                    state.begin(wanted.from);
                     state.download_complete = false;
                     return Some(FetchPlan {
-                        offset,
+                        offset: wanted.from,
                         end: None,
                         origin: PlanOrigin::ReaderRequest,
+                        target: wanted.target,
                     });
                 }
             }
@@ -2825,6 +2849,7 @@ pub(crate) mod tests {
             offset,
             end: None,
             origin: PlanOrigin::ReaderRequest,
+            target: offset,
         }
     }
 
@@ -2878,9 +2903,15 @@ pub(crate) mod tests {
             }
             thread::sleep(Duration::from_millis(5));
         };
-        assert_eq!(plan.offset, target);
-        assert_eq!(plan.range_header(), format!("bytes={target}-"));
-        feed(&writer, plan, b"jump");
+        // From a megabyte early, for the bisection that follows a landing
+        // (SEEK_LOOKBEHIND_BYTES), still naming the byte it is for.
+        let from = target - 1024 * 1024;
+        assert_eq!(plan.offset, from);
+        assert_eq!(plan.target, target);
+        assert_eq!(plan.range_header(), format!("bytes={from}-"));
+        let mut body = vec![0u8; (target - from) as usize];
+        body.extend_from_slice(b"jump");
+        feed(&writer, plan, &body);
 
         assert_eq!(&handle.join().unwrap(), b"jump");
         // Reads are measured from the resume point now, not from byte 0.
@@ -2890,9 +2921,11 @@ pub(crate) mod tests {
         // back is well past that, but `HEADER_PIN_BYTES` is kept as its own
         // snapshot so a decoder reset can still find STREAMINFO.
         assert_eq!(source.head_bytes(), 1024);
+        // What IS held is the look-behind the window keeps behind the reader:
+        // the head start this body opened with, less what was read past.
         assert_eq!(
             source.buffer_size(),
-            4,
+            1024 * 1024,
             "the run at byte 0 is 32 MB behind the reader and is not held"
         );
     }
@@ -2965,6 +2998,106 @@ pub(crate) mod tests {
         assert_eq!(back.seek(SeekFrom::Start(34_584_000)).unwrap(), 34_584_000);
         assert_eq!(back.seek(SeekFrom::Start(34_374_679)).unwrap(), 34_374_679);
         assert!(writer.take_request().is_none());
+    }
+
+    #[test]
+    fn a_request_whose_head_start_is_held_still_reaches_the_feeder() {
+        // The megabyte before a target can be bytes the buffer already holds
+        // while the target itself is not. Judged on where the body would
+        // START, the request read as "already buffered" and was dropped,
+        // leaving the reader waiting on bytes nobody was fetching: a hang on
+        // the audio thread. Judged on the target, it goes out.
+        let config = StreamingConfig {
+            initial_buffer_bytes: 4,
+            window_bytes: 200 * 1024 * 1024,
+        };
+        let (source, writer) = BufferedMediaSource::new_seekable(config, Some(64 * 1024 * 1024));
+        feed(&writer, to_eof(0), &[1u8; 100 * 1024]);
+        // A later jump: the body in hand starts 40 MB in.
+        feed(&writer, to_eof(40 * 1024 * 1024), &[2u8; 64 * 1024]);
+
+        let target: u64 = 1024 * 1024 + 50 * 1024;
+        let mut reader = source.create_reader();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let reader_thread = thread::spawn(move || {
+            let mut buf = [0u8; 1];
+            reader.seek(SeekFrom::Start(target)).unwrap();
+            reader.read_exact(&mut buf).unwrap();
+            let _ = done_tx.send(buf[0]);
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let plan = loop {
+            if let Some(plan) = writer.take_request() {
+                break plan;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the request never reached the feeder: its head start is buffered, its target is not"
+            );
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(plan.target, target);
+        assert!(
+            plan.offset < 100 * 1024,
+            "the head start overlaps the held run"
+        );
+
+        feed(
+            &writer,
+            plan,
+            &vec![3u8; (target - plan.offset) as usize + 1],
+        );
+        let got = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the reader is still waiting for its target");
+        assert_eq!(got, 3);
+        reader_thread.join().unwrap();
+    }
+
+    #[test]
+    fn a_forward_jump_fetches_from_before_itself() {
+        // A seek to 4:54 of a 5:10 track on the Pi, 2026-10-18. The jump
+        // re-opened the body AT 52,037,582; Symphonia's bisection then probed
+        // 51,609,279, 428 KB behind it, and that probe needed a body of its
+        // own. Both opens paid the CDN's ~5 s cold-offset first byte: the seek
+        // took 10.5 s. Of the day's eight seeks, three walked back like this,
+        // by 179-428 KB each time.
+        let config = StreamingConfig {
+            initial_buffer_bytes: 4,
+            window_bytes: 200 * 1024 * 1024,
+        };
+        let (source, writer) = BufferedMediaSource::new_seekable(config, Some(54_442_000));
+        feed(&writer, to_eof(0), &[9u8; 4_539_690]);
+
+        let mut reader = source.create_reader();
+        let handle = thread::spawn(move || {
+            let mut buf = [0u8; 1];
+            reader.seek(SeekFrom::Start(52_037_582)).unwrap();
+            reader.read_exact(&mut buf).unwrap();
+            buf[0]
+        });
+
+        let plan = loop {
+            if let Some(plan) = writer.take_request() {
+                break plan;
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(plan.offset, 52_037_582 - 1024 * 1024);
+        assert_eq!(source.primary_offset(), 52_037_582);
+
+        feed(&writer, plan, &[7u8; 1024 * 1024 + 64]);
+        assert_eq!(handle.join().unwrap(), 7);
+        let mut back = source.create_reader();
+        let mut buf = [0u8; 1];
+        assert_eq!(back.seek(SeekFrom::Start(51_609_279)).unwrap(), 51_609_279);
+        back.read_exact(&mut buf).unwrap();
+        assert_eq!(buf[0], 7);
+        assert!(
+            writer.take_request().is_none(),
+            "the probe behind the jump must be served from the body the jump opened"
+        );
     }
 
     #[test]
@@ -3212,7 +3345,13 @@ pub(crate) mod tests {
         // The jump moved the playback offset: the megabyte behind us no
         // longer counts, only what is buffered at the resume point.
         assert!(!source.has_min_buffer());
-        feed(&writer, plan, &[1u8; 4]);
+        // The body starts a megabyte before the resume point; none of that
+        // megabyte counts either, only what lies past the resume point.
+        feed(
+            &writer,
+            plan,
+            &vec![1u8; (target - plan.offset) as usize + 4],
+        );
         assert!(!source.has_min_buffer());
         writer.push_chunk(&[1u8; 4]).unwrap();
         assert!(source.has_min_buffer());
@@ -3227,6 +3366,7 @@ pub(crate) mod tests {
                 offset: 100,
                 end: Some(200),
                 origin: PlanOrigin::GapFill,
+                target: 100,
             }
             .range_header(),
             "bytes=100-199"
@@ -3237,6 +3377,7 @@ pub(crate) mod tests {
                 offset: 100,
                 end: Some(100),
                 origin: PlanOrigin::GapFill,
+                target: 100,
             }
             .range_header(),
             "bytes=100-"
@@ -4269,7 +4410,9 @@ mod buffer_behaviour_tests {
     ) {
         let mut plan = writer.initial_plan();
         'plans: loop {
-            let resume = map.resume_at(plan.offset);
+            // As `Player::cmaf_stream_segments` does: the segment holding the
+            // byte the reader wants, not the head start before it.
+            let resume = map.resume_at(plan.target);
             log.bodies.fetch_add(1, AtomicOrdering::SeqCst);
             log.last_body
                 .store(resume.body_offset, AtomicOrdering::SeqCst);
