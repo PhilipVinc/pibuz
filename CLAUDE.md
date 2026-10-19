@@ -216,11 +216,11 @@ the suite is 0.01 s: `cargo test -p qconnect-app controller_sync`.
 BEFORE it is fixed.** Assert against the SCREEN, not against protocol fields —
 the screen is what was wrong every time. The shared invariants in
 `assert_invariants` (the progress display never blanks, the echo never reaches
-the player, the cursor names the audible track, one gesture is not a report
-storm) are checked by every case, so a rule added for one bug catches the next
-one for free.
+the player, the cursor names the audible track, the screen names the track that
+is playing, one gesture is not a report storm) are checked by every case, so a
+rule added for one bug catches the next one for free.
 
-Three traps, each of which silently walked the happy path until a mutation
+Four traps, each of which silently walked the happy path until something
 exposed it:
 - **Call `let_the_load_windows_expire()`** unless the case is about those
   windows. The 5 s load-dedup and 1.5 s handoff-echo windows both hang off one
@@ -230,6 +230,11 @@ exposed it:
   default the fake adopts a track the instant the stream opens; the real audio
   thread adopts it only once it has samples, and several guards exist ONLY for
   that gap.
+- Queue item ids start at 0, as the cloud numbers a pushed queue. The wire
+  drops a field at its default, so a report that leaves `current_queue_item_id`
+  out names item 0, and the screen model folds it that way. Numbering from
+  anywhere else turned "forgot the queue item" into "named an item nothing
+  holds", which no invariant can see (issue #5).
 - The fake's queue must hold the REAL tracks. `align_queue_cursor` looks the
   target up in it, so placeholder ids send it down the "not in queue" fallback
   every time and hide every cursor bug behind harness noise.

@@ -123,6 +123,57 @@ async fn a_state_only_pause_does_not_rewind_to_an_earlier_track() {
     harness.assert_invariants();
 }
 
+/// Skipping through a queue must leave the phone on the track it skipped to,
+/// and a pause must leave it there too (issue #5).
+///
+/// The renderer's answer to every SetState left out the queue item, and the
+/// wire cannot tell a missing field from 0 — the head of the queue. So each skip
+/// slid to the next song, flashed back to the first one picked, and slid on
+/// again; a pause, which the cloud does not follow with a correction, left the
+/// phone on that first song, and play then started it.
+#[tokio::test]
+async fn skips_and_a_pause_keep_the_screen_on_the_track_that_is_playing() {
+    let harness = ControllerHarness::new().await;
+    harness.become_active_renderer().await;
+    let items = harness.controller().push_queue(&TRACKS, 0).await;
+    harness.controller().tap_track(&items, 0).await;
+    harness.report_tick().await;
+
+    harness.let_the_load_windows_expire();
+    harness.controller().tap_track(&items, 1).await;
+    assert_eq!(
+        harness.view().track_id,
+        Some(items[1].queue_item_id),
+        "the skip must leave the screen on the track skipped to; timeline:\n{}",
+        harness.rendered_timeline()
+    );
+    harness.advance_playback(12_000);
+    harness.report_tick().await;
+
+    harness.let_the_load_windows_expire();
+    harness.controller().tap_pause().await;
+    assert_eq!(
+        harness.view().track_id,
+        Some(items[1].queue_item_id),
+        "a pause must not move the screen; timeline:\n{}",
+        harness.rendered_timeline()
+    );
+
+    // And after a track the player reached on its own, which no command named.
+    harness.controller().tap_play().await;
+    harness.advance_gaplessly_to(103);
+    harness.report_tick().await;
+    harness.let_the_load_windows_expire();
+    harness.controller().tap_pause().await;
+    assert_eq!(
+        harness.view().track_id,
+        Some(items[2].queue_item_id),
+        "a pause after a gapless advance must name the track reached; timeline:\n{}",
+        harness.rendered_timeline()
+    );
+    harness.assert_invariants();
+}
+
 /// A pause within 1.5 s of a load is IGNORED, on purpose.
 ///
 /// Claiming the render from a peer makes that peer stop its own playback, and
@@ -628,10 +679,7 @@ async fn the_cloud_re_emitting_the_current_state_does_not_restart_the_track() {
     harness.let_the_load_windows_expire();
 
     let before = harness.engine_calls().len();
-    harness
-        .controller()
-        .reemits_the_current_state(101, 1000)
-        .await;
+    harness.controller().reemits_the_current_state(101, 0).await;
 
     let after: Vec<_> = harness.engine_calls().into_iter().skip(before).collect();
     assert!(

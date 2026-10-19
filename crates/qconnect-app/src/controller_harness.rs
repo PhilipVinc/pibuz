@@ -162,6 +162,11 @@ struct FakePlayer {
     /// a failure the engine sees SYNCHRONOUSLY (the stream URL would not
     /// resolve), as opposed to `fail_the_pending_load`'s audio-thread one.
     next_stream_fails: Option<String>,
+    /// The player moved on gaplessly and no state report has said so yet. In
+    /// the daemon the driver's track-change edge closes this within
+    /// milliseconds; here it stays open until the next report tick, so cases
+    /// can land a gesture inside it.
+    unreported_advance: bool,
 }
 
 /// A player that models just enough to answer the orchestration's questions.
@@ -277,6 +282,7 @@ impl FakeEngine {
         player.duration_ms = self.track_duration_secs * 1000;
         player.loaded_audio = true;
         player.playing = true;
+        player.unreported_advance = true;
         // The player pulls the next track from its OWN queue, so the cursor
         // moves with the audio. Only the cloud is left behind — which is the
         // whole point of the manoeuvre, and would be lost if the fake let the
@@ -336,6 +342,14 @@ impl FakeEngine {
     }
 
     /// Whether a stream has been opened that the audio thread has not adopted.
+    fn advance_is_unreported(&self) -> bool {
+        self.player.lock().expect("fake player").unreported_advance
+    }
+
+    fn advance_reported(&self) {
+        self.player.lock().expect("fake player").unreported_advance = false;
+    }
+
     pub(crate) fn is_catching_up(&self) -> bool {
         self.player
             .lock()
@@ -726,7 +740,12 @@ impl Default for ControllerView {
 /// - an explicit `duration: null` BLANKS the progress display (this is the
 ///   `0:00` flicker on every play/pause tap),
 /// - an explicit `buffer_state: null` leaves the spinner alone (the renderer
-///   omits it on purpose so the report loop stays authoritative).
+///   omits it on purpose so the report loop stays authoritative),
+/// - a missing `current_queue_item_id` names queue item 0. The wire leaves a
+///   field at its default off, so the cloud cannot tell "not stated" from 0, and
+///   0 is the HEAD of a freshly pushed queue: a state report that left it out
+///   put the first song picked back on the phone after every skip (issue #5),
+///   and the cloud's next SET_STATE offered item 1 as the one after it.
 fn fold_report_into_view(view: &mut ControllerView, message_type: &str, payload: &Value) {
     match message_type {
         "MESSAGE_TYPE_RNDR_SRVR_STATE_UPDATED" => {
@@ -750,9 +769,12 @@ fn fold_report_into_view(view: &mut ControllerView, message_type: &str, payload:
             if let Some(position) = payload.get("current_position") {
                 view.elapsed_ms = as_stated_ms(position);
             }
-            if let Some(track_id) = payload.get("current_queue_item_id").and_then(Value::as_u64) {
-                view.track_id = Some(track_id);
-            }
+            view.track_id = Some(
+                payload
+                    .get("current_queue_item_id")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            );
         }
         "MESSAGE_TYPE_RNDR_SRVR_VOLUME_CHANGED" => {
             if let Some(volume) = payload.get("volume").and_then(Value::as_i64) {
@@ -806,8 +828,14 @@ pub(crate) struct Step {
     pub(crate) audible_track: u64,
     /// Track ids in the queue the CLOUD holds.
     pub(crate) cloud_queue: Vec<u64>,
+    /// The track the SCREEN names: its queue item looked up in the cloud's
+    /// queue. `None` when the screen names nothing, or an item that queue does
+    /// not hold.
+    pub(crate) screen_track: Option<u64>,
     /// A stream is open that the audio thread has not adopted yet.
     pub(crate) audio_catching_up: bool,
+    /// The player has moved on gaplessly and no report has told the cloud.
+    pub(crate) advance_unreported: bool,
 }
 
 // =================================================================== the cloud
@@ -1327,19 +1355,26 @@ impl HarnessInner {
         };
 
         let (player_queue, cursor_track) = self.engine.queue();
-        let audible_track = self.engine.snapshot().track_id;
-        let cloud_queue = self
-            .app
-            .queue_state_snapshot()
-            .await
-            .queue_items
-            .iter()
-            .map(|item| item.track_id)
-            .collect();
+        // Nothing is audible without loaded audio, whatever id the player keeps:
+        // a stop, or a queue that played out, leaves `track_id` behind.
+        let audible_track = if self.engine.has_loaded_audio() {
+            self.engine.snapshot().track_id
+        } else {
+            0
+        };
+        let cloud_items = self.app.queue_state_snapshot().await.queue_items;
+        let cloud_queue = cloud_items.iter().map(|item| item.track_id).collect();
+        let view = self.cloud.view();
+        let screen_track = view.track_id.and_then(|queue_item_id| {
+            cloud_items
+                .iter()
+                .find(|item| item.queue_item_id == queue_item_id)
+                .map(|item| item.track_id)
+        });
 
         self.timeline.lock().expect("timeline").push(Step {
             label: label.to_string(),
-            view: self.cloud.view(),
+            view,
             reports,
             engine_calls,
             echo_engine_calls,
@@ -1347,7 +1382,9 @@ impl HarnessInner {
             cursor_track,
             audible_track,
             cloud_queue,
+            screen_track,
             audio_catching_up: self.engine.is_catching_up(),
+            advance_unreported: self.engine.advance_is_unreported(),
         });
     }
 }
@@ -1418,7 +1455,11 @@ impl ControllerHarness {
 
         let controller = VirtualController {
             harness: Arc::clone(&inner),
-            next_queue_item_id: StdMutex::new(1000),
+            // From 0, as the cloud numbers a pushed queue. Item 0 is the one id
+            // a report can name by leaving the field out, so starting anywhere
+            // else made "forgot the queue item" indistinguishable from "named
+            // the first track" — the screen just showed an id nothing held.
+            next_queue_item_id: StdMutex::new(0),
         };
         Self { inner, controller }
     }
@@ -1527,7 +1568,19 @@ impl ControllerHarness {
             .queue_items
             .first()
             .cloned();
+        // As `report.rs` does: report the rested-on track, at 0:00 and
+        // paused, and only then publish it as the renderer's current track.
         if let Some(first) = first {
+            self.report_tick_naming(
+                ReportTick {
+                    playing_state: 3, // PAUSED
+                    buffer_state: BUFFER_STATE_OK,
+                    position_ms: 0,
+                    duration_ms: self.inner.engine.track_duration_secs * 1000,
+                },
+                first.track_id,
+            )
+            .await;
             self.inner.app.update_renderer_current_track(first).await;
         }
         self.inner.app.update_renderer_position(0).await;
@@ -1769,6 +1822,29 @@ impl ControllerHarness {
                         .collect::<Vec<_>>()
                 ));
             }
+            // 7. The screen names the track the renderer is on: the audible one,
+            //    or, while a load is in flight, the one it is loading — the
+            //    cloud moves there the moment it orders the load. Anything else
+            //    is the phone showing another song: after every skip in a long
+            //    queue it flashed back to the first track picked, and a pause
+            //    left it there (issue #5).
+            //
+            //    Exempt while a gapless advance is unreported: nothing has told
+            //    the cloud yet, so the screen is on the previous track and an
+            //    answer to a gesture in that gap can only repeat it. The
+            //    driver's track-change report is what closes the gap, and the
+            //    harness does not run the driver.
+            let renderer_tracks = [Some(step.audible_track), step.cursor_track];
+            if !step.advance_unreported
+                && step.audible_track != 0
+                && step.screen_track.is_some()
+                && !renderer_tracks.contains(&step.screen_track)
+            {
+                violations.push(format!(
+                    "'{}': the screen names {:?} while {} is audible (cursor {:?})",
+                    step.label, step.screen_track, step.audible_track, step.cursor_track
+                ));
+            }
             previous = Some(step);
         }
 
@@ -1870,6 +1946,13 @@ impl ControllerHarness {
     /// A report tick with the triple stated outright — for the states the fake
     /// player has no way to reach, above all BUFFERING.
     pub(crate) async fn report_tick_as(&self, tick: ReportTick) {
+        let audible_track_id = self.inner.engine.snapshot().track_id;
+        self.report_tick_naming(tick, audible_track_id).await;
+    }
+
+    /// A report tick about `audible_track_id`, whatever the fake player holds.
+    async fn report_tick_naming(&self, tick: ReportTick, audible_track_id: u64) {
+        self.inner.engine.advance_reported();
         let queue = self.inner.app.queue_state_snapshot().await;
         let queue_version = queue.version;
         // Mirrors `resolve_queue_item_ids_by_track_id`: the daemon does not
@@ -1879,7 +1962,6 @@ impl ControllerHarness {
         // which is the one value that is never wrong — and would hide every bug
         // in that resolution, the normalization of a freshly-pushed queue's
         // placeholder head among them.
-        let audible_track_id = self.inner.engine.snapshot().track_id;
         let (queue_item_id, next_queue_item_id, next_track_id) =
             crate::queue_resolution::resolve_queue_item_ids_from_queue_state(
                 &queue,
