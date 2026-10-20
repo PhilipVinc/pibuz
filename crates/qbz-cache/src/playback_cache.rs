@@ -51,6 +51,11 @@ struct PlaybackCacheState {
     /// gapless-via-disk made two Hi-Res tracks the normal residents of a
     /// 400 MB budget.
     pinned: std::collections::HashSet<u64>,
+    /// Tracks a writer is staging right now, between [`PlaybackCache::begin_write`]
+    /// and its commit or abort. One writer a track: they all stage to
+    /// `<id>.part` under their own nonce, so two at once interleave
+    /// ciphertext nothing can decrypt (issue #5).
+    staging: std::collections::HashSet<u64>,
 }
 
 /// Disk-based playback cache for evicted tracks
@@ -109,6 +114,7 @@ impl PlaybackCache {
                 entries: HashMap::new(),
                 current_size: 0,
                 pinned: std::collections::HashSet::new(),
+                staging: std::collections::HashSet::new(),
             }),
             cache_dir,
             max_size_bytes,
@@ -295,8 +301,20 @@ impl PlaybackCache {
     /// seal header, so a plaintext file would be accounted wrong even if the
     /// reader could somehow make sense of it.
     ///
-    /// `None` when the track cannot fit the cache at all.
+    /// One writer stages a track at a time: until it commits or aborts, a
+    /// second call for the same track gets `None` and plays without staging.
+    /// The first writer still lands the track; the second would only have
+    /// written the same bytes to the card again, into the same file.
+    ///
+    /// `None` when the track cannot fit the cache at all, or is already being
+    /// staged.
     pub fn begin_write(&self, track_id: u64, expected_size: u64) -> Option<PathBuf> {
+        if self.state.lock().unwrap().staging.contains(&track_id) {
+            log::info!(
+                "Track {track_id} is already being staged to the playback cache; not staging it twice"
+            );
+            return None;
+        }
         if expected_size > self.max_size_bytes {
             log::debug!(
                 "Track {} too large for playback cache ({} MB > {} MB)",
@@ -314,6 +332,11 @@ impl PlaybackCache {
             );
             return None;
         }
+        // Claimed under the lock it is checked under: two writers racing
+        // through the checks above must not both come out holding it.
+        if !self.state.lock().unwrap().staging.insert(track_id) {
+            return None;
+        }
         let part = self.track_path(track_id).with_extension("part");
         if let Some(parent) = part.parent() {
             let _ = fs::create_dir_all(parent);
@@ -328,6 +351,8 @@ impl PlaybackCache {
     /// is always a whole file — so the caller must have flushed and synced the
     /// `.part` before calling this.
     pub fn commit_write(&self, track_id: u64) -> Option<PathBuf> {
+        // Whatever happens below, this writer is done with the track.
+        self.state.lock().unwrap().staging.remove(&track_id);
         let part = self.track_path(track_id).with_extension("part");
         let path = self.track_path(track_id);
         // The file itself is the authority on how big it is — the caller would
@@ -373,7 +398,11 @@ impl PlaybackCache {
     }
 
     /// Discard a partial write. Safe to call when there is nothing to discard.
+    ///
+    /// Only the writer [`Self::begin_write`] handed the `.part` to may call
+    /// this: it deletes that file and frees the track for another writer.
     pub fn abort_write(&self, track_id: u64) {
+        self.state.lock().unwrap().staging.remove(&track_id);
         let part = self.track_path(track_id).with_extension("part");
         if part.exists() {
             let _ = fs::remove_file(&part);
@@ -440,6 +469,20 @@ impl PlaybackCache {
             return;
         }
 
+        // The same `<id>.part` every other writer stages to, so the same one
+        // writer a track: a stream landing this track already will publish it.
+        if !self.state.lock().unwrap().staging.insert(track_id) {
+            log::info!(
+                "Track {track_id} is already being staged to the playback cache; not writing it twice"
+            );
+            return;
+        }
+        self.write_whole(track_id, data, size);
+        self.state.lock().unwrap().staging.remove(&track_id);
+    }
+
+    /// [`Self::insert`]'s write, with the track's staging slot held.
+    fn write_whole(&self, track_id: u64, data: &[u8], size: u64) {
         let path = self.track_path(track_id);
 
         // Write through a temp file and rename into place. A track is 30-220 MB
@@ -647,6 +690,69 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One writer stages a track at a time (issue #5).
+    ///
+    /// Every writer stages to `<id>.part`, and each seals under a fresh nonce.
+    /// A gapless prefetch was still writing an 84 MB track when the listener
+    /// skipped to it and the live stream began staging the same one: the second
+    /// writer truncated the first one's file and wrote its own header over it,
+    /// and the skip away deleted it from under the prefetch. That run lost the
+    /// track; in the other order the cache publishes one file holding two
+    /// writers' ciphertext, which decrypts as noise on the next replay.
+    #[test]
+    fn a_track_is_staged_by_one_writer_at_a_time() {
+        let (cache, _dir) = temp_cache(10 * 1024 * 1024);
+        let part = cache.begin_write(7, 1000).expect("room for it");
+        assert!(
+            cache.begin_write(7, 1000).is_none(),
+            "a second writer was handed the same .part"
+        );
+        // Other tracks are not held up by it.
+        assert!(cache.begin_write(8, 1000).is_some());
+
+        // Given up: the slot is free again.
+        cache.abort_write(7);
+        let part_again = cache.begin_write(7, 1000).expect("free once abandoned");
+        assert_eq!(part_again, part);
+
+        // Published: free again too, for a later re-stage.
+        std::fs::write(&part, vec![0u8; 1000 + SEAL_HEADER_LEN as usize]).expect("stage");
+        assert!(cache.commit_write(7).is_some());
+        assert!(cache.begin_write(7, 1000).is_some());
+    }
+
+    /// An L1 track spilling to the card while a stream stages the same track
+    /// leaves the stream's file alone: `insert` writes through the same
+    /// `<id>.part`, and creating it truncated the stream's.
+    #[test]
+    fn a_spill_does_not_write_over_a_track_being_staged() {
+        let (cache, _dir) = temp_cache(10 * 1024 * 1024);
+        let part = cache.begin_write(5, 1000).expect("room for it");
+        std::fs::write(&part, b"the stream's bytes").expect("stage");
+
+        cache.insert(5, &[7u8; 1000]);
+
+        assert_eq!(
+            std::fs::read(&part).expect("the stream's .part"),
+            b"the stream's bytes"
+        );
+        assert!(cache.file_if_present(5).is_none());
+        // And a spill of a track nobody is staging still lands.
+        cache.insert(6, &[7u8; 1000]);
+        assert!(cache.file_if_present(6).is_some());
+    }
+
+    /// A publish that fails still lets go of the slot, or the track could never
+    /// be staged again this run.
+    #[test]
+    fn a_failed_publish_frees_the_slot() {
+        let (cache, _dir) = temp_cache(10 * 1024 * 1024);
+        cache.begin_write(9, 1000).expect("room for it");
+        // Nothing was written: there is no .part to publish.
+        assert!(cache.commit_write(9).is_none());
+        assert!(cache.begin_write(9, 1000).is_some());
     }
 
     fn temp_cache(max_bytes: u64) -> (PlaybackCache, PathBuf) {

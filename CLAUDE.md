@@ -169,7 +169,7 @@ path downloads plaintext to begin with. It is now AES-128-CTR'd on the way to
 the card — `crates/qbz-cmaf/src/vault.rs`, which has the full reasoning — under
 a key `PlaybackCache` generates at construction and never writes down.
 
-Four things follow, and each is load-bearing:
+Five things follow, and each is load-bearing:
 
 - **There are exactly three writers, and all three seal.** `DiskTee`
   (`qbz-player`, used by the CMAF feeder and the remote body pump),
@@ -177,6 +177,13 @@ Four things follow, and each is load-bearing:
   `PlaybackCache::insert` (an L1 track spilling to L2). A fourth route into
   that directory is a plaintext leak; there is no test that would catch one but
   the reader refusing it later, loudly, on someone's Pi.
+- **One writer a track at a time.** All three stage to `<id>.part`, each under
+  a fresh nonce, so two writers of one track interleave ciphertext that
+  decrypts as noise. `begin_write` (and `insert`) take the track's staging
+  slot and refuse a second writer, which then plays without staging; commit or
+  abort frees it. Only the holder may abort — `abort_write` deletes the
+  `.part` by name — so the prefetch and hand-off failure paths go through
+  `StagingClaim` (issue #5: a prefetch and the live stream of the same track).
 - **The cache cannot survive a restart**, so `PlaybackCache::with_path` WIPES
   the directory instead of adopting it. A file from a previous run is
   ciphertext under a key that no longer exists. On moOde that is every renderer

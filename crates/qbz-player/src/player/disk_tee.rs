@@ -49,18 +49,28 @@ impl DiskTee {
             return None;
         }
         let part = cache.begin_write(track_id, expected)?;
-        let file = std::fs::File::create(&part)
-            .map_err(|e| log::debug!("[CACHE] cannot stage track {track_id}: {e}"))
-            .ok()?;
-        // 256 KiB so a 64 KiB chunk is not a syscall each. The write lands
-        // in the page cache either way; this is about syscall count on a
-        // tokio worker, not about durability.
-        let file = SealWriter::new(
-            cache.key(),
-            std::io::BufWriter::with_capacity(256 * 1024, file),
-        )
-        .map_err(|e| log::debug!("[CACHE] cannot seal track {track_id}: {e}"))
-        .ok()?;
+        // From here the track's staging slot is ours: a failure must give it
+        // back, or nothing could stage this track again this run.
+        let opened = std::fs::File::create(&part)
+            .map_err(|e| format!("cannot stage track {track_id}: {e}"))
+            .and_then(|file| {
+                // 256 KiB so a 64 KiB chunk is not a syscall each. The write
+                // lands in the page cache either way; this is about syscall
+                // count on a tokio worker, not about durability.
+                SealWriter::new(
+                    cache.key(),
+                    std::io::BufWriter::with_capacity(256 * 1024, file),
+                )
+                .map_err(|e| format!("cannot seal track {track_id}: {e}"))
+            });
+        let file = match opened {
+            Ok(file) => file,
+            Err(e) => {
+                log::debug!("[CACHE] {e}");
+                cache.abort_write(track_id);
+                return None;
+            }
+        };
         Some(Self {
             cache,
             track_id,
@@ -151,6 +161,35 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("qbz-tee-{}-{n}", std::process::id()));
         let cache = PlaybackCache::with_path(dir.clone(), 8 * 1024 * 1024).expect("cache");
         (Arc::new(cache), dir)
+    }
+
+    /// A second writer of a track that is already staging stages nothing, and
+    /// the first writer's file survives it (issue #5).
+    ///
+    /// On the Pi a gapless prefetch was staging an 84 MB track when the listener
+    /// skipped to it, and the live stream opened a tee on the same `.part`:
+    /// that truncated the prefetch's file, and when the listener skipped on,
+    /// the tee's drop deleted it. The prefetch's publish then found nothing.
+    #[test]
+    fn a_second_writer_leaves_the_first_ones_file_alone() {
+        let (cache, dir) = temp_cache();
+        let track: Vec<u8> = (0..30_000u32).map(|i| (i % 241) as u8).collect();
+        let len = track.len() as u64;
+
+        let mut first = DiskTee::open(Some(cache.clone()), 7, len).expect("tee");
+        first.write_at(0, &track[..8_192]);
+
+        let second = DiskTee::open(Some(cache.clone()), 7, len);
+        assert!(second.is_none(), "a second writer was given the same .part");
+        drop(second);
+
+        first.write_at(8_192, &track[8_192..]);
+        first.finish();
+        let file = cache
+            .file_if_present(7)
+            .expect("the first writer's track was published");
+        assert_eq!(file.read_all().expect("read back"), track);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The seam this type sits on, end to end: bytes go past the tee, the
