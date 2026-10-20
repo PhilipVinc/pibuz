@@ -174,6 +174,41 @@ async fn skips_and_a_pause_keep_the_screen_on_the_track_that_is_playing() {
     harness.assert_invariants();
 }
 
+/// A skip must put the new track's length on screen, not the old one's.
+///
+/// The renderer's answer to the skip stated the length of the track it had
+/// been playing, and it reached the phone after the report that had the right
+/// one, so the new song's progress bar ran against the old song's total until
+/// the next report (issue #5: 201 s shown for a 221 s track). The lengths here
+/// are the three from that log.
+#[tokio::test]
+async fn a_skip_shows_the_length_of_the_track_skipped_to() {
+    let harness = ControllerHarness::new().await;
+    harness.the_catalog_says_it_is(101, 201);
+    harness.the_catalog_says_it_is(102, 221);
+    harness.the_catalog_says_it_is(103, 208);
+    harness.become_active_renderer().await;
+    let items = harness.controller().push_queue(&TRACKS, 0).await;
+    harness.controller().tap_track(&items, 0).await;
+    harness.report_tick().await;
+    assert_eq!(harness.view().total_ms, Some(201_000));
+
+    harness.let_the_load_windows_expire();
+    harness.controller().tap_track(&items, 1).await;
+    assert_eq!(
+        harness.view().total_ms,
+        Some(221_000),
+        "the skip must show the length of the track skipped to; timeline:\n{}",
+        harness.rendered_timeline()
+    );
+
+    harness.report_tick().await;
+    harness.let_the_load_windows_expire();
+    harness.controller().tap_track(&items, 2).await;
+    assert_eq!(harness.view().total_ms, Some(208_000));
+    harness.assert_invariants();
+}
+
 /// A pause within 1.5 s of a load is IGNORED, on purpose.
 ///
 /// Claiming the render from a peer makes that peer stop its own playback, and

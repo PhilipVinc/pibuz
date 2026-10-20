@@ -201,6 +201,33 @@ impl BufferingLatch {
         }
     }
 
+    /// Arm the latch for a load of `track_id`, tell the report scheduler, and
+    /// only then run `resolve` — the stream-URL lookup, which walks the quality
+    /// ladder one signed API call per rung. A failed resolve releases the latch.
+    ///
+    /// It used to be armed after the resolve, so for the 0.3-0.9 s that took on
+    /// a Pi the scheduler went on reporting the track being LEFT: a skip slid
+    /// to the new song on the phone, back to the old one, and on again
+    /// (issue #5). Armed first, every report in that window names the track
+    /// arriving, as BUFFERING, which is what the controller was already showing.
+    pub(crate) async fn while_resolving<T>(
+        &self,
+        report_notify: &tokio::sync::Notify,
+        track_id: u64,
+        start_position_secs: u64,
+        duration_secs: u64,
+        resolve: impl std::future::Future<Output = Result<T, String>>,
+    ) -> Result<T, String> {
+        self.begin(track_id, start_position_secs, duration_secs);
+        report_notify.notify_one();
+        let resolved = resolve.await;
+        if resolved.is_err() {
+            self.finish(track_id);
+            report_notify.notify_one();
+        }
+        resolved
+    }
+
     /// Record that the load of `track_id` failed with `error_type`, replacing
     /// any failure not yet reported: only the latest one names the track the
     /// controller is looking at.
@@ -700,10 +727,22 @@ impl QconnectRendererEngine for DaemonRendererEngine {
         }
 
         let stream_url = self
-            .core()
-            .get_stream_url(track_id, quality)
-            .await
-            .map_err(|err| format!("resolve stream url for remote track {track_id}: {err}"))?;
+            .buffering
+            .while_resolving(
+                &self.report_notify,
+                track_id,
+                start_position_secs,
+                duration_secs,
+                async {
+                    self.core()
+                        .get_stream_url(track_id, quality)
+                        .await
+                        .map_err(|err| {
+                            format!("resolve stream url for remote track {track_id}: {err}")
+                        })
+                },
+            )
+            .await?;
 
         // A track this account cannot stream comes back as a 30 s preview, and
         // is played as what it is: a 30 s track. From here on `duration_secs`
@@ -747,8 +786,9 @@ impl QconnectRendererEngine for DaemonRendererEngine {
         // cancellation path, not a reordering.
         self.abort_current_feeder();
 
-        // tell the controller we are loading. The stream is not
-        // audible until the feeder reaches `start_position_secs` and the
+        // Still loading, armed again now the resolve has said what the file IS:
+        // a preview's length and start replace the catalog's. The stream is
+        // not audible until the feeder reaches `start_position_secs` and the
         // pre-skip completes; the report scheduler clears this once the player
         // starts producing audio.
         self.buffering

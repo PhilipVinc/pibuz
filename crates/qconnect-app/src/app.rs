@@ -792,7 +792,7 @@ where
                 // would create an infinite feedback loop if we replied to it.
                 let is_substantive = playing_state.is_some() || current_track.is_some();
                 if is_substantive {
-                    let (current_queue_item_id, next_queue_item_id) = {
+                    let (current_queue_item_id, next_queue_item_id, answer_track_id) = {
                         let state = self.state.lock().await;
                         setstate_report_queue_items(
                             current_track.as_ref(),
@@ -800,6 +800,31 @@ where
                             &state.queue,
                             state.reported_queue_items,
                         )
+                    };
+                    // The length of the track this answer names. For a SetState
+                    // naming a track that is the catalog's: the renderer's own
+                    // figure is the track it was playing until a moment ago —
+                    // on a skip, the previous one, and this answer lands after
+                    // the report that had it right (issue #5). For a state-only
+                    // one the renderer's figure comes first: its report loop
+                    // publishes the audible track's, a 30 s preview's included.
+                    // Separate lock from `state`: the two are never co-locked.
+                    let catalog_length_ms = match answer_track_id {
+                        Some(track_id) => self
+                            .sync
+                            .lock()
+                            .await
+                            .known_tracks
+                            .get(&track_id)
+                            .and_then(Option::as_ref)
+                            .map(|track| track.duration_secs * 1000)
+                            .filter(|&ms| ms > 0),
+                        None => None,
+                    };
+                    let duration_ms = if current_track.is_some() {
+                        catalog_length_ms.or(renderer.current_duration_ms)
+                    } else {
+                        renderer.current_duration_ms.or(catalog_length_ms)
                     };
                     log::info!(
                         "[QConnect/Report] SetState report: playing={:?} pos={:?} track={:?} next={:?} qv={}.{}",
@@ -837,7 +862,7 @@ where
                             // 0:00 until the next report from the renderer's own loop.
                             // Racing that echo with a faster follow-up only shortened
                             // the flash; stating the duration removes it.
-                            "duration": renderer.current_duration_ms,
+                            "duration": duration_ms,
                             "queue_version": {
                                 "major": queue_version_ref.major,
                                 "minor": queue_version_ref.minor
@@ -972,7 +997,8 @@ where
     }
 }
 
-/// The `(current, next)` queue items a SetState's answer names.
+/// The `(current, next)` queue items a SetState's answer names, and the track
+/// the current one holds.
 ///
 /// - The command named a track: that one, normalized the way every report
 ///   names it (a fresh release's placeholder head is item 0), and the next
@@ -986,10 +1012,10 @@ fn setstate_report_queue_items(
     renderer: &QConnectRendererState,
     queue: &QConnectQueueState,
     reported: Option<(u64, Option<u64>)>,
-) -> (Option<u64>, Option<u64>) {
+) -> (Option<u64>, Option<u64>, Option<u64>) {
     use crate::queue_resolution::{
         find_cursor_index_by_queue_item_id, normalize_current_queue_item_id_from_queue_state,
-        ordered_queue_cursors,
+        ordered_queue_cursors, QconnectOrderedQueueCursor,
     };
 
     let normalized = |item: &QueueItem| {
@@ -1005,17 +1031,23 @@ fn setstate_report_queue_items(
     let next = || renderer.next_track.as_ref().map(|item| item.queue_item_id);
 
     if let Some(item) = named {
-        return (Some(normalized(item)), next());
+        return (Some(normalized(item)), next(), Some(item.track_id));
     }
     if let Some((current, reported_next)) = reported {
         let cursors = ordered_queue_cursors(queue);
-        if find_cursor_index_by_queue_item_id(&cursors, queue, Some(current)).is_some() {
-            return (Some(current), reported_next);
+        if let Some(cursor) = find_cursor_index_by_queue_item_id(&cursors, queue, Some(current))
+            .map(|position| cursors[position])
+        {
+            let track_id = match cursor {
+                QconnectOrderedQueueCursor::Queue(index) => queue.queue_items[index].track_id,
+                QconnectOrderedQueueCursor::Autoplay(index) => queue.autoplay_items[index].track_id,
+            };
+            return (Some(current), reported_next, Some(track_id));
         }
     }
     match renderer.current_track.as_ref() {
-        Some(item) => (Some(normalized(item)), next()),
-        None => (None, None),
+        Some(item) => (Some(normalized(item)), next(), Some(item.track_id)),
+        None => (None, None, None),
     }
 }
 
@@ -2405,7 +2437,7 @@ mod tests {
                 &queue,
                 Some((0, Some(1)))
             ),
-            (Some(1), Some(2))
+            (Some(1), Some(2), Some(102))
         );
 
         let fresh = queue_of(vec![
@@ -2420,7 +2452,7 @@ mod tests {
                 &fresh,
                 None
             ),
-            (Some(0), None)
+            (Some(0), None, Some(126_886_853))
         );
     }
 
@@ -2441,17 +2473,17 @@ mod tests {
         };
         assert_eq!(
             setstate_report_queue_items(None, &renderer, &queue, Some((2, None))),
-            (Some(2), None)
+            (Some(2), None, Some(103))
         );
         // An item from a queue that has since been replaced is not repeated.
         assert_eq!(
             setstate_report_queue_items(None, &renderer, &queue, Some((57, Some(58)))),
-            (Some(0), Some(1))
+            (Some(0), Some(1), Some(101))
         );
         // Nothing reported yet: the cached current track.
         assert_eq!(
             setstate_report_queue_items(None, &renderer, &queue, None),
-            (Some(0), Some(1))
+            (Some(0), Some(1), Some(101))
         );
     }
 

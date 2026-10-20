@@ -179,7 +179,8 @@ struct FakePlayer {
 pub(crate) struct FakeEngine {
     player: StdMutex<FakePlayer>,
     calls: StdMutex<Vec<EngineCall>>,
-    /// Seconds reported for every synthetic catalog track.
+    /// Seconds reported for a synthetic catalog track with no length of its
+    /// own in [`FakeCatalog::lengths`].
     track_duration_secs: u64,
     catalog: StdMutex<FakeCatalog>,
 }
@@ -202,6 +203,10 @@ struct FakeCatalog {
     failing_lists: usize,
     /// How many of the next `track/get` calls fail on the network.
     failing_gets: usize,
+    /// Tracks with a length of their own, in seconds. Everything else is
+    /// `track_duration_secs` long, under which no report can name the wrong
+    /// track's length and be caught at it.
+    lengths: std::collections::HashMap<u64, u64>,
 }
 
 impl FakeEngine {
@@ -279,7 +284,7 @@ impl FakeEngine {
         let mut player = self.player.lock().expect("fake player");
         player.track_id = track_id;
         player.position_ms = 0;
-        player.duration_ms = self.track_duration_secs * 1000;
+        player.duration_ms = self.length_secs(track_id) * 1000;
         player.loaded_audio = true;
         player.playing = true;
         player.unreported_advance = true;
@@ -400,11 +405,25 @@ impl FakeEngine {
         (ids, current)
     }
 
-    fn mock_track(&self, id: u64) -> Track {
+    /// How long the catalog says `track_id` is, in seconds.
+    pub(crate) fn length_secs(&self, track_id: u64) -> u64 {
+        self.length_in(&self.catalog(), track_id)
+    }
+
+    /// [`Self::length_secs`] for a caller already holding the catalog.
+    fn length_in(&self, catalog: &FakeCatalog, track_id: u64) -> u64 {
+        catalog
+            .lengths
+            .get(&track_id)
+            .copied()
+            .unwrap_or(self.track_duration_secs)
+    }
+
+    fn mock_track(&self, catalog: &FakeCatalog, id: u64) -> Track {
         serde_json::from_value(json!({
             "id": id,
             "title": format!("track {id}"),
-            "duration": self.track_duration_secs,
+            "duration": self.length_in(catalog, id),
             // As the catalog answers for anything it still serves; a
             // withdrawn track is not answered at all.
             "streamable": true,
@@ -569,7 +588,7 @@ impl QconnectRendererEngine for FakeEngine {
         if catalog.withdrawn.contains(&track_id) {
             return Ok(None);
         }
-        Ok(Some(self.mock_track(track_id)))
+        Ok(Some(self.mock_track(&catalog, track_id)))
     }
 
     async fn get_tracks_batch(&self, track_ids: &[u64]) -> Result<Vec<Track>, String> {
@@ -582,7 +601,7 @@ impl QconnectRendererEngine for FakeEngine {
         Ok(track_ids
             .iter()
             .filter(|id| !catalog.withdrawn.contains(id) && !catalog.left_out_of_lists.contains(id))
-            .map(|&id| self.mock_track(id))
+            .map(|&id| self.mock_track(&catalog, id))
             .collect())
     }
 
@@ -605,7 +624,7 @@ impl QconnectRendererEngine for FakeEngine {
         let duration_ms = if duration_secs > 0 {
             duration_secs * 1000
         } else {
-            self.track_duration_secs * 1000
+            self.length_secs(track_id) * 1000
         };
         if player.audio_thread_lags {
             // The stream is open; nothing is audible yet. The player goes on
@@ -832,6 +851,8 @@ pub(crate) struct Step {
     /// queue. `None` when the screen names nothing, or an item that queue does
     /// not hold.
     pub(crate) screen_track: Option<u64>,
+    /// How long the catalog says `screen_track` is, in milliseconds.
+    pub(crate) screen_track_length_ms: Option<u64>,
     /// A stream is open that the audio thread has not adopted yet.
     pub(crate) audio_catching_up: bool,
     /// The player has moved on gaplessly and no report has told the cloud.
@@ -1383,6 +1404,8 @@ impl HarnessInner {
             audible_track,
             cloud_queue,
             screen_track,
+            screen_track_length_ms: screen_track
+                .map(|track_id| self.engine.length_secs(track_id) * 1000),
             audio_catching_up: self.engine.is_catching_up(),
             advance_unreported: self.engine.advance_is_unreported(),
         });
@@ -1576,7 +1599,7 @@ impl ControllerHarness {
                     playing_state: 3, // PAUSED
                     buffer_state: BUFFER_STATE_OK,
                     position_ms: 0,
-                    duration_ms: self.inner.engine.track_duration_secs * 1000,
+                    duration_ms: self.inner.engine.length_secs(first.track_id) * 1000,
                 },
                 first.track_id,
             )
@@ -1664,6 +1687,11 @@ impl ControllerHarness {
     /// The pending stream fails to open. See [`FakeEngine::fail_the_pending_load`].
     pub(crate) fn the_pending_load_fails(&self) {
         self.inner.engine.fail_the_pending_load();
+    }
+
+    /// Give `track_id` a length of its own in the catalog.
+    pub(crate) fn the_catalog_says_it_is(&self, track_id: u64, secs: u64) {
+        self.inner.engine.catalog().lengths.insert(track_id, secs);
     }
 
     /// The next stream fails before it opens. See [`FakeEngine::fail_the_next_stream`].
@@ -1844,6 +1872,19 @@ impl ControllerHarness {
                     "'{}': the screen names {:?} while {} is audible (cursor {:?})",
                     step.label, step.screen_track, step.audible_track, step.cursor_track
                 ));
+            }
+            // 8. The length on screen is the length of the track on screen. A
+            //    skip that answered with the previous track's length drew the
+            //    new song's progress bar against the old one's total until the
+            //    next report (issue #5).
+            if let (Some(shown), Some(expected)) = (step.view.total_ms, step.screen_track_length_ms)
+            {
+                if shown != expected {
+                    violations.push(format!(
+                        "'{}': the screen gives {:?} a length of {shown} ms; it is {expected} ms",
+                        step.label, step.screen_track
+                    ));
+                }
             }
             previous = Some(step);
         }
