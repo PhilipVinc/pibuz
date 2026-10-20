@@ -210,10 +210,12 @@ fn hook_env(ev: &CoreEvent) -> Option<Vec<(String, String)>> {
             state,
             device_name,
             session_active,
+            is_active,
         } => {
             push("EVENT", "QconnectSessionChanged".into());
             push("STATE", state.clone());
             push("SESSION_ACTIVE", session_active.to_string());
+            push("IS_ACTIVE", is_active.to_string());
             if let Some(name) = device_name {
                 push("DEVICE_NAME", name.clone());
             }
@@ -310,11 +312,13 @@ mod tests {
             state: "connected".into(),
             device_name: Some("Moode Qobuz".into()),
             session_active: true,
+            is_active: false,
         })
         .unwrap();
         assert_eq!(get(&vars, "QBZ_EVENT"), Some("QconnectSessionChanged"));
         assert_eq!(get(&vars, "QBZ_STATE"), Some("connected"));
         assert_eq!(get(&vars, "QBZ_SESSION_ACTIVE"), Some("true"));
+        assert_eq!(get(&vars, "QBZ_IS_ACTIVE"), Some("false"));
         assert_eq!(get(&vars, "QBZ_DEVICE_NAME"), Some("Moode Qobuz"));
     }
 

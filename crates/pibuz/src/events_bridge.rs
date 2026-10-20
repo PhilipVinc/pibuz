@@ -23,6 +23,7 @@ use tokio::sync::{broadcast, Notify};
 use tokio::task::JoinHandle;
 
 use crate::adapter::DaemonAdapter;
+use crate::state::DaemonShared;
 
 type Runtime = Arc<AppRuntime<DaemonAdapter>>;
 
@@ -39,6 +40,7 @@ const FALLBACK_POLL: Duration = Duration::from_secs(2);
 /// * `VolumeChanged` on a volume change.
 pub(crate) fn spawn(
     runtime: &Runtime,
+    shared: Arc<std::sync::Mutex<DaemonShared>>,
     bus: broadcast::Sender<CoreEvent>,
     edge: Arc<Notify>,
 ) -> JoinHandle<()> {
@@ -47,6 +49,7 @@ pub(crate) fn spawn(
         let mut last_track_id: u64 = 0;
         let mut last_state: Option<PlaybackState> = None;
         let mut last_volume: Option<f32> = None;
+        let mut was_at_rest = false;
         loop {
             // Wake on a driver edge, or fall back to a slow poll so a
             // track-id-clearing stop still surfaces as a transition.
@@ -72,17 +75,10 @@ pub(crate) fn spawn(
                 }
             }
 
-            // Three-way mapping: loaded-but-not-playing
-            // audio is Paused, nothing loaded is Stopped. Dedup on the MAPPED
-            // state, not `is_playing` — paused and stopped are both
-            // not-playing, and a pause -> stop transition must still emit.
-            let state = if ev.is_playing {
-                PlaybackState::Playing
-            } else if has_audio {
-                PlaybackState::Paused
-            } else {
-                PlaybackState::Stopped
-            };
+            let rests_here = shared
+                .lock()
+                .is_ok_and(|s| s.queue_at_rest && s.qconnect.is_active);
+            let state = playback_state(ev.is_playing, has_audio, rests_here);
             if last_state != Some(state) {
                 let _ = bus.send(CoreEvent::PlaybackStateChanged { state });
                 last_state = Some(state);
@@ -92,6 +88,13 @@ pub(crate) fn spawn(
                     last_track_id = 0;
                 }
             }
+            // So does a queue coming to rest, which reads as Paused rather than
+            // Stopped: play from there starts the queue again, and a one-track
+            // queue starts the very track that just ended.
+            if rests_here && !was_at_rest {
+                last_track_id = 0;
+            }
+            was_at_rest = rests_here;
 
             if ev.is_playing {
                 let _ = bus.send(CoreEvent::PositionUpdated {
@@ -106,4 +109,56 @@ pub(crate) fn spawn(
             }
         }
     })
+}
+
+/// What the bus calls the player's state.
+///
+/// Loaded-but-not-playing audio is Paused, nothing loaded is Stopped — except a
+/// queue that played out and came to rest on its first track while this device
+/// holds the render (`rests_here`). Nothing is loaded then, but the controller
+/// shows that track paused at 0:00 and play starts the queue again
+/// (`qconnect::report`), and the session is very much still ours. Integrators
+/// read `stopped` as "the session is over" — moOde's hook marks the renderer
+/// inactive on it and its worker restarts the daemon, which dropped the device
+/// from the app seven seconds after every album ended (#6). Losing the render
+/// while at rest still reads as Stopped, so a real disconnect is not hidden.
+///
+/// Callers dedup on the MAPPED state, not `is_playing` — paused and stopped
+/// are both not-playing, and a pause -> stop transition must still emit.
+fn playback_state(is_playing: bool, has_audio: bool, rests_here: bool) -> PlaybackState {
+    if is_playing {
+        PlaybackState::Playing
+    } else if has_audio || rests_here {
+        PlaybackState::Paused
+    } else {
+        PlaybackState::Stopped
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loaded_audio_is_paused_and_nothing_loaded_is_stopped() {
+        assert_eq!(playback_state(true, true, false), PlaybackState::Playing);
+        assert_eq!(playback_state(false, true, false), PlaybackState::Paused);
+        assert_eq!(playback_state(false, false, false), PlaybackState::Stopped);
+    }
+
+    /// #6, case A: the last track of an album ends, the driver stops and
+    /// rewinds to the first track with nothing loaded. The hook heard `paused`,
+    /// then `stopped`, and moOde restarted the daemon on the second one.
+    #[test]
+    fn a_queue_at_rest_on_this_device_stays_paused_once_the_audio_unloads() {
+        assert_eq!(playback_state(false, true, true), PlaybackState::Paused);
+        assert_eq!(playback_state(false, false, true), PlaybackState::Paused);
+    }
+
+    /// Playing wins over the latch: the report loop clears it once something
+    /// plays, but the bridge may read it a wake before that.
+    #[test]
+    fn playing_wins_over_a_stale_rest() {
+        assert_eq!(playback_state(true, true, true), PlaybackState::Playing);
+    }
 }

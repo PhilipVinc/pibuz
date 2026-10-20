@@ -140,8 +140,12 @@ pub(crate) async fn run(
     //       `drop(booted)` so a mid-wake strong Arc can't outlive the ordering.
     // The API pulses the same edge after a volume change (`ApiState::events_edge`).
     let events_edge = edge_notify.clone();
-    let events_bridge =
-        crate::events_bridge::spawn(&booted.runtime, booted.bus.clone(), edge_notify);
+    let events_bridge = crate::events_bridge::spawn(
+        &booted.runtime,
+        booted.shared.clone(),
+        booted.bus.clone(),
+        edge_notify,
+    );
 
     // 10c¾. Event hook: fork `hooks.script` (or `QBZD_HOOK`) once per
     //       forwarded bus event with QBZ_* variables in its environment — push

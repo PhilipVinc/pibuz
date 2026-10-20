@@ -50,6 +50,10 @@ pub enum CoreEvent {
         device_name: Option<String>,
         /// True only while a session is established ("connected")
         session_active: bool,
+        /// True while the session's active renderer is this device. A
+        /// controller that disconnects, or moves playback elsewhere, leaves
+        /// `session_active` true and turns this false.
+        is_active: bool,
     },
 
     // ============ Authentication Events ============
