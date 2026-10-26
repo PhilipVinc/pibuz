@@ -13,6 +13,14 @@ tags on `main`.
   seconds apart and saw nothing at all for the first stretch, not even the
   headers (reported on #6). Every frame is now its own chunk, flushed at
   once; HTTP/1.0 clients get bare frames and a closing connection.
+- **A skip no longer waits about 5 s for the new track's first byte** while a
+  gapless prefetch is downloading. The time went on looking up the CDN's
+  name, not on the CDN: on a saturated Wi-Fi downlink, roughly one lookup in
+  four lost a packet and waited out the system resolver's 5 s retry. The
+  daemon now remembers each host's last answer, uses it at once and refreshes
+  it in the background, so a connection waits on a lookup only for a host's
+  first one, or after half an hour unused. A lookup slower than a second is
+  logged as `[dns]`.
 
 ## 2.7.2 — 2026-10-27
 
