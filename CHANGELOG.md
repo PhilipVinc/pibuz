@@ -15,6 +15,26 @@ tags on `main`.
   and came back at `qconnect.initial_volume`. The at-rest queue is now
   `paused`, as the app and `/api/status` already showed it, for as long as
   this box holds the render; a disconnect while at rest is still `stopped`.
+- **A skip or a pause no longer puts the first track picked back on the
+  phone** (#5). The answer to every play, pause and skip left out the queue
+  item, which the wire reads as item 0, the head of the queue: each skip
+  slid to the new song, flashed back to the first one and slid on again, and
+  a pause left the phone on the first one, so play then started it. The
+  answer now names the item, and states that track's own length.
+- **A skip shows the arriving track while its stream URL resolves** (#5),
+  instead of the one being left for up to a second.
+- **One writer stages a track to the disk cache at a time** (#5). A gapless
+  prefetch and the live stream of the same track could write one `.part`
+  together, losing the track or caching one that decodes as noise.
+- **A skip near the end of a track loads the new one once.** When the
+  stream's first range was slow (about 5 s from the CDN) and the outgoing
+  track ran out meanwhile, the new track was streamed a second time and the
+  skip took twice as long.
+- **A gapless prefetch is called off when the listener skips past it.** It
+  used to run to the end, up to 220 MB of Hi-Res through the network and
+  onto the card for a track nobody would hear, and to hold the playback
+  driver for as long. A skip to the track being prefetched plays it from
+  that fetch if it lands before the stream opens.
 
 ### Added
 
