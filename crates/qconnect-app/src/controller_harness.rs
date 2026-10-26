@@ -179,11 +179,18 @@ struct FakePlayer {
 pub(crate) struct FakeEngine {
     player: StdMutex<FakePlayer>,
     calls: StdMutex<Vec<EngineCall>>,
+    /// What happens in the wall-clock time the next `start_track_stream`
+    /// spends before its stream opens. Run once, then cleared.
+    next_stream_stall: StdMutex<Option<StreamStall>>,
     /// Seconds reported for a synthetic catalog track with no length of its
     /// own in [`FakeCatalog::lengths`].
     track_duration_secs: u64,
     catalog: StdMutex<FakeCatalog>,
 }
+
+/// The world moving on while a stream is slow to open. It is handed the engine
+/// rather than capturing it, which would be a reference cycle.
+type StreamStall = Box<dyn FnOnce(&FakeEngine) + Send>;
 
 /// The Qobuz catalog, as far as the renderer asks it about tracks.
 #[derive(Debug, Default)]
@@ -217,6 +224,7 @@ impl FakeEngine {
                 ..FakePlayer::default()
             }),
             calls: StdMutex::new(Vec::new()),
+            next_stream_stall: StdMutex::new(None),
             track_duration_secs: 240,
             catalog: StdMutex::new(FakeCatalog::default()),
         }
@@ -395,6 +403,12 @@ impl FakeEngine {
     /// The next `start_track_stream` fails with `error` before opening anything.
     pub(crate) fn fail_the_next_stream(&self, error: &str) {
         self.player.lock().expect("fake player").next_stream_fails = Some(error.to_string());
+    }
+
+    /// The next `start_track_stream` runs `stall` before it opens anything:
+    /// whatever the world does in the seconds the open takes.
+    pub(crate) fn stall_the_next_stream(&self, stall: StreamStall) {
+        *self.next_stream_stall.lock().expect("stream stall") = Some(stall);
     }
 
     /// What the player holds: how many tracks, and which one the cursor names.
@@ -617,6 +631,10 @@ impl QconnectRendererEngine for FakeEngine {
             start_secs: start_position_secs,
             quality,
         });
+        let stall = self.next_stream_stall.lock().expect("stream stall").take();
+        if let Some(stall) = stall {
+            stall(self);
+        }
         let mut player = self.player.lock().expect("fake player");
         if let Some(error) = player.next_stream_fails.take() {
             return Err(error);
@@ -1270,6 +1288,19 @@ fn queue_item_json(item: &QueueItem) -> Value {
 
 // ===================================================================== harness
 
+/// Age the last load attempt past both windows that hang off it. See
+/// [`ControllerHarness::let_the_load_windows_expire`].
+fn expire_load_windows(sync_state: &Arc<Mutex<QconnectRemoteSyncState>>) {
+    // The lock is never held across a step or an engine call, so try_lock is
+    // enough and keeps this synchronous at the call site.
+    let mut state = sync_state
+        .try_lock()
+        .expect("sync state is idle between steps and across engine calls");
+    if let Some((track_id, _)) = state.last_load_attempt {
+        state.last_load_attempt = Some((track_id, Instant::now() - Duration::from_secs(10)));
+    }
+}
+
 struct HarnessInner {
     app: Arc<HarnessApp>,
     /// Held so the in-memory transport always has a subscriber; never read.
@@ -1664,13 +1695,28 @@ impl ControllerHarness {
     /// real fix, and the reason this helper carries a warning instead of being
     /// quietly convenient.
     pub(crate) fn let_the_load_windows_expire(&self) {
+        expire_load_windows(&self.inner.sync_state);
+    }
+
+    /// The next stream takes longer to open than the load-dedup window, and
+    /// the outgoing track plays to its end while it does.
+    ///
+    /// The Pi's normal case, not a corner: the CDN answers the first range of a
+    /// cold offset in 5.2-5.4 s (`[remote-stream/PROBE] 206 headers in
+    /// 5399ms`), longer than `LOAD_ATTEMPT_DEDUP_WINDOW`, and the open does not
+    /// return until it has. So by the time `start_track_stream` returns, the
+    /// load it just made is no longer "recent", and a skip near the end of a
+    /// track finds that track over. Pair it with `make_the_audio_thread_lag`:
+    /// the stream has opened but is not audible, so the player still names the
+    /// track that ran out.
+    pub(crate) fn the_next_stream_outlasts_the_load_windows_and_the_outgoing_track(&self) {
         let sync = Arc::clone(&self.inner.sync_state);
-        // The lock is never contended between steps, so try_lock is enough and
-        // keeps this helper synchronous at the call site.
-        let mut state = sync.try_lock().expect("sync state is idle between steps");
-        if let Some((track_id, _)) = state.last_load_attempt {
-            state.last_load_attempt = Some((track_id, Instant::now() - Duration::from_secs(10)));
-        }
+        self.inner
+            .engine
+            .stall_the_next_stream(Box::new(move |engine| {
+                engine.run_out();
+                expire_load_windows(&sync);
+            }));
     }
 
     /// From here on, a stream that opens is not instantly audible. See
