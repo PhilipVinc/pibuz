@@ -14,8 +14,12 @@
 //   * `advance_and_play` — the full advance ritual (skip-walk → play →
 //                        prefetch), reused verbatim by the CLI next/prev routes
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
+
+use tokio_util::sync::CancellationToken;
 
 use crate::orchestrator::QbzCore;
 use qbz_models::FrontendAdapter;
@@ -393,6 +397,78 @@ pub struct DriverDeps {
 /// `status` CLI.
 const AUDIO_THREAD_STUCK: Duration = Duration::from_secs(90);
 
+/// How long shutdown waits for a called-off gapless fetch to clean up after
+/// itself: join its disk writer and delete its `.part`.
+const GAPLESS_CANCEL_GRACE: Duration = Duration::from_secs(5);
+
+/// A gapless successor being fetched while the current track plays.
+///
+/// The driver polls it beside its ticker instead of awaiting it in line. In
+/// line, a Hi-Res successor held the driver for as long as it took to arrive:
+/// 45 s on a Pi, during which no tick ran, and a skip in the meantime could not
+/// stop it — the fetch ran on to the end, 164 MB through the network and onto
+/// the card for a track nobody would hear, competing with the stream of the
+/// one they skipped to.
+///
+/// Polled by the driver task itself rather than spawned, so nothing outlives
+/// the driver holding the runtime (the #521 shutdown ordering in pibuz).
+struct GaplessFetch<'a> {
+    id: u64,
+    /// The track playing when it was armed. It is wanted while that one still
+    /// plays: [`gapless_fetch_still_wanted`].
+    armed_against: u64,
+    /// Calls it off. A called-off fetch is still polled until it returns, so it
+    /// cleans up its card copy in order; see `download_full_sized`.
+    cancel: CancellationToken,
+    fetch: Pin<Box<dyn Future<Output = Option<qbz_player::TrackAudio>> + Send + 'a>>,
+}
+
+/// Await the fetch in flight, or never when there is none.
+async fn gapless_fetched(fetch: &mut Option<GaplessFetch<'_>>) -> Option<qbz_player::TrackAudio> {
+    match fetch {
+        Some(fetch) => fetch.fetch.as_mut().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Hand a finished fetch to the player as the next track, if it is still the
+/// next track.
+fn queue_gapless_successor(
+    player: &qbz_player::Player,
+    fetch: &GaplessFetch<'_>,
+    fetched: Option<qbz_player::TrackAudio>,
+) {
+    let id = fetch.id;
+    if fetch.cancel.is_cancelled() {
+        return;
+    }
+    let now_playing = player.get_playback_event().track_id;
+    if fetched.is_some() && !gapless_fetch_still_wanted(fetch.armed_against, now_playing) {
+        // Stale: it finished between the last tick and this one. Queueing it
+        // would play a track the listener has already moved past — see
+        // `gapless_fetch_still_wanted`.
+        log::info!(
+            "[pibuz] driver: dropping the gapless fetch of {id} — it was armed while {} played \
+             and the player is now on {now_playing}",
+            fetch.armed_against
+        );
+        return;
+    }
+    match fetched {
+        Some(qbz_player::TrackAudio::File(cached)) => {
+            if let Err(e) = player.play_next_file(cached, id) {
+                log::warn!("[pibuz] driver: gapless from disk failed: {e}");
+            }
+        }
+        Some(qbz_player::TrackAudio::Memory(bytes)) => {
+            if let Err(e) = player.play_next(bytes, id) {
+                log::warn!("[pibuz] driver: gapless play_next failed: {e}");
+            }
+        }
+        None => {}
+    }
+}
+
 /// The 450 ms IO shell. Each tick: read the player event, drain the stream-error
 /// latch, project the queue, `plan_tick`, execute the actions, then
 /// `advance_state`. Breaks when `shutdown` flips to `true`; the loop is thin by
@@ -408,10 +484,30 @@ pub async fn run_driver<A: FrontendAdapter + Send + Sync + 'static>(
     let mut reported_stuck = false;
     let mut ticker = tokio::time::interval(Duration::from_millis(TICK_MS));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut gapless: Option<GaplessFetch<'_>> = None;
 
     loop {
         tokio::select! {
             _ = ticker.tick() => {}
+            fetched = gapless_fetched(&mut gapless), if gapless.is_some() => {
+                if let Some(fetch) = gapless.take() {
+                    let player = runtime.core().player();
+                    // Called off, and the listener is back on the track it was
+                    // armed for (skipped away and back): `plan_tick` arms once
+                    // per track, so without this that track never gets a
+                    // successor again.
+                    if fetch.cancel.is_cancelled()
+                        && gapless_fetch_still_wanted(
+                            fetch.armed_against,
+                            player.get_playback_event().track_id,
+                        )
+                    {
+                        state.gapless_requested_for = 0;
+                    }
+                    queue_gapless_successor(&player, &fetch, fetched);
+                }
+                continue;
+            }
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
                     break;
@@ -423,6 +519,26 @@ pub async fn run_driver<A: FrontendAdapter + Send + Sync + 'static>(
         let core = runtime.core();
         let player = core.player();
         let ev = player.get_playback_event();
+
+        // The successor in flight is for the track that was playing when it was
+        // armed. Once the listener has moved off that one it is worthless, and
+        // a Hi-Res one is 120-220 MB still to come down beside the stream of
+        // the track they moved to: call it off now rather than drop it when it
+        // lands.
+        if let Some(fetch) = &gapless {
+            if !fetch.cancel.is_cancelled()
+                && !gapless_fetch_still_wanted(fetch.armed_against, ev.track_id)
+            {
+                log::info!(
+                    "[pibuz] driver: calling off the gapless fetch of {} — it was armed while \
+                     {} played and the player is now on {}",
+                    fetch.id,
+                    fetch.armed_against,
+                    ev.track_id
+                );
+                fetch.cancel.cancel();
+            }
+        }
 
         // The audio thread takes one command at a time, so one that never
         // finishes silences everything queued behind it — and this loop keeps
@@ -448,7 +564,15 @@ pub async fn run_driver<A: FrontendAdapter + Send + Sync + 'static>(
         let stream_error = player.state.take_stream_error_message();
         let queue = queue_snapshot(core).await;
 
-        let actions = plan_tick(&state, &ev, &queue, stream_error.as_deref());
+        let mut actions = plan_tick(&state, &ev, &queue, stream_error.as_deref());
+        if gapless.is_some() {
+            // One successor at a time. The one in flight is either still
+            // wanted, or called off and finishing its clean-up — which must
+            // not overlap a new writer of the card. Leaving the arm out also
+            // keeps `advance_state` from recording it, so a later tick plans
+            // it again.
+            actions.retain(|action| !matches!(action, DriverAction::ArmGapless(_)));
+        }
 
         for action in &actions {
             match action {
@@ -456,11 +580,6 @@ pub async fn run_driver<A: FrontendAdapter + Send + Sync + 'static>(
                     core.sync_current_to_id(*id).await;
                 }
                 DriverAction::ArmGapless(id) => {
-                    let quality = (deps.quality)();
-                    // Which track this successor was chosen for. Checked again
-                    // after the download, because the download is async and the
-                    // user is not.
-                    let armed_against = ev.track_id;
                     // Where the bytes live is decided during the download now,
                     // from the size the CMAF segment table gives up front — so
                     // there is nothing left to arrange here. This used to
@@ -468,31 +587,17 @@ pub async fn run_driver<A: FrontendAdapter + Send + Sync + 'static>(
                     // big, and if so write it to the card in one blocking fsync'd
                     // burst and drop the copy: a 195 MB `Arc` clone plus 11-15 s
                     // of a pinned card, which underran ALSA audibly.
-                    let fetched = core.fetch_for_gapless_resolved(*id, quality).await;
-                    let now_playing = player.get_playback_event().track_id;
-                    if fetched.is_some() && !gapless_fetch_still_wanted(armed_against, now_playing)
-                    {
-                        // Stale. Queueing it would play a track the listener
-                        // has already moved past — see the function's docs.
-                        log::info!(
-                            "[pibuz] driver: dropping the gapless fetch of {id} — it was armed \
-                             while {armed_against} played and the player is now on {now_playing}"
-                        );
-                        continue;
-                    }
-                    match fetched {
-                        Some(qbz_player::TrackAudio::File(cached)) => {
-                            if let Err(e) = player.play_next_file(cached, *id) {
-                                log::warn!("[pibuz] driver: gapless from disk failed: {e}");
-                            }
-                        }
-                        Some(qbz_player::TrackAudio::Memory(bytes)) => {
-                            if let Err(e) = player.play_next(bytes, *id) {
-                                log::warn!("[pibuz] driver: gapless play_next failed: {e}");
-                            }
-                        }
-                        None => {}
-                    }
+                    let cancel = CancellationToken::new();
+                    gapless = Some(GaplessFetch {
+                        id: *id,
+                        armed_against: ev.track_id,
+                        cancel: cancel.clone(),
+                        fetch: Box::pin(core.fetch_for_gapless_resolved(
+                            *id,
+                            (deps.quality)(),
+                            cancel,
+                        )),
+                    });
                 }
                 DriverAction::ReleaseCachedTrack(id) => {
                     // Also blocking: releasing spills the track to L2, which is
@@ -549,6 +654,21 @@ pub async fn run_driver<A: FrontendAdapter + Send + Sync + 'static>(
 
         state = advance_state(&state, &ev, &actions);
         (deps.on_tick)();
+    }
+    if let Some(fetch) = gapless.take() {
+        // Called off and drained rather than dropped, so a successor being
+        // written to the card leaves no `.part` behind.
+        fetch.cancel.cancel();
+        if tokio::time::timeout(GAPLESS_CANCEL_GRACE, fetch.fetch)
+            .await
+            .is_err()
+        {
+            log::warn!(
+                "[pibuz] driver: the gapless fetch of {} did not wind down within {}s",
+                fetch.id,
+                GAPLESS_CANCEL_GRACE.as_secs()
+            );
+        }
     }
     log::info!("[pibuz] driver: shutting down");
 }

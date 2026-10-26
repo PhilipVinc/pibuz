@@ -59,6 +59,9 @@ tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 futures-util = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
+# CancellationToken: how the driver calls off a gapless download it no longer
+# wants (`qbz_qobuz::cmaf::download_full_sized`). Already in the tree via reqwest.
+tokio-util = "0.7"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

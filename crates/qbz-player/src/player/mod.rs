@@ -44,6 +44,7 @@ use symphonia::core::io::{MediaSource, MediaSourceStream};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 use symphonia::default::{get_codecs, get_probe};
+use tokio_util::sync::CancellationToken;
 
 use playback_engine::PlaybackEngine;
 use qbz_audio::{
@@ -6057,9 +6058,15 @@ impl Player {
         // `next` allocated ~210 MB of Hi-Res beside the playing track — the same
         // OOM `GAPLESS_MIN_TOTAL_KB` was written to prevent, reached through the
         // other door.
+        // Nothing calls a warm-up off: its caller awaits it in line, so no
+        // later decision can overtake it the way a skip overtakes a gapless
+        // fetch (`fetch_for_gapless`).
+        let never = CancellationToken::new();
         let (choose, staging) = self.destination_chooser(track_id, "PREFETCH");
         let result: Result<Option<TrackBytes>, String> =
-            match qbz_qobuz::cmaf::download_full_sized(client, track_id, quality, choose).await {
+            match qbz_qobuz::cmaf::download_full_sized(client, track_id, quality, choose, &never)
+                .await
+            {
                 // Already the allocation the cache will share — assembled there
                 // segment by segment, so the track is never resident twice.
                 Ok(qbz_qobuz::DownloadedTrack::Memory(data)) => Ok(Some(data)),
@@ -6111,6 +6118,7 @@ impl Player {
                                 &stream_url.url,
                                 track_id,
                                 choose,
+                                &never,
                             )
                             .await
                             {
@@ -6328,12 +6336,15 @@ impl Player {
     /// Fetch a track's audio for a gapless handoff: L1 memory →
     /// L2 disk → CMAF `download_full_sized` (legacy full download as fallback).
     /// Does not start playback — the caller hands the result to `play_next`
-    /// or `play_next_file`. Returns `None` only when every tier fails.
+    /// or `play_next_file`. Returns `None` when every tier fails, and when
+    /// `cancel` fires: a skip makes the successor worthless, and a Hi-Res one
+    /// is 120-220 MB of network and card that the track now playing needs.
     pub async fn fetch_for_gapless(
         &self,
         client: &QobuzClient,
         track_id: u64,
         quality: Quality,
+        cancel: &CancellationToken,
     ) -> Option<TrackAudio> {
         // The player is about to hold this track's path across a hand-off, and
         // the playing track's across the rest of it. An LRU that cannot see
@@ -6373,7 +6384,8 @@ impl Player {
         // audibly, twice, measured mid-write.
         let (choose, staging) = self.destination_chooser(track_id, "GAPLESS");
 
-        match qbz_qobuz::cmaf::download_full_sized(client, track_id, quality, choose).await {
+        match qbz_qobuz::cmaf::download_full_sized(client, track_id, quality, choose, cancel).await
+        {
             Ok(qbz_qobuz::DownloadedTrack::File(_)) => {
                 return match self.audio_cache.get_playback_cache().and_then(|c| {
                     c.commit_write(track_id)
@@ -6403,6 +6415,14 @@ impl Player {
                 // and the legacy fallback below would undo the decision.
                 return None;
             }
+            // Called off, not failed: the legacy fallback would fetch the very
+            // track nobody wants any more. The download has deleted its
+            // `.part` by now, so the slot can go.
+            Err(_) if cancel.is_cancelled() => {
+                log::info!("[GAPLESS] Fetch of track {track_id} called off");
+                staging.abort(self.audio_cache.get_playback_cache(), track_id);
+                return None;
+            }
             Err(e) => {
                 log::warn!("[GAPLESS] CMAF failed for track {track_id}: {e}, trying legacy");
                 staging.abort(self.audio_cache.get_playback_cache(), track_id);
@@ -6413,7 +6433,10 @@ impl Player {
         // and sent through the same chooser as the CMAF path — it used to be a
         // whole track in a `Vec` whatever its size, which on a Pi was 550 MB,
         // twice, with the daemon deep in swap and the playing track dropping out.
-        let stream_url = match client.get_stream_url_with_fallback(track_id, quality).await {
+        let stream_url = match cancel
+            .run_until_cancelled(client.get_stream_url_with_fallback(track_id, quality))
+            .await?
+        {
             Ok(stream_url) => stream_url,
             Err(e) => {
                 log::warn!("[GAPLESS] No stream URL for {track_id}: {e}");
@@ -6441,7 +6464,8 @@ impl Player {
             return None;
         }
         let (choose, staging) = self.destination_chooser(track_id, "GAPLESS");
-        match qbz_qobuz::cmaf::download_plain_sized(&stream_url.url, track_id, choose).await {
+        match qbz_qobuz::cmaf::download_plain_sized(&stream_url.url, track_id, choose, cancel).await
+        {
             Ok(qbz_qobuz::DownloadedTrack::File(_)) => {
                 match self.audio_cache.get_playback_cache().and_then(|c| {
                     c.commit_write(track_id)
@@ -6463,6 +6487,11 @@ impl Player {
                 Some(TrackAudio::Memory(bytes))
             }
             Ok(qbz_qobuz::DownloadedTrack::Refused) => None,
+            Err(_) if cancel.is_cancelled() => {
+                log::info!("[GAPLESS] Fetch of track {track_id} called off");
+                staging.abort(self.audio_cache.get_playback_cache(), track_id);
+                None
+            }
             Err(e) => {
                 log::warn!("[GAPLESS] Legacy download failed for {track_id}: {e}");
                 staging.abort(self.audio_cache.get_playback_cache(), track_id);

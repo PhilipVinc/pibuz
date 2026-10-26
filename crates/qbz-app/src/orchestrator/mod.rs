@@ -334,16 +334,21 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
     }
 
     /// Resolve the bytes for a GAPLESS successor, L1/L2 → network. Returns
-    /// bytes to hand to `Player::play_next`, or None.
+    /// bytes to hand to `Player::play_next`, or None — also once `cancel`
+    /// fires.
+    ///
+    /// The client is cloned out of its lock rather than borrowed through it:
+    /// the download runs for as long as a Hi-Res track takes to arrive, beside
+    /// everything else that reads the client, and a clone shares its state.
     pub(crate) async fn fetch_for_gapless_resolved(
         &self,
         track_id: u64,
         quality: Quality,
+        cancel: tokio_util::sync::CancellationToken,
     ) -> Option<qbz_player::TrackAudio> {
-        let guard = self.client.read().await;
-        let client = guard.as_ref()?;
+        let client = self.client.read().await.as_ref()?.clone();
         self.player
-            .fetch_for_gapless(client, track_id, quality)
+            .fetch_for_gapless(&client, track_id, quality, &cancel)
             .await
     }
 

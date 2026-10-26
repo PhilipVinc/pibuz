@@ -36,6 +36,7 @@
 use std::sync::Arc;
 
 use qbz_models::Quality;
+use tokio_util::sync::CancellationToken;
 
 use crate::client::QobuzClient;
 
@@ -166,6 +167,11 @@ pub enum TrackDestination {
     /// [`DownloadedTrack::Refused`] rather than as a failure the caller would
     /// log, retry and back off.
     Refuse,
+}
+
+/// The error a sized download returns when its `cancel` token fires.
+fn cancelled(track_id: u64) -> String {
+    format!("download of track {track_id} cancelled")
 }
 
 /// What [`download_full_sized`] produced.
@@ -315,13 +321,22 @@ impl TrackSink for ArcSlab {
 ///     measured, mid-write).
 ///     Writing as the segments decrypt spreads the same bytes across the ~40 s the
 ///     download already takes, so neither the copy nor the burst exists.
+///
+/// `cancel` calls the download off: it returns an error, with any
+/// card copy already deleted. Cancel through it rather than by dropping the
+/// future — on the card path the writer runs on a blocking thread, and a
+/// dropped future leaves it to finish a `.part` nobody will clean up.
 pub async fn download_full_sized(
     client: &QobuzClient,
     track_id: u64,
     quality: Quality,
     choose: impl FnOnce(usize) -> TrackDestination,
+    cancel: &CancellationToken,
 ) -> std::result::Result<DownloadedTrack, String> {
-    let setup = setup_streaming(client, track_id, quality).await?;
+    let setup = cancel
+        .run_until_cancelled(setup_streaming(client, track_id, quality))
+        .await
+        .ok_or_else(|| cancelled(track_id))??;
     let http = build_cdn_client()?;
 
     let total_size: usize = setup.flac_header.len()
@@ -343,15 +358,17 @@ pub async fn download_full_sized(
         TrackDestination::Memory => {
             let mut output = ArcSlab::with_capacity(total_size);
             output.append(&setup.flac_header)?;
-            fetch_decrypt_in_order(
-                http,
-                &setup.url_template,
-                setup.n_segments,
-                "CMAF-FULL",
-                &setup.content_key,
-                &mut Sink::Memory(&mut output),
-            )
-            .await?;
+            cancel
+                .run_until_cancelled(fetch_decrypt_in_order(
+                    http,
+                    &setup.url_template,
+                    setup.n_segments,
+                    "CMAF-FULL",
+                    &setup.content_key,
+                    &mut Sink::Memory(&mut output),
+                ))
+                .await
+                .ok_or_else(|| cancelled(track_id))??;
             log::info!(
                 "[CMAF-FULL] Track {} complete in memory: {:.2} MB FLAC, expected {:.2} MB",
                 track_id,
@@ -380,15 +397,21 @@ pub async fn download_full_sized(
                 write_track_to_disk(&writer_path, key, header, rx)
             });
 
-            let fetch = fetch_decrypt_in_order(
-                http,
-                &setup.url_template,
-                setup.n_segments,
-                "CMAF-DISK",
-                &setup.content_key,
-                &mut Sink::File { tx },
-            )
-            .await;
+            // A cancel drops the fetch, and the sink with it, so it ends the
+            // same way a failed fetch does: the channel closes, the writer is
+            // joined, and the file goes below — in that order, so the writer
+            // cannot recreate the `.part` after it was deleted.
+            let fetch = cancel
+                .run_until_cancelled(fetch_decrypt_in_order(
+                    http,
+                    &setup.url_template,
+                    setup.n_segments,
+                    "CMAF-DISK",
+                    &setup.content_key,
+                    &mut Sink::File { tx },
+                ))
+                .await
+                .unwrap_or_else(|| Err(cancelled(track_id)));
 
             // Dropping the sink closed the channel, so the writer finishes and
             // reports what it managed to write. Join it either way: on a fetch
@@ -449,17 +472,18 @@ pub async fn download_full_sized(
 /// path, so this adds no fourth route onto the card. A body that disagrees
 /// with its `Content-Length` is refused rather than published, and a response
 /// with no length at all is declined: an unbounded download is exactly what
-/// this exists to prevent.
+/// this exists to prevent. `cancel` works as it does there.
 pub async fn download_plain_sized(
     url: &str,
     track_id: u64,
     choose: impl FnOnce(usize) -> TrackDestination,
+    cancel: &CancellationToken,
 ) -> std::result::Result<DownloadedTrack, String> {
     let http = build_cdn_client()?;
-    let mut response = http
-        .get(url)
-        .send()
+    let mut response = cancel
+        .run_until_cancelled(http.get(url).send())
         .await
+        .ok_or_else(|| cancelled(track_id))?
         .map_err(|e| format!("plain download of track {track_id}: {e}"))?;
     if !response.status().is_success() {
         return Err(format!(
@@ -486,13 +510,19 @@ pub async fn download_plain_sized(
         }
         TrackDestination::Memory => {
             let mut output = ArcSlab::with_capacity(total);
-            while let Some(chunk) = response
-                .chunk()
+            cancel
+                .run_until_cancelled(async {
+                    while let Some(chunk) = response
+                        .chunk()
+                        .await
+                        .map_err(|e| format!("plain download of track {track_id}: {e}"))?
+                    {
+                        output.append(&chunk)?;
+                    }
+                    Ok::<(), String>(())
+                })
                 .await
-                .map_err(|e| format!("plain download of track {track_id}: {e}"))?
-            {
-                output.append(&chunk)?;
-            }
+                .ok_or_else(|| cancelled(track_id))??;
             Ok(DownloadedTrack::Memory(output.into_arc()?))
         }
         TrackDestination::File { path, key } => {
@@ -505,19 +535,21 @@ pub async fn download_plain_sized(
             let writer = tokio::task::spawn_blocking(move || {
                 write_track_to_disk(&writer_path, key, Vec::new(), rx)
             });
-            let fetch = async {
-                while let Some(chunk) = response
-                    .chunk()
-                    .await
-                    .map_err(|e| format!("plain download of track {track_id}: {e}"))?
-                {
-                    tx.send(chunk.to_vec())
+            let fetch = cancel
+                .run_until_cancelled(async {
+                    while let Some(chunk) = response
+                        .chunk()
                         .await
-                        .map_err(|_| "disk writer stopped early".to_string())?;
-                }
-                Ok::<(), String>(())
-            }
-            .await;
+                        .map_err(|e| format!("plain download of track {track_id}: {e}"))?
+                    {
+                        tx.send(chunk.to_vec())
+                            .await
+                            .map_err(|_| "disk writer stopped early".to_string())?;
+                    }
+                    Ok::<(), String>(())
+                })
+                .await
+                .unwrap_or_else(|| Err(cancelled(track_id)));
             drop(tx);
             let written = match writer.await {
                 Ok(Ok(written)) => written,
@@ -1349,7 +1381,7 @@ mod arc_slab_tests {
 /// length is never published.
 #[cfg(test)]
 mod plain_sized_tests {
-    use super::{download_plain_sized, DownloadedTrack, TrackDestination};
+    use super::{DownloadedTrack, TrackDestination};
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1362,6 +1394,9 @@ mod plain_sized_tests {
         Unsized,
         /// Claims more than it sends, then hangs up.
         Short,
+        /// Claims more than it sends, then keeps the connection open: a
+        /// download that stalls mid-body, as one parked behind a slow CDN does.
+        Stalls,
     }
 
     async fn serve(body: Vec<u8>, framing: Framing) -> String {
@@ -1385,17 +1420,35 @@ mod plain_sized_tests {
                             body.len()
                         ),
                         Framing::Unsized => "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".into(),
-                        Framing::Short => format!(
+                        Framing::Short | Framing::Stalls => format!(
                             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                             body.len() * 2
                         ),
                     };
                     let _ = conn.write_all(header.as_bytes()).await;
                     let _ = conn.write_all(&body).await;
+                    if matches!(framing, Framing::Stalls) {
+                        std::future::pending::<()>().await;
+                    }
                 });
             }
         });
         url
+    }
+
+    /// [`super::download_plain_sized`] with a token nothing cancels.
+    async fn download(
+        url: &str,
+        track_id: u64,
+        choose: impl FnOnce(usize) -> TrackDestination,
+    ) -> Result<DownloadedTrack, String> {
+        super::download_plain_sized(
+            url,
+            track_id,
+            choose,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
     }
 
     fn track(len: usize) -> Vec<u8> {
@@ -1415,7 +1468,7 @@ mod plain_sized_tests {
         let url = serve(body.clone(), Framing::Sized).await;
         let seen = Arc::new(Mutex::new(None));
         let saw = Arc::clone(&seen);
-        let got = download_plain_sized(&url, 1, move |total| {
+        let got = download(&url, 1, move |total| {
             *saw.lock().unwrap() = Some(total);
             TrackDestination::Memory
         })
@@ -1440,10 +1493,9 @@ mod plain_sized_tests {
         let path = dir.join("track.part");
         let key = qbz_cmaf::SealKey::random();
         let dest = path.clone();
-        let got =
-            download_plain_sized(&url, 1, move |_| TrackDestination::File { path: dest, key })
-                .await
-                .unwrap();
+        let got = download(&url, 1, move |_| TrackDestination::File { path: dest, key })
+            .await
+            .unwrap();
         assert!(matches!(got, DownloadedTrack::File(p) if p == path));
         let on_disk = std::fs::read(&path).unwrap();
         std::fs::remove_dir_all(&dir).ok();
@@ -1456,7 +1508,7 @@ mod plain_sized_tests {
     async fn a_refusal_downloads_nothing() {
         crypto();
         let url = serve(track(1000), Framing::Sized).await;
-        let got = download_plain_sized(&url, 1, |_| TrackDestination::Refuse)
+        let got = download(&url, 1, |_| TrackDestination::Refuse)
             .await
             .unwrap();
         assert!(matches!(got, DownloadedTrack::Refused));
@@ -1468,7 +1520,7 @@ mod plain_sized_tests {
     async fn a_response_with_no_length_is_declined() {
         crypto();
         let url = serve(track(1000), Framing::Unsized).await;
-        let got = download_plain_sized(&url, 1, |_| panic!("nothing to decide on"))
+        let got = download(&url, 1, |_| panic!("nothing to decide on"))
             .await
             .unwrap();
         assert!(matches!(got, DownloadedTrack::Refused));
@@ -1480,7 +1532,7 @@ mod plain_sized_tests {
     async fn a_short_body_is_refused_in_memory_and_on_the_card() {
         crypto();
         let url = serve(track(50_000), Framing::Short).await;
-        assert!(download_plain_sized(&url, 1, |_| TrackDestination::Memory)
+        assert!(download(&url, 1, |_| TrackDestination::Memory)
             .await
             .is_err());
 
@@ -1488,7 +1540,7 @@ mod plain_sized_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("track.part");
         let dest = path.clone();
-        let got = download_plain_sized(&url, 1, move |_| TrackDestination::File {
+        let got = download(&url, 1, move |_| TrackDestination::File {
             path: dest,
             key: qbz_cmaf::SealKey::random(),
         })
@@ -1497,6 +1549,66 @@ mod plain_sized_tests {
         assert!(
             !path.exists(),
             "a short file must not be left for the cache to publish"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A cancelled download stops, and leaves no file behind — not even once
+    /// the blocking writer has finished.
+    ///
+    /// The gapless successor is fetched while the current track plays, and a
+    /// skip makes it worthless: on the Pi a 164 MB fetch ran on for 45 s after
+    /// the listener had moved on, holding the card and the driver. Cancelling
+    /// by dropping the future would leave the writer thread to finish a `.part`
+    /// on its own, after anything that tried to clean it up.
+    #[tokio::test]
+    async fn a_cancelled_download_to_the_card_stops_and_leaves_nothing() {
+        crypto();
+        let url = serve(track(200_000), Framing::Stalls).await;
+        let dir = std::env::temp_dir().join(format!("qbz-plain-cancel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("track.part");
+        let dest = path.clone();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let download = tokio::spawn({
+            let cancel = cancel.clone();
+            async move {
+                super::download_plain_sized(
+                    &url,
+                    1,
+                    move |_| TrackDestination::File {
+                        path: dest,
+                        key: qbz_cmaf::SealKey::random(),
+                    },
+                    &cancel,
+                )
+                .await
+            }
+        });
+
+        // Under way: the writer has the file open and part of the body in it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the download never started"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(!download.is_finished(), "the stalled body cannot complete");
+
+        cancel.cancel();
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), download)
+            .await
+            .expect("a cancel must end the download, not wait for the body")
+            .expect("the download task");
+        assert!(got.is_err(), "a cancelled download is not a track");
+        assert!(!path.exists(), "the cancelled download left its file");
+        // The writer was joined before the file went, so nothing writes it back.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !path.exists(),
+            "the writer recreated the file after the cancel"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
