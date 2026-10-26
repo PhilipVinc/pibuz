@@ -1071,6 +1071,55 @@ async fn a_re_emitted_state_during_a_load_does_not_open_a_second_stream() {
     harness.assert_invariants();
 }
 
+/// A skip whose stream takes longer to open than the dedup window, while the
+/// outgoing track runs out, must open that stream ONCE.
+///
+/// Seen on the Pi (track 443926715): the CDN took 5.4 s to answer the first
+/// range, the track being skipped away from ended in the meantime, and the same
+/// SetState then read "PLAYING on an ended track" as a play on a dead engine
+/// and cold-started the new track a second time. Neither guard in the
+/// cold-start load caught it: the player still named the outgoing track, and
+/// the load it was a copy of was now more than 5 s old. The first stream was
+/// "superseded after 0ms buffer wait", the second paid the 5 s probe again, and
+/// the skip took 11.5 s to answer instead of about 6.
+#[tokio::test]
+async fn a_skip_whose_load_outlasts_the_outgoing_track_opens_one_stream() {
+    let harness = ControllerHarness::new().await;
+    harness.become_active_renderer().await;
+    harness.controller().push_queue_and_play(&TRACKS, 0).await;
+    harness.advance_playback(TRACK_DURATION_MS - 2_000);
+    harness.report_tick().await;
+    harness.let_the_load_windows_expire();
+
+    harness.make_the_audio_thread_lag();
+    harness.the_next_stream_outlasts_the_load_windows_and_the_outgoing_track();
+    let before = harness.engine_calls().len();
+    harness.controller().tap_next_track(102, Some(103)).await;
+    let after: Vec<_> = harness.engine_calls().into_iter().skip(before).collect();
+    let streams: Vec<_> = after
+        .iter()
+        .filter(|call| matches!(call, EngineCall::StartStream { .. }))
+        .collect();
+    assert!(
+        matches!(
+            streams.as_slice(),
+            [EngineCall::StartStream {
+                track_id: 102,
+                start_secs: 0,
+                ..
+            }]
+        ),
+        "the skip must open exactly one stream, for 102 at 0 s; it opened \
+         {streams:?}\ntimeline:\n{}",
+        harness.rendered_timeline()
+    );
+
+    harness.audio_thread_catches_up();
+    assert_eq!(harness.engine().snapshot().track_id, 102);
+    assert!(harness.engine().snapshot().is_playing);
+    harness.assert_invariants();
+}
+
 // ====================================================== modes the cloud owns
 
 /// Repeat mode from the controller reaches the player, with the right meaning.

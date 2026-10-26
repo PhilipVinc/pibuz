@@ -486,9 +486,19 @@ pub async fn apply_renderer_command(
                         // its own — and it plays from the top unless the
                         // frame names a position: the cached one is where the
                         // track ended.
+                        //
+                        // None of this applies when this frame has just
+                        // started a stream itself: the engine still describes
+                        // the track being LEFT until the audio thread adopts
+                        // the new one. On the Pi the open alone outlasts
+                        // `LOAD_ATTEMPT_DEDUP_WINDOW` (the CDN's first range
+                        // takes ~5.4 s), so a skip near the end of a track
+                        // found that track over, read it as a play on a dead
+                        // engine, and streamed the new track a second time.
                         let ended = *playing_state == Some(PLAYING_STATE_PLAYING)
                             && track_has_ended(&engine.get_playback_state());
-                        let cold_engine = !engine.has_loaded_audio() || ended;
+                        let cold_engine =
+                            stream_started_at.is_none() && (!engine.has_loaded_audio() || ended);
                         let cold_track = projection_renderer_state.current_track.as_ref();
                         if cold_engine && cold_track.is_some() {
                             let track_id = cold_track.map(|t| t.track_id).unwrap_or(0);
