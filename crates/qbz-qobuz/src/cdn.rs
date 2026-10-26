@@ -79,6 +79,9 @@ pub fn client() -> Result<&'static reqwest::Client, String> {
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(READ_TIMEOUT)
         .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+        // Every track load opens a connection here while a prefetch fills the
+        // link, which is when a lookup stalls for 5 s; see `crate::dns`.
+        .dns_resolver(crate::dns::shared())
         .build()
         .map_err(|e| format!("CDN client error: {e}"))?;
     Ok(CDN_CLIENT.get_or_init(|| built))

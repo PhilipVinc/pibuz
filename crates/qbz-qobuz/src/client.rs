@@ -118,6 +118,9 @@ impl QobuzClient {
             // address) can't hang startup. Does not affect body-read time, so
             // long streaming reads are unaffected.
             .connect_timeout(std::time::Duration::from_secs(10))
+            // The stream-URL resolve of a skip runs under the same saturated link
+            // as the CDN fetches; see `crate::dns`.
+            .dns_resolver(crate::dns::shared())
             .build()?;
 
         Ok(Self {

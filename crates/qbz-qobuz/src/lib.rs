@@ -35,6 +35,7 @@ pub mod bundle;
 pub mod cdn;
 pub mod client;
 pub mod cmaf;
+pub(crate) mod dns;
 pub mod endpoints;
 pub mod error;
 pub(crate) mod forbidden_breaker;
