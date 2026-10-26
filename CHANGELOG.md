@@ -3,6 +3,27 @@
 Notable changes per release. Versions are plain semver; releases are `vX.Y.Z`
 tags on `main`.
 
+## Unreleased
+
+### Fixed
+
+- **A queue that has played out no longer tells the event hook `stopped`**
+  (#6). At rest on its first track nothing is loaded, so the hook heard
+  `paused` and then, seven seconds later, `stopped` — the same event a
+  controller disconnect produces. moOde reads that as the client leaving and
+  restarts the daemon, so the box dropped out of the app after every album
+  and came back at `qconnect.initial_volume`. The at-rest queue is now
+  `paused`, as the app and `/api/status` already showed it, for as long as
+  this box holds the render; a disconnect while at rest is still `stopped`.
+
+### Added
+
+- **`QconnectSessionChanged` fires when the render moves**, not only when the
+  cloud connection does, and carries `is_active` (`QBZ_IS_ACTIVE` in the
+  hook): true while this box is the session's active renderer. A controller
+  that disconnects or switches to other speakers turns it false while
+  `session_active` stays true.
+
 ## 2.7.1 — 2026-10-18
 
 ### Fixed

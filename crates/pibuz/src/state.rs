@@ -85,6 +85,7 @@ impl DaemonShared {
                 device_name: (!self.qconnect.device_name.is_empty())
                     .then(|| self.qconnect.device_name.clone()),
                 session_active: self.qconnect.session_active,
+                is_active: self.qconnect.is_active,
             });
         }
     }

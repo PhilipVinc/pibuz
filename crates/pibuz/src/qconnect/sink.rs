@@ -283,8 +283,13 @@ impl DaemonEventSink {
                         "elsewhere"
                     }
                 );
+                shared.qconnect.is_active = is_active;
+                // On the bus too. A controller that disconnects, or moves
+                // playback elsewhere, leaves the cloud connection up, so no
+                // lifecycle event fires; integrators saw only a `stopped`,
+                // which a played-out queue also used to produce (#6).
+                shared.emit_qconnect_session_changed();
             }
-            shared.qconnect.is_active = is_active;
         }
     }
 
