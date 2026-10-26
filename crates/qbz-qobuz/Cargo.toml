@@ -15,6 +15,7 @@ qbz-log = { path = "../qbz-log" }
 
 # Async
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 futures-util = { workspace = true }
 
 # HTTP

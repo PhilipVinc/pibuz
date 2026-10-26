@@ -1884,6 +1884,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "uuid",
 ]
 
@@ -1979,6 +1980,7 @@ dependencies = [
  "serde",
  "symphonia",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -2002,6 +2004,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
