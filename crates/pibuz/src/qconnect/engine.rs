@@ -462,6 +462,55 @@ impl DaemonRendererEngine {
         self.core().set_volume(level).map_err(|err| err.to_string())
     }
 
+    /// Start `track_id` from the L1/L2 cache if it is there, as a load: drop
+    /// the previous track's feeder and arm the buffering latch. False when it
+    /// is not cached, or would not start from there.
+    fn play_from_cache(
+        &self,
+        track_id: u64,
+        quality: Quality,
+        start_position_secs: u64,
+        duration_secs: u64,
+    ) -> bool {
+        if !self.core().player().play_cached_if_present(
+            track_id,
+            quality,
+            start_position_secs,
+            duration_secs,
+        ) {
+            return false;
+        }
+        self.abort_current_feeder();
+
+        // Arm the latch here TOO, not just on the streaming path.
+        //
+        // An earlier version of this skipped it, reasoning that a cache
+        // hit is audible almost immediately and has no feeder to wait
+        // for. Both are true and neither is what the latch is for: it
+        // stops the report scheduler publishing the state of the track
+        // we are leaving while the audio thread is still changing over.
+        // Without it, a correct report naming the new track was followed
+        // 27 ms later by a stale one naming the OLD track as stopped —
+        //
+        //   21:37:37.223  Track 74936706 served from the cache
+        //   21:37:37.223  report: track=(74936706, 7)
+        //   21:37:37.250  report: track=(208204223, 0) playing=Some(0)
+        //
+        // — so the controller drew the previous track's cover over the
+        // new one and corrected itself a moment later. Reported as
+        // artwork flicking to the wrong song when jumping back a few
+        // tracks in the queue, which is exactly when the cache hits.
+        //
+        // It clears on the audible edge like any other, which for a
+        // cache hit is the next few milliseconds.
+        self.buffering
+            .begin(track_id, start_position_secs, duration_secs);
+        self.report_notify.notify_one();
+
+        log::info!("[QConnect] Track {track_id} served from the cache — no stream needed");
+        true
+    }
+
     /// Abort the previous track's feeder (no-op when none). The dropped
     /// FailGuard marks the OLD writer errored, which is correct — that buffer
     /// belongs to the abandoned source.
@@ -690,139 +739,139 @@ impl QconnectRendererEngine for DaemonRendererEngine {
         //
         // `Loading` has already been emitted above, which is what frees the card
         // on moOde, and that must still happen before either path.
-        {
-            let player = self.core().player();
-            if player.play_cached_if_present(track_id, quality, start_position_secs, duration_secs)
-            {
-                self.abort_current_feeder();
+        if self.play_from_cache(track_id, quality, start_position_secs, duration_secs) {
+            return Ok(());
+        }
 
-                // Arm the latch here TOO, not just on the streaming path.
-                //
-                // An earlier version of this skipped it, reasoning that a cache
-                // hit is audible almost immediately and has no feeder to wait
-                // for. Both are true and neither is what the latch is for: it
-                // stops the report scheduler publishing the state of the track
-                // we are leaving while the audio thread is still changing over.
-                // Without it, a correct report naming the new track was followed
-                // 27 ms later by a stale one naming the OLD track as stopped —
-                //
-                //   21:37:37.223  Track 74936706 served from the cache
-                //   21:37:37.223  report: track=(74936706, 7)
-                //   21:37:37.250  report: track=(208204223, 0) playing=Some(0)
-                //
-                // — so the controller drew the previous track's cover over the
-                // new one and corrected itself a moment later. Reported as
-                // artwork flicking to the wrong song when jumping back a few
-                // tracks in the queue, which is exactly when the cache hits.
-                //
-                // It clears on the audible edge like any other, which for a
-                // cache hit is the next few milliseconds.
-                self.buffering
-                    .begin(track_id, start_position_secs, duration_secs);
-                self.report_notify.notify_one();
+        // The gapless fetch of this very track may be under way: a skip to the
+        // next track usually lands while it downloads. Race it against our own
+        // resolve and first range rather than fetch the file twice, and play
+        // from the cache if it lands first. On the Pi the stream's first range
+        // took 5 s to answer while the fetch finished, and was then thrown away
+        // (2026-10-27). When the stream wins, the driver calls the fetch off.
+        //
+        // Dropping `open_stream` mid-race is safe: its only awaits are the
+        // resolve and the probe, and nothing has started playing before the
+        // probe returns.
+        let prefetch_done = self.core().player().gapless_fetch_finished(track_id);
+        let open_stream = async {
+            let stream_url = self
+                .buffering
+                .while_resolving(
+                    &self.report_notify,
+                    track_id,
+                    start_position_secs,
+                    duration_secs,
+                    async {
+                        self.core()
+                            .get_stream_url(track_id, quality)
+                            .await
+                            .map_err(|err| {
+                                format!("resolve stream url for remote track {track_id}: {err}")
+                            })
+                    },
+                )
+                .await?;
 
-                log::info!("[QConnect] Track {track_id} served from the cache — no stream needed");
-                return Ok(());
+            // A track this account cannot stream comes back as a 30 s preview, and
+            // is played as what it is: a 30 s track. From here on `duration_secs`
+            // is the FILE's length — the latch, the player's clock, and so every
+            // report the controller draws its progress bar from — and an offset
+            // past the end of the preview starts it from the top.
+            let duration_secs = stream_url.playable_duration_secs(duration_secs);
+            let start_position_secs = if stream_url.sample && start_position_secs >= duration_secs {
+                0
+            } else {
+                start_position_secs
+            };
+            if stream_url.sample {
+                log::info!(
+                    "[QConnect] Track {track_id}: playing Qobuz's {duration_secs}s preview from {start_position_secs}s"
+                );
             }
-        }
 
-        let stream_url = self
-            .buffering
-            .while_resolving(
-                &self.report_notify,
-                track_id,
-                start_position_secs,
-                duration_secs,
-                async {
-                    self.core()
-                        .get_stream_url(track_id, quality)
+            // Stop the previous track's download before starting the next one (see
+            // `current_feeder`) — AFTER the resolve above, deliberately.
+            //
+            // Moving it before the resolve was tried, to stop a skipped-past track
+            // pulling bytes while the next one starts, and reverted: aborting the
+            // feeder does not merely stop the download, it POISONS the buffer.
+            // `FailGuard::drop` in `remote_stream.rs` calls `writer.error(..)`, and
+            // `BufferedMediaSource::read` checks `download_error` BEFORE it will
+            // serve bytes it already holds — so the outgoing track goes silent
+            // within one decode read even with megabytes buffered. `get_stream_url`
+            // is also not one round trip: it walks `Quality::fallback_order()`,
+            // each rung a signed API call. So the early abort bought a silence gap
+            // on every track change, and permanent silence whenever the resolve
+            // failed, since the caller only logs that error.
+            //
+            // The contention it was meant to fix is small in any case: the outgoing
+            // feeder is window-parked and rate-matched to playback, and the body it
+            // was observed opening mid-skip was serving the decoder that was still
+            // audible.
+            //
+            // A safe version would cancel the feeder task WITHOUT arming the
+            // FailGuard, leaving the buffered audio playable. That needs a new
+            // cancellation path, not a reordering.
+            self.abort_current_feeder();
+
+            // Still loading, armed again now the resolve has said what the file IS:
+            // a preview's length and start replace the catalog's. The stream is
+            // not audible until the feeder reaches `start_position_secs` and the
+            // pre-skip completes; the report scheduler clears this once the player
+            // starts producing audio.
+            self.buffering
+                .begin(track_id, start_position_secs, duration_secs);
+            self.report_notify.notify_one();
+
+            // The feeder outlives its signed URL whenever a track is paused for
+            // long enough, and re-resolves through this. Same call, same quality,
+            // so it names the same file; the feeder refuses one that does not.
+            let refresh_core = Arc::clone(self.core());
+            let refresh_url: super::remote_stream::UrlRefresher = Arc::new(move || {
+                let core = Arc::clone(&refresh_core);
+                Box::pin(async move {
+                    core.get_stream_url(track_id, quality)
                         .await
-                        .map_err(|err| {
-                            format!("resolve stream url for remote track {track_id}: {err}")
-                        })
-                },
+                        .map(|fresh| fresh.url)
+                        .map_err(|err| err.to_string())
+                })
+            });
+
+            let player = self.core().player();
+            let stream_result = super::remote_stream::stream_remote_track_into_player(
+                &player,
+                track_id,
+                duration_secs,
+                start_position_secs,
+                &stream_url.url,
+                Some(refresh_url),
+                // Never stage a preview on the card: the cache is keyed by track
+                // id, and the next cast would replay it as the track.
+                !stream_url.sample,
+                "QConnect",
             )
-            .await?;
-
-        // A track this account cannot stream comes back as a 30 s preview, and
-        // is played as what it is: a 30 s track. From here on `duration_secs`
-        // is the FILE's length — the latch, the player's clock, and so every
-        // report the controller draws its progress bar from — and an offset
-        // past the end of the preview starts it from the top.
-        let duration_secs = stream_url.playable_duration_secs(duration_secs);
-        let start_position_secs = if stream_url.sample && start_position_secs >= duration_secs {
-            0
-        } else {
-            start_position_secs
+            .await;
+            Ok::<_, String>((stream_url, start_position_secs, stream_result))
         };
-        if stream_url.sample {
-            log::info!(
-                "[QConnect] Track {track_id}: playing Qobuz's {duration_secs}s preview from {start_position_secs}s"
-            );
-        }
-
-        // Stop the previous track's download before starting the next one (see
-        // `current_feeder`) — AFTER the resolve above, deliberately.
-        //
-        // Moving it before the resolve was tried, to stop a skipped-past track
-        // pulling bytes while the next one starts, and reverted: aborting the
-        // feeder does not merely stop the download, it POISONS the buffer.
-        // `FailGuard::drop` in `remote_stream.rs` calls `writer.error(..)`, and
-        // `BufferedMediaSource::read` checks `download_error` BEFORE it will
-        // serve bytes it already holds — so the outgoing track goes silent
-        // within one decode read even with megabytes buffered. `get_stream_url`
-        // is also not one round trip: it walks `Quality::fallback_order()`,
-        // each rung a signed API call. So the early abort bought a silence gap
-        // on every track change, and permanent silence whenever the resolve
-        // failed, since the caller only logs that error.
-        //
-        // The contention it was meant to fix is small in any case: the outgoing
-        // feeder is window-parked and rate-matched to playback, and the body it
-        // was observed opening mid-skip was serving the decoder that was still
-        // audible.
-        //
-        // A safe version would cancel the feeder task WITHOUT arming the
-        // FailGuard, leaving the buffered audio playable. That needs a new
-        // cancellation path, not a reordering.
-        self.abort_current_feeder();
-
-        // Still loading, armed again now the resolve has said what the file IS:
-        // a preview's length and start replace the catalog's. The stream is
-        // not audible until the feeder reaches `start_position_secs` and the
-        // pre-skip completes; the report scheduler clears this once the player
-        // starts producing audio.
-        self.buffering
-            .begin(track_id, start_position_secs, duration_secs);
-        self.report_notify.notify_one();
-
-        // The feeder outlives its signed URL whenever a track is paused for
-        // long enough, and re-resolves through this. Same call, same quality,
-        // so it names the same file; the feeder refuses one that does not.
-        let refresh_core = Arc::clone(self.core());
-        let refresh_url: super::remote_stream::UrlRefresher = Arc::new(move || {
-            let core = Arc::clone(&refresh_core);
-            Box::pin(async move {
-                core.get_stream_url(track_id, quality)
-                    .await
-                    .map(|fresh| fresh.url)
-                    .map_err(|err| err.to_string())
-            })
-        });
-
-        let player = self.core().player();
-        let stream_result = super::remote_stream::stream_remote_track_into_player(
-            &player,
-            track_id,
-            duration_secs,
-            start_position_secs,
-            &stream_url.url,
-            Some(refresh_url),
-            // Never stage a preview on the card: the cache is keyed by track
-            // id, and the next cast would replay it as the track.
-            !stream_url.sample,
-            "QConnect",
-        )
-        .await;
+        let (stream_url, start_position_secs, stream_result) = match prefetch_done {
+            None => open_stream.await?,
+            Some(prefetch_done) => {
+                let mut open_stream = std::pin::pin!(open_stream);
+                tokio::select! {
+                    opened = &mut open_stream => opened?,
+                    () = prefetch_done => {
+                        if self.play_from_cache(track_id, quality, start_position_secs, duration_secs) {
+                            log::info!(
+                                "[QConnect] Track {track_id}: its gapless fetch landed before the stream opened"
+                            );
+                            return Ok(());
+                        }
+                        open_stream.await?
+                    }
+                }
+            }
+        };
 
         let stream_err = match stream_result {
             Ok(feeder) => {
