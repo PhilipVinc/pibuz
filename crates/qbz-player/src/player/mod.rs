@@ -12,6 +12,7 @@
 
 mod cmaf_fetch;
 mod disk_tee;
+mod gapless_fetches;
 mod playback_engine;
 mod streaming_source;
 
@@ -2254,6 +2255,8 @@ pub struct Player {
     /// Two-level playback cache (L1 memory + optional L2 disk). A track is
     /// cached after its first play so replays start instantly.
     audio_cache: Arc<qbz_cache::AudioCache>,
+    /// The gapless successor [`Player::fetch_for_gapless`] is downloading.
+    gapless_fetches: gapless_fetches::GaplessFetches,
 }
 
 impl Default for Player {
@@ -5553,6 +5556,7 @@ impl Player {
             state,
             audio_settings: settings,
             audio_cache,
+            gapless_fetches: Default::default(),
         }
     }
 
@@ -6333,6 +6337,17 @@ impl Player {
         l2.set_pinned(ids);
     }
 
+    /// While [`Self::fetch_for_gapless`] is downloading `track_id`: a future
+    /// that completes once it is over, however it ended. A fetch that
+    /// succeeded has put the track in the cache by then, where
+    /// [`Self::play_cached_if_present`] finds it.
+    pub fn gapless_fetch_finished(
+        &self,
+        track_id: u64,
+    ) -> Option<impl std::future::Future<Output = ()> + Send + 'static> {
+        self.gapless_fetches.finished(track_id)
+    }
+
     /// Fetch a track's audio for a gapless handoff: L1 memory →
     /// L2 disk → CMAF `download_full_sized` (legacy full download as fallback).
     /// Does not start playback — the caller hands the result to `play_next`
@@ -6375,6 +6390,11 @@ impl Player {
                 return Some(TrackAudio::File(file));
             }
         }
+
+        // Listed until this returns, so a load of this very track can wait for
+        // the bytes instead of fetching them again; the guard drops after the
+        // cache has them.
+        let _in_flight = self.gapless_fetches.begin(track_id);
 
         // Not cached anywhere. Decide WHERE the download lands before it starts:
         // the segment table gives the exact size up front, so a track too big to
@@ -8466,6 +8486,7 @@ mod cached_play_duration_tests {
             state: SharedState::new(),
             audio_settings: Arc::new(Mutex::new(AudioSettings::default())),
             audio_cache: Arc::new(qbz_cache::AudioCache::new(16 * 1024 * 1024)),
+            gapless_fetches: Default::default(),
         };
         (player, rx)
     }
