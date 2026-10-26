@@ -18,7 +18,7 @@ members = [
 ]
 
 [workspace.package]
-version = "2.7.1"
+version = "2.7.2"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/PhilipVinc/pibuz"

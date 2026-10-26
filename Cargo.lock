@@ -1690,7 +1690,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "pibuz"
-version = "2.7.1"
+version = "2.7.2"
 dependencies = [
  "async-trait",
  "clap",
@@ -1868,7 +1868,7 @@ dependencies = [
 
 [[package]]
 name = "qbz-app"
-version = "2.7.1"
+version = "2.7.2"
 dependencies = [
  "chrono",
  "log",
@@ -1890,7 +1890,7 @@ dependencies = [
 
 [[package]]
 name = "qbz-audio"
-version = "2.7.1"
+version = "2.7.2"
 dependencies = [
  "alsa",
  "alsa-sys",
@@ -1912,7 +1912,7 @@ dependencies = [
 
 [[package]]
 name = "qbz-cache"
-version = "2.7.1"
+version = "2.7.2"
 dependencies = [
  "dirs 6.0.0",
  "filetime",
@@ -1923,7 +1923,7 @@ dependencies = [
 
 [[package]]
 name = "qbz-cmaf"
-version = "2.7.1"
+version = "2.7.2"
 dependencies = [
  "aes",
  "base64",
@@ -1939,7 +1939,7 @@ dependencies = [
 
 [[package]]
 name = "qbz-log"
-version = "2.7.1"
+version = "2.7.2"
 dependencies = [
  "chrono",
  "dirs 5.0.1",
@@ -1950,7 +1950,7 @@ dependencies = [
 
 [[package]]
 name = "qbz-models"
-version = "2.7.1"
+version = "2.7.2"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1963,7 +1963,7 @@ dependencies = [
 
 [[package]]
 name = "qbz-player"
-version = "2.7.1"
+version = "2.7.2"
 dependencies = [
  "bytes",
  "log",
@@ -1985,7 +1985,7 @@ dependencies = [
 
 [[package]]
 name = "qbz-qobuz"
-version = "2.7.1"
+version = "2.7.2"
 dependencies = [
  "anyhow",
  "base64",
@@ -2009,7 +2009,7 @@ dependencies = [
 
 [[package]]
 name = "qconnect-app"
-version = "2.7.1"
+version = "2.7.2"
 dependencies = [
  "async-trait",
  "log",
@@ -2028,7 +2028,7 @@ dependencies = [
 
 [[package]]
 name = "qconnect-core"
-version = "2.7.1"
+version = "2.7.2"
 dependencies = [
  "qbz-models",
  "serde",
@@ -2037,7 +2037,7 @@ dependencies = [
 
 [[package]]
 name = "qconnect-protocol"
-version = "2.7.1"
+version = "2.7.2"
 dependencies = [
  "log",
  "prost",
@@ -2050,7 +2050,7 @@ dependencies = [
 
 [[package]]
 name = "qconnect-transport-ws"
-version = "2.7.1"
+version = "2.7.2"
 dependencies = [
  "async-trait",
  "futures-util",

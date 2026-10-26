@@ -3,7 +3,7 @@
 Notable changes per release. Versions are plain semver; releases are `vX.Y.Z`
 tags on `main`.
 
-## Unreleased
+## 2.7.2 — 2026-10-27
 
 ### Fixed
 
