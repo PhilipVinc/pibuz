@@ -123,6 +123,92 @@ async fn a_state_only_pause_does_not_rewind_to_an_earlier_track() {
     harness.assert_invariants();
 }
 
+/// Skipping through a queue must leave the phone on the track it skipped to,
+/// and a pause must leave it there too (issue #5).
+///
+/// The renderer's answer to every SetState left out the queue item, and the
+/// wire cannot tell a missing field from 0 — the head of the queue. So each skip
+/// slid to the next song, flashed back to the first one picked, and slid on
+/// again; a pause, which the cloud does not follow with a correction, left the
+/// phone on that first song, and play then started it.
+#[tokio::test]
+async fn skips_and_a_pause_keep_the_screen_on_the_track_that_is_playing() {
+    let harness = ControllerHarness::new().await;
+    harness.become_active_renderer().await;
+    let items = harness.controller().push_queue(&TRACKS, 0).await;
+    harness.controller().tap_track(&items, 0).await;
+    harness.report_tick().await;
+
+    harness.let_the_load_windows_expire();
+    harness.controller().tap_track(&items, 1).await;
+    assert_eq!(
+        harness.view().track_id,
+        Some(items[1].queue_item_id),
+        "the skip must leave the screen on the track skipped to; timeline:\n{}",
+        harness.rendered_timeline()
+    );
+    harness.advance_playback(12_000);
+    harness.report_tick().await;
+
+    harness.let_the_load_windows_expire();
+    harness.controller().tap_pause().await;
+    assert_eq!(
+        harness.view().track_id,
+        Some(items[1].queue_item_id),
+        "a pause must not move the screen; timeline:\n{}",
+        harness.rendered_timeline()
+    );
+
+    // And after a track the player reached on its own, which no command named.
+    harness.controller().tap_play().await;
+    harness.advance_gaplessly_to(103);
+    harness.report_tick().await;
+    harness.let_the_load_windows_expire();
+    harness.controller().tap_pause().await;
+    assert_eq!(
+        harness.view().track_id,
+        Some(items[2].queue_item_id),
+        "a pause after a gapless advance must name the track reached; timeline:\n{}",
+        harness.rendered_timeline()
+    );
+    harness.assert_invariants();
+}
+
+/// A skip must put the new track's length on screen, not the old one's.
+///
+/// The renderer's answer to the skip stated the length of the track it had
+/// been playing, and it reached the phone after the report that had the right
+/// one, so the new song's progress bar ran against the old song's total until
+/// the next report (issue #5: 201 s shown for a 221 s track). The lengths here
+/// are the three from that log.
+#[tokio::test]
+async fn a_skip_shows_the_length_of_the_track_skipped_to() {
+    let harness = ControllerHarness::new().await;
+    harness.the_catalog_says_it_is(101, 201);
+    harness.the_catalog_says_it_is(102, 221);
+    harness.the_catalog_says_it_is(103, 208);
+    harness.become_active_renderer().await;
+    let items = harness.controller().push_queue(&TRACKS, 0).await;
+    harness.controller().tap_track(&items, 0).await;
+    harness.report_tick().await;
+    assert_eq!(harness.view().total_ms, Some(201_000));
+
+    harness.let_the_load_windows_expire();
+    harness.controller().tap_track(&items, 1).await;
+    assert_eq!(
+        harness.view().total_ms,
+        Some(221_000),
+        "the skip must show the length of the track skipped to; timeline:\n{}",
+        harness.rendered_timeline()
+    );
+
+    harness.report_tick().await;
+    harness.let_the_load_windows_expire();
+    harness.controller().tap_track(&items, 2).await;
+    assert_eq!(harness.view().total_ms, Some(208_000));
+    harness.assert_invariants();
+}
+
 /// A pause within 1.5 s of a load is IGNORED, on purpose.
 ///
 /// Claiming the render from a peer makes that peer stop its own playback, and
@@ -628,10 +714,7 @@ async fn the_cloud_re_emitting_the_current_state_does_not_restart_the_track() {
     harness.let_the_load_windows_expire();
 
     let before = harness.engine_calls().len();
-    harness
-        .controller()
-        .reemits_the_current_state(101, 1000)
-        .await;
+    harness.controller().reemits_the_current_state(101, 0).await;
 
     let after: Vec<_> = harness.engine_calls().into_iter().skip(before).collect();
     assert!(

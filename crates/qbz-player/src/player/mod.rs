@@ -956,6 +956,31 @@ pub(crate) fn plan_successor(
     }
 }
 
+/// Whether a download's [`destination_chooser`] claimed its track's staging
+/// slot in the L2 cache.
+///
+/// The failure paths used to call `abort_write` whatever had happened, and
+/// `abort_write` deletes `<id>.part` by name: a download that never staged
+/// anything deleted the file another writer was still filling, and freed that
+/// writer's slot for a third (issue #5).
+#[derive(Clone, Default)]
+struct StagingClaim(Arc<std::sync::atomic::AtomicBool>);
+
+impl StagingClaim {
+    fn claim(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Abort the staging this download claimed, and only that.
+    fn abort(&self, cache: Option<&Arc<qbz_cache::PlaybackCache>>, track_id: u64) {
+        if self.0.load(std::sync::atomic::Ordering::Acquire) {
+            if let Some(cache) = cache {
+                cache.abort_write(track_id);
+            }
+        }
+    }
+}
+
 /// [`plan_successor`] as the closure `download_full_sized` asks for.
 ///
 /// A free function taking owned arguments rather than a method, so both fetch
@@ -968,13 +993,18 @@ pub(crate) fn plan_successor(
 /// `begin_write` failing is the one thing the plan cannot see coming — a full
 /// card, a read-only mount, an IO error on this one track — so the disk arm
 /// re-decides as if there were no disk at all rather than falling through to a
-/// whole-track allocation on a board that cannot take one.
+/// whole-track allocation on a board that cannot take one. So does another
+/// writer already staging the same track, which `begin_write` also refuses.
+///
+/// `staging` is marked when the disk arm claims the track's slot, so the
+/// caller's failure path aborts the staging it owns and nobody else's.
 fn destination_chooser(
     track_id: u64,
     tag: &'static str,
     spill_cache: Option<Arc<qbz_cache::PlaybackCache>>,
     budget: usize,
     host_can_hold_whole_track: bool,
+    staging: StagingClaim,
 ) -> impl FnOnce(usize) -> qbz_qobuz::TrackDestination {
     move |total: usize| {
         let mb = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
@@ -990,6 +1020,7 @@ fn destination_chooser(
                     .begin_write(track_id, total as u64)
                     .map(|part| (part, cache.key()))
             }) {
+                staging.claim();
                 log::info!(
                     "[{tag}] Track {track_id} is {:.1} MB — streaming it to disk (L1 budget {:.1} MB)",
                     mb(total),
@@ -6026,7 +6057,7 @@ impl Player {
         // `next` allocated ~210 MB of Hi-Res beside the playing track — the same
         // OOM `GAPLESS_MIN_TOTAL_KB` was written to prevent, reached through the
         // other door.
-        let choose = self.destination_chooser(track_id, "PREFETCH");
+        let (choose, staging) = self.destination_chooser(track_id, "PREFETCH");
         let result: Result<Option<TrackBytes>, String> =
             match qbz_qobuz::cmaf::download_full_sized(client, track_id, quality, choose).await {
                 // Already the allocation the cache will share — assembled there
@@ -6060,9 +6091,7 @@ impl Player {
                 }
                 Err(e) => {
                     log::warn!("[PREFETCH] CMAF failed for track {track_id}: {e}, trying legacy");
-                    if let Some(cache) = self.audio_cache.get_playback_cache() {
-                        cache.abort_write(track_id);
-                    }
+                    staging.abort(self.audio_cache.get_playback_cache(), track_id);
                     // The plain download is sized too — from `Content-Length` —
                     // so it goes through the same chooser: memory, card, or not
                     // at all. It used to land in a `Vec` whatever its size.
@@ -6077,7 +6106,7 @@ impl Player {
                             return Ok(());
                         }
                         Ok(stream_url) => {
-                            let choose = self.destination_chooser(track_id, "PREFETCH");
+                            let (choose, staging) = self.destination_chooser(track_id, "PREFETCH");
                             match qbz_qobuz::cmaf::download_plain_sized(
                                 &stream_url.url,
                                 track_id,
@@ -6107,9 +6136,7 @@ impl Player {
                                     return Ok(());
                                 }
                                 Err(e) => {
-                                    if let Some(cache) = self.audio_cache.get_playback_cache() {
-                                        cache.abort_write(track_id);
-                                    }
+                                    staging.abort(self.audio_cache.get_playback_cache(), track_id);
                                     Err(e)
                                 }
                             }
@@ -6247,19 +6274,26 @@ impl Player {
         )
     }
 
-    /// This player's [`destination_chooser`], for a download of `track_id`.
+    /// This player's [`destination_chooser`], for a download of `track_id`,
+    /// with the claim its failure path aborts through.
     fn destination_chooser(
         &self,
         track_id: u64,
         tag: &'static str,
-    ) -> impl FnOnce(usize) -> qbz_qobuz::TrackDestination {
-        destination_chooser(
+    ) -> (
+        impl FnOnce(usize) -> qbz_qobuz::TrackDestination,
+        StagingClaim,
+    ) {
+        let staging = StagingClaim::default();
+        let choose = destination_chooser(
             track_id,
             tag,
             self.audio_cache.get_playback_cache().cloned(),
             self.audio_cache.budget_bytes(),
             self.host_can_hold_whole_track(),
-        )
+            staging.clone(),
+        );
+        (choose, staging)
     }
 
     /// Tell the L2 cache which tracks must not be evicted: the one playing and
@@ -6337,7 +6371,7 @@ impl Player {
         // it decrypts. Assembling it in RAM and writing it out afterwards was a
         // whole-track `Arc` copy plus an 11-15 s fsync'd burst that underran ALSA
         // audibly, twice, measured mid-write.
-        let choose = self.destination_chooser(track_id, "GAPLESS");
+        let (choose, staging) = self.destination_chooser(track_id, "GAPLESS");
 
         match qbz_qobuz::cmaf::download_full_sized(client, track_id, quality, choose).await {
             Ok(qbz_qobuz::DownloadedTrack::File(_)) => {
@@ -6371,9 +6405,7 @@ impl Player {
             }
             Err(e) => {
                 log::warn!("[GAPLESS] CMAF failed for track {track_id}: {e}, trying legacy");
-                if let Some(cache) = self.audio_cache.get_playback_cache() {
-                    cache.abort_write(track_id);
-                }
+                staging.abort(self.audio_cache.get_playback_cache(), track_id);
             }
         }
 
@@ -6408,7 +6440,7 @@ impl Player {
             );
             return None;
         }
-        let choose = self.destination_chooser(track_id, "GAPLESS");
+        let (choose, staging) = self.destination_chooser(track_id, "GAPLESS");
         match qbz_qobuz::cmaf::download_plain_sized(&stream_url.url, track_id, choose).await {
             Ok(qbz_qobuz::DownloadedTrack::File(_)) => {
                 match self.audio_cache.get_playback_cache().and_then(|c| {
@@ -6433,9 +6465,7 @@ impl Player {
             Ok(qbz_qobuz::DownloadedTrack::Refused) => None,
             Err(e) => {
                 log::warn!("[GAPLESS] Legacy download failed for {track_id}: {e}");
-                if let Some(cache) = self.audio_cache.get_playback_cache() {
-                    cache.abort_write(track_id);
-                }
+                staging.abort(self.audio_cache.get_playback_cache(), track_id);
                 None
             }
         }
@@ -7919,9 +7949,11 @@ mod memory_policy_tests {
 
     use qbz_models::system_capabilities::{l1_cache_bytes_for_total_kb, GAPLESS_MIN_TOTAL_KB};
 
+    use std::sync::Arc;
+
     use super::{
-        gapless_prefetch_allowed, gapless_successor_can_be_bounded, plan_successor,
-        should_promote_streaming_buffer, SuccessorPlan,
+        destination_chooser, gapless_prefetch_allowed, gapless_successor_can_be_bounded,
+        plan_successor, should_promote_streaming_buffer, StagingClaim, SuccessorPlan,
     };
 
     /// The user's preference cannot switch the host floor off.
@@ -8023,6 +8055,71 @@ mod memory_policy_tests {
             SuccessorPlan::OnDisk,
             "and with a card it still prefers the card: the pair has to fit"
         );
+    }
+
+    /// A download that could not claim its track's staging slot must not abort
+    /// the staging of the writer that did (issue #5).
+    ///
+    /// The prefetch and hand-off failure paths call `abort`, which deletes
+    /// `<id>.part` by name. They used to call it unconditionally, so a fetch
+    /// that never staged anything — the slot was taken, so it went to memory —
+    /// deleted the file another writer was filling, and handed its slot on.
+    #[test]
+    fn a_download_aborts_only_the_staging_it_claimed() {
+        const TRACK: u64 = 19_860_549;
+        const SIZE: usize = 84 * 1024 * 1024;
+        let dir = std::env::temp_dir().join(format!("qbz-claim-{}", std::process::id()));
+        let cache = Arc::new(
+            qbz_cache::PlaybackCache::with_path(dir.clone(), 400 * 1024 * 1024).expect("cache"),
+        );
+        let budget = l1_cache_bytes_for_total_kb(926_832);
+
+        // Another writer — the live stream's tee — is staging the track.
+        let held = cache
+            .begin_write(TRACK, SIZE as u64)
+            .expect("the first writer");
+        std::fs::write(&held, b"the first writer's bytes").expect("stage");
+
+        let staging = StagingClaim::default();
+        let choose = destination_chooser(
+            TRACK,
+            "PREFETCH",
+            Some(cache.clone()),
+            budget,
+            true,
+            staging.clone(),
+        );
+        assert!(
+            matches!(choose(SIZE), qbz_qobuz::TrackDestination::Memory),
+            "with the slot taken, the download goes to memory"
+        );
+        // Its download fails, and its failure path runs.
+        staging.abort(Some(&cache), TRACK);
+
+        assert!(held.exists(), "the first writer's .part was deleted");
+        assert!(
+            cache.begin_write(TRACK, SIZE as u64).is_none(),
+            "the first writer's slot was handed on"
+        );
+
+        // A download that did claim it aborts it.
+        cache.abort_write(TRACK);
+        let staging = StagingClaim::default();
+        let choose = destination_chooser(
+            TRACK,
+            "PREFETCH",
+            Some(cache.clone()),
+            budget,
+            true,
+            staging.clone(),
+        );
+        assert!(matches!(
+            choose(SIZE),
+            qbz_qobuz::TrackDestination::File { .. }
+        ));
+        staging.abort(Some(&cache), TRACK);
+        assert!(cache.begin_write(TRACK, SIZE as u64).is_some());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 

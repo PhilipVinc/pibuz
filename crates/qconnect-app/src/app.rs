@@ -792,6 +792,40 @@ where
                 // would create an infinite feedback loop if we replied to it.
                 let is_substantive = playing_state.is_some() || current_track.is_some();
                 if is_substantive {
+                    let (current_queue_item_id, next_queue_item_id, answer_track_id) = {
+                        let state = self.state.lock().await;
+                        setstate_report_queue_items(
+                            current_track.as_ref(),
+                            renderer,
+                            &state.queue,
+                            state.reported_queue_items,
+                        )
+                    };
+                    // The length of the track this answer names. For a SetState
+                    // naming a track that is the catalog's: the renderer's own
+                    // figure is the track it was playing until a moment ago —
+                    // on a skip, the previous one, and this answer lands after
+                    // the report that had it right (issue #5). For a state-only
+                    // one the renderer's figure comes first: its report loop
+                    // publishes the audible track's, a 30 s preview's included.
+                    // Separate lock from `state`: the two are never co-locked.
+                    let catalog_length_ms = match answer_track_id {
+                        Some(track_id) => self
+                            .sync
+                            .lock()
+                            .await
+                            .known_tracks
+                            .get(&track_id)
+                            .and_then(Option::as_ref)
+                            .map(|track| track.duration_secs * 1000)
+                            .filter(|&ms| ms > 0),
+                        None => None,
+                    };
+                    let duration_ms = if current_track.is_some() {
+                        catalog_length_ms.or(renderer.current_duration_ms)
+                    } else {
+                        renderer.current_duration_ms.or(catalog_length_ms)
+                    };
                     log::info!(
                         "[QConnect/Report] SetState report: playing={:?} pos={:?} track={:?} next={:?} qv={}.{}",
                         renderer.playing_state,
@@ -828,13 +862,18 @@ where
                             // 0:00 until the next report from the renderer's own loop.
                             // Racing that echo with a faster follow-up only shortened
                             // the flash; stating the duration removes it.
-                            "duration": renderer.current_duration_ms,
+                            "duration": duration_ms,
                             "queue_version": {
                                 "major": queue_version_ref.major,
                                 "minor": queue_version_ref.minor
                             },
-                            "current_queue_item_id": Option::<i32>::None,
-                            "next_queue_item_id": Option::<i32>::None
+                            // Stated, never left out: the wire drops a field at
+                            // its default, so a missing item IS item 0 — the
+                            // head of the queue. Leaving these out sent the
+                            // phone back to the first track picked after every
+                            // skip and pause (issue #5).
+                            "current_queue_item_id": current_queue_item_id,
+                            "next_queue_item_id": next_queue_item_id
                         }),
                     );
                     self.send_renderer_report(report).await?;
@@ -927,10 +966,88 @@ where
         });
     }
 
+    /// Every renderer report goes out through here, the host's own report loop
+    /// included, so this is where we learn which queue item the controller is
+    /// showing for us: the one our last state report named.
+    ///
+    /// That is the answer a state-only SetState (a pause, a play) has to repeat.
+    /// The cached `current_track` cannot give it: it follows the cloud's
+    /// commands, so after a gapless advance it still names the track the cloud
+    /// last ordered. The report loop names the AUDIBLE track.
     async fn send_renderer_report(&self, report: RendererReport) -> Result<(), QconnectAppError> {
+        let reported = (report.message_type() == "MESSAGE_TYPE_RNDR_SRVR_STATE_UPDATED")
+            .then(|| {
+                let current = report
+                    .payload
+                    .get("current_queue_item_id")
+                    .and_then(Value::as_u64)?;
+                let next = report
+                    .payload
+                    .get("next_queue_item_id")
+                    .and_then(Value::as_u64);
+                Some((current, next))
+            })
+            .flatten();
         let envelope = build_qconnect_renderer_outbound_envelope(report)?;
         self.transport.send(envelope).await?;
+        if let Some(reported) = reported {
+            self.state.lock().await.reported_queue_items = Some(reported);
+        }
         Ok(())
+    }
+}
+
+/// The `(current, next)` queue items a SetState's answer names, and the track
+/// the current one holds.
+///
+/// - The command named a track: that one, normalized the way every report
+///   names it (a fresh release's placeholder head is item 0), and the next
+///   track the command named with it.
+/// - A state-only command (pause, play): what our last state report named,
+///   while the queue still holds it — the screen already shows it, and it
+///   follows the audible track through gapless advances that no command named.
+/// - Otherwise the cached current track, the last thing the cloud ordered.
+fn setstate_report_queue_items(
+    named: Option<&QueueItem>,
+    renderer: &QConnectRendererState,
+    queue: &QConnectQueueState,
+    reported: Option<(u64, Option<u64>)>,
+) -> (Option<u64>, Option<u64>, Option<u64>) {
+    use crate::queue_resolution::{
+        find_cursor_index_by_queue_item_id, normalize_current_queue_item_id_from_queue_state,
+        ordered_queue_cursors, QconnectOrderedQueueCursor,
+    };
+
+    let normalized = |item: &QueueItem| {
+        queue
+            .queue_items
+            .iter()
+            .position(|queued| {
+                queued.queue_item_id == item.queue_item_id && queued.track_id == item.track_id
+            })
+            .map(|index| normalize_current_queue_item_id_from_queue_state(queue, index))
+            .unwrap_or(item.queue_item_id)
+    };
+    let next = || renderer.next_track.as_ref().map(|item| item.queue_item_id);
+
+    if let Some(item) = named {
+        return (Some(normalized(item)), next(), Some(item.track_id));
+    }
+    if let Some((current, reported_next)) = reported {
+        let cursors = ordered_queue_cursors(queue);
+        if let Some(cursor) = find_cursor_index_by_queue_item_id(&cursors, queue, Some(current))
+            .map(|position| cursors[position])
+        {
+            let track_id = match cursor {
+                QconnectOrderedQueueCursor::Queue(index) => queue.queue_items[index].track_id,
+                QconnectOrderedQueueCursor::Autoplay(index) => queue.autoplay_items[index].track_id,
+            };
+            return (Some(current), reported_next, Some(track_id));
+        }
+    }
+    match renderer.current_track.as_ref() {
+        Some(item) => (Some(normalized(item)), next(), Some(item.track_id)),
+        None => (None, None, None),
     }
 }
 
@@ -2248,8 +2365,8 @@ mod tests {
         );
     }
 
-    use super::{queue_hashes_diverge, QconnectApp};
-    use qconnect_core::QConnectQueueState;
+    use super::{queue_hashes_diverge, setstate_report_queue_items, QconnectApp};
+    use qconnect_core::{QConnectQueueState, QConnectRendererState};
     use qconnect_protocol::{
         QueueCommandType, QueueEventType, QueueServerEvent, RendererCommandType,
         RendererServerCommand,
@@ -2280,6 +2397,94 @@ mod tests {
             subscribe_channels: vec![vec![1, 2, 3]],
             ..Default::default()
         }
+    }
+
+    fn queue_item(queue_item_id: u64, track_id: u64) -> qconnect_core::QueueItem {
+        qconnect_core::QueueItem {
+            track_context_uuid: "ctx".to_string(),
+            track_id,
+            queue_item_id,
+        }
+    }
+
+    fn queue_of(items: Vec<qconnect_core::QueueItem>) -> QConnectQueueState {
+        QConnectQueueState {
+            queue_items: items,
+            ..Default::default()
+        }
+    }
+
+    /// A SetState that names a track is answered with that track's item — the
+    /// placeholder head of a fresh release normalized to 0, as every report
+    /// names it — and the next track it named.
+    #[test]
+    fn a_setstate_naming_a_track_is_answered_with_its_queue_item() {
+        let queue = queue_of(vec![
+            queue_item(0, 101),
+            queue_item(1, 102),
+            queue_item(2, 103),
+        ]);
+        let renderer = QConnectRendererState {
+            current_track: Some(queue_item(1, 102)),
+            next_track: Some(queue_item(2, 103)),
+            ..Default::default()
+        };
+        // What we last reported is the PREVIOUS track; the command wins.
+        assert_eq!(
+            setstate_report_queue_items(
+                Some(&queue_item(1, 102)),
+                &renderer,
+                &queue,
+                Some((0, Some(1)))
+            ),
+            (Some(1), Some(2), Some(102))
+        );
+
+        let fresh = queue_of(vec![
+            queue_item(126_886_853, 126_886_853),
+            queue_item(10, 123_452_387),
+        ]);
+        let head = queue_item(126_886_853, 126_886_853);
+        assert_eq!(
+            setstate_report_queue_items(
+                Some(&head),
+                &QConnectRendererState::default(),
+                &fresh,
+                None
+            ),
+            (Some(0), None, Some(126_886_853))
+        );
+    }
+
+    /// A state-only SetState (pause, play) repeats what we last reported: the
+    /// cached current track is the last thing the cloud ORDERED, which a
+    /// gapless advance has since left behind.
+    #[test]
+    fn a_state_only_setstate_repeats_the_item_last_reported() {
+        let queue = queue_of(vec![
+            queue_item(0, 101),
+            queue_item(1, 102),
+            queue_item(2, 103),
+        ]);
+        let renderer = QConnectRendererState {
+            current_track: Some(queue_item(0, 101)),
+            next_track: Some(queue_item(1, 102)),
+            ..Default::default()
+        };
+        assert_eq!(
+            setstate_report_queue_items(None, &renderer, &queue, Some((2, None))),
+            (Some(2), None, Some(103))
+        );
+        // An item from a queue that has since been replaced is not repeated.
+        assert_eq!(
+            setstate_report_queue_items(None, &renderer, &queue, Some((57, Some(58)))),
+            (Some(0), Some(1), Some(101))
+        );
+        // Nothing reported yet: the cached current track.
+        assert_eq!(
+            setstate_report_queue_items(None, &renderer, &queue, None),
+            (Some(0), Some(1), Some(101))
+        );
     }
 
     async fn build_connected_app() -> (
@@ -3138,11 +3343,8 @@ mod tests {
             .iter()
             .find(|msg| msg.message_type == "MESSAGE_TYPE_RNDR_SRVR_STATE_UPDATED")
             .expect("state update report");
-        assert!(state_update
-            .payload
-            .get("current_queue_item_id")
-            .expect("current_queue_item_id field")
-            .is_null());
+        // The item the command named, stated: left out it would read as item 0.
+        assert_eq!(state_update.payload["current_queue_item_id"], 991);
         assert!(state_update
             .payload
             .get("next_queue_item_id")

@@ -703,6 +703,53 @@ mod report_decision_tests {
         assert_eq!(d.buffer_state, BUFFER_STATE_BUFFERING);
     }
 
+    /// The same flicker, earlier in the load: while the stream URL resolves.
+    ///
+    /// The resolve walks the quality ladder, one signed call per rung — 0.9 s
+    /// on the Pi in issue #5 — and the latch used to be armed only after it.
+    /// Every report in between named the track being left, so a skip slid to
+    /// the new song on the phone, back to the old one, and on again.
+    #[tokio::test]
+    async fn a_load_reports_the_arriving_track_while_its_stream_url_resolves() {
+        use std::sync::Arc;
+        const LEAVING: u64 = 400280969;
+        const ARRIVING: u64 = 224052362;
+
+        let latch = Arc::new(BufferingLatch::default());
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let (answer, resolved) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        let load = tokio::spawn({
+            let (latch, notify) = (Arc::clone(&latch), Arc::clone(&notify));
+            async move {
+                latch
+                    .while_resolving(&notify, ARRIVING, 0, 221, async {
+                        resolved.await.expect("the resolve is answered")
+                    })
+                    .await
+            }
+        });
+
+        // The scheduler is told before the resolve has answered...
+        tokio::time::timeout(std::time::Duration::from_secs(5), notify.notified())
+            .await
+            .expect("the report scheduler is pulsed as the load starts");
+        // ...and what it reports is the track arriving, though the player is
+        // still 14 s into the one being left.
+        let d = tick(&latch, on(LEAVING, 14, true), false);
+        assert_eq!(d.track_id, ARRIVING);
+        assert_eq!(d.buffer_state, BUFFER_STATE_BUFFERING);
+        assert_eq!(d.duration_secs, 221);
+
+        // A resolve that fails lets go: no spinner for audio that is not coming.
+        answer
+            .send(Err("resolve stream url: no quality available".into()))
+            .expect("the load is waiting");
+        assert!(load.await.expect("the load ran").is_err());
+        let d = tick(&latch, on(LEAVING, 14, true), false);
+        assert_eq!(d.track_id, LEAVING);
+        assert_eq!(d.buffer_state, BUFFER_STATE_OK);
+    }
+
     /// And with no load in flight the player is authoritative — otherwise a
     /// stale latch would pin the report to a track that already finished.
     #[test]
