@@ -3,6 +3,17 @@
 Notable changes per release. Versions are plain semver; releases are `vX.Y.Z`
 tags on `main`.
 
+## Unreleased
+
+### Fixed
+
+- **`/api/events` delivers each event as it happens.** The stream went out
+  through tiny_http's chunked writer, which holds 8 KB before sending, so
+  clients — `pibuz watch`, `curl -N`, a script — got it in bursts tens of
+  seconds apart and saw nothing at all for the first stretch, not even the
+  headers (reported on #6). Every frame is now its own chunk, flushed at
+  once; HTTP/1.0 clients get bare frames and a closing connection.
+
 ## 2.7.2 — 2026-10-27
 
 ### Fixed
