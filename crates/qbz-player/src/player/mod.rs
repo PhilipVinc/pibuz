@@ -14,6 +14,7 @@ mod cmaf_fetch;
 mod disk_tee;
 mod gapless_fetches;
 mod playback_engine;
+mod served_depths;
 mod streaming_source;
 
 pub use cmaf_fetch::CmafRefresher;
@@ -422,12 +423,21 @@ fn read_head(file: &qbz_cache::CachedFile, len: usize) -> Option<TrackBytes> {
 /// True when a cached FLAC is a lower quality than `requested`, so the
 /// cache entry should be bypassed and the track re-fetched. An unparseable
 /// buffer is assumed compatible.
-fn cached_quality_below_requested(data: &TrackBytes, requested: Quality) -> bool {
+fn cached_quality_below_requested(
+    data: &TrackBytes,
+    requested: Quality,
+    served: Option<u32>,
+) -> bool {
     let meta = match extract_audio_metadata_full(data) {
         Ok(m) => m,
         Err(_) => return false,
     };
-    quality_below_requested(meta.sample_rate, meta.bit_depth.unwrap_or(16), requested)
+    quality_below_requested(
+        meta.sample_rate,
+        meta.bit_depth.unwrap_or(16),
+        requested,
+        served,
+    )
 }
 
 /// Whether the copy already on disk can serve a request for `requested`.
@@ -438,9 +448,13 @@ fn cached_quality_below_requested(data: &TrackBytes, requested: Quality) -> bool
 ///
 /// Note the `unwrap_or(false)`: a head we cannot read is treated as unusable
 /// and re-fetched, which is the safe direction but is also silent.
-pub(crate) fn l2_copy_is_usable(file: &qbz_cache::CachedFile, requested: Quality) -> bool {
+pub(crate) fn l2_copy_is_usable(
+    file: &qbz_cache::CachedFile,
+    requested: Quality,
+    served: Option<u32>,
+) -> bool {
     read_head(file, HEAD_BYTES)
-        .map(|head| !cached_quality_below_requested(&head, requested))
+        .map(|head| !cached_quality_below_requested(&head, requested, served))
         .unwrap_or(false)
 }
 
@@ -448,10 +462,14 @@ pub(crate) fn l2_copy_is_usable(file: &qbz_cache::CachedFile, requested: Quality
 ///
 /// Separate so it can be tested: the parse returns `false` on ANY error, so a
 /// test that feeds it bytes it cannot read passes for the wrong reason.
+///
+/// `served` is the bit depth Qobuz answered a request at this tier or above
+/// with, when known: a 16-bit master has no 24-bit copy to wait for.
 pub(crate) fn quality_below_requested(
     sample_rate: u32,
     bit_depth: u32,
     requested: Quality,
+    served: Option<u32>,
 ) -> bool {
     // Bit depth only. A tier is a CEILING — "up to 24/192" — not a promise,
     // and most of the hi-res catalogue masters at 24/96, so a 24/96 file is
@@ -476,8 +494,8 @@ pub(crate) fn quality_below_requested(
     // fetched at, in a sidecar beside it, would settle it exactly.
     let _ = sample_rate;
     match requested {
-        // Either hi-res tier: expect 24-bit.
-        Quality::UltraHiRes | Quality::HiRes => bit_depth < 24,
+        // Either hi-res tier: expect 24-bit, or what Qobuz serves if less.
+        Quality::UltraHiRes | Quality::HiRes => bit_depth < served.map_or(24, |b| b.min(24)),
         // Lossless / Mp3: any FLAC satisfies the request.
         _ => false,
     }
@@ -2257,6 +2275,9 @@ pub struct Player {
     audio_cache: Arc<qbz_cache::AudioCache>,
     /// The gapless successor [`Player::fetch_for_gapless`] is downloading.
     gapless_fetches: gapless_fetches::GaplessFetches,
+    /// What Qobuz served for each track, so the cache gate can accept a copy
+    /// that is already the best one there is.
+    served_depths: served_depths::ServedDepths,
 }
 
 impl Default for Player {
@@ -5557,6 +5578,7 @@ impl Player {
             audio_settings: settings,
             audio_cache,
             gapless_fetches: Default::default(),
+            served_depths: Default::default(),
         }
     }
 
@@ -5579,6 +5601,24 @@ impl Player {
         self.state.is_current_play(gen)
     }
 
+    /// Record what Qobuz served for `track_id` when asked for `tier`. For
+    /// callers that resolve stream URLs themselves (the cast path).
+    pub fn note_served(&self, track_id: u64, tier: Quality, bit_depth: Option<u32>) {
+        self.served_depths.note(track_id, tier, bit_depth);
+    }
+
+    /// Record a copy just fetched at `tier`, from its own header.
+    fn note_served_copy(&self, track_id: u64, tier: Quality, audio: &TrackAudio) {
+        let head = match audio {
+            TrackAudio::Memory(bytes) => Some(bytes.clone()),
+            TrackAudio::File(file) => read_head(file, HEAD_BYTES),
+        };
+        let bit_depth = head
+            .and_then(|head| extract_audio_metadata_full(&head).ok())
+            .and_then(|meta| meta.bit_depth);
+        self.served_depths.note(track_id, tier, bit_depth);
+    }
+
     /// L1 then L2 for `track_id`, honouring the quality gate.
     ///
     /// `Some(_)` means this call has handled the play — the caller must not go
@@ -5599,7 +5639,8 @@ impl Player {
         // Cache hit: replay instantly from L1/L2 unless the cached copy is
         // a lower quality than now requested.
         if let Some(cached) = self.audio_cache.get(track_id) {
-            if cached_quality_below_requested(&cached.data, quality) {
+            let served = self.served_depths.best_for(track_id, quality);
+            if cached_quality_below_requested(&cached.data, quality, served) {
                 log::info!(
                     "[CACHE] Track {} cached below requested {:?} — re-fetching",
                     track_id,
@@ -5657,7 +5698,8 @@ impl Player {
             .and_then(|l2| l2.file_if_present(track_id))
         {
             // Same quality gate as the L1 hit above, from the header alone.
-            let head_ok = l2_copy_is_usable(&file, quality);
+            let served = self.served_depths.best_for(track_id, quality);
+            let head_ok = l2_copy_is_usable(&file, quality, served);
             if head_ok {
                 if !self.is_current_play(gen) {
                     log::info!("Player: L2-hit play for track {track_id} superseded (gen {gen})");
@@ -5787,6 +5829,8 @@ impl Player {
                     log::info!("Player: CMAF setup for track {track_id} superseded (gen {gen})");
                     return Ok(());
                 }
+                self.served_depths
+                    .note(track_id, quality, cmaf_info.bit_depth);
                 // Derive stream parameters from init segment metadata.
                 let sample_rate = cmaf_info.sampling_rate.unwrap_or(44100);
                 let channels = 2u16; // FLAC from Qobuz is always stereo
@@ -5965,6 +6009,10 @@ impl Player {
             stream_url.url,
             stream_url.mime_type
         );
+        if !stream_url.sample {
+            self.served_depths
+                .note(track_id, quality, stream_url.bit_depth);
+        }
 
         // Download the audio data
         log::info!("Player: Starting audio caching...");
@@ -6164,6 +6212,7 @@ impl Player {
                 // audio thread.
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 let len = data.len();
+                self.note_served_copy(track_id, quality, &TrackAudio::Memory(data.clone()));
                 self.audio_cache.insert(track_id, data);
                 self.audio_cache.unmark_fetching(track_id);
                 self.audio_cache.clear_failed(track_id);
@@ -6171,6 +6220,13 @@ impl Player {
                 Ok(())
             }
             Ok(None) => {
+                if let Some(file) = self
+                    .audio_cache
+                    .get_playback_cache()
+                    .and_then(|l2| l2.file_if_present(track_id))
+                {
+                    self.note_served_copy(track_id, quality, &TrackAudio::File(file));
+                }
                 self.audio_cache.unmark_fetching(track_id);
                 self.audio_cache.clear_failed(track_id);
                 Ok(())
@@ -6355,6 +6411,23 @@ impl Player {
     /// `cancel` fires: a skip makes the successor worthless, and a Hi-Res one
     /// is 120-220 MB of network and card that the track now playing needs.
     pub async fn fetch_for_gapless(
+        &self,
+        client: &QobuzClient,
+        track_id: u64,
+        quality: Quality,
+        cancel: &CancellationToken,
+    ) -> Option<TrackAudio> {
+        let was_cached = self.is_track_cached(track_id);
+        let audio = self
+            .fetch_for_gapless_uncounted(client, track_id, quality, cancel)
+            .await;
+        if let (false, Some(fetched)) = (was_cached, &audio) {
+            self.note_served_copy(track_id, quality, fetched);
+        }
+        audio
+    }
+
+    async fn fetch_for_gapless_uncounted(
         &self,
         client: &QobuzClient,
         track_id: u64,
@@ -7715,30 +7788,98 @@ mod cached_quality_tests {
     #[test]
     fn a_24_96_copy_satisfies_either_hi_res_tier() {
         assert!(
-            !quality_below_requested(96_000, 24, Quality::UltraHiRes),
+            !quality_below_requested(96_000, 24, Quality::UltraHiRes, None),
             "24/96 is what Qobuz has for most hi-res tracks — refusing it means never using the cache"
         );
-        assert!(!quality_below_requested(96_000, 24, Quality::HiRes));
+        assert!(!quality_below_requested(96_000, 24, Quality::HiRes, None));
     }
 
     /// The check that still has to bite: a 16-bit copy is a real downgrade.
     #[test]
     fn a_16_bit_copy_does_not_satisfy_a_hi_res_tier() {
-        assert!(quality_below_requested(44_100, 16, Quality::UltraHiRes));
-        assert!(quality_below_requested(44_100, 16, Quality::HiRes));
-        assert!(quality_below_requested(96_000, 16, Quality::HiRes));
+        assert!(quality_below_requested(
+            44_100,
+            16,
+            Quality::UltraHiRes,
+            None
+        ));
+        assert!(quality_below_requested(44_100, 16, Quality::HiRes, None));
+        assert!(quality_below_requested(96_000, 16, Quality::HiRes, None));
+    }
+
+    /// Unless Qobuz itself serves 16 bits at that tier: the master is 16-bit
+    /// and the copy is the best there is. Refusing it re-fetched the same file
+    /// on every skip (2026-11-04, track 7529809).
+    #[test]
+    fn a_16_bit_copy_satisfies_a_hi_res_tier_that_serves_16_bits() {
+        assert!(!quality_below_requested(
+            44_100,
+            16,
+            Quality::UltraHiRes,
+            Some(16)
+        ));
+        assert!(!quality_below_requested(
+            44_100,
+            16,
+            Quality::HiRes,
+            Some(16)
+        ));
+        assert!(!quality_below_requested(
+            48_000,
+            16,
+            Quality::UltraHiRes,
+            Some(16)
+        ));
+    }
+
+    /// A record never lowers the bar for a 24-bit master.
+    #[test]
+    fn a_24_bit_record_changes_nothing_for_24_bit_copies() {
+        assert!(!quality_below_requested(
+            96_000,
+            24,
+            Quality::UltraHiRes,
+            Some(24)
+        ));
+        assert!(!quality_below_requested(
+            192_000,
+            24,
+            Quality::UltraHiRes,
+            Some(24)
+        ));
+    }
+
+    /// Knowing the tier serves 24 bits keeps a 16-bit copy refused.
+    #[test]
+    fn a_16_bit_copy_still_fails_a_tier_that_serves_24_bits() {
+        assert!(quality_below_requested(
+            44_100,
+            16,
+            Quality::UltraHiRes,
+            Some(24)
+        ));
     }
 
     /// A 24/192 copy is obviously fine for everything.
     #[test]
     fn a_24_192_copy_satisfies_everything() {
-        assert!(!quality_below_requested(192_000, 24, Quality::UltraHiRes));
+        assert!(!quality_below_requested(
+            192_000,
+            24,
+            Quality::UltraHiRes,
+            None
+        ));
     }
 
     /// Lossless asks for nothing a FLAC cannot give.
     #[test]
     fn any_flac_satisfies_lossless() {
-        assert!(!quality_below_requested(44_100, 16, Quality::Lossless));
+        assert!(!quality_below_requested(
+            44_100,
+            16,
+            Quality::Lossless,
+            None
+        ));
     }
 
     // ---- the same question one level up, against real files on disk --------
@@ -7770,11 +7911,11 @@ mod cached_quality_tests {
         assert_eq!(meta.bit_depth, Some(24));
 
         assert!(
-            l2_copy_is_usable(&file, Quality::UltraHiRes),
+            l2_copy_is_usable(&file, Quality::UltraHiRes, None),
             "a 24/96 copy is the best Qobuz has for most hi-res tracks — refusing it \
              means the disk cache is never used at all"
         );
-        assert!(l2_copy_is_usable(&file, Quality::HiRes));
+        assert!(l2_copy_is_usable(&file, Quality::HiRes, None));
         std::fs::remove_file(file.path()).ok();
     }
 
@@ -7785,9 +7926,10 @@ mod cached_quality_tests {
         let meta = super::extract_audio_metadata_full(&bytes).expect("fixture must parse");
         assert_eq!(meta.bit_depth, Some(16));
 
-        assert!(!l2_copy_is_usable(&file, Quality::UltraHiRes));
-        assert!(!l2_copy_is_usable(&file, Quality::HiRes));
-        assert!(l2_copy_is_usable(&file, Quality::Lossless));
+        assert!(!l2_copy_is_usable(&file, Quality::UltraHiRes, None));
+        assert!(!l2_copy_is_usable(&file, Quality::HiRes, None));
+        assert!(l2_copy_is_usable(&file, Quality::Lossless, None));
+        assert!(l2_copy_is_usable(&file, Quality::UltraHiRes, Some(16)));
         std::fs::remove_file(file.path()).ok();
     }
 
@@ -7796,7 +7938,8 @@ mod cached_quality_tests {
     fn a_missing_file_is_not_usable() {
         assert!(!l2_copy_is_usable(
             &fixture("definitely-not-here.flac"),
-            Quality::Lossless
+            Quality::Lossless,
+            None
         ));
     }
 }
@@ -8487,6 +8630,7 @@ mod cached_play_duration_tests {
             audio_settings: Arc::new(Mutex::new(AudioSettings::default())),
             audio_cache: Arc::new(qbz_cache::AudioCache::new(16 * 1024 * 1024)),
             gapless_fetches: Default::default(),
+            served_depths: Default::default(),
         };
         (player, rx)
     }
