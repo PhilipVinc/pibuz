@@ -452,10 +452,14 @@ impl<A: FrontendAdapter + Send + Sync + 'static> QbzCore<A> {
         let client = self.client.read().await;
         let client = client.as_ref().ok_or(CoreError::NotInitialized)?;
 
-        client
+        let url = client
             .get_stream_url_with_fallback(track_id, quality)
             .await
-            .map_err(CoreError::Api)
+            .map_err(CoreError::Api)?;
+        if !url.sample {
+            self.player.note_served(track_id, quality, url.bit_depth);
+        }
+        Ok(url)
     }
 
     // ==================== Playback Operations ====================
