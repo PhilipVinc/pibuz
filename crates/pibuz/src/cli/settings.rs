@@ -1,5 +1,5 @@
 // crates/pibuz/src/cli/settings.rs — `pibuz settings show|set|export|import`,
-// `pibuz qconnect enable|disable|name`, `pibuz config path|show`. Every verb
+// `pibuz qconnect enable|disable|name` (deprecated), `pibuz config path|show`. Every verb
 // here works with the daemon down: it reads/writes the daemon's REAL stores
 // directly at the daemon roots (`AudioSettingsStore::new_at`, `daemon_prefs`,
 // the qconnect `_at` helpers) and best-effort nudges a running daemon via
@@ -831,7 +831,7 @@ fn write_one(roots: &ProfileRoots, key: &str, raw: &str) -> Result<ApplyClass, S
                 "off" => qconnect_app::QconnectStartupMode::Off,
                 other => {
                     return Err(SetError::Usage(format!(
-                        "invalid startup mode '{other}' — expected one of: on, off (use: pibuz qconnect enable|disable)"
+                        "invalid startup mode '{other}' — expected one of: on, off"
                     )))
                 }
             };
@@ -1464,7 +1464,7 @@ fn print_buckets(
                 dn.new
             );
             println!(
-                "  one name are hard to tell apart in the Qobuz app; rename with: pibuz qconnect name <name>"
+                "  one name are hard to tell apart in the Qobuz app; rename with: pibuz settings set qconnect.device_name <name>"
             );
         }
     }

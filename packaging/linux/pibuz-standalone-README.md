@@ -50,8 +50,7 @@ sudo loginctl enable-linger $USER
 ```bash
 pibuz settings set audio.backend alsa
 pibuz settings set audio.device hw:CARD=YourDac,DEV=0   # `aplay -L` lists them
-pibuz qconnect name "Living Room"
-pibuz qconnect enable
+pibuz settings set qconnect.device_name "Living Room"
 ```
 
 `pibuz settings show` lists every setting and its current value. There is no

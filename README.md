@@ -29,7 +29,7 @@ the same network; pick it as the output.
 ```bash
 pibuz status                                    # is it up, connected, what is it playing
 pibuz settings show                             # every setting and its current value
-pibuz qconnect name "Living Room"               # the name the Qobuz apps show
+pibuz settings set qconnect.device_name "Living Room"  # the name the Qobuz apps show
 pibuz settings set qconnect.device_type speaker # the icon next to it (default: streamer)
 pibuz --help                                    # everything else
 ```

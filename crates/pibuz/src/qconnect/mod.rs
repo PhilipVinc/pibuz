@@ -402,8 +402,8 @@ impl DaemonQconnectService {
 
     /// `POST /api/settings/reload`: re-cache the device-name override from
     /// settings.toml so the NEXT `connect()` (whenever that happens) uses
-    /// whatever `pibuz qconnect name` / `settings set qconnect.device_name` most
-    /// recently wrote — a rename applies on the next connection. Does NOT force
+    /// whatever `settings set qconnect.device_name` most recently
+    /// wrote — a rename applies on the next connection. Does NOT force
     /// a reconnect by itself (a rename alone must not bounce an active
     /// session).
     async fn refresh_device_name(&self, root: &std::path::Path) {
@@ -571,7 +571,7 @@ impl QconnectControl {
     }
 
     pub(crate) async fn disconnect(&self) -> Result<(), String> {
-        // Operator intent (`pibuz qconnect disable`): drop any handed-over
+        // Operator intent (`startup_mode` set to off): drop any handed-over
         // pairing credentials, so a later enable does not silently re-join
         // the last LAN caster's session. Abort any in-flight takeover FIRST
         // and do the clearing under the ops lock — otherwise a takeover that
@@ -672,8 +672,7 @@ pub(crate) fn start(
     let settings_root = roots.data.clone();
     transport::init_data_root(settings_root.clone());
 
-    // Effective startup decision (Ready-state only), from the setting that
-    // `pibuz qconnect enable|disable` writes. `remember_last`
+    // Effective startup decision (Ready-state only), from `qconnect.startup_mode`. `remember_last`
     // resolves to off.
     let mode = transport::load_startup_mode_at(&settings_root);
     let should_auto_connect = mode.auto_connects();

@@ -67,7 +67,7 @@ impl DaemonShared {
     /// Clears `is_active` with `session_active`: with no session we are
     /// nobody's renderer, and `is_active` used to be written only by the sink's
     /// ownership latch, so `/api/status` went on saying `is_active: true` after
-    /// `pibuz qconnect disable` or a reconnect that gave up.
+    /// `startup_mode` turned off or a reconnect that gave up.
     pub(crate) fn latch_qconnect_session_down(&mut self, state: &str) {
         self.qconnect.state = state.to_string();
         self.qconnect.session_active = false;

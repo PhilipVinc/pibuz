@@ -24,7 +24,9 @@ pub struct QconnectSettings {
     pub device_uuid: Option<String>,
     /// The name shown in the Qobuz app; unset derives one from the hostname.
     pub device_name: Option<String>,
-    /// `off` | `on`.
+    /// `on` | `off`; `on` unless someone turned it off. pibuz does nothing
+    /// BUT Qobuz Connect, so a fresh install that does not connect is a
+    /// daemon that does nothing.
     pub startup_mode: String,
     /// `software` | `locked` | `external`; unset is `software`.
     pub volume_mode: Option<String>,
@@ -45,7 +47,7 @@ impl Default for QconnectSettings {
         Self {
             device_uuid: None,
             device_name: None,
-            startup_mode: "off".to_string(),
+            startup_mode: "on".to_string(),
             volume_mode: None,
             device_type: None,
             initial_volume: 0,

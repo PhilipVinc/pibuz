@@ -373,7 +373,7 @@ pub(crate) fn resolve_local_identity() -> qconnect_app::LocalIdentity {
 // ---------------------------------------------------------------------------
 // The `[qconnect]` section of settings.toml, read and written field by field
 // (`qbz_app::settings::qconnect` owns the struct and the file). The CLI
-// (`pibuz qconnect enable|disable`, `settings show/set`) and the connect path
+// (`settings show/set`) and the connect path
 // both go through these, against the daemon root.
 // Every LOAD is fail-open (returns the default on any error); every SAVE
 // returns the error, so `pibuz settings set qconnect.*` can exit 1 instead of
@@ -394,7 +394,7 @@ pub(crate) fn persist_device_name_at(root: &Path, name: Option<&str>) -> Result<
     qconnect_settings::update(root, |s| s.device_name = name.map(str::to_string))
 }
 
-/// Load the QConnect startup mode (`startup_mode` = "off" | "on"). `Off` (the
+/// Load the QConnect startup mode (`startup_mode` = "on" | "off"). `On` (the
 /// default) when unset or unknown.
 pub(crate) fn load_startup_mode_at(root: &Path) -> qconnect_app::QconnectStartupMode {
     qconnect_app::QconnectStartupMode::from_str(&qconnect_settings::load(root).startup_mode)
@@ -820,7 +820,7 @@ mod tests {
         // Unset -> defaults / None.
         assert_eq!(
             load_startup_mode_at(&root),
-            qconnect_app::QconnectStartupMode::Off
+            qconnect_app::QconnectStartupMode::On
         );
         assert_eq!(load_device_name_at(&root), None);
         assert_eq!(load_volume_mode_at(&root), None);
