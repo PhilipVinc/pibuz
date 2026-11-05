@@ -40,12 +40,17 @@
 //!   "succeeded", each xrun "recovered", and the ring was thrown away every
 //!   ~15 ms. The writer saw a device that took audio as fast as it could be
 //!   decoded and owed nothing.
+//! - **A DAC whose clock stops.** After [`VirtualAudioOut::freeze`] the clock
+//!   stands still with the device running, so the ring never frees room. A
+//!   write waiting for room fails once it has waited as long as the ALSA path
+//!   would ([`WriteStall`]) instead of hanging the writer for ever.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::audio_out::AudioOut;
+use crate::write_stall::WriteStall;
 
 /// What the device is doing, mirroring the ALSA states that matter here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +92,8 @@ pub struct VirtualAudioOut {
     underruns: AtomicU64,
     /// Set by [`Self::kill`]: the device accepts everything and plays nothing.
     dead: AtomicBool,
+    /// Set by [`Self::freeze`]: the clock stands still with the device running.
+    frozen: AtomicBool,
     /// Frames accepted and thrown away unplayed: what was queued when the
     /// device died, and everything handed over since.
     lost: AtomicU64,
@@ -119,6 +126,7 @@ impl VirtualAudioOut {
             silence_written: AtomicU64::new(0),
             underruns: AtomicU64::new(0),
             dead: AtomicBool::new(false),
+            frozen: AtomicBool::new(false),
             lost: AtomicU64::new(0),
             tape: Mutex::new(None),
             mixer_writes: Mutex::new(Vec::new()),
@@ -209,6 +217,15 @@ impl VirtualAudioOut {
         self.dead.store(true, Ordering::Release);
     }
 
+    /// Stop the clock dead with the device still running: the other way a USB
+    /// DAC fails. Nothing queued is played and no room ever frees, so a write
+    /// that needs room waits, and fails once it has waited past the deadline.
+    pub fn freeze(&self) {
+        let mut clock = self.clock.lock().expect("clock");
+        self.advance(&mut clock);
+        self.frozen.store(true, Ordering::Release);
+    }
+
     /// Frames accepted and never played because the device was dead.
     pub fn frames_lost(&self) -> u64 {
         self.lost.load(Ordering::Acquire)
@@ -224,7 +241,7 @@ impl VirtualAudioOut {
         let now = Instant::now();
         let elapsed = now.saturating_duration_since(clock.last_tick);
         clock.last_tick = now;
-        if clock.state != ClockState::Running {
+        if clock.state != ClockState::Running || self.frozen.load(Ordering::Acquire) {
             return;
         }
         let exact = elapsed.as_secs_f64() * f64::from(self.sample_rate) * self.speed + clock.carry;
@@ -251,7 +268,10 @@ impl VirtualAudioOut {
     }
 
     /// Accept up to `frames`, blocking (in virtual time) until there is room.
-    fn accept(&self, frames: usize, cancel: &AtomicBool, silence: bool) -> usize {
+    ///
+    /// `Err` when the ring stays full with nothing moving for as long as the
+    /// ALSA write would wait — a frozen clock.
+    fn accept(&self, frames: usize, cancel: &AtomicBool, silence: bool) -> Result<usize, String> {
         if self.dead.load(Ordering::Acquire) {
             // Taken at once and gone: written, never queued, never played.
             let mut clock = self.clock.lock().expect("clock");
@@ -262,8 +282,9 @@ impl VirtualAudioOut {
             }
             self.lost.fetch_add(frames as u64, Ordering::AcqRel);
             clock.played = written;
-            return frames;
+            return Ok(frames);
         }
+        let mut stall = WriteStall::new(self.buffer_frames, self.sample_rate, self.speed);
         let mut accepted = 0usize;
         while accepted < frames {
             if cancel.load(Ordering::SeqCst) {
@@ -272,15 +293,24 @@ impl VirtualAudioOut {
             let room = {
                 let mut clock = self.clock.lock().expect("clock");
                 self.advance(&mut clock);
-                let room = self.buffer_frames.saturating_sub(self.queued(&clock));
+                let queued = self.queued(&clock);
+                let room = self.buffer_frames.saturating_sub(queued);
                 if room == 0 {
                     // Full. On hardware the writer waits on the device; here it
                     // waits for the virtual clock to consume a period. Bounded,
-                    // so a cancel is always noticed.
+                    // so a cancel is always noticed — and so is a clock that
+                    // never frees anything.
                     drop(clock);
+                    if let Some(waited) = stall.full(Instant::now(), queued) {
+                        return Err(format!(
+                            "the device took no audio for {} ms",
+                            waited.as_millis()
+                        ));
+                    }
                     std::thread::sleep(self.period_wait());
                     continue;
                 }
+                stall.progressed();
                 room
             };
             let take = room.min(frames - accepted);
@@ -302,7 +332,7 @@ impl VirtualAudioOut {
                 clock.carry = 0.0;
             }
         }
-        accepted
+        Ok(accepted)
     }
 
     /// How long to wait for the clock to free a period, in real time.
@@ -338,7 +368,7 @@ impl AudioOut for VirtualAudioOut {
     fn write_f32(&self, samples: &[f32], cancel: &AtomicBool) -> Result<usize, String> {
         let channels = usize::from(self.channels).max(1);
         let frames = samples.len() / channels;
-        let accepted = self.accept(frames, cancel, false);
+        let accepted = self.accept(frames, cancel, false)?;
         if let Some(tape) = self.tape.lock().expect("tape").as_mut() {
             tape.extend_from_slice(&samples[..accepted * channels]);
         }
@@ -360,7 +390,7 @@ impl AudioOut for VirtualAudioOut {
         if needed == 0 {
             return Ok(0);
         }
-        let accepted = self.accept(needed, cancel, true);
+        let accepted = self.accept(needed, cancel, true)?;
         if let Some(tape) = self.tape.lock().expect("tape").as_mut() {
             tape.extend(std::iter::repeat_n(
                 0.0,

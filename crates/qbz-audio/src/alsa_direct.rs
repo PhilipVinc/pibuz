@@ -1375,6 +1375,13 @@ impl AlsaDirectStream {
         // Only the first measurement of this chunk is interesting: later
         // iterations report the ring we have just been filling.
         let mut fill_sampled = false;
+        // A clock that has stopped never frees room, and this loop would wait
+        // for it for ever: see `WriteStall`.
+        let mut stall = crate::write_stall::WriteStall::new(
+            self.buffer_frames.max(0) as usize,
+            self.sample_rate,
+            1.0,
+        );
 
         let mut offset = 0usize;
         while offset < data.len() {
@@ -1434,10 +1441,31 @@ impl AlsaDirectStream {
                     Ok(_) => {}
                     Err(e) => {
                         recover_write_error(&pcm, e.errno(), "(wait)")?;
+                        // The stream changed state; whatever wait was running
+                        // is a different one now.
+                        stall.progressed();
+                        continue;
                     }
+                }
+                // Full, and the delay is the only sign of life. An unreadable
+                // delay is a value too: one that stays unreadable with the ring
+                // full is no more alive than one that stays put.
+                let delay = pcm.delay().map_or(usize::MAX, |d| d.max(0) as usize);
+                if let Some(waited) = stall.full(std::time::Instant::now(), delay) {
+                    return Err(format!(
+                        "the device took no audio for {} ms with its ring full ({:?}, delay {})",
+                        waited.as_millis(),
+                        pcm.state(),
+                        if delay == usize::MAX {
+                            "unreadable".to_string()
+                        } else {
+                            format!("{delay} frames")
+                        }
+                    ));
                 }
                 continue;
             }
+            stall.progressed();
 
             let frames = frames_this_step(avail, data.len() - offset, frame_bytes);
             if frames == 0 {

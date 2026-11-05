@@ -69,6 +69,7 @@ pub mod rt;
 pub mod settings;
 pub(crate) mod virtual_out;
 pub mod volume_curve;
+pub(crate) mod write_stall;
 
 // Re-export commonly used types
 #[cfg(target_os = "linux")]

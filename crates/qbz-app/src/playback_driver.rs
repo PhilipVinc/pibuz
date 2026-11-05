@@ -70,6 +70,9 @@ pub(crate) struct LastTick {
     pub position: u64,
     pub duration: u64,
     pub is_playing: bool,
+    /// The player's dead-device count at that tick. See
+    /// [`PlaybackEvent::device_failures`].
+    pub device_failures: u64,
 }
 
 impl LastTick {
@@ -79,6 +82,7 @@ impl LastTick {
             position: ev.position,
             duration: ev.duration,
             is_playing: ev.is_playing,
+            device_failures: ev.device_failures,
         }
     }
 }
@@ -233,8 +237,14 @@ pub(crate) fn plan_tick(
     //    shorter than the duration it was announced with still ends — a Qobuz
     //    preview stops at 30 s of a 267 s track, and without this the queue
     //    stood still on a "paused" track that had nothing left to play.
+    //
+    //    NOT when the stop came with a dead output device: the player is
+    //    reopening it, or has stopped with an error, and either way the track
+    //    did not end. The count moves before `is_playing` drops, so the tick
+    //    that sees the stop sees it.
     let track_ended = last.is_playing
         && !ev.is_playing
+        && ev.device_failures == last.device_failures
         && last.track_id != 0
         && (ev.track_id == 0 || ev.track_id == last.track_id)
         && ev.duration > 0
@@ -334,6 +344,7 @@ pub(crate) fn advance_state(
             position: prev.last.position,
             duration: prev.last.duration,
             is_playing: ev.is_playing,
+            device_failures: ev.device_failures,
         }
     };
     let mut gapless_requested_for = if armed {
@@ -345,7 +356,12 @@ pub(crate) fn advance_state(
     // Track-end handler resets the edge trackers + the gapless guard (both the
     // stop-after and advance branches).
     if ended {
-        last = LastTick::default();
+        last = LastTick {
+            // The count is not an edge tracker: a reset must not make the
+            // next tick read as a fresh failure.
+            device_failures: ev.device_failures,
+            ..LastTick::default()
+        };
         gapless_requested_for = 0;
     }
 
@@ -906,6 +922,7 @@ mod tests {
             gapless_next_track_id: 0,
             bit_perfect_mode: None,
             buffer_progress: None,
+            device_failures: 0,
         }
     }
 
@@ -969,6 +986,32 @@ mod tests {
             None,
         );
         assert!(!a.contains(&DriverAction::AdvanceAndPlay));
+    }
+
+    /// A DAC that dies in the last seconds of a track stops playback there:
+    /// the player reopens it and resumes, or, if it is really gone, stops with
+    /// an error. Either way the stop is the device. Read as the end of the
+    /// track it advanced the queue — onto a device that could not play the
+    /// next one either, or past the tail the reopen was about to play.
+    #[test]
+    fn a_dead_device_near_the_end_does_not_advance() {
+        let s = DriverState::after(&ev(1, true, 579, 581));
+        let mut died = ev(1, false, 579, 581);
+        died.device_failures = 1;
+        let a = plan_tick(&s, &died, &q(1, &[(2, true)], "off", None), None);
+        assert!(!a.contains(&DriverAction::AdvanceAndPlay), "{a:?}");
+        assert!(!a.contains(&DriverAction::QueueFinished), "{a:?}");
+
+        // The count is carried: the NEXT natural end still advances.
+        let after = advance_state(&s, &died, &a);
+        let mut resumed = ev(1, true, 580, 581);
+        resumed.device_failures = 1;
+        let a = plan_tick(&after, &resumed, &q(1, &[(2, true)], "off", None), None);
+        let after = advance_state(&after, &resumed, &a);
+        let mut ended = ev(1, false, 581, 581);
+        ended.device_failures = 1;
+        let a = plan_tick(&after, &ended, &q(1, &[(2, true)], "off", None), None);
+        assert!(a.contains(&DriverAction::AdvanceAndPlay), "{a:?}");
     }
 
     /// A finished track's bytes are released at the transition rather than left
@@ -1201,6 +1244,7 @@ mod residency_session_tests {
             gapless_next_track_id: 0,
             bit_perfect_mode: None,
             buffer_progress: None,
+            device_failures: 0,
         }
     }
 

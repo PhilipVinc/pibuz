@@ -1818,6 +1818,12 @@ pub struct PlaybackEvent {
     /// the track is fully buffered.
     #[serde(default)]
     pub buffer_progress: Option<f32>,
+    /// Times the output device has been found dead since the daemon started.
+    /// The playback driver compares it tick to tick: a stop that came with a
+    /// new failure is the device, not the end of the track, however close to
+    /// the end it landed. Internal, so not serialized.
+    #[serde(skip)]
+    pub device_failures: u64,
 }
 
 /// A snapshot of both cache tiers, from [`Player::cache_report`].
@@ -1928,6 +1934,11 @@ pub struct SharedState {
     /// The command the audio thread is handling right now, and since when.
     /// `None` while it is waiting for one. See [`SharedState::audio_thread_busy`].
     audio_thread_busy: Arc<std::sync::Mutex<Option<(Instant, &'static str)>>>,
+    /// Times the output device has been found dead, ever. Bumped BEFORE
+    /// `is_playing` drops for it, so a driver tick that sees the stop also
+    /// sees the count move — and does not take a dead device near the end of
+    /// a track for the end of the track. See [`PlaybackEvent::device_failures`].
+    device_failures: Arc<AtomicU64>,
 }
 
 impl Default for SharedState {
@@ -1962,7 +1973,13 @@ impl SharedState {
             play_generation: Arc::new(AtomicU64::new(0)),
             disk_spill_available: Arc::new(AtomicBool::new(false)),
             volume_external: Arc::new(AtomicBool::new(false)),
+            device_failures: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// See [`SharedState::device_failures`].
+    pub(crate) fn device_failures(&self) -> u64 {
+        self.device_failures.load(Ordering::SeqCst)
     }
 
     /// See [`SharedState::volume_external`].
@@ -5351,21 +5368,39 @@ impl Player {
                                         .as_ref()
                                         .and_then(PlaybackEngine::position_secs);
                                     release_output(&mut current_engine, &mut stream_opt);
+                                    // Counted BEFORE the stop below, so the driver
+                                    // tick that sees the stop sees this too and
+                                    // does not read a death in the last seconds of
+                                    // a track as the end of it.
+                                    thread_state.device_failures.fetch_add(1, Ordering::SeqCst);
                                     // Not playing first, so the position below is
                                     // read verbatim rather than extrapolated.
                                     thread_state.is_playing.store(false, Ordering::SeqCst);
                                     if let Some(secs) = frozen_secs {
                                         thread_state.position.store(secs, Ordering::SeqCst);
                                     }
-                                    // A queued next track went with the engine.
+                                    // The queued next track went with the engine,
+                                    // but which track comes next has not changed and
+                                    // its bytes are still in hand: carried across
+                                    // the reopen and re-queued once the new engine
+                                    // exists, exactly as a seek does (see Seek for
+                                    // why ARMED stays set while that is in flight).
+                                    let requeue_gapless = gapless_pending.take().map(|pending| {
+                                        (
+                                            pending.audio,
+                                            pending.track_id,
+                                            pending.sample_rate,
+                                            pending.channels,
+                                        )
+                                    });
                                     thread_state.set_gapless_ready(false);
                                     thread_state.set_gapless_next_track_id(0);
-                                    gapless_pending = None;
                                     gapless_request_armed = false;
 
                                     let reopen = last_device_reopen
                                         .is_none_or(|at| at.elapsed() >= DEVICE_REOPEN_COOLDOWN);
                                     if reopen {
+                                        gapless_request_armed = requeue_gapless.is_some();
                                         last_device_reopen = Some(Instant::now());
                                         log::warn!(
                                             "Audio thread: {failure}; reopening it and resuming at {}s",
@@ -5388,6 +5423,33 @@ impl Player {
                                             &mut gapless_pending,
                                             &mut gapless_request_armed,
                                         );
+                                        match requeue_gapless {
+                                            Some((audio, track_id, sample_rate, channels))
+                                                if current_engine.is_some() =>
+                                            {
+                                                log::info!(
+                                                    "Gapless: re-queueing track {track_id} after the device was reopened"
+                                                );
+                                                if let Err(e) =
+                                                    self_tx.send(AudioCommand::PlayNext {
+                                                        audio,
+                                                        track_id,
+                                                        sample_rate,
+                                                        channels,
+                                                    })
+                                                {
+                                                    // Not fatal: the driver re-arms the
+                                                    // prefetch on its own.
+                                                    log::warn!(
+                                                        "Gapless: could not re-queue after the reopen: {e}"
+                                                    );
+                                                    gapless_request_armed = false;
+                                                }
+                                            }
+                                            // The resume failed and said why; nothing
+                                            // to hand the successor to.
+                                            _ => gapless_request_armed = false,
+                                        }
                                     } else {
                                         log::error!(
                                             "Audio thread: {failure}, again within {}s of reopening it; stopping",
@@ -7505,6 +7567,9 @@ impl Player {
             gapless_next_track_id: self.state.get_gapless_next_track_id(),
             bit_perfect_mode: self.state.get_bit_perfect_mode(),
             buffer_progress: self.state.get_buffer_progress(),
+            // After `is_playing` above, and the audio thread bumps it before
+            // that drops: a snapshot that saw the stop sees the failure too.
+            device_failures: self.state.device_failures(),
         }
     }
 }
