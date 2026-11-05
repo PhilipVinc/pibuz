@@ -1,7 +1,6 @@
 //! One-shot logger installation + the on-disk file sink (open / rotate).
 
 use std::fs::File;
-use std::io::BufWriter;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -43,7 +42,7 @@ pub fn install(default_level: &str, log_file: Option<PathBuf>) {
 
 /// Open the log file for this run, rotating any previous one to `<path>.prev`.
 /// Returns `None` (file sink disabled, gracefully) on any filesystem error.
-fn open_log_file(path: PathBuf) -> Option<Mutex<BufWriter<File>>> {
+fn open_log_file(path: PathBuf) -> Option<Mutex<File>> {
     let dir = path.parent()?;
     std::fs::create_dir_all(dir).ok()?;
 
@@ -55,5 +54,5 @@ fn open_log_file(path: PathBuf) -> Option<Mutex<BufWriter<File>>> {
     }
 
     let file = File::create(&path).ok()?;
-    Some(Mutex::new(BufWriter::new(file)))
+    Some(Mutex::new(file))
 }
