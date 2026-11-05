@@ -164,6 +164,83 @@ fn unknown_key_error(key: &str) -> String {
     out
 }
 
+/// What each key accepts, as the parsers below check it. `None` marks the one
+/// computed at run time (`qconnect.device_type`, from the protocol's list).
+/// Order and coverage are KEY_TABLE's; a test holds them together.
+const KEY_VALUES: &[(&str, Option<&str>)] = &[
+    (
+        "audio.backend",
+        Some("system | alsa | pipewire | pulse | jack"),
+    ),
+    (
+        "audio.device",
+        Some("an output device (`aplay -L` lists them), or system"),
+    ),
+    ("audio.alsa_plugin", Some("hw | plughw | pcm | auto")),
+    ("audio.alsa_hardware_volume", Some("true | false")),
+    (
+        "audio.alsa_mixer_device",
+        Some("auto, or a card such as hw:0 (no subdevice)"),
+    ),
+    ("audio.exclusive_mode", Some("true | false")),
+    ("audio.dac_passthrough", Some("true | false")),
+    ("audio.skip_sink_switch", Some("true | false")),
+    ("audio.stream_first_track", Some("true | false")),
+    ("audio.stream_buffer_seconds", Some("1-10")),
+    ("audio.stream_window_seconds", Some("2-60")),
+    ("audio.streaming_only", Some("true | false")),
+    ("audio.memory_cache_mb", Some("auto, or 0-4096")),
+    ("audio.volume_curve", Some("perceptual | linear")),
+    ("audio.cache_to_disk", Some("true | false")),
+    ("audio.disk_cache_mb", Some("auto, or 100-65535")),
+    ("audio.alsa_buffer_ms", Some("auto, or 50-4000")),
+    ("audio.dac_keepalive_ms", Some("off, or 10-500")),
+    ("audio.pcm_ring_ms", Some("auto, or 250-30000")),
+    ("audio.writer_rt_priority", Some("off, or 1-20")),
+    ("audio.gapless_enabled", Some("true | false")),
+    ("audio.normalization_enabled", Some("true | false")),
+    (
+        "audio.normalization_target_lufs",
+        Some("a loudness in LUFS, such as -14"),
+    ),
+    ("audio.pw_force_bitperfect", Some("true | false")),
+    ("playback.quality", Some("mp3 | cd | hires | hires_plus")),
+    (
+        "qconnect.device_name",
+        Some("the name the Qobuz apps show; system = the hostname"),
+    ),
+    ("qconnect.startup_mode", Some("on | off")),
+    ("qconnect.volume_mode", Some("software | locked | external")),
+    ("qconnect.device_type", None),
+    (
+        "qconnect.initial_volume",
+        Some("off, or 1-100 (the volume a phone starts at)"),
+    ),
+    ("qconnect.pairing", Some("on | off")),
+    ("qconnect.pairing_port", Some("1-65535")),
+    (
+        "hooks.script",
+        Some("an absolute path to run on each event, or empty for none"),
+    ),
+];
+
+/// The `pibuz settings set --help` key list: every key and what it accepts.
+pub(crate) fn key_reference() -> String {
+    let width = KEY_VALUES.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+    let mut out = String::from("Keys (current values: pibuz settings show):\n");
+    for (key, values) in KEY_VALUES {
+        let values = match values {
+            Some(v) => (*v).to_string(),
+            None => qconnect_kv::device_type_choices()
+                .collect::<Vec<_>>()
+                .join(" | "),
+        };
+        out.push_str(&format!("  {key:<width$}  {values}\n"));
+    }
+    out.push_str("\ntrue | false also accept on/off, yes/no and 1/0.");
+    out
+}
+
 // ============================ value parsing ============================
 
 fn parse_bool(v: &str) -> Result<bool, String> {
@@ -1509,6 +1586,30 @@ mod tests {
     /// place it writes — the log and the caches included, which it used to
     /// leave out while naming a cache folder nothing used — and marks what is
     /// optional instead of presenting a file nobody has as if it were there.
+    /// `settings set --help` is where someone looks for what a key accepts, so
+    /// it lists every key `set` takes, in `settings show` order, each with a
+    /// description. A key added to KEY_TABLE without one fails here.
+    #[test]
+    fn the_key_reference_lists_every_key_with_its_values() {
+        let reference = key_reference();
+        let listed: Vec<&str> = reference
+            .lines()
+            .filter_map(|l| l.split_whitespace().next())
+            .filter(|w| w.contains('.') && !w.ends_with('.'))
+            .collect();
+        let known: Vec<&str> = KEY_TABLE.iter().map(|(k, _)| *k).collect();
+        assert_eq!(listed, known);
+        for line in reference.lines().filter(|l| l.trim_start().contains('.')) {
+            let mut words = line.split_whitespace();
+            let key = words.next().unwrap_or_default();
+            if known.contains(&key) {
+                assert!(words.next().is_some(), "`{key}` has no description");
+            }
+        }
+        // Built from the same list the parser checks, not copied into a string.
+        assert!(reference.contains("speaker"), "{reference}");
+    }
+
     #[test]
     fn config_path_names_every_place_the_daemon_writes() {
         let roots = scratch_roots("config-path");

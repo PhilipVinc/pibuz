@@ -37,7 +37,9 @@ struct Cli {
     /// Target daemon (default 127.0.0.1:8182; env QBZD_HOST)
     #[arg(long, global = true)]
     host: Option<String>,
-    #[arg(short, long, global = true)]
+    // Parsed and never read. Hidden rather than removed, so a script that
+    // passes `-q` keeps working.
+    #[arg(short, long, global = true, hide = true)]
     quiet: bool,
     #[command(subcommand)]
     cmd: Cmd,
@@ -47,63 +49,66 @@ struct Cli {
 enum Cmd {
     /// Run the daemon in the foreground (systemd ExecStart)
     Run,
-    /// Composite daemon diagnostic
+    /// What the daemon is doing: connection, playback, audio device
     Status {
+        /// Print JSON
         #[arg(long)]
         json: bool,
         /// Also show the memory, cache and buffer sections
         #[arg(short, long)]
         verbose: bool,
     },
+    /// Check that the daemon is answering
     Ping {
+        /// Print JSON
         #[arg(long)]
         json: bool,
     },
     /// One-line now-playing
     Now {
+        /// Print JSON
         #[arg(long)]
         json: bool,
     },
     /// Stream live daemon events (SSE); default = newline-delimited JSON
     Watch {
+        /// Print the raw event stream as the daemon sends it
         #[arg(long)]
         raw: bool,
     },
     /// Shuffle: on | off | toggle (bare = toggle)
-    Shuffle {
-        mode: Option<String>,
-    },
+    Shuffle { mode: Option<String> },
     /// Repeat: off | all | one
-    Repeat {
-        mode: String,
-    },
+    Repeat { mode: String },
     /// Resume (bare) or play content: album:ID | track:ID | artist:ID | playlist:ID | URL
-    Play {
-        content: Option<String>,
-    },
+    Play { content: Option<String> },
+    /// Pause
     Pause,
+    /// Play if paused, pause if playing
     Toggle,
+    /// Stop
     Stop,
+    /// Next track
     Next,
+    /// Previous track
     Prev,
     /// Absolute secs, +N/-N, or mm:ss
-    Seek {
-        position: String,
-    },
+    Seek { position: String },
     /// Bare = read; 0-100, +N, -N
     Volume {
         value: Option<String>,
+        /// Print JSON
         #[arg(long)]
         json: bool,
     },
-    /// Bare = toggle
-    Mute {
-        state: Option<String>,
-    },
+    /// Mute: on | off (bare = toggle)
+    Mute { state: Option<String> },
+    /// Show and edit the play queue
     Queue {
         #[command(subcommand)]
         cmd: QueueCmd,
     },
+    /// Show and change the settings: audio output, playback, Qobuz Connect, hooks
     Settings {
         #[command(subcommand)]
         cmd: SettingsCmd,
@@ -117,11 +122,14 @@ enum Cmd {
         #[command(subcommand)]
         cmd: QconnectCmd,
     },
+    /// Where pibuz keeps its files, and pibuz.toml (control port, token, log level)
     Config {
         #[command(subcommand)]
         cmd: ConfigCmd,
     },
+    /// Print the version
     Version {
+        /// Print JSON
         #[arg(long)]
         json: bool,
     },
@@ -141,9 +149,7 @@ enum Cmd {
     },
     /// Shell completions (hidden; for packagers)
     #[command(hide = true)]
-    Completions {
-        shell: clap_complete::Shell,
-    },
+    Completions { shell: clap_complete::Shell },
 }
 
 /// The top-level help lists the commands in these sections, in this order,
@@ -197,6 +203,11 @@ fn command_with_sections() -> clap::Command {
         }
         sections.push('\n');
     }
+    // What every key accepts, where someone about to set one will look. Built
+    // at run time because one list comes from the protocol.
+    let cmd = cmd.mut_subcommand("settings", |settings| {
+        settings.mut_subcommand("set", |set| set.after_help(cli::settings::key_reference()))
+    });
     cmd.help_template(format!(
         "{{about-with-newline}}\n{{usage-heading}} {{usage}}\n\n{sections}\
          {header}Options:{header:#}\n{{options}}"
@@ -205,35 +216,33 @@ fn command_with_sections() -> clap::Command {
 
 #[derive(Subcommand)]
 enum QueueCmd {
+    /// List the queue, numbered from 1
     List {
+        /// Print JSON
         #[arg(long)]
         json: bool,
     },
+    /// Add a track (its Qobuz id) at the end of the queue
     Add {
         track_id: u64,
+        /// Add it right after the current track instead
         #[arg(long)]
         next: bool,
     },
-    Remove {
-        index: usize,
-    },
+    /// Remove the track at a 1-based position
+    Remove { index: usize },
+    /// Empty the queue
     Clear {
+        /// Keep the track that is playing
         #[arg(long)]
         keep_current: bool,
     },
     /// Reorder a 1-based position to another
-    Move {
-        from: usize,
-        to: usize,
-    },
+    Move { from: usize, to: usize },
     /// Jump to (play) a 1-based position
-    Jump {
-        position: usize,
-    },
+    Jump { position: usize },
     /// Stop after the current track (or `off` to clear)
-    StopAfter {
-        arg: Option<String>,
-    },
+    StopAfter { arg: Option<String> },
 }
 
 #[derive(Subcommand)]
@@ -318,33 +327,46 @@ enum PlaylistCmd {
 
 #[derive(Subcommand)]
 enum SettingsCmd {
+    /// Save every setting to a JSON file, to copy to another box
     Export {
+        /// Where to write it (default: a dated file in the current folder)
         file: Option<String>,
+        /// Also export stored credentials, if there are any
         #[arg(long)]
         include_auth: bool,
     },
+    /// Apply settings from a file written by `settings export`
     Import {
         file: String,
+        /// Also import the credentials in it, if there are any
         #[arg(long)]
         include_auth: bool,
-        #[arg(long)]
-        remap: Vec<String>, // OLD=NEW, repeatable
+        // OLD=NEW, repeatable. Validated and then unused: it remapped library
+        // folders, which pibuz does not have. Hidden, kept for scripts.
+        #[arg(long, hide = true)]
+        remap: Vec<String>,
+        /// Show what would change, and change nothing
         #[arg(long)]
         dry_run: bool,
     },
+    /// Every setting and its current value
     Show {
+        /// Print JSON
         #[arg(long)]
         json: bool,
     },
+    /// Change one setting; `pibuz settings set --help` lists every key
     Set {
+        /// The setting, such as audio.device (all of them are listed below)
         key: String,
-        /// `allow_hyphen_values` because a setting's value may legitimately
-        /// start with `-`: `audio.normalization_target_lufs` is NEGATIVE at
-        /// every usable setting, its own default included. Without this, clap
-        /// reads `-14` as an unknown short flag and
-        /// `settings set audio.normalization_target_lufs -14` fails with
-        /// "unexpected argument '-1' found" — the one key the CLI could not
-        /// write at all, and the failure looked like a typo rather than a bug.
+        /// Its new value
+        // `allow_hyphen_values` because a setting's value may legitimately
+        // start with `-`: `audio.normalization_target_lufs` is NEGATIVE at
+        // every usable setting, its own default included. Without this, clap
+        // reads `-14` as an unknown short flag and
+        // `settings set audio.normalization_target_lufs -14` fails with
+        // "unexpected argument '-1' found" — the one key the CLI could not
+        // write at all, and the failure looked like a typo rather than a bug.
         #[arg(allow_hyphen_values = true)]
         value: String,
     },
@@ -361,8 +383,11 @@ enum QconnectCmd {
 // Rotating the opt-in [server] token = edit pibuz.toml + restart.
 #[derive(Subcommand)]
 enum ConfigCmd {
+    /// Every folder and file pibuz reads or writes
     Path,
+    /// The pibuz.toml settings: control API address, token, log level
     Show {
+        /// Print JSON
         #[arg(long)]
         json: bool,
     },
