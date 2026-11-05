@@ -163,7 +163,13 @@ fn a_refused_second_start_leaves_the_live_log_alone() {
     } else {
         home.path().join(".local/share")
     };
-    let logs = data_dir.join("pibuz/logs");
+    // The log is XDG state on Linux; macOS has no state folder, so it falls
+    // back to the data root.
+    let logs = if cfg!(target_os = "macos") {
+        data_dir.join("pibuz/logs")
+    } else {
+        home.path().join(".local/state/pibuz/logs")
+    };
     std::fs::create_dir_all(&logs).unwrap();
     std::fs::write(logs.join("pibuz.log"), "the live daemon's log\n").unwrap();
     std::fs::write(logs.join("pibuz.log.prev"), "the previous run's log\n").unwrap();
@@ -190,6 +196,7 @@ fn a_refused_second_start_leaves_the_live_log_alone() {
         .env("XDG_DATA_HOME", home.path().join(".local/share"))
         .env("XDG_CONFIG_HOME", home.path().join(".config"))
         .env("XDG_CACHE_HOME", home.path().join(".cache"))
+        .env("XDG_STATE_HOME", home.path().join(".local/state"))
         .output()
         .unwrap();
     assert_eq!(

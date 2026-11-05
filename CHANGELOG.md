@@ -3,13 +3,14 @@
 Notable changes per release. Versions are plain semver; releases are `vX.Y.Z`
 tags on `main`.
 
-## 2.8.0 — 2026-11-06
+## 2.8.0 — unreleased
 
 ### Changed
 
 - **Everything the daemon writes is in its own folders**, which `pibuz config
-  path` now lists in full and `data_root` now moves. The log is
-  `<data>/logs/pibuz.log` (it was `~/.local/share/qbz/logs/qbz.log`), and the
+  path` now lists in full and `data_root` now moves. The log is XDG state,
+  `$XDG_STATE_HOME/pibuz/logs/pibuz.log` (`~/.local/state/...`; it was
+  `~/.local/share/qbz/logs/qbz.log`), and the
   disk cache and the Qobuz token cache are in the cache folder (they were in
   `~/.cache/qbz`). The old cache files are deleted at the first start, and the
   folder with them once it is empty; the old log and token files are left
@@ -39,6 +40,9 @@ tags on `main`.
 
 ### Fixed
 
+- **The log file has each line as soon as it is logged.** It went through an
+  8 KB buffer that nothing flushed, so it read 0 bytes for the first stretch of
+  every run, and a crash lost the lines that explained it.
 - **`/api/events` delivers each event as it happens.** The stream went out
   through tiny_http's chunked writer, which holds 8 KB before sending, so
   clients — `pibuz watch`, `curl -N`, a script — got it in bursts tens of
