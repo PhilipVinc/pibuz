@@ -51,7 +51,7 @@ pub(crate) async fn run(
     qbz_log::install(&cfg.log.level, Some(crate::paths::log_file(&roots)));
     // The folders pibuz used before it kept everything in its own; see
     // `paths::clear_legacy_folders`. After the logger, so it can say so.
-    crate::paths::clear_legacy_folders();
+    crate::paths::clear_legacy_folders(&roots);
     crate::paths::clear_stale_data_logs(&roots);
     // …including libasound's, which otherwise writes straight to stderr. It
     // used to be installed only by `BackendManager::create_backend`, i.e. not

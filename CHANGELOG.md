@@ -10,12 +10,12 @@ tags on `main`.
 - **Everything the daemon writes is in its own folders**, which `pibuz config
   path` now lists in full and `data_root` now moves. The log is XDG state,
   `$XDG_STATE_HOME/pibuz/logs/pibuz.log` (`~/.local/state/...`; it was
-  `~/.local/share/qbz/logs/qbz.log`), and the
-  disk cache and the Qobuz token cache are in the cache folder (they were in
-  `~/.cache/qbz`). The old cache files are deleted at the first start, and the
-  folder with them once it is empty; the old log and token files are left
-  alone, since other software also uses `qbz` folders. On a box where only
-  pibuz did, `rm -r ~/.local/share/qbz ~/.cache/qbz` clears them.
+  `~/.local/share/qbz/logs/qbz.log`), and the disk cache and the Qobuz token
+  cache are in the cache folder (they were in `~/.cache/qbz`). The first start
+  removes what pibuz left in the old places: the cache files, the token cache,
+  the old log, and the empty `~/.config/pibuz` earlier versions created. Each
+  old folder goes once it is empty; anything else in a `qbz` folder is not
+  pibuz's and stays.
 - **`pibuz config path` shows only what is there.** It used to name a cache
   folder nothing used and a systemd unit that was not installed, and to leave
   out the log and the real cache. `pibuz.toml` is marked as optional, and the
