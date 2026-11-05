@@ -163,7 +163,7 @@ belong to, which decodes as noise rather than as an error.
 
 ## The L2 disk cache is sealed, and the key dies with the process
 
-Everything the daemon writes to `~/.cache/qbz/playback/` used to be a playable
+Everything the daemon writes to `<cache root>/playback/` used to be a playable
 FLAC: the CMAF path decrypts each segment before it assembles, and the legacy
 path downloads plaintext to begin with. It is now AES-128-CTR'd on the way to
 the card — `crates/qbz-cmaf/src/vault.rs`, which has the full reasoning — under

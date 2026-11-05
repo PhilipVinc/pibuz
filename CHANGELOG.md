@@ -5,6 +5,22 @@ tags on `main`.
 
 ## Unreleased
 
+### Changed
+
+- **Everything the daemon writes is in its own folders**, which `pibuz config
+  path` now lists in full and `data_root` now moves. The log is
+  `<data>/logs/pibuz.log` (it was `~/.local/share/qbz/logs/qbz.log`), and the
+  disk cache and the Qobuz token cache are in the cache folder (they were in
+  `~/.cache/qbz`). The old cache files are deleted at the first start, and the
+  folder with them once it is empty; the old log and token files are left
+  alone, since other software also uses `qbz` folders. On a box where only
+  pibuz did, `rm -r ~/.local/share/qbz ~/.cache/qbz` clears them.
+- **`pibuz config path` shows only what is there.** It used to name a cache
+  folder nothing used and a systemd unit that was not installed, and to leave
+  out the log and the real cache. `pibuz.toml` is marked as optional, and the
+  empty `~/.config/pibuz` is no longer created. `pibuz config show` points to
+  `pibuz settings show` for everything it does not cover.
+
 ### Fixed
 
 - **`/api/events` delivers each event as it happens.** The stream went out

@@ -1019,19 +1019,44 @@ pub(crate) fn qconnect_name(roots: &ProfileRoots, name: &str) -> i32 {
     0
 }
 
-/// `pibuz config path`. Process roots, the settings file, and the
-/// (conventional, not necessarily installed) systemd user unit path. No
-/// `--json`.
+/// `pibuz config path`. Every place the daemon reads or writes: the data root
+/// with its settings and log, the cache root, the optional `pibuz.toml`, and
+/// the systemd user unit when one is installed. No `--json`.
 pub(crate) fn config_path(roots: &ProfileRoots) -> i32 {
-    println!("config   : {}", roots.config.display());
-    println!("data     : {}", roots.data.display());
-    println!("cache    : {}", roots.cache.display());
-    println!(
-        "settings : {}",
-        qbz_models::settings_file::path(&roots.data).display()
-    );
-    println!("unit     : {}", unit_path().display());
+    let unit = unit_path();
+    for (label, value) in path_lines(roots, unit.is_file().then_some(unit)) {
+        println!("{label:<9}: {value}");
+    }
     0
+}
+
+/// The `config path` lines. `unit` is the installed unit, if there is one.
+fn path_lines(roots: &ProfileRoots, unit: Option<PathBuf>) -> Vec<(&'static str, String)> {
+    let config_file = roots.config_file();
+    let config = if config_file.is_file() {
+        config_file.display().to_string()
+    } else {
+        format!(
+            "{} (not present: built-in defaults, see `pibuz config show`)",
+            config_file.display()
+        )
+    };
+    let mut lines = vec![
+        ("data", roots.data.display().to_string()),
+        (
+            "settings",
+            qbz_models::settings_file::path(&roots.data)
+                .display()
+                .to_string(),
+        ),
+        ("logs", crate::paths::log_file(roots).display().to_string()),
+        ("cache", roots.cache.display().to_string()),
+        ("config", config),
+    ];
+    if let Some(unit) = unit {
+        lines.push(("unit", unit.display().to_string()));
+    }
+    lines
 }
 
 fn unit_path() -> PathBuf {
@@ -1088,6 +1113,10 @@ pub(crate) fn config_show(json: bool, roots: &ProfileRoots) -> i32 {
         },
     );
     line("log.level", "log.level", cfg.log.level.clone());
+    // These six are all pibuz.toml holds; everything about playback is in the
+    // other file, and nothing here said so.
+    println!();
+    println!("Audio, playback, Qobuz Connect and hook settings: pibuz settings show");
     0
 }
 
@@ -1474,6 +1503,51 @@ mod tests {
             data: base.join("data"),
             cache: base.join("cache"),
         }
+    }
+
+    /// `config path` lists where the daemon keeps things, so it lists every
+    /// place it writes — the log and the caches included, which it used to
+    /// leave out while naming a cache folder nothing used — and marks what is
+    /// optional instead of presenting a file nobody has as if it were there.
+    #[test]
+    fn config_path_names_every_place_the_daemon_writes() {
+        let roots = scratch_roots("config-path");
+        let lines = path_lines(&roots, None);
+        let get = |label: &str| {
+            lines
+                .iter()
+                .find(|(l, _)| *l == label)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("no `{label}` line in {lines:?}"))
+        };
+
+        assert_eq!(get("data"), roots.data.display().to_string());
+        assert!(get("settings").ends_with("settings.toml"));
+        assert_eq!(
+            get("logs"),
+            roots
+                .data
+                .join("logs")
+                .join("pibuz.log")
+                .display()
+                .to_string()
+        );
+        assert_eq!(get("cache"), roots.cache.display().to_string());
+        assert!(
+            get("config").contains("not present"),
+            "a pibuz.toml nobody wrote is optional: {}",
+            get("config")
+        );
+        assert!(
+            lines.iter().all(|(l, _)| *l != "unit"),
+            "no unit installed, so no unit line: {lines:?}"
+        );
+
+        let unit = roots.config.join("pibuz.service");
+        let lines = path_lines(&roots, Some(unit.clone()));
+        assert!(lines
+            .iter()
+            .any(|(l, v)| *l == "unit" && *v == unit.display().to_string()));
     }
 
     fn cleanup(roots: &ProfileRoots) {

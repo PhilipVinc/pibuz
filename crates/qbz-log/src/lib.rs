@@ -3,7 +3,8 @@
 //! It owns a composite [`log::Log`] implementation ([`tee::TeeLogger`]) that wraps
 //! `env_logger`'s built `Logger` and fans every record out to two sinks:
 //!   1. **stderr** (redacted text, same line format as the file sink), and
-//!   2. an **on-disk file** (`~/.local/share/qbz/logs/qbz.log`, prev-rotated at startup).
+//!   2. an **on-disk file**, wherever the caller says (pibuz: `<data>/logs/pibuz.log`),
+//!      prev-rotated at startup.
 //!
 //! Secret **redaction** ([`redact`]) is applied once at the single write choke point,
 //! so both sinks get clean text.

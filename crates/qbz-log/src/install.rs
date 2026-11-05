@@ -13,9 +13,14 @@ static INSTALLED: AtomicBool = AtomicBool::new(false);
 /// Install the [`TeeLogger`] as the global `log` logger.
 ///
 /// Builds the inner `env_logger` logger from `RUST_LOG` (falling back to `default_level`),
-/// opens/rotates the on-disk file, then sets the boxed logger + max level. Idempotent:
-/// a second call is a guarded no-op (it neither rotates the file again nor panics).
-pub fn install(default_level: &str) {
+/// opens/rotates `log_file` (to `<log_file>.prev`), then sets the boxed logger + max level.
+/// `None` logs to stderr only. Idempotent: a second call is a guarded no-op (it neither
+/// rotates the file again nor panics).
+///
+/// The caller names the file. This crate used to put it at
+/// `~/.local/share/qbz/logs/qbz.log` itself, outside the daemon's own folders, where
+/// `pibuz config path` never said it was and `data_root` could not move it.
+pub fn install(default_level: &str, log_file: Option<PathBuf>) {
     // True one-shot guard: avoid re-rotating the log file or fighting an already-set logger.
     if INSTALLED.swap(true, Ordering::SeqCst) {
         return;
@@ -28,7 +33,7 @@ pub fn install(default_level: &str) {
     )
     .build();
     let level = inner.filter();
-    let file = open_log_file();
+    let file = log_file.and_then(open_log_file);
 
     // Ignore the Err if a logger was somehow already set elsewhere.
     if log::set_boxed_logger(Box::new(TeeLogger { inner, file })).is_ok() {
@@ -36,20 +41,15 @@ pub fn install(default_level: &str) {
     }
 }
 
-/// Path to the current-run log file (`~/.local/share/qbz/logs/qbz.log`), if a data dir exists.
-pub(crate) fn log_file_path() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join("qbz").join("logs").join("qbz.log"))
-}
-
-/// Open the log file for this run, rotating any previous one to `qbz.log.prev`.
+/// Open the log file for this run, rotating any previous one to `<path>.prev`.
 /// Returns `None` (file sink disabled, gracefully) on any filesystem error.
-fn open_log_file() -> Option<Mutex<BufWriter<File>>> {
-    let path = log_file_path()?;
+fn open_log_file(path: PathBuf) -> Option<Mutex<BufWriter<File>>> {
     let dir = path.parent()?;
     std::fs::create_dir_all(dir).ok()?;
 
     if path.exists() {
-        let prev = dir.join("qbz.log.prev");
+        let mut prev = path.clone().into_os_string();
+        prev.push(".prev");
         // Best-effort rotation; a failure here must not disable logging.
         let _ = std::fs::rename(&path, &prev);
     }

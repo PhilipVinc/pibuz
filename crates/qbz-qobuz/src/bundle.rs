@@ -69,8 +69,22 @@ impl From<CachedBundle> for BundleTokens {
     }
 }
 
+/// Where the token cache lives, set once by the process that owns a cache
+/// folder. Unset, nothing is cached on disk and every start fetches the bundle.
+///
+/// A process-wide setting, deliberately: the cache is read and written from
+/// deep inside client construction, and the daemon has exactly one cache
+/// folder for its whole life. It used to be `~/.cache/qbz` hard-coded here,
+/// outside the daemon's own folders, where `data_root` could not move it.
+static CACHE_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Keep the bundle-token cache in `dir`. The first call wins.
+pub fn set_cache_dir(dir: PathBuf) {
+    let _ = CACHE_DIR.set(dir);
+}
+
 fn cache_path() -> Option<PathBuf> {
-    Some(dirs::cache_dir()?.join("qbz").join("bundle_tokens.json"))
+    Some(CACHE_DIR.get()?.join("bundle_tokens.json"))
 }
 
 /// Load cached tokens if a valid cache file exists. Returns `None` on any error

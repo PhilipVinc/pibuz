@@ -33,7 +33,6 @@ base64 = { workspace = true }
 chrono = { workspace = true }
 
 # Filesystem (bundle-token cache location)
-dirs = "6"
 
 # Logging
 log = { workspace = true }

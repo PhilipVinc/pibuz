@@ -39,7 +39,7 @@
 //! use std::sync::Arc;
 //!
 //! // Create L2 disk cache
-//! let playback_cache = Arc::new(PlaybackCache::new(800 * 1024 * 1024).unwrap());
+//! let playback_cache = Arc::new(PlaybackCache::with_path(cache_dir.join("playback"), 800 * 1024 * 1024).unwrap());
 //!
 //! // Create L1 memory cache with L2 spillover
 //! let audio_cache = AudioCache::with_playback_cache(
@@ -62,4 +62,4 @@ mod playback_cache;
 
 pub use audio_cache::{AudioCache, CacheStats, CachedTrack, TrackBytes};
 pub use cached_file::CachedFile;
-pub use playback_cache::{PlaybackCache, PlaybackCacheStats};
+pub use playback_cache::{remove_sealed_leftovers, PlaybackCache, PlaybackCacheStats};
