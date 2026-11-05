@@ -25,6 +25,13 @@ tags on `main`.
 
 ### Fixed
 
+- **A pause of more than two seconds no longer skips the next track.** Such a
+  pause releases the audio device, and the next track, already fetched and
+  queued for a gapless hand-off, went with it while the player still counted
+  it as queued. Resuming played the current track alone; at its end the player
+  moved on to a next track there was no audio for, read the silence as that
+  track having finished, and went on to the one after. Resuming now queues the
+  next track again, as a seek already did, so it plays, gaplessly.
 - **The log file has each line as soon as it is logged.** It went through an
   8 KB buffer that nothing flushed, so it read 0 bytes for the first minutes
   of every run, and a crash lost the lines that explained it.
