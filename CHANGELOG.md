@@ -25,6 +25,9 @@ tags on `main`.
   `pibuz qconnect enable`. A box with `startup_mode = "off"` already in its
   `settings.toml` keeps it; `pibuz settings set qconnect.startup_mode on`
   turns it on.
+- **Every command says what it does in `--help`**, and
+  `pibuz settings set --help` lists every key with the values it accepts.
+  `--quiet`, which never did anything, is no longer listed.
 
 ### Deprecated
 
