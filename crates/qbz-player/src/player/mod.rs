@@ -898,6 +898,56 @@ fn begin_new_track(
     thread_state.set_gapless_next_track_id(0);
 }
 
+/// A prepared successor taken out of an engine that is being replaced, to be
+/// queued again into the one that replaces it. See [`take_successor_for_requeue`].
+struct Requeue {
+    audio: TrackAudio,
+    track_id: u64,
+    sample_rate: u32,
+    channels: u16,
+}
+
+/// Take the prepared successor back from an engine that is going away while
+/// the CURRENT track carries on, so it can be queued into the new one.
+///
+/// The successor lives inside the engine, appended behind the current track,
+/// so anything that rebuilds the engine around the same track loses it while
+/// `gapless_pending` still says it is queued. Which track comes next has not
+/// changed and its bytes are still in hand, so they come back for re-queueing.
+/// Two paths rebuild the engine that way:
+///
+/// - a seek within the track;
+/// - a resume after a pause long enough to release the device
+///   (`PAUSE_SUSPEND_DELAY_MS`). This one used to keep nothing: the rebuilt
+///   engine played the current track alone, and at its end the position-based
+///   transition swapped the player to a successor the engine never had. The
+///   engine ran dry, the player parked the successor at its full duration, and
+///   the driver read that as its end and advanced past it — the next track was
+///   skipped after any long pause.
+///
+/// ARMED is left set while a re-queue is in flight. The re-issued `PlayNext`
+/// arrives asynchronously, and until it lands "no pending, not armed, ready
+/// false, next id 0" is exactly what the prefetch check looks for — a tick there
+/// would start a SECOND prefetch, and `PlayNext` appends unconditionally, so two
+/// sources would be queued with only the later one described. The transition
+/// clears the flag, as it does for any normal arm.
+fn take_successor_for_requeue(
+    thread_state: &SharedState,
+    gapless_pending: &mut Option<GaplessPending>,
+    gapless_request_armed: &mut bool,
+) -> Option<Requeue> {
+    let requeue = gapless_pending.take().map(|pending| Requeue {
+        audio: pending.audio,
+        track_id: pending.track_id,
+        sample_rate: pending.sample_rate,
+        channels: pending.channels,
+    });
+    *gapless_request_armed = requeue.is_some();
+    thread_state.set_gapless_ready(false);
+    thread_state.set_gapless_next_track_id(0);
+    requeue
+}
+
 /// Would a successor at `next_rate` be refused by the engine for a rate change?
 ///
 /// `next_rate` is what the stream URL reports, which Qobuz gives in kHz (`96`,
@@ -4250,6 +4300,40 @@ impl Player {
                                 *current_engine = Some(engine);
 
                                 log::info!("Audio thread: resumed from {}s", resume_pos);
+
+                                // The engine the pause dropped held the prepared
+                                // next track; this one holds only the current
+                                // track. Left as it was, `gapless_pending` named a
+                                // successor nothing would play, and the transition
+                                // at the end of this track swapped to it anyway:
+                                // the next track was skipped. Hand it back, as a
+                                // seek does. Only here, on success, so a resume
+                                // that fails above leaves nothing armed.
+                                if let Some(Requeue {
+                                    audio,
+                                    track_id,
+                                    sample_rate,
+                                    channels,
+                                }) = take_successor_for_requeue(
+                                    &thread_state,
+                                    gapless_pending,
+                                    gapless_request_armed,
+                                ) {
+                                    log::info!(
+                                        "Gapless: re-queueing track {track_id} after the engine was rebuilt on resume"
+                                    );
+                                    if let Err(e) = self_tx.send(AudioCommand::PlayNext {
+                                        audio,
+                                        track_id,
+                                        sample_rate,
+                                        channels,
+                                    }) {
+                                        // Not fatal: with nothing armed, the
+                                        // prefetch check can ask for it again.
+                                        log::warn!("Gapless: could not re-queue after resume: {e}");
+                                        *gapless_request_armed = false;
+                                    }
+                                }
                                 return;
                             }
 
@@ -4439,29 +4523,14 @@ impl Player {
                             // transition. But seeking WITHIN a track does not
                             // change which track comes next, and its bytes are
                             // still in hand, so they come with us and are
-                            // re-queued once the new engine exists.
-                            //
-                            // ARMED stays set while that re-queue is in flight:
-                            // the re-issued PlayNext is delivered asynchronously,
-                            // and until it lands, "no pending, not armed, ready
-                            // false, next id 0" is exactly what the prefetch check
-                            // looks for -- a tick there would start a SECOND
-                            // prefetch, and PlayNext appends unconditionally, so
-                            // two sources would be queued with only the later one
-                            // described. The transition clears the flag, as it
-                            // does for any normal arm.
-                            let requeue_gapless = gapless_pending.as_ref().map(|pending| {
-                                (
-                                    pending.audio.clone(),
-                                    pending.track_id,
-                                    pending.sample_rate,
-                                    pending.channels,
-                                )
-                            });
-                            *gapless_pending = None;
-                            *gapless_request_armed = requeue_gapless.is_some();
-                            thread_state.set_gapless_ready(false);
-                            thread_state.set_gapless_next_track_id(0);
+                            // re-queued once the new engine exists (see
+                            // `take_successor_for_requeue`, which also says why
+                            // ARMED stays set meanwhile).
+                            let requeue_gapless = take_successor_for_requeue(
+                                &thread_state,
+                                gapless_pending,
+                                gapless_request_armed,
+                            );
 
                             // After take(), every failure path must clear playing
                             // state — otherwise the controller is told "playing" with no engine.
@@ -4708,7 +4777,12 @@ impl Player {
                             // re-validates everything, so a re-queue that is no
                             // longer appropriate is refused exactly as a fresh
                             // one would be.
-                            if let Some((audio, track_id, sample_rate, channels)) = requeue_gapless
+                            if let Some(Requeue {
+                                audio,
+                                track_id,
+                                sample_rate,
+                                channels,
+                            }) = requeue_gapless
                             {
                                 log::info!(
                                     "Gapless: re-queueing track {track_id} after the seek rebuilt the engine"
@@ -7946,8 +8020,58 @@ mod cached_quality_tests {
 
 #[cfg(test)]
 mod new_track_and_prefetch_tests {
-    use super::{begin_new_track, should_arm_prefetch, GaplessPending, SharedState, TrackAudio};
+    use super::{
+        begin_new_track, should_arm_prefetch, take_successor_for_requeue, GaplessPending,
+        SharedState, TrackAudio,
+    };
     use qbz_cache::TrackBytes;
+
+    /// A pause over two seconds drops the engine to release the DAC, and the
+    /// successor queued INSIDE it goes too — but `pending` said it was still
+    /// queued. The rebuilt engine played the current track alone; at its end
+    /// the position-based transition swapped the player to the successor the
+    /// engine never had, the engine ran dry, the player parked the successor
+    /// at its full duration, and the driver advanced past it. The successor was
+    /// skipped, after any pause long enough to release the device.
+    ///
+    /// The contract: an engine rebuilt around the same track takes the
+    /// successor back — handed over for re-queueing, with ARMED held so the
+    /// prefetch does not fetch a second one while the re-queue is in flight.
+    #[test]
+    fn a_rebuilt_engine_gets_the_successor_back() {
+        let state = SharedState::new();
+        let mut pending = Some(a_pending(2_944_914));
+        let mut armed = false;
+        state.set_gapless_ready(true);
+        state.set_gapless_next_track_id(2_944_914);
+
+        let requeue = take_successor_for_requeue(&state, &mut pending, &mut armed)
+            .expect("the successor must come back for re-queueing");
+
+        assert_eq!(requeue.track_id, 2_944_914);
+        assert_eq!((requeue.sample_rate, requeue.channels), (44_100, 2));
+        assert!(
+            pending.is_none(),
+            "left in place, it names a track the new engine does not have"
+        );
+        assert!(
+            armed,
+            "until the re-queue lands, a second prefetch must not start"
+        );
+        assert!(!state.is_gapless_ready());
+        assert_eq!(state.get_gapless_next_track_id(), 0);
+    }
+
+    /// Nothing queued: nothing to give back, and nothing held armed — a held
+    /// flag with no re-queue behind it would block this track's prefetch.
+    #[test]
+    fn a_rebuild_with_no_successor_arms_nothing() {
+        let state = SharedState::new();
+        let mut pending: Option<GaplessPending> = None;
+        let mut armed = true;
+        assert!(take_successor_for_requeue(&state, &mut pending, &mut armed).is_none());
+        assert!(!armed);
+    }
 
     fn a_pending(track_id: u64) -> GaplessPending {
         GaplessPending {

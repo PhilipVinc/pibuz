@@ -29,6 +29,13 @@ tags on `main`.
   of one. The player now remembers the depth Qobuz served each track at, and
   accepts a copy that is already the best there is. The record is in memory,
   so after a restart a disk-cached 16-bit track is fetched again once.
+- **A pause of more than two seconds no longer skips the next track.** Such a
+  pause releases the audio device, and the next track, already fetched and
+  queued for a gapless hand-off, went with it while the player still counted
+  it as queued. Resuming played the current track alone; at its end the player
+  moved on to a next track there was no audio for, read the silence as that
+  track having finished, and went on to the one after. Resuming now queues the
+  next track again, as a seek already did, so it plays, gaplessly.
 
 ## 2.7.2 — 2026-10-27
 
