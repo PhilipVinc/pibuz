@@ -14,6 +14,14 @@ tags on `main`.
   it stays in the data folder, so a container keeps everything in one place.
   `pibuz config path` shows where it is. The first start removes the old
   `<data>/logs` folder, with the log of the last run before the upgrade.
+- **The first start removes everything pibuz left in its old places**, not
+  only the old disk cache files: the Qobuz token cache
+  (`~/.cache/qbz/bundle_tokens.json`), the old log
+  (`~/.local/share/qbz/logs/qbz.log` and `.prev`), and the empty
+  `~/.config/pibuz` that every version up to 2.7.2 created. Each old folder
+  goes once it is empty. Only those named files are removed, so anything else
+  in a `qbz` folder stays, and a `~/.config/pibuz` holding a `pibuz.toml` is
+  kept.
 
 ### Fixed
 
