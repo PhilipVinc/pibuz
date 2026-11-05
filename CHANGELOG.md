@@ -21,6 +21,14 @@ tags on `main`.
   it in the background, so a connection waits on a lookup only for a host's
   first one, or after half an hour unused. A lookup slower than a second is
   logged as `[dns]`.
+- **A 16-bit track plays from the cache with a hi-res tier selected** (#9,
+  thanks to Gjuju). A tier is a ceiling, so Hi-Res on a track mastered at 16
+  bits gets the 16-bit file — but the cache demanded 24 bits for either
+  hi-res tier, refused that copy on every play and fetched the same file
+  again, so a skip to a prefetched track took seconds instead of a fraction
+  of one. The player now remembers the depth Qobuz served each track at, and
+  accepts a copy that is already the best there is. The record is in memory,
+  so after a restart a disk-cached 16-bit track is fetched again once.
 
 ## 2.7.2 — 2026-10-27
 
