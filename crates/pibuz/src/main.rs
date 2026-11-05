@@ -108,6 +108,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: SettingsCmd,
     },
+    // Deprecated, and hidden from `--help`: each verb is one `settings set
+    // qconnect.*` key. Kept working because moOde 10.3.7's renderer.php runs
+    // `pibuz qconnect enable` on every start; remove once a moOde release no
+    // longer does.
+    #[command(hide = true)]
     Qconnect {
         #[command(subcommand)]
         cmd: QconnectCmd,
@@ -149,8 +154,7 @@ const HELP_SECTIONS: &[(&str, &[&str])] = &[
     (
         "Pibuz",
         &[
-            "run", "status", "ping", "watch", "settings", "qconnect", "config", "service",
-            "version", "help",
+            "run", "status", "ping", "watch", "settings", "config", "service", "version", "help",
         ],
     ),
     ("Queue", &["queue", "shuffle", "repeat"]),
@@ -517,6 +521,13 @@ async fn main() {
         }
         Cmd::Qconnect { cmd } => {
             let roots = login_roots();
+            // stderr, so a script reading stdout sees exactly what it did.
+            let instead = match &cmd {
+                QconnectCmd::Enable => "pibuz settings set qconnect.startup_mode on",
+                QconnectCmd::Disable => "pibuz settings set qconnect.startup_mode off",
+                QconnectCmd::Name { .. } => "pibuz settings set qconnect.device_name \"<name>\"",
+            };
+            eprintln!("note: `pibuz qconnect` is deprecated and will be removed; use `{instead}`");
             match cmd {
                 QconnectCmd::Enable => cli::settings::qconnect_enable(&roots),
                 QconnectCmd::Disable => cli::settings::qconnect_disable(&roots),

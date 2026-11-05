@@ -9,10 +9,12 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum QconnectStartupMode {
-    /// Never auto-connect on startup. Default for fresh installs.
-    #[default]
+    /// Never auto-connect on startup.
     Off,
-    /// Always auto-connect on every startup, regardless of last state.
+    /// Always auto-connect on every startup, regardless of last state. The
+    /// default: the daemon does nothing but Qobuz Connect, so a fresh install
+    /// has to appear in the Qobuz apps without being told to.
+    #[default]
     On,
     /// Restore the on/off state captured at last connect/disconnect.
     RememberLast,
@@ -59,8 +61,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_is_off() {
-        assert_eq!(QconnectStartupMode::default(), QconnectStartupMode::Off);
+    fn default_is_on() {
+        assert_eq!(QconnectStartupMode::default(), QconnectStartupMode::On);
     }
 
     #[test]

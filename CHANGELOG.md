@@ -20,6 +20,19 @@ tags on `main`.
   out the log and the real cache. `pibuz.toml` is marked as optional, and the
   empty `~/.config/pibuz` is no longer created. `pibuz config show` points to
   `pibuz settings show` for everything it does not cover.
+- **Qobuz Connect is on by default.** pibuz does nothing else, yet a fresh
+  install stayed invisible to the Qobuz apps until something ran
+  `pibuz qconnect enable`. A box with `startup_mode = "off"` already in its
+  `settings.toml` keeps it; `pibuz settings set qconnect.startup_mode on`
+  turns it on.
+
+### Deprecated
+
+- **`pibuz qconnect enable|disable|name`.** Each one is a setting:
+  `pibuz settings set qconnect.startup_mode on|off` and
+  `pibuz settings set qconnect.device_name "<name>"`. The commands still
+  work, print a note on stderr, and are gone from `--help`; they will be
+  removed once moOde no longer runs `pibuz qconnect enable` on every start.
 
 ### Fixed
 

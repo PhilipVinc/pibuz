@@ -204,7 +204,7 @@ pub(crate) async fn run(
 
     // 12. QConnect: mint the daemon's OWN device identity in the data root's
     //     settings.toml, decide auto-connect from the persisted startup mode
-    //     (the value `pibuz qconnect enable|disable` writes), and — when
+    //     (`settings set qconnect.startup_mode`), and — when
     //     enabled — connect-on-Ready with the bounded retry schedule. Reads
     //     NOTHING from pibuz.toml. Held to shut the session down ahead of
     //     playback (shutdown step 1); it also clones `Arc<AppRuntime>`, so it
@@ -574,11 +574,10 @@ pub(crate) fn reload_quality(state: &crate::api::ApiState) {
 }
 
 /// Re-cache the QConnect device-name override from the data root's
-/// settings.toml (so the NEXT connect uses whatever `pibuz qconnect name` /
-/// `settings set qconnect.device_name` most recently wrote — a rename applies
+/// settings.toml (so the NEXT connect uses whatever /// `settings set qconnect.device_name` most recently wrote — a rename applies
 /// on the next connection, never forcing a reconnect on its own), then
 /// reconcile the connect/disconnect state against the freshly-read
-/// `startup_mode` (`pibuz qconnect enable|disable` — idempotent either way, see
+/// `startup_mode` (`settings set qconnect.startup_mode` — idempotent either way, see
 /// `qconnect::QconnectControl`). A no-op before step 12 populates the cell.
 pub(crate) async fn reload_qconnect(state: &crate::api::ApiState) {
     let Some(qc) = state.qconnect_control.get() else {
