@@ -18,6 +18,7 @@ qbz-player = { path = "../qbz-player" }
 qbz-audio = { path = "../qbz-audio" }          # PROTECTED — read-only consumer
 qbz-qobuz = { path = "../qbz-qobuz" }
 qbz-log = { path = "../qbz-log" }
+qbz-cache = { path = "../qbz-cache" }
 qconnect-core = { path = "../qconnect-core" }
 qconnect-protocol = { path = "../qconnect-protocol" }
 qconnect-transport-ws = { path = "../qconnect-transport-ws" }

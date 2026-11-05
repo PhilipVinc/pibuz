@@ -73,19 +73,47 @@ pub struct PlaybackCache {
     key: SealKey,
 }
 
-impl PlaybackCache {
-    /// Create a new playback cache with default location
-    ///
-    /// Default path: `~/.cache/qbz/playback/`
-    pub fn new(max_size_bytes: u64) -> Result<Self, String> {
-        let cache_dir = dirs::cache_dir()
-            .ok_or("Could not determine cache directory")?
-            .join("qbz")
-            .join("playback");
-
-        Self::with_path(cache_dir, max_size_bytes)
+/// Delete the cache files a previous pibuz sealed into `dir`, then `dir` itself
+/// if that leaves it empty. Returns the files and bytes removed.
+///
+/// For the folder the cache USED to live in, `~/.cache/qbz/playback`, before
+/// the daemon kept it in its own cache folder: nothing reads it any more, and
+/// its files are ciphertext under a key that died with the run that wrote
+/// them. But `qbz` is a name other software in this family uses, so this is
+/// not `with_path`'s sweep: a file goes only if it has a cache file's name AND
+/// starts with the vault's magic. Anything else stays, and so does the folder.
+pub fn remove_sealed_leftovers(dir: &std::path::Path) -> (usize, u64) {
+    let mut files = 0usize;
+    let mut bytes = 0u64;
+    let Ok(entries) = fs::read_dir(dir) else {
+        return (0, 0);
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !(name.ends_with(".audio") || name.ends_with(".part")) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        let mut head = [0u8; 8];
+        let ours = fs::File::open(entry.path())
+            .and_then(|mut f| f.read_exact(&mut head))
+            .is_ok()
+            && qbz_cmaf::vault::is_sealed(&head);
+        if ours && fs::remove_file(entry.path()).is_ok() {
+            files += 1;
+            bytes += meta.len();
+        }
     }
+    // Only succeeds on an empty folder, which is the point.
+    let _ = fs::remove_dir(dir);
+    (files, bytes)
+}
 
+impl PlaybackCache {
     /// Declare which tracks the player is holding open, replacing the previous
     /// set. Pinned entries are never evicted.
     ///
@@ -643,6 +671,49 @@ mod tests {
     /// a shared directory makes `insert_leaves_no_partial_file` — which scans
     /// the whole directory — fail on another test's in-flight `.part`.
     static TEMP_DIR_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn scratch(tag: &str) -> PathBuf {
+        let seq = TEMP_DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("qbz-l2-{tag}-{}-{}", std::process::id(), seq));
+        std::fs::create_dir_all(&dir).expect("make dir");
+        dir
+    }
+
+    /// The folder pibuz used before it kept its cache in its own folders,
+    /// `~/.cache/qbz/playback`, is a name other software in this family uses
+    /// too. Only what pibuz sealed goes — a FLAC somebody else cached there
+    /// does not, and neither does the folder while anything is left in it.
+    #[test]
+    fn only_sealed_leftovers_are_removed_from_the_old_folder() {
+        let dir = scratch("legacy");
+        let sealed = qbz_cmaf::vault::seal_to_vec(SealKey::random(), &[7u8; 2048]);
+        std::fs::write(dir.join("1.audio"), &sealed).expect("seed");
+        std::fs::write(dir.join("2.part"), &sealed[..40]).expect("seed");
+        std::fs::write(dir.join("3.audio"), b"fLaC not sealed by us").expect("seed");
+        std::fs::write(dir.join("notes.txt"), &sealed).expect("seed");
+
+        let (files, bytes) = remove_sealed_leftovers(&dir);
+
+        assert_eq!(files, 2, "the two sealed cache files");
+        assert_eq!(bytes, sealed.len() as u64 + 40);
+        assert!(!dir.join("1.audio").exists());
+        assert!(!dir.join("2.part").exists());
+        assert!(dir.join("3.audio").exists(), "an unsealed file is not ours");
+        assert!(dir.join("notes.txt").exists(), "not a cache file name");
+        assert!(dir.exists(), "the folder still holds other files");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Emptied, the old folder goes too; absent, nothing happens.
+    #[test]
+    fn an_emptied_old_folder_is_removed() {
+        let dir = scratch("legacy-empty");
+        let sealed = qbz_cmaf::vault::seal_to_vec(SealKey::random(), &[1u8; 64]);
+        std::fs::write(dir.join("9.audio"), &sealed).expect("seed");
+        assert_eq!(remove_sealed_leftovers(&dir).0, 1);
+        assert!(!dir.exists());
+        assert_eq!(remove_sealed_leftovers(&dir), (0, 0));
+    }
 
     /// Nothing a previous run wrote survives into this one — not the tracks,
     /// not an interrupted write.

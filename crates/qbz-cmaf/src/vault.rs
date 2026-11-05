@@ -2,7 +2,7 @@
 //!
 //! Everything the daemon writes to the card is DECRYPTED audio: the CMAF path
 //! decrypts each segment before it assembles, and the legacy path downloads a
-//! plain FLAC to begin with. Left as-is, `~/.cache/qbz/playback/` is a folder of
+//! plain FLAC to begin with. Left as-is, the cache's `playback/` folder is a folder of
 //! playable Hi-Res FLACs. This module is what stops that: every byte that
 //! reaches the cache is AES-128-CTR'd first, and nothing outside this process
 //! can turn a `<id>.audio` back into audio.
@@ -44,6 +44,15 @@ type Aes128Ctr = ctr::Ctr128BE<aes::Aes128>;
 /// `b"PIBUZSL1"` — present on every sealed file, checked on every open. A file
 /// without it is refused rather than read.
 const MAGIC: [u8; 8] = *b"PIBUZSL1";
+
+/// Whether `head` — the first bytes of a file — is a file this vault sealed.
+///
+/// The one way to tell pibuz's cache files from anybody else's: cleaning up a
+/// folder that other software may share has to delete only what is provably
+/// ours.
+pub fn is_sealed(head: &[u8]) -> bool {
+    head.starts_with(&MAGIC)
+}
 
 const VERSION: u16 = 1;
 

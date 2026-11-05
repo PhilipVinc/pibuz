@@ -2282,7 +2282,7 @@ pub struct Player {
 
 impl Default for Player {
     fn default() -> Self {
-        Self::new(None, AudioSettings::default(), None)
+        Self::new(None, AudioSettings::default(), None, None)
     }
 }
 
@@ -2294,10 +2294,15 @@ impl Player {
     /// kept — the same root `AudioSettingsStore::new_at` is given. `None` means
     /// the caller has no root of its own, and the cache then lives in memory
     /// for the run rather than guessing at a path outside the caller's profile.
+    ///
+    /// `cache_root` is the caller's cache folder; the disk cache (L2) lives in
+    /// its `playback` folder. `None` keeps the cache in memory only, for the same
+    /// reason. It used to be `~/.cache/qbz/playback` whoever the caller was.
     pub fn new(
         device_name: Option<String>,
         audio_settings: AudioSettings,
         data_root: Option<std::path::PathBuf>,
+        cache_root: Option<std::path::PathBuf>,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<AudioCommand>();
         // The audio thread sends to ITSELF in one place: after a seek rebuilds
@@ -5518,13 +5523,13 @@ impl Player {
         let audio_cache = if !audio_settings.cache_to_disk {
             log::info!("[Player] L2 disk cache: off (audio.cache_to_disk) — nothing is written to the card");
             Arc::new(qbz_cache::AudioCache::new(l1_max_bytes))
-        } else {
+        } else if let Some(l2_dir) = cache_root.map(|root| root.join("playback")) {
             let l2_mb = match audio_settings.disk_cache_mb {
                 0 => qbz_audio::settings::DEFAULT_DISK_CACHE_MB,
                 mb => mb,
             };
             log::info!("[Player] L2 disk cache: {l2_mb} MB (audio.disk_cache_mb)");
-            match qbz_cache::PlaybackCache::new(u64::from(l2_mb) * 1024 * 1024) {
+            match qbz_cache::PlaybackCache::with_path(l2_dir, u64::from(l2_mb) * 1024 * 1024) {
                 Ok(pc) => Arc::new(qbz_cache::AudioCache::with_playback_cache(
                     l1_max_bytes,
                     Arc::new(pc),
@@ -5534,6 +5539,9 @@ impl Player {
                     Arc::new(qbz_cache::AudioCache::new(l1_max_bytes))
                 }
             }
+        } else {
+            log::info!("[Player] L2 disk cache: off (no cache folder given) — memory cache only");
+            Arc::new(qbz_cache::AudioCache::new(l1_max_bytes))
         };
 
         // What the audio thread's arming gate reads, and the reason it is a fact

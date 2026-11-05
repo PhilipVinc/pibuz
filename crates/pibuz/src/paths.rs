@@ -40,9 +40,9 @@ impl ProfileRoots {
     /// in which case cache = `<data_root>/cache` — never
     /// `<data_root>/../pibuz-cache`, which would walk outside the container.
     ///
-    /// The config directory is created (mode 0700 on unix) on first use;
-    /// data/cache directories are created by their respective owners
-    /// (the instance lock creates the data root, cache writers create theirs).
+    /// Nothing is created here. The config folder only ever holds a
+    /// `pibuz.toml` someone wrote by hand; the data root is created by the
+    /// instance lock and the cache root by the caches that write to it.
     pub(crate) fn resolve(
         config_override: Option<&Path>,
         data_root_override: Option<&Path>,
@@ -62,8 +62,6 @@ impl ProfileRoots {
             Some(_) => data.join("cache"),
             None => default_cache_dir(),
         };
-
-        ensure_config_dir(&config);
 
         Self {
             config,
@@ -122,24 +120,36 @@ pub(crate) fn config_file_in(config_dir: &Path) -> PathBuf {
     current
 }
 
-#[cfg(unix)]
-fn ensure_config_dir(dir: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    match std::fs::create_dir_all(dir) {
-        Ok(()) => {
-            if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
-                log::warn!("could not set 0700 on config dir {}: {e}", dir.display());
-            }
-        }
-        Err(e) => {
-            log::warn!("could not create config dir {}: {e}", dir.display());
-        }
-    }
+/// The daemon's log, rotated to `pibuz.log.prev` at each start.
+pub(crate) fn log_file(roots: &ProfileRoots) -> PathBuf {
+    roots.data.join("logs").join("pibuz.log")
 }
 
-#[cfg(not(unix))]
-fn ensure_config_dir(dir: &Path) {
-    let _ = std::fs::create_dir_all(dir);
+/// Where the logs, the disk cache and the Qobuz token cache lived before the
+/// daemon kept them in its own roots: `~/.local/share/qbz` and `~/.cache/qbz`,
+/// named after the crates rather than the program, unlisted by `config path`,
+/// and out of `data_root`'s reach. Only `pibuz run` calls this.
+///
+/// It removes the sealed audio files, which are by far the bulk (tens of MB
+/// on a Pi) and unreadable by anything (their key died with the run that
+/// wrote them), and then each folder that is left empty. It deliberately
+/// leaves the old log and token files: `qbz` is a name other software in
+/// this family also uses, and neither file says whose it is.
+pub(crate) fn clear_legacy_folders() {
+    let Some(cache) = dirs::cache_dir().map(|dir| dir.join("qbz")) else {
+        return;
+    };
+    let (files, bytes) = qbz_cache::remove_sealed_leftovers(&cache.join("playback"));
+    if files > 0 {
+        log::info!(
+            "[paths] removed {files} sealed cache file(s) ({} MB) from {}, where the disk \
+             cache lived before it moved into pibuz's own cache folder",
+            bytes / (1024 * 1024),
+            cache.join("playback").display()
+        );
+    }
+    // Only succeeds once nothing else is in it.
+    let _ = std::fs::remove_dir(&cache);
 }
 
 #[cfg(test)]
@@ -215,8 +225,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The config folder holds `pibuz.toml` and nothing else, and nothing in
+    /// pibuz writes that file: someone who wants one creates it. Resolving the
+    /// roots used to create the folder anyway, so every box carried an empty
+    /// `~/.config/pibuz` that `config path` pointed at.
     #[test]
-    fn config_override_uses_parent_dir_and_creates_it_0700() {
+    fn config_override_uses_parent_dir_and_creates_nothing() {
         let dir = scratch_dir("config-override");
         let _ = std::fs::remove_dir_all(&dir);
         let config_file = dir.join("nested").join("pibuz.toml");
@@ -224,14 +238,22 @@ mod tests {
         let roots = ProfileRoots::resolve(Some(&config_file), None);
 
         assert_eq!(roots.config, dir.join("nested"));
-        let meta = std::fs::metadata(&roots.config).expect("config dir created");
-        assert!(meta.is_dir());
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(meta.permissions().mode() & 0o777, 0o700);
-        }
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            !dir.exists(),
+            "resolving the roots created {}",
+            dir.display()
+        );
+    }
+
+    /// Everything the daemon writes is under its own roots, so `data_root`
+    /// moves all of it: settings and logs in the data root, the disk cache and
+    /// the token cache in the cache root under it.
+    #[test]
+    fn logs_live_in_the_data_root() {
+        let data_dir = scratch_dir("logs");
+        let roots = ProfileRoots::resolve(None, Some(&data_dir));
+        assert_eq!(log_file(&roots), data_dir.join("logs").join("pibuz.log"));
+        assert!(roots.cache.starts_with(&data_dir));
     }
 
     #[test]

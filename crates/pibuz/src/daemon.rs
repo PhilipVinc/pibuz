@@ -38,8 +38,8 @@ pub(crate) async fn run(
     //    the port, protects the one-device_uuid / one-settings.toml-writer
     //    invariants. A second daemon on the same root is diagnosed → exit 3.
     //
-    //    And before LOGGING, because installing the logger rotates `qbz.log`
-    //    to `qbz.log.prev`: a second start that is about to be refused used to
+    //    And before LOGGING, because installing the logger rotates `pibuz.log`
+    //    to `pibuz.log.prev`: a second start that is about to be refused used to
     //    rotate the LIVE daemon's log out from under it — the live process kept
     //    writing into `.prev` through its descriptor, and the previous run's
     //    log was gone. moOde starts the daemon twice in quick succession after
@@ -47,8 +47,11 @@ pub(crate) async fn run(
     //    why the watchdog had fired. The refusal prints to stderr, which is all
     //    it ever needed.
     let _lock = InstanceLock::acquire(&roots.data).map_err(diagnose_lock)?;
-    // 3. logging:
-    qbz_log::install(&cfg.log.level);
+    // 3. logging, into the data root like everything else the daemon keeps:
+    qbz_log::install(&cfg.log.level, Some(crate::paths::log_file(&roots)));
+    // The folders pibuz used before it kept everything in its own; see
+    // `paths::clear_legacy_folders`. After the logger, so it can say so.
+    crate::paths::clear_legacy_folders();
     // …including libasound's, which otherwise writes straight to stderr. It
     // used to be installed only by `BackendManager::create_backend`, i.e. not
     // until something played — so every libasound message before the first
@@ -291,7 +294,11 @@ async fn boot(
         // own path (`dirs::data_dir()/qbz`), which put the daemon's cache in the
         // DESKTOP app's directory and ignored `--profile`.
         Some(roots.data.clone()),
+        // The disk cache (L2), likewise: `~/.cache/qbz/playback` before.
+        Some(roots.cache.clone()),
     ));
+    // And the Qobuz web-bundle tokens, read during `init` below.
+    qbz_qobuz::bundle::set_cache_dir(roots.cache.clone());
 
     // Offline-tolerant: a network failure here still leaves a locally
     // usable core; a missing DAC is likewise non-fatal (Player starts deviceless

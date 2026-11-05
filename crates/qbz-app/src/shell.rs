@@ -27,8 +27,9 @@ impl<A: FrontendAdapter + Send + Sync + 'static> AppRuntime<A> {
         device_name: Option<String>,
         audio_settings: AudioSettings,
         data_root: Option<std::path::PathBuf>,
+        cache_root: Option<std::path::PathBuf>,
     ) -> Self {
-        let player = Player::new(device_name, audio_settings, data_root);
+        let player = Player::new(device_name, audio_settings, data_root, cache_root);
         let core = QbzCore::new(adapter, player);
         Self {
             core: Arc::new(core),
@@ -63,7 +64,7 @@ mod tests {
         // in `main`; a test binary has no `main`, so it happens here.
         // Idempotent, so every test can call it.
         crate::ensure_crypto_provider();
-        AppRuntime::with_audio_settings(NoOpAdapter, None, AudioSettings::default(), None)
+        AppRuntime::with_audio_settings(NoOpAdapter, None, AudioSettings::default(), None, None)
     }
 
     #[test]

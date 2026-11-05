@@ -142,7 +142,7 @@ fn every_setting_moode_writes_is_still_accepted() {
 
 /// A second `pibuz run` that is refused must leave the LIVE daemon's log alone.
 ///
-/// Installing the logger rotates `qbz.log` to `qbz.log.prev`, and it used to
+/// Installing the logger rotates `pibuz.log` to `pibuz.log.prev`, and it used to
 /// run before the instance lock: a refused second start rotated the running
 /// daemon's log out from under it (the live process kept writing into `.prev`
 /// through its descriptor) and destroyed the previous run's. moOde starts the
@@ -163,10 +163,10 @@ fn a_refused_second_start_leaves_the_live_log_alone() {
     } else {
         home.path().join(".local/share")
     };
-    let logs = data_dir.join("qbz/logs");
+    let logs = data_dir.join("pibuz/logs");
     std::fs::create_dir_all(&logs).unwrap();
-    std::fs::write(logs.join("qbz.log"), "the live daemon's log\n").unwrap();
-    std::fs::write(logs.join("qbz.log.prev"), "the previous run's log\n").unwrap();
+    std::fs::write(logs.join("pibuz.log"), "the live daemon's log\n").unwrap();
+    std::fs::write(logs.join("pibuz.log.prev"), "the previous run's log\n").unwrap();
 
     let root = data_dir.join("pibuz");
     std::fs::create_dir_all(&root).unwrap();
@@ -199,12 +199,12 @@ fn a_refused_second_start_leaves_the_live_log_alone() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(
-        std::fs::read_to_string(logs.join("qbz.log")).unwrap(),
+        std::fs::read_to_string(logs.join("pibuz.log")).unwrap(),
         "the live daemon's log\n",
         "the live daemon's log was rotated away by a start that never ran"
     );
     assert_eq!(
-        std::fs::read_to_string(logs.join("qbz.log.prev")).unwrap(),
+        std::fs::read_to_string(logs.join("pibuz.log.prev")).unwrap(),
         "the previous run's log\n",
         "the previous run's log was overwritten"
     );

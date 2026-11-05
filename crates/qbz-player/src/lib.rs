@@ -27,8 +27,8 @@
 //! use qbz_player::{Player, QueueManager};
 //! use qbz_audio::AudioSettings;
 //!
-//! // `None` for the profile root: the loudness cache then stays in memory.
-//! let player = Player::new(None, AudioSettings::default(), None);
+//! // `None` for the profile and cache roots: the loudness and disk caches stay in memory.
+//! let player = Player::new(None, AudioSettings::default(), None, None);
 //! let queue = QueueManager::new();
 //! ```
 
