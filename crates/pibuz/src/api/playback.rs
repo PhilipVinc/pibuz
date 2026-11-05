@@ -473,6 +473,7 @@ mod tests {
             gapless_next_track_id: 0,
             bit_perfect_mode: None,
             buffer_progress: None,
+            device_failures: 0,
         }
     }
 

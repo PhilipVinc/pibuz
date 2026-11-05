@@ -49,13 +49,17 @@ tags on `main`.
   silence.** When a USB DAC stopped responding mid-track (seen after a moOde
   restart), ALSA kept accepting audio and throwing it away, so a six-minute
   track went by in about 25 seconds, reported as playing, and the queue moved
-  on to the next track the same way. The daemon now notices within about a
-  quarter of a second that audio is going out faster than the DAC's clock can
-  play it. It closes the device, reopens it, and carries on from where the
-  sound stopped, which is what brought the DAC back on the Pi. If it fails
-  again within 30 seconds, playback stops at that point with an error instead
-  of moving through the queue. An output write that fails outright is handled
-  the same way, rather than being taken for the end of the track.
+  on to the next track the same way. The daemon now notices when audio goes
+  out faster than the DAC's clock can play it — at once for a mid-track death,
+  within a few seconds even when the audio is only arriving at one and a half
+  times real time. A DAC whose clock stops instead, which used to leave
+  playback "playing" in silence for ever, is noticed after two seconds without
+  progress, and so is an output write that fails outright. In each case the
+  daemon closes the device, reopens it, and carries on from where the sound
+  stopped, with the next gapless track still queued; reopening is what brought
+  the DAC back on the Pi. If it fails again within 30 seconds, playback stops
+  there with an error. A failure in the last seconds of a track no longer
+  moves the queue on.
 
 ## 2.7.2 — 2026-10-27
 
