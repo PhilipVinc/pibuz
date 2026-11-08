@@ -20,7 +20,9 @@
 //! The handed-over `jwt_api` is the streaming credential:
 //! `reconnect_for_pairing` installs it on the `QobuzClient` as its
 //! `Authorization: Bearer`, and the refresh heartbeat below keeps both JWTs
-//! alive past their expiry.
+//! alive past their expiry. When it cannot — the api credential expires or is
+//! refused — `retire_dead_pairing` drops the session rather than leave a
+//! connected-looking device that 401s every play.
 //! Tokens are never persisted (a daemon restart just waits for the next
 //! handoff POST) and never logged (registered with the qbz-log redactor on
 //! receipt and on every refresh).
@@ -57,16 +59,21 @@ const EXP_SLACK_SECS: u64 = 60;
 /// Tokens handed over by the Qobuz app in `connect-to-qconnect`. `exp` values
 /// are unix seconds as sent on the wire; `0` = not provided (treated as
 /// non-expiring — nothing in this repo decodes JWTs to find out more).
+/// `*_issued` is when THIS process received the token (handoff or refresh):
+/// the wire carries no issue time, and the refresh heartbeat needs one to find
+/// the token's half-life.
 #[derive(Clone)]
 pub(crate) struct PairingTokens {
     pub session_id: String,
     pub(crate) ws_jwt: String,
     pub(crate) ws_exp: u64,
+    pub(crate) ws_issued: u64,
     pub(crate) ws_endpoint: String,
     /// Streaming credential (`Authorization: Bearer`), installed on the client
     /// by `reconnect_for_pairing`.
     pub(crate) api_jwt: Option<String>,
     pub(crate) api_exp: u64,
+    pub(crate) api_issued: u64,
 }
 
 impl PairingTokens {
@@ -83,9 +90,11 @@ impl std::fmt::Debug for PairingTokens {
             .field("session_id", &self.session_id)
             .field("ws_jwt", &"<redacted>")
             .field("ws_exp", &self.ws_exp)
+            .field("ws_issued", &self.ws_issued)
             .field("ws_endpoint", &self.ws_endpoint)
             .field("api_jwt", &self.api_jwt.as_ref().map(|_| "<redacted>"))
             .field("api_exp", &self.api_exp)
+            .field("api_issued", &self.api_issued)
             .finish()
     }
 }
@@ -168,15 +177,18 @@ fn parse_connect_request(body: &Value) -> Result<PairingTokens, String> {
         None => (None, 0),
     };
 
+    let now = now_secs();
     let tokens = PairingTokens {
         session_id,
         ws_jwt,
         ws_exp,
+        ws_issued: now,
         ws_endpoint,
         api_jwt,
         api_exp,
+        api_issued: now,
     };
-    if !tokens.ws_token_live(now_secs()) {
+    if !tokens.ws_token_live(now) {
         return Err("jwt_qconnect is already expired".to_string());
     }
     Ok(tokens)
@@ -310,38 +322,64 @@ fn register_mdns(port: u16, friendly_name: &str) -> Result<(ServiceDaemon, Strin
 // Bearer api credential renews jwt_api (body `jwt=jwt_api`) and jwt_qws (body
 // `jwt=jwt_qws`), so a paired, account-less device can outlive its handed-over
 // tokens' expiry without the app re-casting.
+//
+// The body names the KIND of token wanted, not the token: what authenticates
+// the call is the api credential in the Bearer header. So the api credential
+// is the whole pairing. While it lives, either token can be renewed; once it
+// has expired, Qobuz answers 401 and nothing this device holds can get it
+// back. Only a fresh handoff can.
+//
+// That is why renewal starts at HALF-LIFE, not just ahead of expiry. On
+// 2026-11-07 refreshToken answered 500 for the whole five minutes ahead of a
+// one-hour token's expiry; the old five-minute lead had no slack left, the
+// credential expired, and every stream after it was a 401 behind a WS session
+// that still looked connected. Half-life gives a 30-minute outage room to
+// clear, at the cost of one extra refresh an hour.
 // ---------------------------------------------------------------------------
 
-type Runtime = Arc<qbz_app::shell::AppRuntime<crate::adapter::DaemonAdapter>>;
-
 const REFRESH_CHECK_SECS: u64 = 30;
-/// Refresh once a token is within this window of its expiry.
-const REFRESH_LEAD_SECS: u64 = 300;
+
+/// Where one token stands at `now`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenPhase {
+    /// Less than half its lifetime used (or no expiry on the wire).
+    Fresh,
+    /// Past half-life and not yet expired: renew it, and keep retrying every
+    /// tick until that lands.
+    Renew,
+    /// Expired. For the api credential this ends the pairing.
+    Expired,
+}
+
+/// `issued` is when this process received the token, `exp` its expiry (both
+/// unix seconds). `exp == 0` (no expiry on the wire) is always fresh.
+fn token_phase(issued: u64, exp: u64, now: u64) -> TokenPhase {
+    if exp == 0 {
+        TokenPhase::Fresh
+    } else if now >= exp {
+        TokenPhase::Expired
+    } else if now >= issued + exp.saturating_sub(issued) / 2 {
+        TokenPhase::Renew
+    } else {
+        TokenPhase::Fresh
+    }
+}
 
 /// Daemon-lifetime refresh heartbeat: a no-op until a handoff populates the
 /// store. Held by `QconnectHandle` and abort+joined at shutdown (it clones
-/// `Arc<AppRuntime>` — #521 ordering, same contract as the report scheduler).
+/// the service, and through it `Arc<AppRuntime>` — #521 ordering, same
+/// contract as the report scheduler).
 pub(crate) fn spawn_token_refresh(
-    store: PairingStore,
-    runtime: Runtime,
+    service: Arc<DaemonQconnectService>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(REFRESH_CHECK_SECS));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            refresh_if_needed(&store, &runtime).await;
+            refresh_if_needed(&service).await;
         }
     })
-}
-
-/// A token is refresh-worthy inside a window around its expiry: from
-/// `REFRESH_LEAD_SECS` before it until `REFRESH_LEAD_SECS` after it. Earlier
-/// is pointless, later the token is dead — retrying a guaranteed-401 forever
-/// would poll Qobuz for the daemon lifetime. `exp == 0` (no expiry on the
-/// wire) is never due.
-fn refresh_due(exp: u64, now: u64) -> bool {
-    exp != 0 && now + REFRESH_LEAD_SECS >= exp && now <= exp + REFRESH_LEAD_SECS
 }
 
 /// Extract `{jwt, exp[, endpoint]}` from a refreshToken token payload.
@@ -388,33 +426,65 @@ fn install_refreshed(
     }
 }
 
-async fn refresh_if_needed(store: &PairingStore, runtime: &Runtime) {
+/// Empty the store ONLY if it still holds the handoff `snapshot` came from —
+/// the retire-a-dead-credential twin of [`install_refreshed`]. A handoff that
+/// landed while the dead one was being discovered owns the store now and must
+/// survive. Returns whether it cleared anything.
+pub(super) fn clear_if_same_handoff(store: &PairingStore, snapshot: &PairingTokens) -> bool {
+    let Ok(mut guard) = store.lock() else {
+        return false;
+    };
+    match guard.as_ref() {
+        Some(tokens) if same_handoff(tokens, snapshot) => {
+            *guard = None;
+            true
+        }
+        _ => false,
+    }
+}
+
+async fn refresh_if_needed(service: &DaemonQconnectService) {
+    let store = service.pairing_store();
     let Some(snapshot) = store.lock().ok().and_then(|guard| guard.clone()) else {
         return;
     };
-    let now = now_secs();
-    let api_due = snapshot.api_jwt.is_some() && refresh_due(snapshot.api_exp, now);
-    let ws_due = refresh_due(snapshot.ws_exp, now);
-    if !api_due && !ws_due {
-        return;
-    }
     // The refresh endpoint itself authenticates with the Bearer api credential;
     // without one (degenerate handoff) there is nothing we can renew.
     let Some(mut api_jwt) = snapshot.api_jwt.clone() else {
         return;
     };
-    let Some(client) = runtime.core().client().read().await.clone() else {
+    let now = now_secs();
+    let api_phase = token_phase(snapshot.api_issued, snapshot.api_exp, now);
+    if api_phase == TokenPhase::Expired {
+        service
+            .retire_dead_pairing(
+                &snapshot,
+                "the Qobuz Connect credential expired before it could be renewed",
+            )
+            .await;
+        return;
+    }
+    let api_due = api_phase == TokenPhase::Renew;
+    // An expired ws token is still renewable: the call mints a fresh one from
+    // the (live) api credential.
+    let ws_due = token_phase(snapshot.ws_issued, snapshot.ws_exp, now) != TokenPhase::Fresh;
+    if !api_due && !ws_due {
+        return;
+    }
+    let Some(client) = service.runtime.core().client().read().await.clone() else {
         return;
     };
+    let left = snapshot.api_exp.saturating_sub(now);
 
     if api_due {
         match refresh_jwt(&client, &api_jwt, "jwt_api").await {
             Ok(payload) => {
                 if let Some((jwt, exp, _)) = parse_refresh_payload(&payload) {
                     qbz_log::register_secret(jwt.clone());
-                    let landed = install_refreshed(store, &snapshot, |tokens| {
+                    let landed = install_refreshed(&store, &snapshot, |tokens| {
                         tokens.api_jwt = Some(jwt.clone());
                         tokens.api_exp = exp;
+                        tokens.api_issued = now;
                     });
                     if landed {
                         api_jwt = jwt;
@@ -451,7 +521,20 @@ async fn refresh_if_needed(store: &PairingStore, runtime: &Runtime) {
                     }
                 }
             }
-            Err(err) => log::warn!("[QConnect/Pairing] jwt_api refresh failed: {err}"),
+            Err(RefreshError::Rejected(err)) => {
+                log::warn!("[QConnect/Pairing] jwt_api refresh rejected: {err}");
+                service
+                    .retire_dead_pairing(
+                        &snapshot,
+                        "Qobuz rejected the Qobuz Connect credential when renewing it",
+                    )
+                    .await;
+                return;
+            }
+            Err(RefreshError::Transient(err)) => log::warn!(
+                "[QConnect/Pairing] jwt_api refresh failed ({left} s before it expires; \
+                 retrying every {REFRESH_CHECK_SECS} s): {err}"
+            ),
         }
     }
 
@@ -460,9 +543,10 @@ async fn refresh_if_needed(store: &PairingStore, runtime: &Runtime) {
             Ok(payload) => {
                 if let Some((jwt, exp, endpoint)) = parse_refresh_payload(&payload) {
                     qbz_log::register_secret(jwt.clone());
-                    let landed = install_refreshed(store, &snapshot, |tokens| {
+                    let landed = install_refreshed(&store, &snapshot, |tokens| {
                         tokens.ws_jwt = jwt.clone();
                         tokens.ws_exp = exp;
+                        tokens.ws_issued = now;
                         if let Some(endpoint) = endpoint {
                             tokens.ws_endpoint = endpoint;
                         }
@@ -478,9 +562,35 @@ async fn refresh_if_needed(store: &PairingStore, runtime: &Runtime) {
                     }
                 }
             }
-            Err(err) => log::warn!("[QConnect/Pairing] jwt_qws refresh failed: {err}"),
+            // The ws arm authenticates with the same api credential, so a
+            // rejection here is the api credential's death too. Unless the api
+            // arm just renewed it, in which case the snapshot no longer names
+            // the store's credential — the next tick re-reads and decides.
+            Err(RefreshError::Rejected(err)) if !api_due => {
+                log::warn!("[QConnect/Pairing] jwt_qws refresh rejected: {err}");
+                service
+                    .retire_dead_pairing(
+                        &snapshot,
+                        "Qobuz rejected the Qobuz Connect credential when renewing it",
+                    )
+                    .await;
+            }
+            Err(RefreshError::Rejected(err) | RefreshError::Transient(err)) => log::warn!(
+                "[QConnect/Pairing] jwt_qws refresh failed ({left} s before the api \
+                 credential expires; retrying every {REFRESH_CHECK_SECS} s): {err}"
+            ),
         }
     }
+}
+
+/// Why a refreshToken round-trip failed.
+#[derive(Debug)]
+enum RefreshError {
+    /// 401/403: Qobuz refuses the Bearer credential. Retrying cannot help.
+    Rejected(String),
+    /// Anything else (5xx, network, a malformed body): worth retrying while
+    /// the credential is still alive.
+    Transient(String),
 }
 
 /// One `POST /qws/refreshToken` round-trip; returns the renewed token payload
@@ -489,11 +599,12 @@ async fn refresh_jwt(
     client: &qbz_qobuz::QobuzClient,
     bearer: &str,
     kind: &str,
-) -> Result<Value, String> {
-    let app_id = client
-        .app_id()
-        .await
-        .map_err(|err| format!("refreshToken requires initialized API client: {err}"))?;
+) -> Result<Value, RefreshError> {
+    let app_id = client.app_id().await.map_err(|err| {
+        RefreshError::Transient(format!(
+            "refreshToken requires initialized API client: {err}"
+        ))
+    })?;
     let url = qbz_qobuz::endpoints::build_url("/qws/refreshToken");
     let response = client
         .get_http()
@@ -503,22 +614,28 @@ async fn refresh_jwt(
         .form(&[("jwt", kind)])
         .send()
         .await
-        .map_err(|err| format!("refreshToken HTTP request failed: {err}"))?;
+        .map_err(|err| {
+            RefreshError::Transient(format!("refreshToken HTTP request failed: {err}"))
+        })?;
     let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|err| format!("refreshToken response read failed: {err}"))?;
+    let body = response.text().await.map_err(|err| {
+        RefreshError::Transient(format!("refreshToken response read failed: {err}"))
+    })?;
     if !status.is_success() {
         let preview = body.trim().chars().take(300).collect::<String>();
-        return Err(format!("refreshToken status {status}: {preview}"));
+        let message = format!("refreshToken status {status}: {preview}");
+        return Err(if matches!(status.as_u16(), 401 | 403) {
+            RefreshError::Rejected(message)
+        } else {
+            RefreshError::Transient(message)
+        });
     }
-    let payload: Value = serde_json::from_str(&body)
-        .map_err(|err| format!("refreshToken response decode failed: {err}"))?;
-    payload
-        .get(kind)
-        .cloned()
-        .ok_or_else(|| format!("refreshToken response missing {kind} payload"))
+    let payload: Value = serde_json::from_str(&body).map_err(|err| {
+        RefreshError::Transient(format!("refreshToken response decode failed: {err}"))
+    })?;
+    payload.get(kind).cloned().ok_or_else(|| {
+        RefreshError::Transient(format!("refreshToken response missing {kind} payload"))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -661,9 +778,11 @@ mod tests {
             session_id: "s".into(),
             ws_jwt: "jwt".into(),
             ws_exp: exp,
+            ws_issued: 0,
             ws_endpoint: "wss://e".into(),
             api_jwt: None,
             api_exp: 0,
+            api_issued: 0,
         };
         let now = 1_000_000;
         // Strictly greater than now + slack is required: exactly at the slack
@@ -680,9 +799,11 @@ mod tests {
                 session_id: "s".into(),
                 ws_jwt: "SECRET-WS".into(),
                 ws_exp: 0,
+                ws_issued: 0,
                 ws_endpoint: "wss://e".into(),
                 api_jwt: Some("SECRET-API".into()),
                 api_exp: 0,
+                api_issued: 0,
             }
         );
         assert!(!rendered.contains("SECRET-WS"));
@@ -695,9 +816,11 @@ mod tests {
             session_id: "s".into(),
             ws_jwt: "jwt".into(),
             ws_exp: 1, // long expired
+            ws_issued: 0,
             ws_endpoint: "wss://e".into(),
             api_jwt: None,
             api_exp: 0,
+            api_issued: 0,
         })));
         assert!(valid_ws_tokens(&store).is_none());
         assert!(
@@ -712,9 +835,11 @@ mod tests {
             session_id: "s".into(),
             ws_jwt: "jwt".into(),
             ws_exp: 0,
+            ws_issued: 0,
             ws_endpoint: "wss://e".into(),
             api_jwt: None,
             api_exp: 0,
+            api_issued: 0,
         };
         let config = transport_config_from(&tokens);
         assert_eq!(config.endpoint_url, "wss://e");
@@ -728,14 +853,89 @@ mod tests {
     }
 
     #[test]
-    fn refresh_due_window_brackets_the_expiry() {
-        let now = 1_000_000;
-        assert!(!refresh_due(0, now), "no expiry on the wire = never due");
-        assert!(!refresh_due(now + REFRESH_LEAD_SECS + 1, now), "too early");
-        assert!(refresh_due(now + REFRESH_LEAD_SECS, now), "lead edge");
-        assert!(refresh_due(now, now), "at expiry");
-        assert!(refresh_due(now - REFRESH_LEAD_SECS, now), "grace edge");
-        assert!(!refresh_due(now - REFRESH_LEAD_SECS - 1, now), "dead token");
+    fn token_phase_renews_from_half_life_until_expiry() {
+        let issued = 1_000_000;
+        let exp = issued + 3600;
+        assert_eq!(
+            token_phase(issued, 0, issued),
+            TokenPhase::Fresh,
+            "no expiry"
+        );
+        assert_eq!(token_phase(issued, exp, issued), TokenPhase::Fresh);
+        assert_eq!(token_phase(issued, exp, issued + 1799), TokenPhase::Fresh);
+        assert_eq!(token_phase(issued, exp, issued + 1800), TokenPhase::Renew);
+        assert_eq!(token_phase(issued, exp, exp - 1), TokenPhase::Renew);
+        assert_eq!(token_phase(issued, exp, exp), TokenPhase::Expired);
+        // Handed over already past its own expiry (clock skew): dead at once,
+        // not "renew forever".
+        assert_eq!(token_phase(exp + 10, exp, exp + 10), TokenPhase::Expired);
+    }
+
+    /// Replays the heartbeat over three hours of 30 s ticks against a fake
+    /// refreshToken that answers 500 for `outage` (seconds after the first
+    /// handoff) and otherwise issues a fresh one-hour token. Returns when the
+    /// api credential was found expired, if it was.
+    fn credential_death(outage: std::ops::Range<u64>) -> Option<u64> {
+        const LIFETIME: u64 = 3600;
+        let (mut issued, mut exp) = (0, LIFETIME);
+        for now in (0..3 * LIFETIME).step_by(REFRESH_CHECK_SECS as usize) {
+            match token_phase(issued, exp, now) {
+                TokenPhase::Fresh => {}
+                TokenPhase::Renew if outage.contains(&now) => {}
+                TokenPhase::Renew => (issued, exp) = (now, now + LIFETIME),
+                TokenPhase::Expired => return Some(now),
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn the_2026_11_07_outage_no_longer_kills_the_pairing() {
+        // refreshToken answered 500 from five minutes before the expiry of a
+        // one-hour token until past it. The old five-minute lead lost the
+        // credential to exactly this; half-life renews it long before.
+        assert_eq!(credential_death(3300..3900), None);
+        // Nor does an outage that begins right at half-life, as long as it
+        // clears before the expiry.
+        assert_eq!(credential_death(1800..3500), None);
+    }
+
+    #[test]
+    fn an_outage_through_the_whole_second_half_is_found_at_expiry() {
+        // No renewal can land: the credential is lost, and the heartbeat must
+        // say so at the expiry itself, so the session is dropped right away
+        // instead of left up behind a dead credential.
+        assert_eq!(credential_death(1800..3600), Some(3600));
+    }
+
+    #[test]
+    fn clear_if_same_handoff_spares_a_newer_handoff() {
+        let original = PairingTokens {
+            session_id: "s1".into(),
+            ws_jwt: "jwt1".into(),
+            ws_exp: 0,
+            ws_issued: 0,
+            ws_endpoint: "wss://e".into(),
+            api_jwt: Some("api1".into()),
+            api_exp: 0,
+            api_issued: 0,
+        };
+        // A newer handoff landed while the old credential was found dead: it
+        // owns the store and must survive.
+        let mut newer = original.clone();
+        newer.ws_jwt = "jwt2".into();
+        let store: PairingStore = Arc::new(StdMutex::new(Some(newer)));
+        assert!(!clear_if_same_handoff(&store, &original));
+        assert!(store.lock().unwrap().is_some());
+        // A refresh renewing the api credential does not change the handoff's
+        // identity, so the dead one's own entry is still found and cleared.
+        let mut renewed = original.clone();
+        renewed.api_jwt = Some("api2".into());
+        *store.lock().unwrap() = Some(renewed);
+        assert!(clear_if_same_handoff(&store, &original));
+        assert!(store.lock().unwrap().is_none());
+        // Already cleared (operator disconnect): nothing to do.
+        assert!(!clear_if_same_handoff(&store, &original));
     }
 
     #[test]
@@ -758,9 +958,11 @@ mod tests {
             session_id: "s1".into(),
             ws_jwt: "jwt1".into(),
             ws_exp: 0,
+            ws_issued: 0,
             ws_endpoint: "wss://e".into(),
             api_jwt: Some("api1".into()),
             api_exp: 0,
+            api_issued: 0,
         };
         // Same handoff still in the store -> the write lands.
         let store: PairingStore = Arc::new(StdMutex::new(Some(original.clone())));

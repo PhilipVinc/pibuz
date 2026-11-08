@@ -445,7 +445,50 @@ impl DaemonQconnectService {
         // renderer join.
         self.handoff_join_pending
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        self.connect_locked().await
+        self.connect_locked().await?;
+        // A fresh credential is what an auth latch from `retire_dead_pairing`
+        // was asking for; once it has connected, that latch is history.
+        if let Ok(mut s) = self.shared.lock() {
+            s.last_errors.auth = None;
+        }
+        Ok(())
+    }
+
+    /// The handed-over api credential is dead: expired, or refused by Qobuz
+    /// when renewing it (pairing.rs refresh heartbeat). Nothing this device
+    /// holds can get it back, so stop pretending. Without this the WS session
+    /// stays up on a connection opened while the token was good, the
+    /// controller keeps showing this device as connected, and every play is a
+    /// stream-URL 401 (2026-11-07).
+    ///
+    /// Drops the credential, the Bearer and the session, and latches the
+    /// reason as `last_errors.auth`. The device is left exactly where a fresh
+    /// boot leaves it: off, advertised on mDNS, waiting for the app to hand
+    /// it a session when someone picks it again.
+    ///
+    /// A no-op if the store no longer holds `snapshot`'s handoff: a newer one
+    /// landed while this one was found dead, and it owns everything now.
+    pub(crate) async fn retire_dead_pairing(
+        &self,
+        snapshot: &pairing::PairingTokens,
+        reason: &str,
+    ) {
+        // Under the ops lock, like the operator disconnect: a takeover that
+        // starts after the check below queues behind us and reconnects with
+        // its own credential once we are done.
+        let _ops = self.ops.lock().await;
+        if !pairing::clear_if_same_handoff(&self.pairing_store, snapshot) {
+            return;
+        }
+        if let Some(client) = self.runtime.core().client().read().await.clone() {
+            client.set_bearer_api_token(None).await;
+        }
+        let message = format!("{reason}; pick this device in the Qobuz app again to reconnect");
+        log::warn!("[QConnect/Pairing] {message}; dropping the session");
+        if let Ok(mut s) = self.shared.lock() {
+            s.last_errors.auth = Some(message);
+        }
+        let _ = self.disconnect_locked().await;
     }
 
     /// Track the latest takeover task, aborting the previous one (a newer
@@ -729,10 +772,7 @@ pub(crate) fn start(
                 tokio::runtime::Handle::current(),
             ) {
                 Ok(handle) => {
-                    let refresh = pairing::spawn_token_refresh(
-                        service.pairing_store(),
-                        Arc::clone(&service.runtime),
-                    );
+                    let refresh = pairing::spawn_token_refresh(Arc::clone(&service));
                     (Some(handle), Some(refresh), Some(port))
                 }
                 Err(err) => {

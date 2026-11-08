@@ -3,6 +3,22 @@
 Notable changes per release. Versions are plain semver; releases are `vX.Y.Z`
 tags on `main`.
 
+## Unreleased
+
+### Fixed
+
+- **A short Qobuz outage no longer leaves the renderer silently broken.** The
+  credential the Qobuz app hands over lasts an hour, and pibuz renewed it only
+  in the last five minutes. When Qobuz's renewal endpoint failed for those five
+  minutes, the credential expired and could not be renewed any more, but the
+  device still showed as connected in the app. Every play then failed with a
+  401 until pibuz was restarted. Renewal now starts halfway through the
+  token's life, so an outage of up to 30 minutes is ridden out. If the
+  credential is lost anyway (expired, or refused by Qobuz), pibuz drops the
+  session so the device stops showing as connected. `pibuz status` reports
+  the reason under `last_errors.auth`, and picking the device in the app again
+  reconnects it.
+
 ## 2.8.0 — 2026-11-06
 
 ### Changed
