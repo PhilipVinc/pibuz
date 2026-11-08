@@ -110,6 +110,16 @@ pub(crate) struct DaemonRendererEngine {
     /// Pulsed when buffering starts so the report scheduler tells the
     /// controller within milliseconds instead of at its next 2 s tick.
     report_notify: Arc<tokio::sync::Notify>,
+    /// Told when a load is refused with a 401, so the pairing heartbeat can
+    /// check the credential (pairing.rs, `AuthSuspect`).
+    auth_suspect: Arc<super::pairing::AuthSuspect>,
+    /// The latest load: `(track_id, when it started)`, on the
+    /// `pairing::mono_ms` clock. Read back by
+    /// `on_load_failed`, which the orchestration calls synchronously right
+    /// after `start_track_stream` fails, so the 401 report can say WHEN the
+    /// refused load began — which is what tells the heartbeat which
+    /// credential it went out with.
+    load_started: std::sync::Mutex<Option<(u64, u64)>>,
 }
 
 /// Which track is filling its buffer, shared between the renderer engine (the
@@ -411,6 +421,14 @@ pub(crate) fn playback_error_type(error: &str) -> Option<i32> {
     }
 }
 
+/// Whether a failed load was refused because the credential was: the stream
+/// URL request answered 401, which `qbz_qobuz` reports as
+/// `ApiError::AuthenticationError` ("Authentication failed: ..."). Reads the
+/// error TEXT for the same reason `playback_error_type` does.
+pub(crate) fn is_auth_refusal(error: &str) -> bool {
+    error.contains("Authentication failed:")
+}
+
 /// How long a load may sit below its own start offset before the tripwire
 /// fires. Comfortably longer than a real load, which reaches the offset as soon
 /// as the first samples are audible.
@@ -428,6 +446,7 @@ impl DaemonRendererEngine {
         buffering: Arc<BufferingLatch>,
         report_notify: Arc<tokio::sync::Notify>,
         shared: Arc<std::sync::Mutex<crate::state::DaemonShared>>,
+        auth_suspect: Arc<super::pairing::AuthSuspect>,
     ) -> Self {
         Self {
             runtime,
@@ -436,6 +455,8 @@ impl DaemonRendererEngine {
             buffering,
             shared,
             report_notify,
+            auth_suspect,
+            load_started: std::sync::Mutex::new(None),
         }
     }
 
@@ -689,6 +710,20 @@ impl QconnectRendererEngine for DaemonRendererEngine {
     }
 
     fn on_load_failed(&self, track_id: u64, error: &str) {
+        if is_auth_refusal(error) {
+            // Only this track's own stamp: a stamp from another load could be
+            // LATER than this one began, and would make a refusal of an old
+            // credential look like a refusal of a newer one. Unknown -> 0,
+            // which the heartbeat ignores.
+            let started_ms = self
+                .load_started
+                .lock()
+                .ok()
+                .and_then(|guard| *guard)
+                .filter(|(stamped, _)| *stamped == track_id)
+                .map_or(0, |(_, started_ms)| started_ms);
+            self.auth_suspect.report(started_ms);
+        }
         match playback_error_type(error) {
             Some(error_type) => {
                 self.buffering.fail(track_id, error_type);
@@ -709,6 +744,9 @@ impl QconnectRendererEngine for DaemonRendererEngine {
         duration_secs: u64,
         start_position_secs: u64,
     ) -> Result<(), String> {
+        if let Ok(mut guard) = self.load_started.lock() {
+            *guard = Some((track_id, super::pairing::mono_ms()));
+        }
         // Announce the load BEFORE anything touches the audio device.
         //
         // A host integration has to free the card for us: on moOde the event
@@ -1016,6 +1054,32 @@ async fn download_remote_audio(url: &str) -> Result<Vec<u8>, String> {
 // two enforcement points of the software|locked contract.
 #[cfg(test)]
 mod tests {
+
+    /// The 401 hook reads the same flattened text: fed the REAL messages, so
+    /// a reworded `ApiError::AuthenticationError` fails here instead of
+    /// silently switching the 401 check off.
+    #[test]
+    fn only_a_refused_credential_reads_as_an_auth_refusal() {
+        use super::is_auth_refusal;
+        use qbz_qobuz::ApiError;
+        let wrapped = |err: ApiError| format!("resolve stream url for remote track 7: {err}");
+        // What the Pi logged on 2026-11-08 for every play.
+        assert!(is_auth_refusal(&wrapped(ApiError::AuthenticationError(
+            "stream URL 401 — user auth token invalid or expired".into()
+        ))));
+        // 403s, the breaker and the rest are not about the credential.
+        assert!(!is_auth_refusal(&wrapped(ApiError::Forbidden(
+            String::new()
+        ))));
+        assert!(!is_auth_refusal(&wrapped(ApiError::ForbiddenCircuitOpen(
+            30
+        ))));
+        assert!(!is_auth_refusal(&wrapped(ApiError::ServerError(503))));
+        assert!(!is_auth_refusal(&wrapped(ApiError::NonStreamable)));
+        assert!(!is_auth_refusal(
+            "resolve stream url for remote track 7: Network error: connection reset"
+        ));
+    }
 
     /// Fed the REAL `ApiError` messages, wrapped the way `start_track_stream`
     /// wraps them, so a reworded variant fails here rather than quietly

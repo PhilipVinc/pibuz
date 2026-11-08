@@ -18,6 +18,16 @@ tags on `main`.
   session so the device stops showing as connected. `pibuz status` reports
   the reason under `last_errors.auth`, and picking the device in the app again
   reconnects it.
+- **A play refused with a 401 is checked at once.** Pibuz renews the
+  credential once; if Qobuz refuses that renewal, or refuses a play again
+  within ten minutes of it, pibuz drops the session as above instead of
+  waiting for the next scheduled renewal. A 403 from the renewal no longer
+  counts as a refused credential, and a renewal that hangs gives up after
+  20 s instead of stalling renewals for good.
+- **Stopping pibuz no longer leaves a Qobuz Connect session running behind
+  it.** A session being torn down when the daemon stopped, or when a second
+  handoff replaced the first, could keep running and hold the audio device;
+  a settings reload during shutdown could also start a new one.
 
 ## 2.8.0 — 2026-11-06
 

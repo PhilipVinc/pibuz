@@ -141,6 +141,38 @@ pub(crate) async fn update_lifecycle_state_if_running(
         .await;
 }
 
+/// Wait out a session teardown, if one is parked. Awaited through `&mut`, so a
+/// caller cancelled here leaves the handle in the slot for the next one.
+async fn join_teardown(slot: &mut Option<JoinHandle<()>>) {
+    if let Some(task) = slot.as_mut() {
+        let _ = task.await;
+    }
+    *slot = None;
+}
+
+/// Stop one session: everything `disconnect_locked` used to do inline after
+/// taking the runtime out of `inner`. Runs as its own task (see there).
+async fn tear_down(runtime: DaemonQconnectRuntime, inner: Arc<Mutex<DaemonQconnectInner>>) {
+    // Disarm any in-flight liveness watchdog + clear the session topology
+    // BEFORE aborting the loop, so a late event can't resurrect a stale
+    // active-renderer state.
+    {
+        let mut state = runtime.sync_state.lock().await;
+        state.watchdog_generation = state.watchdog_generation.wrapping_add(1);
+        state.session = QconnectSessionState::default();
+        state.session_renderer_states.clear();
+    }
+    if let Err(err) = runtime.app.disconnect().await {
+        let mut guard = inner.lock().await;
+        guard.last_error = Some(format!("qconnect disconnect failed: {err}"));
+    }
+    runtime.event_loop.abort();
+    let _ = runtime.event_loop.await;
+    // After the loop, which is what starts fill-ins: none can begin once
+    // this one is stopped.
+    runtime.sink.stop_queue_fill_in().await;
+}
+
 /// The headless QConnect connect service.
 pub(crate) struct DaemonQconnectService {
     inner: Arc<Mutex<DaemonQconnectInner>>,
@@ -175,6 +207,17 @@ pub(crate) struct DaemonQconnectService {
     buffering: Arc<engine::BufferingLatch>,
     /// Report-tick wakeup, shared with the engine so a load reports at once.
     report_notify: Arc<tokio::sync::Notify>,
+    /// A load refused with a 401: written by each session's renderer engine,
+    /// answered by the pairing refresh heartbeat (pairing.rs). Service-level,
+    /// like `report_notify`, so it outlives the sessions that report into it.
+    pub(crate) auth_suspect: Arc<pairing::AuthSuspect>,
+    /// A session teardown in flight (see `disconnect_locked`).
+    teardown: Mutex<Option<JoinHandle<()>>>,
+    /// Set first thing in `QconnectHandle::shutdown`: no new session may start
+    /// after it. The control API is joined only AFTER Connect shuts down, so
+    /// a settings reload landing in between would otherwise connect a session
+    /// nothing tears down (#521).
+    shutting_down: std::sync::atomic::AtomicBool,
 }
 
 impl DaemonQconnectService {
@@ -187,6 +230,9 @@ impl DaemonQconnectService {
     }
 
     async fn connect_locked(&self) -> Result<(), String> {
+        if self.shutting_down.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("the daemon is shutting down".to_string());
+        }
         if !self.runtime.core().is_api_initialized().await {
             return Err("Qobuz API is not initialized; cannot start Qobuz Connect".to_string());
         }
@@ -244,6 +290,7 @@ impl DaemonQconnectService {
             Arc::clone(&self.buffering),
             Arc::clone(&self.report_notify),
             Arc::clone(&self.shared),
+            Arc::clone(&self.auth_suspect),
         );
         let sink = Arc::new(DaemonEventSink::new(
             engine,
@@ -365,32 +412,27 @@ impl DaemonQconnectService {
         self.disconnect_locked().await
     }
 
+    /// Cancel-safe: the teardown itself runs in its own task, parked in
+    /// `self.teardown` before anything awaits it. Aborting the caller (a
+    /// superseded takeover, the refresh heartbeat at shutdown) used to drop
+    /// the detached session runtime mid-teardown — and with it the event
+    /// loop's JoinHandle, unaborted, so the loop ran on holding
+    /// `Arc<AppRuntime>` and the final disconnect found nothing to stop
+    /// (#521). Now an abandoned teardown keeps running, and the next
+    /// disconnect — at the latest, shutdown's final one — joins it.
     async fn disconnect_locked(&self) -> Result<(), String> {
+        let mut teardown = self.teardown.lock().await;
+        join_teardown(&mut teardown).await;
         let runtime = {
             let mut guard = self.inner.lock().await;
             guard.lifecycle_state = QconnectLifecycleState::Off;
             guard.runtime.take()
         };
-
         if let Some(runtime) = runtime {
-            // Disarm any in-flight liveness watchdog + clear the session topology
-            // BEFORE aborting the loop, so a late event can't resurrect a stale
-            // active-renderer state.
-            {
-                let mut state = runtime.sync_state.lock().await;
-                state.watchdog_generation = state.watchdog_generation.wrapping_add(1);
-                state.session = QconnectSessionState::default();
-                state.session_renderer_states.clear();
-            }
-            if let Err(err) = runtime.app.disconnect().await {
-                let mut guard = self.inner.lock().await;
-                guard.last_error = Some(format!("qconnect disconnect failed: {err}"));
-            }
-            runtime.event_loop.abort();
-            let _ = runtime.event_loop.await;
-            // After the loop, which is what starts fill-ins: none can begin once
-            // this one is stopped.
-            runtime.sink.stop_queue_fill_in().await;
+            // Parked synchronously, in the same step that took the runtime:
+            // there is no await between them for a cancellation to land on.
+            *teardown = Some(tokio::spawn(tear_down(runtime, Arc::clone(&self.inner))));
+            join_teardown(&mut teardown).await;
         }
 
         if let Ok(mut s) = self.shared.lock() {
@@ -437,6 +479,9 @@ impl DaemonQconnectService {
         if let Some(tokens) = pairing::valid_ws_tokens(&self.pairing_store) {
             if let Some(client) = self.runtime.core().client().read().await.clone() {
                 client.set_bearer_api_token(tokens.api_jwt.clone()).await;
+                // The credential is in use from HERE: a 401 on a load that
+                // started earlier went out with the previous one.
+                pairing::mark_api_in_use(&self.pairing_store, &tokens);
             }
         }
         let _ = self.disconnect_locked().await;
@@ -505,11 +550,16 @@ impl DaemonQconnectService {
     /// Abort any in-flight takeover so it cannot resurrect a session after
     /// shutdown's final disconnect (#521 ordering).
     fn abort_takeover_task(&self) {
-        if let Ok(mut guard) = self.takeover_task.lock() {
-            if let Some(task) = guard.take() {
-                task.abort();
-            }
+        if let Some(task) = self.take_takeover_task() {
+            task.abort();
         }
+    }
+
+    fn take_takeover_task(&self) -> Option<JoinHandle<()>> {
+        self.takeover_task
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take())
     }
 
     /// Wait until the API client is up and a usable credential exists, then
@@ -666,14 +716,44 @@ impl QconnectHandle {
         // final disconnect below. The listener join is a blocking call and the
         // pairing thread may itself be parked in `Handle::block_on`, so move
         // the join off this worker (multi-thread runtime; see main.rs).
+        self.service
+            .shutting_down
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         if let Some(mut pairing) = self.pairing.take() {
             tokio::task::block_in_place(move || pairing.shutdown());
         }
-        self.service.abort_takeover_task();
+        // The takeover, the auto-connect watcher and the refresh heartbeat all
+        // run connect/disconnect under the ops lock. A teardown they abandon
+        // is joined by the final disconnect below (`disconnect_locked`), but a
+        // connect aborted mid-way can still strand the event loop it spawned
+        // before installing it. So take the ops lock first: each of them is
+        // then either finished or parked on the lock, where an abort cancels
+        // it cleanly. Bounded, so a connect stuck on a dead network cannot
+        // hold up moOde's stop indefinitely; past that the aborts go ahead
+        // unguarded.
+        let ops = tokio::time::timeout(SHUTDOWN_OPS_WAIT, self.service.ops.lock())
+            .await
+            .ok();
+        if ops.is_none() {
+            log::warn!(
+                "[QConnect] shutdown: a connect/disconnect is still running after {} s; \
+                 stopping its tasks anyway",
+                SHUTDOWN_OPS_WAIT.as_secs()
+            );
+        }
+        if let Some(takeover) = self.service.take_takeover_task() {
+            takeover.abort();
+            let _ = takeover.await;
+        }
         if let Some(watcher) = self.watcher.take() {
             watcher.abort();
             let _ = watcher.await;
         }
+        if let Some(refresh_task) = self.refresh_task.take() {
+            refresh_task.abort();
+            let _ = refresh_task.await;
+        }
+        drop(ops);
         // Stop the report scheduler too, so its `Arc<AppRuntime>` clone drops
         // ahead of `drop(booted)`.
         if let Some(report_task) = self.report_task.take() {
@@ -690,14 +770,13 @@ impl QconnectHandle {
             volume_publish_task.abort();
             let _ = volume_publish_task.await;
         }
-        // And the pairing token-refresh heartbeat.
-        if let Some(refresh_task) = self.refresh_task.take() {
-            refresh_task.abort();
-            let _ = refresh_task.await;
-        }
         let _ = self.service.disconnect().await;
     }
 }
+
+/// How long shutdown waits for an in-flight connect/disconnect to finish
+/// before stopping the tasks that run them (see `QconnectHandle::shutdown`).
+const SHUTDOWN_OPS_WAIT: Duration = Duration::from_secs(5);
 
 /// Boot step 12: wire QConnect. Mints the daemon's OWN device identity in the
 /// data root's settings.toml, decides auto-connect from the persisted startup
@@ -756,6 +835,9 @@ pub(crate) fn start(
         handoff_join_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         buffering: Arc::new(engine::BufferingLatch::default()),
         report_notify: Arc::clone(&report_notify),
+        auth_suspect: Arc::new(pairing::AuthSuspect::default()),
+        teardown: Mutex::new(None),
+        shutting_down: std::sync::atomic::AtomicBool::new(false),
     });
 
     // Local pairing surface (`qconnect.pairing` = on|off, default on; port

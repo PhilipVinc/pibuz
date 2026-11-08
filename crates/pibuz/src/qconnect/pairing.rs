@@ -59,21 +59,33 @@ const EXP_SLACK_SECS: u64 = 60;
 /// Tokens handed over by the Qobuz app in `connect-to-qconnect`. `exp` values
 /// are unix seconds as sent on the wire; `0` = not provided (treated as
 /// non-expiring — nothing in this repo decodes JWTs to find out more).
-/// `*_issued` is when THIS process received the token (handoff or refresh):
-/// the wire carries no issue time, and the refresh heartbeat needs one to find
-/// the token's half-life.
+/// `*_issued_ms` is when THIS process received the token (handoff or
+/// refresh), in unix milliseconds: the wire carries no issue time, and the
+/// refresh heartbeat needs one to find the token's half-life.
 #[derive(Clone)]
 pub(crate) struct PairingTokens {
     pub session_id: String,
     pub(crate) ws_jwt: String,
     pub(crate) ws_exp: u64,
-    pub(crate) ws_issued: u64,
+    pub(crate) ws_issued_ms: u64,
     pub(crate) ws_endpoint: String,
     /// Streaming credential (`Authorization: Bearer`), installed on the client
     /// by `reconnect_for_pairing`.
     pub(crate) api_jwt: Option<String>,
     pub(crate) api_exp: u64,
-    pub(crate) api_issued: u64,
+    pub(crate) api_issued_ms: u64,
+    /// When the client started SENDING this api credential (its Bearer
+    /// install), on the process-monotonic [`mono_ms`] clock; `None` until
+    /// then. The 401 check compares load start times against it, so it must
+    /// be the install, not the receipt: between the two, loads still go out
+    /// with the previous credential. And monotonic, because the Pi has no RTC
+    /// and its wall clock can step at boot.
+    pub(crate) api_in_use_since: Option<u64>,
+    /// This api credential was renewed BECAUSE a load 401'd on the one before
+    /// it. A 401 on a load that started after it was installed is then the
+    /// second strike: renewal is not curing it, so the pairing is retired
+    /// instead of renewed again (see `judge_suspicion`).
+    pub(crate) api_renewed_on_suspicion: bool,
 }
 
 impl PairingTokens {
@@ -90,11 +102,13 @@ impl std::fmt::Debug for PairingTokens {
             .field("session_id", &self.session_id)
             .field("ws_jwt", &"<redacted>")
             .field("ws_exp", &self.ws_exp)
-            .field("ws_issued", &self.ws_issued)
+            .field("ws_issued_ms", &self.ws_issued_ms)
             .field("ws_endpoint", &self.ws_endpoint)
             .field("api_jwt", &self.api_jwt.as_ref().map(|_| "<redacted>"))
             .field("api_exp", &self.api_exp)
-            .field("api_issued", &self.api_issued)
+            .field("api_issued_ms", &self.api_issued_ms)
+            .field("api_in_use_since", &self.api_in_use_since)
+            .field("api_renewed_on_suspicion", &self.api_renewed_on_suspicion)
             .finish()
     }
 }
@@ -104,9 +118,24 @@ impl std::fmt::Debug for PairingTokens {
 pub(crate) type PairingStore = Arc<StdMutex<Option<PairingTokens>>>;
 
 fn now_secs() -> u64 {
+    now_ms() / 1000
+}
+
+/// Milliseconds on a process-monotonic clock, for ORDERING events (a load's
+/// start against a credential's install) — immune to the wall clock stepping.
+/// Never 0, which callers use for "unknown".
+pub(crate) fn mono_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
+    u64::try_from(elapsed.as_millis())
+        .unwrap_or(u64::MAX - 1)
+        .saturating_add(1)
+}
+
+fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0)
 }
 
@@ -177,18 +206,20 @@ fn parse_connect_request(body: &Value) -> Result<PairingTokens, String> {
         None => (None, 0),
     };
 
-    let now = now_secs();
+    let now_ms = now_ms();
     let tokens = PairingTokens {
         session_id,
         ws_jwt,
         ws_exp,
-        ws_issued: now,
+        ws_issued_ms: now_ms,
         ws_endpoint,
         api_jwt,
         api_exp,
-        api_issued: now,
+        api_issued_ms: now_ms,
+        api_in_use_since: None,
+        api_renewed_on_suspicion: false,
     };
-    if !tokens.ws_token_live(now) {
+    if !tokens.ws_token_live(now_ms / 1000) {
         return Err("jwt_qconnect is already expired".to_string());
     }
     Ok(tokens)
@@ -338,6 +369,8 @@ fn register_mdns(port: u16, friendly_name: &str) -> Result<(ServiceDaemon, Strin
 // ---------------------------------------------------------------------------
 
 const REFRESH_CHECK_SECS: u64 = 30;
+/// Ceiling on one refreshToken round trip; a timeout is `Transient`.
+const REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Where one token stands at `now`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -369,6 +402,11 @@ fn token_phase(issued: u64, exp: u64, now: u64) -> TokenPhase {
 /// store. Held by `QconnectHandle` and abort+joined at shutdown (it clones
 /// the service, and through it `Arc<AppRuntime>` — #521 ordering, same
 /// contract as the report scheduler).
+///
+/// It also answers [`AuthSuspect`]: a load the engine saw refused with a 401.
+/// Both arms run in THIS task, one after the other, never concurrently: two
+/// api renewals in flight would each install a credential, and if Qobuz
+/// invalidates the older one on renewal, the loser could be left installed.
 pub(crate) fn spawn_token_refresh(
     service: Arc<DaemonQconnectService>,
 ) -> tokio::task::JoinHandle<()> {
@@ -376,10 +414,130 @@ pub(crate) fn spawn_token_refresh(
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(REFRESH_CHECK_SECS));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            tick.tick().await;
-            refresh_if_needed(&service).await;
+            tokio::select! {
+                _ = tick.tick() => refresh_if_needed(&service).await,
+                () = service.auth_suspect.notified() => verify_suspicion(&service).await,
+            }
         }
     })
+}
+
+// ---------------------------------------------------------------------------
+// A 401 on playback. The heartbeat above only knows a credential is dead by
+// the clock or by refreshToken refusing it, so a credential Qobuz stops
+// accepting early (logout, password change — never observed, but nothing
+// rules it out) would leave the session up behind 401s until the next
+// renewal: the 2026-11-07 symptom for up to half a token's life.
+//
+// So the engine reports a load refused with "Authentication failed", and the
+// heartbeat checks it with ONE renewal ("one retry"). That renewal settles
+// less than it looks: refreshToken may accept a credential the stream
+// endpoint refuses. So if the renewal succeeds, the NEXT 401 — on a load that
+// started after the renewed credential was installed — retires the pairing
+// rather than renewing again. Every failure is stamped with when its load
+// started, so a burst of failures from one gesture, or a leftover from a
+// previous credential or handoff, can never count against a newer one.
+// ---------------------------------------------------------------------------
+
+/// Retire reasons, as they land in `last_errors.auth`.
+const EXPIRED_REASON: &str = "the Qobuz Connect credential expired before it could be renewed";
+const REFUSED_REASON: &str = "Qobuz refused the Qobuz Connect credential when renewing it";
+const REFUSED_AFTER_RENEWAL_REASON: &str =
+    "Qobuz refused to stream with the Qobuz Connect credential even after renewing it";
+
+/// "A load was refused with a 401": from the renderer engine (writer) to the
+/// refresh heartbeat (reader). Carries the LATEST start time of a refused
+/// load, so the heartbeat can tell which credential the refusal was about.
+#[derive(Default)]
+pub(crate) struct AuthSuspect {
+    notify: tokio::sync::Notify,
+    latest_failed_load_ms: std::sync::atomic::AtomicU64,
+}
+
+impl AuthSuspect {
+    /// A load that started at `load_started_ms` ([`mono_ms`]) was refused
+    /// with a 401. Synchronous and lock-free: it is called from the engine's
+    /// `on_load_failed`, on the session event loop.
+    pub(crate) fn report(&self, load_started_ms: u64) {
+        self.latest_failed_load_ms
+            .fetch_max(load_started_ms, std::sync::atomic::Ordering::SeqCst);
+        self.notify.notify_one();
+    }
+
+    async fn notified(&self) {
+        self.notify.notified().await;
+    }
+
+    fn latest_failed_load_ms(&self) -> u64 {
+        self.latest_failed_load_ms
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// What a reported 401 means for the credential in the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Suspicion {
+    /// Not about this credential: its load started before the credential was
+    /// put to use (a burst from one gesture, a previous credential, a
+    /// previous handoff), or there is no api credential to judge.
+    Ignore,
+    /// Renew it once; a renewed credential that is refused again is retired.
+    Renew,
+    /// Nothing will cure it: retire the pairing, for this reason.
+    Retire(&'static str),
+}
+
+/// How long after a suspicion renewal a 401 still counts as its second
+/// strike. Past it, a 401 gets its own one retry: a credential that played
+/// fine for a while and then hits one bad answer is not retired on sight.
+const SECOND_STRIKE_WINDOW_MS: u64 = 10 * 60 * 1000;
+
+/// Pure decision behind [`verify_suspicion`]. `failed_load_started` is the
+/// latest start of a load refused with a 401, on the [`mono_ms`] clock
+/// (0 = unknown, ignored); `now_secs` is the wall clock, for the expiry.
+fn judge_suspicion(tokens: &PairingTokens, failed_load_started: u64, now_secs: u64) -> Suspicion {
+    // Not in use yet (a handoff whose takeover has not installed it, a
+    // renewal between store write and Bearer install), or in use only after
+    // the refused load began: the refusal was of a previous credential.
+    let Some(in_use_since) = tokens.api_in_use_since else {
+        return Suspicion::Ignore;
+    };
+    if tokens.api_jwt.is_none() || failed_load_started <= in_use_since {
+        Suspicion::Ignore
+    } else if token_phase(tokens.api_issued_ms / 1000, tokens.api_exp, now_secs)
+        == TokenPhase::Expired
+    {
+        Suspicion::Retire(EXPIRED_REASON)
+    } else if tokens.api_renewed_on_suspicion
+        && failed_load_started - in_use_since < SECOND_STRIKE_WINDOW_MS
+    {
+        Suspicion::Retire(REFUSED_AFTER_RENEWAL_REASON)
+    } else {
+        Suspicion::Renew
+    }
+}
+
+async fn verify_suspicion(service: &DaemonQconnectService) {
+    let Some(snapshot) = service
+        .pairing_store()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+    else {
+        return;
+    };
+    let failed_load_started_ms = service.auth_suspect.latest_failed_load_ms();
+    match judge_suspicion(&snapshot, failed_load_started_ms, now_secs()) {
+        Suspicion::Ignore => {}
+        Suspicion::Retire(reason) => service.retire_dead_pairing(&snapshot, reason).await,
+        Suspicion::Renew => {
+            log::info!(
+                "[QConnect/Pairing] a load was refused (401); renewing the credential once \
+                 to tell a stale credential from a dead one"
+            );
+            renew(service, &snapshot, true, false, true).await;
+        }
+    }
 }
 
 /// Extract `{jwt, exp[, endpoint]}` from a refreshToken token payload.
@@ -426,6 +584,15 @@ fn install_refreshed(
     }
 }
 
+/// Stamp the store's api credential as in use from now (its Bearer was just
+/// installed), if the store still holds `snapshot`'s handoff (see
+/// `PairingTokens::api_in_use_since`).
+pub(super) fn mark_api_in_use(store: &PairingStore, snapshot: &PairingTokens) {
+    install_refreshed(store, snapshot, |tokens| {
+        tokens.api_in_use_since = Some(mono_ms());
+    });
+}
+
 /// Empty the store ONLY if it still holds the handoff `snapshot` came from —
 /// the retire-a-dead-credential twin of [`install_refreshed`]. A handoff that
 /// landed while the dead one was being discovered owns the store now and must
@@ -444,47 +611,62 @@ pub(super) fn clear_if_same_handoff(store: &PairingStore, snapshot: &PairingToke
 }
 
 async fn refresh_if_needed(service: &DaemonQconnectService) {
-    let store = service.pairing_store();
-    let Some(snapshot) = store.lock().ok().and_then(|guard| guard.clone()) else {
+    let Some(snapshot) = service
+        .pairing_store()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+    else {
         return;
     };
     // The refresh endpoint itself authenticates with the Bearer api credential;
     // without one (degenerate handoff) there is nothing we can renew.
-    let Some(mut api_jwt) = snapshot.api_jwt.clone() else {
+    if snapshot.api_jwt.is_none() {
         return;
-    };
+    }
     let now = now_secs();
-    let api_phase = token_phase(snapshot.api_issued, snapshot.api_exp, now);
+    let api_phase = token_phase(snapshot.api_issued_ms / 1000, snapshot.api_exp, now);
     if api_phase == TokenPhase::Expired {
-        service
-            .retire_dead_pairing(
-                &snapshot,
-                "the Qobuz Connect credential expired before it could be renewed",
-            )
-            .await;
+        service.retire_dead_pairing(&snapshot, EXPIRED_REASON).await;
         return;
     }
     let api_due = api_phase == TokenPhase::Renew;
     // An expired ws token is still renewable: the call mints a fresh one from
     // the (live) api credential.
-    let ws_due = token_phase(snapshot.ws_issued, snapshot.ws_exp, now) != TokenPhase::Fresh;
-    if !api_due && !ws_due {
-        return;
+    let ws_due =
+        token_phase(snapshot.ws_issued_ms / 1000, snapshot.ws_exp, now) != TokenPhase::Fresh;
+    if api_due || ws_due {
+        renew(service, &snapshot, api_due, ws_due, false).await;
     }
+}
+
+/// Renew the api and/or ws credential of the handoff `snapshot` was taken
+/// from. `on_suspicion`: this api renewal answers a 401 on playback, so the
+/// renewed credential carries the second-strike mark (see `judge_suspicion`);
+/// a scheduled renewal clears it.
+async fn renew(
+    service: &DaemonQconnectService,
+    snapshot: &PairingTokens,
+    api_due: bool,
+    ws_due: bool,
+    on_suspicion: bool,
+) {
+    let store = service.pairing_store();
+    let Some(mut api_jwt) = snapshot.api_jwt.clone() else {
+        return;
+    };
     let Some(client) = service.runtime.core().client().read().await.clone() else {
         return;
     };
-    let left = snapshot.api_exp.saturating_sub(now);
+    let left = snapshot.api_exp.saturating_sub(now_secs());
 
     if api_due {
         match refresh_jwt(&client, &api_jwt, "jwt_api").await {
             Ok(payload) => {
                 if let Some((jwt, exp, _)) = parse_refresh_payload(&payload) {
                     qbz_log::register_secret(jwt.clone());
-                    let landed = install_refreshed(&store, &snapshot, |tokens| {
-                        tokens.api_jwt = Some(jwt.clone());
-                        tokens.api_exp = exp;
-                        tokens.api_issued = now;
+                    let landed = install_refreshed(&store, snapshot, |tokens| {
+                        apply_api_renewal(tokens, &jwt, exp, now_ms(), on_suspicion);
                     });
                     if landed {
                         api_jwt = jwt;
@@ -498,7 +680,7 @@ async fn refresh_if_needed(service: &DaemonQconnectService) {
                         let hijacked = store
                             .lock()
                             .map(|guard| match guard.as_ref() {
-                                Some(tokens) => !same_handoff(tokens, &snapshot),
+                                Some(tokens) => !same_handoff(tokens, snapshot),
                                 None => true,
                             })
                             .unwrap_or(true);
@@ -512,6 +694,10 @@ async fn refresh_if_needed(service: &DaemonQconnectService) {
                             );
                             return;
                         }
+                        // In use from now: a load that started between the store
+                        // write and the Bearer install went out with the OLD
+                        // credential, and its 401 must not count against this one.
+                        mark_api_in_use(&store, snapshot);
                         log::info!("[QConnect/Pairing] refreshed jwt_api (exp {exp})");
                     } else {
                         log::info!(
@@ -519,16 +705,13 @@ async fn refresh_if_needed(service: &DaemonQconnectService) {
                         );
                         return;
                     }
+                } else {
+                    log::warn!("[QConnect/Pairing] jwt_api refresh answered without a jwt");
                 }
             }
             Err(RefreshError::Rejected(err)) => {
                 log::warn!("[QConnect/Pairing] jwt_api refresh rejected: {err}");
-                service
-                    .retire_dead_pairing(
-                        &snapshot,
-                        "Qobuz rejected the Qobuz Connect credential when renewing it",
-                    )
-                    .await;
+                service.retire_dead_pairing(snapshot, REFUSED_REASON).await;
                 return;
             }
             Err(RefreshError::Transient(err)) => log::warn!(
@@ -543,10 +726,10 @@ async fn refresh_if_needed(service: &DaemonQconnectService) {
             Ok(payload) => {
                 if let Some((jwt, exp, endpoint)) = parse_refresh_payload(&payload) {
                     qbz_log::register_secret(jwt.clone());
-                    let landed = install_refreshed(&store, &snapshot, |tokens| {
+                    let landed = install_refreshed(&store, snapshot, |tokens| {
                         tokens.ws_jwt = jwt.clone();
                         tokens.ws_exp = exp;
-                        tokens.ws_issued = now;
+                        tokens.ws_issued_ms = now_ms();
                         if let Some(endpoint) = endpoint {
                             tokens.ws_endpoint = endpoint;
                         }
@@ -560,6 +743,8 @@ async fn refresh_if_needed(service: &DaemonQconnectService) {
                             "[QConnect/Pairing] dropped stale jwt_qws refresh (store changed)"
                         );
                     }
+                } else {
+                    log::warn!("[QConnect/Pairing] jwt_qws refresh answered without a jwt");
                 }
             }
             // The ws arm authenticates with the same api credential, so a
@@ -568,12 +753,7 @@ async fn refresh_if_needed(service: &DaemonQconnectService) {
             // the store's credential — the next tick re-reads and decides.
             Err(RefreshError::Rejected(err)) if !api_due => {
                 log::warn!("[QConnect/Pairing] jwt_qws refresh rejected: {err}");
-                service
-                    .retire_dead_pairing(
-                        &snapshot,
-                        "Qobuz rejected the Qobuz Connect credential when renewing it",
-                    )
-                    .await;
+                service.retire_dead_pairing(snapshot, REFUSED_REASON).await;
             }
             Err(RefreshError::Rejected(err) | RefreshError::Transient(err)) => log::warn!(
                 "[QConnect/Pairing] jwt_qws refresh failed ({left} s before the api \
@@ -583,14 +763,43 @@ async fn refresh_if_needed(service: &DaemonQconnectService) {
     }
 }
 
+/// A renewed api credential replaces the old one, received at `now_ms`.
+/// Answering a 401 (`on_suspicion`) marks it for the second strike; a
+/// scheduled renewal clears the mark, so one stale suspicion cannot hang over
+/// every credential after it.
+fn apply_api_renewal(
+    tokens: &mut PairingTokens,
+    jwt: &str,
+    exp: u64,
+    now_ms: u64,
+    on_suspicion: bool,
+) {
+    tokens.api_jwt = Some(jwt.to_string());
+    tokens.api_exp = exp;
+    tokens.api_issued_ms = now_ms;
+    // In use only once the client sends it: `mark_api_in_use` after the
+    // Bearer install.
+    tokens.api_in_use_since = None;
+    tokens.api_renewed_on_suspicion = on_suspicion;
+}
+
 /// Why a refreshToken round-trip failed.
 #[derive(Debug)]
 enum RefreshError {
-    /// 401/403: Qobuz refuses the Bearer credential. Retrying cannot help.
+    /// 401: Qobuz refuses the Bearer credential. Retrying cannot help.
     Rejected(String),
     /// Anything else (5xx, network, a malformed body): worth retrying while
     /// the credential is still alive.
     Transient(String),
+}
+
+/// Only a 401 says the credential itself is refused. A 403 does NOT: Qobuz
+/// answers 403 in storms that have nothing to do with the credential (the
+/// client keeps a circuit breaker for them, issue #637), and treating one as
+/// fatal would drop a working session on a bad minute. A credential that
+/// really is dead still ends at its expiry.
+fn refresh_status_rejects_the_credential(status: u16) -> bool {
+    status == 401
 }
 
 /// One `POST /qws/refreshToken` round-trip; returns the renewed token payload
@@ -612,6 +821,10 @@ async fn refresh_jwt(
         .header("X-App-Id", app_id)
         .header("Authorization", format!("Bearer {bearer}"))
         .form(&[("jwt", kind)])
+        // The whole round trip, body included: the client only bounds the TCP
+        // connect, and one stalled answer would otherwise freeze the heartbeat
+        // — and with it expiry handling and the 401 check — for good.
+        .timeout(REFRESH_TIMEOUT)
         .send()
         .await
         .map_err(|err| {
@@ -624,7 +837,7 @@ async fn refresh_jwt(
     if !status.is_success() {
         let preview = body.trim().chars().take(300).collect::<String>();
         let message = format!("refreshToken status {status}: {preview}");
-        return Err(if matches!(status.as_u16(), 401 | 403) {
+        return Err(if refresh_status_rejects_the_credential(status.as_u16()) {
             RefreshError::Rejected(message)
         } else {
             RefreshError::Transient(message)
@@ -778,11 +991,13 @@ mod tests {
             session_id: "s".into(),
             ws_jwt: "jwt".into(),
             ws_exp: exp,
-            ws_issued: 0,
+            ws_issued_ms: 0,
             ws_endpoint: "wss://e".into(),
             api_jwt: None,
             api_exp: 0,
-            api_issued: 0,
+            api_issued_ms: 0,
+            api_in_use_since: None,
+            api_renewed_on_suspicion: false,
         };
         let now = 1_000_000;
         // Strictly greater than now + slack is required: exactly at the slack
@@ -799,11 +1014,13 @@ mod tests {
                 session_id: "s".into(),
                 ws_jwt: "SECRET-WS".into(),
                 ws_exp: 0,
-                ws_issued: 0,
+                ws_issued_ms: 0,
                 ws_endpoint: "wss://e".into(),
                 api_jwt: Some("SECRET-API".into()),
                 api_exp: 0,
-                api_issued: 0,
+                api_issued_ms: 0,
+                api_in_use_since: None,
+                api_renewed_on_suspicion: false,
             }
         );
         assert!(!rendered.contains("SECRET-WS"));
@@ -816,11 +1033,13 @@ mod tests {
             session_id: "s".into(),
             ws_jwt: "jwt".into(),
             ws_exp: 1, // long expired
-            ws_issued: 0,
+            ws_issued_ms: 0,
             ws_endpoint: "wss://e".into(),
             api_jwt: None,
             api_exp: 0,
-            api_issued: 0,
+            api_issued_ms: 0,
+            api_in_use_since: None,
+            api_renewed_on_suspicion: false,
         })));
         assert!(valid_ws_tokens(&store).is_none());
         assert!(
@@ -835,11 +1054,13 @@ mod tests {
             session_id: "s".into(),
             ws_jwt: "jwt".into(),
             ws_exp: 0,
-            ws_issued: 0,
+            ws_issued_ms: 0,
             ws_endpoint: "wss://e".into(),
             api_jwt: None,
             api_exp: 0,
-            api_issued: 0,
+            api_issued_ms: 0,
+            api_in_use_since: None,
+            api_renewed_on_suspicion: false,
         };
         let config = transport_config_from(&tokens);
         assert_eq!(config.endpoint_url, "wss://e");
@@ -908,17 +1129,219 @@ mod tests {
         assert_eq!(credential_death(1800..3600), Some(3600));
     }
 
+    // ---- a 401 on playback ----
+
+    /// A paired credential received and put to use at `issued_ms`, expiring
+    /// an hour later. (The tests use one timeline for both clocks: only the
+    /// ordering of stamps, and the expiry against `now`, matter here.)
+    fn paired(issued_ms: u64) -> PairingTokens {
+        PairingTokens {
+            session_id: "s1".into(),
+            ws_jwt: "ws1".into(),
+            ws_exp: issued_ms / 1000 + 3600,
+            ws_issued_ms: issued_ms,
+            ws_endpoint: "wss://e".into(),
+            api_jwt: Some("api1".into()),
+            api_exp: issued_ms / 1000 + 3600,
+            api_issued_ms: issued_ms,
+            api_in_use_since: Some(issued_ms),
+            api_renewed_on_suspicion: false,
+        }
+    }
+
+    const T: u64 = 1_800_000_000_000; // unix ms
+
+    #[test]
+    fn judge_suspicion_counts_only_refusals_of_the_current_credential() {
+        let tokens = paired(T);
+        let now = (T + 100_000) / 1000;
+        assert_eq!(
+            judge_suspicion(&tokens, 0, now),
+            Suspicion::Ignore,
+            "no stamp"
+        );
+        // A load that started before the credential was in use went out with
+        // the previous one.
+        assert_eq!(judge_suspicion(&tokens, T - 1, now), Suspicion::Ignore);
+        assert_eq!(judge_suspicion(&tokens, T, now), Suspicion::Ignore);
+        assert_eq!(judge_suspicion(&tokens, T + 1, now), Suspicion::Renew);
+
+        let mut no_api = tokens.clone();
+        no_api.api_jwt = None;
+        assert_eq!(judge_suspicion(&no_api, T + 1, now), Suspicion::Ignore);
+
+        let mut second_strike = tokens.clone();
+        second_strike.api_renewed_on_suspicion = true;
+        assert_eq!(
+            judge_suspicion(&second_strike, T + 1, now),
+            Suspicion::Retire(REFUSED_AFTER_RENEWAL_REASON)
+        );
+
+        // Already past its expiry: no renewal can work, retire at once.
+        assert_eq!(
+            judge_suspicion(&tokens, T + 1, (T + 3_600_000) / 1000),
+            Suspicion::Retire(EXPIRED_REASON)
+        );
+
+        // Received but not yet installed: a takeover still on its way, or a
+        // renewal between store write and Bearer install. Whatever 401'd went
+        // out with the previous credential.
+        let mut not_in_use = tokens.clone();
+        not_in_use.api_in_use_since = None;
+        assert_eq!(
+            judge_suspicion(&not_in_use, T + 50_000, now),
+            Suspicion::Ignore
+        );
+    }
+
+    /// The heartbeat's answer to 401s, over the production decision
+    /// (`judge_suspicion`) and the production renewal (`apply_api_renewal`),
+    /// with refreshToken scripted.
+    struct Heartbeat {
+        tokens: PairingTokens,
+        renewals: u32,
+        retired: Option<&'static str>,
+    }
+
+    impl Heartbeat {
+        fn paired_at(issued_ms: u64) -> Self {
+            Self {
+                tokens: paired(issued_ms),
+                renewals: 0,
+                retired: None,
+            }
+        }
+
+        /// Woken at `now_ms` by a 401 whose load started at `load_started_ms`;
+        /// refreshToken, if asked, answers `renewal_ok` (else a 401).
+        fn wake(&mut self, load_started_ms: u64, now_ms: u64, renewal_ok: bool) {
+            if self.retired.is_some() {
+                return;
+            }
+            match judge_suspicion(&self.tokens, load_started_ms, now_ms / 1000) {
+                Suspicion::Ignore => {}
+                Suspicion::Retire(reason) => self.retired = Some(reason),
+                Suspicion::Renew => {
+                    self.renewals += 1;
+                    if renewal_ok {
+                        let exp = now_ms / 1000 + 3600;
+                        apply_api_renewal(&mut self.tokens, "renewed", exp, now_ms, true);
+                        // ... and the Bearer install that puts it in use.
+                        self.tokens.api_in_use_since = Some(now_ms);
+                    } else {
+                        self.retired = Some(REFUSED_REASON);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_burst_of_refusals_from_one_gesture_renews_once() {
+        // 2026-11-08 10:05:22: four queue items refused within 0.7 s. The
+        // heartbeat answers the first; the other three loads had all started
+        // before its renewal landed, so they say nothing about the renewed
+        // credential.
+        let mut heartbeat = Heartbeat::paired_at(T);
+        heartbeat.wake(T + 1_000, T + 1_100, true);
+        for started in [T + 1_020, T + 1_050, T + 1_090] {
+            heartbeat.wake(started, T + 1_700, true);
+        }
+        assert_eq!(heartbeat.renewals, 1);
+        assert_eq!(heartbeat.retired, None, "a cured credential stays paired");
+    }
+
+    #[test]
+    fn a_refusal_after_the_renewal_retires_instead_of_renewing_again() {
+        // refreshToken may accept a credential the stream endpoint refuses.
+        // Renewing on every 401 would then loop forever behind a session that
+        // looks connected — the 2026-11-07 symptom. The second strike ends it.
+        let mut heartbeat = Heartbeat::paired_at(T);
+        heartbeat.wake(T + 1_000, T + 1_100, true);
+        heartbeat.wake(T + 60_000, T + 60_100, true);
+        assert_eq!(heartbeat.renewals, 1);
+        assert_eq!(heartbeat.retired, Some(REFUSED_AFTER_RENEWAL_REASON));
+    }
+
+    #[test]
+    fn a_refusal_long_after_the_renewal_gets_its_own_retry() {
+        // The renewal cured it; ten minutes of good playback later a single
+        // 401 is a new suspicion, not the second strike of the old one.
+        let mut heartbeat = Heartbeat::paired_at(T);
+        heartbeat.wake(T + 1_000, T + 1_100, true);
+        heartbeat.wake(
+            T + 1_100 + SECOND_STRIKE_WINDOW_MS + 1,
+            T + 1_100 + SECOND_STRIKE_WINDOW_MS + 100,
+            true,
+        );
+        assert_eq!(heartbeat.renewals, 2);
+        assert_eq!(heartbeat.retired, None);
+    }
+
+    #[test]
+    fn a_renewal_refused_with_401_retires_at_once() {
+        let mut heartbeat = Heartbeat::paired_at(T);
+        heartbeat.wake(T + 1_000, T + 1_100, false);
+        assert_eq!(heartbeat.retired, Some(REFUSED_REASON));
+    }
+
+    #[test]
+    fn a_refusal_left_over_from_the_previous_handoff_is_ignored() {
+        // The old session's loads 401'd (which is why the user re-picked);
+        // the suspicion is answered only after the new handoff is in use.
+        let mut heartbeat = Heartbeat::paired_at(T);
+        heartbeat.tokens = paired(T + 30_000); // the new handoff
+        heartbeat.wake(T + 20_000, T + 31_000, true);
+        assert_eq!(heartbeat.renewals, 0);
+        assert_eq!(heartbeat.retired, None);
+    }
+
+    #[test]
+    fn a_scheduled_renewal_clears_the_second_strike() {
+        let mut heartbeat = Heartbeat::paired_at(T);
+        heartbeat.wake(T + 1_000, T + 1_100, true);
+        assert!(heartbeat.tokens.api_renewed_on_suspicion);
+        // A few minutes later the heartbeat renews on schedule ...
+        apply_api_renewal(&mut heartbeat.tokens, "scheduled", 0, T + 300_000, false);
+        heartbeat.tokens.api_in_use_since = Some(T + 300_000);
+        // ... and a later 401, still inside the window of the first renewal,
+        // gets its own one retry again.
+        heartbeat.wake(T + 400_000, T + 400_100, true);
+        assert_eq!(heartbeat.renewals, 2);
+        assert_eq!(heartbeat.retired, None);
+    }
+
+    #[test]
+    fn auth_suspect_keeps_the_latest_refused_load() {
+        let suspect = AuthSuspect::default();
+        assert_eq!(suspect.latest_failed_load_ms(), 0);
+        suspect.report(T + 50);
+        suspect.report(T + 10); // reported later, started earlier
+        assert_eq!(suspect.latest_failed_load_ms(), T + 50);
+    }
+
+    #[test]
+    fn only_a_401_from_refresh_token_rejects_the_credential() {
+        assert!(refresh_status_rejects_the_credential(401));
+        // 403 storms are not about the credential (issue #637).
+        for status in [403, 429, 500, 502, 503] {
+            assert!(!refresh_status_rejects_the_credential(status), "{status}");
+        }
+    }
+
     #[test]
     fn clear_if_same_handoff_spares_a_newer_handoff() {
         let original = PairingTokens {
             session_id: "s1".into(),
             ws_jwt: "jwt1".into(),
             ws_exp: 0,
-            ws_issued: 0,
+            ws_issued_ms: 0,
             ws_endpoint: "wss://e".into(),
             api_jwt: Some("api1".into()),
             api_exp: 0,
-            api_issued: 0,
+            api_issued_ms: 0,
+            api_in_use_since: None,
+            api_renewed_on_suspicion: false,
         };
         // A newer handoff landed while the old credential was found dead: it
         // owns the store and must survive.
@@ -958,11 +1381,13 @@ mod tests {
             session_id: "s1".into(),
             ws_jwt: "jwt1".into(),
             ws_exp: 0,
-            ws_issued: 0,
+            ws_issued_ms: 0,
             ws_endpoint: "wss://e".into(),
             api_jwt: Some("api1".into()),
             api_exp: 0,
-            api_issued: 0,
+            api_issued_ms: 0,
+            api_in_use_since: None,
+            api_renewed_on_suspicion: false,
         };
         // Same handoff still in the store -> the write lands.
         let store: PairingStore = Arc::new(StdMutex::new(Some(original.clone())));
