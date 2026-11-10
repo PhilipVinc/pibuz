@@ -141,7 +141,8 @@ pub(crate) async fn run(
     //       PositionUpdated / VolumeChanged. Holds only a Weak<AppRuntime>
     //       upgraded per wake, but is still aborted+joined ahead of
     //       `drop(booted)` so a mid-wake strong Arc can't outlive the ordering.
-    // The API pulses the same edge after a volume change (`ApiState::events_edge`).
+    // The API and the Connect engine pulse the same edge after a volume change
+    // (`ApiState::events_edge`).
     let events_edge = edge_notify.clone();
     let events_bridge = crate::events_bridge::spawn(
         &booted.runtime,
@@ -214,6 +215,7 @@ pub(crate) async fn run(
         booted.shared.clone(),
         &roots,
         report_notify,
+        events_edge,
         booted.bus.subscribe(),
     );
     // Publish the reload route's handle onto the running service now that
