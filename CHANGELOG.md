@@ -7,6 +7,10 @@ tags on `main`.
 
 ### Fixed
 
+- **A volume change from the app while muted no longer leaves the app
+  showing the mute.** The level ended the mute and the box played, but only
+  the level was reported, so the app kept its mute icon on until the next
+  mute toggle. The unmute is now reported too.
 - **A short Qobuz outage no longer leaves the renderer silently broken.** The
   credential the Qobuz app hands over lasts an hour, and pibuz renewed it only
   in the last five minutes. When Qobuz's renewal endpoint failed for those five

@@ -621,14 +621,28 @@ impl QconnectRendererEngine for DaemonRendererEngine {
             );
             return Ok(());
         }
-        // A level from the controller ends a box-side mute, as one from the
-        // box does (`crate::mute`).
+        // A level from the controller ends a mute, as one from the box does
+        // (`crate::mute`).
+        let mut unmuted = false;
         crate::mute::change(
             &self.shared,
             |level| self.set_player_volume(level),
-            |mute| mute.take_level(fraction),
-        )
-        .map(|_| ())
+            |mute| {
+                let was_muted = mute.is_muted();
+                let level = mute.take_level(fraction);
+                unmuted = was_muted && !mute.is_muted();
+                level
+            },
+        )?;
+        // The controller only asked for a level: its echo carries no unmute,
+        // so the app kept showing the mute over a playing box. Report it the
+        // way a box-side unmute is reported (`publish_local_volume_if_changed`).
+        if unmuted {
+            if let Ok(mut s) = self.shared.lock() {
+                s.volume_changed_here = true;
+            }
+        }
+        Ok(())
     }
     fn set_muted(&self, muted: bool) -> Result<(), String> {
         // Same gate as `set_volume`: in `Locked` the player stays at unity and
