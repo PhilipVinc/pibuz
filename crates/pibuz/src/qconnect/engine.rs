@@ -110,6 +110,9 @@ pub(crate) struct DaemonRendererEngine {
     /// Pulsed when buffering starts so the report scheduler tells the
     /// controller within milliseconds instead of at its next 2 s tick.
     report_notify: Arc<tokio::sync::Notify>,
+    /// Pulsed after a controller's volume or mute, so the events bridge
+    /// publishes `VolumeChanged` at once instead of at its next wake.
+    events_edge: Arc<tokio::sync::Notify>,
     /// Told when a load is refused with a 401, so the pairing heartbeat can
     /// check the credential (pairing.rs, `AuthSuspect`).
     auth_suspect: Arc<super::pairing::AuthSuspect>,
@@ -445,6 +448,7 @@ impl DaemonRendererEngine {
         volume_mode: VolumeMode,
         buffering: Arc<BufferingLatch>,
         report_notify: Arc<tokio::sync::Notify>,
+        events_edge: Arc<tokio::sync::Notify>,
         shared: Arc<std::sync::Mutex<crate::state::DaemonShared>>,
         auth_suspect: Arc<super::pairing::AuthSuspect>,
     ) -> Self {
@@ -455,6 +459,7 @@ impl DaemonRendererEngine {
             buffering,
             shared,
             report_notify,
+            events_edge,
             auth_suspect,
             load_started: std::sync::Mutex::new(None),
         }
@@ -642,6 +647,7 @@ impl QconnectRendererEngine for DaemonRendererEngine {
                 s.volume_changed_here = true;
             }
         }
+        self.events_edge.notify_one();
         Ok(())
     }
     fn set_muted(&self, muted: bool) -> Result<(), String> {
@@ -658,8 +664,9 @@ impl QconnectRendererEngine for DaemonRendererEngine {
             &self.shared,
             |level| self.set_player_volume(level),
             |mute| mute.set(muted, live),
-        )
-        .map(|_| ())
+        )?;
+        self.events_edge.notify_one();
+        Ok(())
     }
     fn get_playback_state(&self) -> PlaybackState {
         self.core().get_playback_state()

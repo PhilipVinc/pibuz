@@ -11,6 +11,9 @@ tags on `main`.
   showing the mute.** The level ended the mute and the box played, but only
   the level was reported, so the app kept its mute icon on until the next
   mute toggle. The unmute is now reported too.
+- **A volume change from the app reaches `/api/events` and the event hook at
+  once.** It waited for the next wake of the events bridge, up to two seconds,
+  while a change made through the control API went out at once.
 - **A short Qobuz outage no longer leaves the renderer silently broken.** The
   credential the Qobuz app hands over lasts an hour, and pibuz renewed it only
   in the last five minutes. When Qobuz's renewal endpoint failed for those five
