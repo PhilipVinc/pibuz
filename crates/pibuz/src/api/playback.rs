@@ -207,7 +207,7 @@ pub(crate) fn volume(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>
     let mute = match crate::mute::change(
         &state.shared,
         |level| set_player_volume(state, level),
-        |mute| mute.take_level(target),
+        |s| s.mute.take_level(target),
     ) {
         Ok((mute, _)) => mute,
         Err(e) => return runtime_error(&e),
@@ -297,7 +297,7 @@ fn apply_mute(state: &ApiState, live: f32, arg: &str) -> Response<Cursor<Vec<u8>
     let (mute, level) = match crate::mute::change(
         &state.shared,
         |level| set_player_volume(state, level),
-        |mute| mute.set(mute_on, live),
+        |s| s.mute.set(mute_on, live),
     ) {
         Ok(changed) => changed,
         Err(e) => return runtime_error(&e),

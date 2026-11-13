@@ -98,8 +98,10 @@ impl Mute {
 /// Apply `change` to the daemon's mute and set the player to the level it asks
 /// for, holding the daemon lock across both: a mute from the box and an unmute
 /// from the controller racing each other must not leave the flag saying one
-/// thing and the player the other. Returns the mute as it now stands, and
-/// the level the player was set to, if `change` asked for one.
+/// thing and the player the other. `change` gets the whole daemon state so a
+/// flag that has to move with the mute (`DaemonShared::unmute_unreported`)
+/// moves under the same lock. Returns the mute as it now stands, and the level
+/// the player was set to, if `change` asked for one.
 ///
 /// On a failed `set_volume` the flag has still moved. That is the old
 /// behaviour of the box's mute, kept: the player's command channel is dead at
@@ -107,16 +109,30 @@ impl Mute {
 pub(crate) fn change(
     shared: &Mutex<DaemonShared>,
     set_volume: impl FnOnce(f32) -> Result<(), String>,
-    change: impl FnOnce(&mut Mute) -> Option<f32>,
+    change: impl FnOnce(&mut DaemonShared) -> Option<f32>,
 ) -> Result<(Mute, Option<f32>), String> {
     let mut guard = shared
         .lock()
         .map_err(|_| "daemon state lock poisoned".to_string())?;
-    let level = change(&mut guard.mute);
+    let level = change(&mut guard);
     if let Some(level) = level {
         set_volume(level)?;
     }
     Ok((guard.mute, level))
+}
+
+/// A level from the Connect controller, for [`change`]: `Mute::take_level`,
+/// and an unmute it makes is flagged for the volume publisher
+/// (`DaemonShared::unmute_unreported`). The controller's echo of its own
+/// `SetVolume` carries the level but not the unmute, so without the flag the
+/// app keeps showing the mute over a box that plays again.
+pub(crate) fn take_controller_level(s: &mut DaemonShared, level: f32) -> Option<f32> {
+    let was_muted = s.mute.is_muted();
+    let set = s.mute.take_level(level);
+    if was_muted && !s.mute.is_muted() {
+        s.unmute_unreported = true;
+    }
+    set
 }
 
 /// The mute as it stands, or unmuted if the lock is poisoned.
@@ -172,6 +188,7 @@ mod tests {
             mute: Mute::default(),
             queue_at_rest: false,
             volume_changed_here: false,
+            unmute_unreported: false,
             started_at: std::time::Instant::now(),
             startup_warnings: 0,
             qconnect: crate::state::QconnectStatus::default(),
@@ -192,20 +209,45 @@ mod tests {
             Ok(())
         };
 
-        let (mute, level) = change(&shared, player, |m| m.set(true, 0.26)).unwrap();
+        let (mute, level) = change(&shared, player, |s| s.mute.set(true, 0.26)).unwrap();
         assert!(mute.is_muted());
         assert_eq!((level, set.get()), (Some(0.0), Some(0.0)));
 
-        let (mute, level) = change(&shared, player, |m| m.set(false, 0.0)).unwrap();
+        let (mute, level) = change(&shared, player, |s| s.mute.set(false, 0.0)).unwrap();
         assert!(!mute.is_muted());
         assert_eq!((level, set.get()), (Some(0.26), Some(0.26)));
 
         set.set(None);
-        let (_, level) = change(&shared, player, |m| m.set(false, 0.26)).unwrap();
+        let (_, level) = change(&shared, player, |s| s.mute.set(false, 0.26)).unwrap();
         assert_eq!(
             (level, set.get()),
             (None, None),
             "a no-op leaves the player alone"
+        );
+    }
+
+    /// A controller's level that ends a mute flags the unmute for the
+    /// publisher; one that does not end one leaves the flag alone.
+    #[test]
+    fn a_controllers_level_flags_only_the_unmute_it_makes() {
+        let shared = shared();
+        let player = |_| Ok(());
+        let flagged = || shared.lock().unwrap().unmute_unreported;
+
+        change(&shared, player, |s| s.mute.set(true, 0.4)).unwrap();
+        change(&shared, player, |s| take_controller_level(s, 0.0)).unwrap();
+        assert!(!flagged(), "a level of 0 leaves the mute on");
+
+        let (mute, level) = change(&shared, player, |s| take_controller_level(s, 0.6)).unwrap();
+        assert!(!mute.is_muted());
+        assert_eq!(level, Some(0.6));
+        assert!(flagged(), "the unmute is news to the controller");
+
+        shared.lock().unwrap().unmute_unreported = false;
+        change(&shared, player, |s| take_controller_level(s, 0.5)).unwrap();
+        assert!(
+            !flagged(),
+            "unmuted already: only the level, which it echoes"
         );
     }
 

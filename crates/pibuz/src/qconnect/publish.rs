@@ -250,6 +250,11 @@ pub(crate) fn spawn_queue_cloud_publish(
 /// like a local change and went back to it a second time. The cloud's view
 /// of OUR volume and mute (`session_renderer_states`) is still compared, so
 /// what it already shows is not sent again.
+///
+/// The one exception is an unmute the controller's own level made
+/// (`DaemonShared::unmute_unreported`): its echo carries the level, not the
+/// unmute. That goes out as the mute ALONE, for the same reason — the level is
+/// the controller's own, and a stale echo in the view would send it back.
 pub(crate) async fn publish_local_volume_if_changed(
     inner: &Arc<Mutex<DaemonQconnectInner>>,
     runtime: &Arc<AppRuntime<DaemonAdapter>>,
@@ -257,11 +262,16 @@ pub(crate) async fn publish_local_volume_if_changed(
 ) {
     // Consumed first, so a change made with no session to tell is not left to
     // fire on the controller's next drag.
-    let changed_here = shared
+    let (changed_here, unmute_unreported) = shared
         .lock()
-        .map(|mut s| std::mem::take(&mut s.volume_changed_here))
-        .unwrap_or(false);
-    if !changed_here {
+        .map(|mut s| {
+            (
+                std::mem::take(&mut s.volume_changed_here),
+                std::mem::take(&mut s.unmute_unreported),
+            )
+        })
+        .unwrap_or((false, false));
+    if !changed_here && !unmute_unreported {
         return;
     }
     let (app, sync_state, volume_mode) = {
@@ -292,13 +302,19 @@ pub(crate) async fn publish_local_volume_if_changed(
             mute.is_muted(),
             renderer.and_then(|renderer| renderer.volume),
             renderer.and_then(|renderer| renderer.muted),
+            changed_here,
         )
     };
     let version = app.queue_state_snapshot().await.version;
     if let Some(muted) = catch_up.muted {
         log::info!(
-            "[QConnect] Reporting {} (changed locally)",
-            if muted { "mute" } else { "unmute" }
+            "[QConnect] Reporting {} ({})",
+            if muted { "mute" } else { "unmute" },
+            if changed_here {
+                "changed locally"
+            } else {
+                "the controller's level ended the mute"
+            }
         );
         let report = RendererReport::new(
             RendererReportType::RndrSrvrVolumeMuted,
@@ -329,6 +345,8 @@ pub(crate) async fn publish_local_volume_if_changed(
 /// cloud's echoes) differs. An unknown level (`None`) is reported — the
 /// controller has told us nothing, so tell it. An unknown mute reads as
 /// unmuted, the cloud's own default, so an unmuted renderer says nothing.
+/// The level is never reported when it is not `level_is_news`: when the
+/// controller set it itself, and only the unmute it made is news.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct VolumeCatchUp {
     muted: Option<bool>,
@@ -340,10 +358,11 @@ fn volume_catch_up(
     ours_muted: bool,
     theirs_level: Option<i32>,
     theirs_muted: Option<bool>,
+    level_is_news: bool,
 ) -> VolumeCatchUp {
     VolumeCatchUp {
         muted: (theirs_muted.unwrap_or(false) != ours_muted).then_some(ours_muted),
-        level: (theirs_level != Some(ours_level)).then_some(ours_level),
+        level: (level_is_news && theirs_level != Some(ours_level)).then_some(ours_level),
     }
 }
 
@@ -409,11 +428,11 @@ mod tests {
         // emits VolumeChanged for it); the cloud's echo has already told us
         // it shows that, so a report would be a duplicate.
         assert_eq!(
-            volume_catch_up(40, false, Some(40), Some(false)),
+            volume_catch_up(40, false, Some(40), Some(false), true),
             catch_up(None, None)
         );
         assert_eq!(
-            volume_catch_up(40, true, Some(40), Some(true)),
+            volume_catch_up(40, true, Some(40), Some(true), true),
             catch_up(None, None)
         );
     }
@@ -421,7 +440,7 @@ mod tests {
     #[test]
     fn a_local_level_change_is_reported() {
         assert_eq!(
-            volume_catch_up(25, false, Some(40), Some(false)),
+            volume_catch_up(25, false, Some(40), Some(false), true),
             catch_up(None, Some(25))
         );
     }
@@ -431,11 +450,11 @@ mod tests {
     #[test]
     fn a_mute_from_the_box_is_reported_as_a_mute_and_so_is_its_unmute() {
         assert_eq!(
-            volume_catch_up(40, true, Some(40), Some(false)),
+            volume_catch_up(40, true, Some(40), Some(false), true),
             catch_up(Some(true), None)
         );
         assert_eq!(
-            volume_catch_up(40, false, Some(40), Some(true)),
+            volume_catch_up(40, false, Some(40), Some(true), true),
             catch_up(Some(false), None)
         );
     }
@@ -443,8 +462,29 @@ mod tests {
     #[test]
     fn a_level_changed_while_muted_is_still_news() {
         assert_eq!(
-            volume_catch_up(25, true, Some(40), Some(true)),
+            volume_catch_up(25, true, Some(40), Some(true), true),
             catch_up(None, Some(25))
+        );
+    }
+
+    /// A level from the controller ended a mute: the unmute goes out, the
+    /// level does not — even with a stale echo in the view mid-drag, which
+    /// would otherwise send the slider back to where the drag had been.
+    #[test]
+    fn an_unmute_the_controllers_level_made_goes_out_alone() {
+        assert_eq!(
+            volume_catch_up(40, false, Some(40), Some(true), false),
+            catch_up(Some(false), None)
+        );
+        assert_eq!(
+            volume_catch_up(40, false, Some(25), Some(true), false),
+            catch_up(Some(false), None),
+            "a stale level in the view is not news either"
+        );
+        assert_eq!(
+            volume_catch_up(40, false, Some(25), Some(false), false),
+            catch_up(None, None),
+            "the cloud already shows the unmute"
         );
     }
 
@@ -452,11 +492,11 @@ mod tests {
     fn an_unknown_controller_view() {
         // An unknown level is reported; an unknown mute reads as unmuted.
         assert_eq!(
-            volume_catch_up(25, false, None, None),
+            volume_catch_up(25, false, None, None, true),
             catch_up(None, Some(25))
         );
         assert_eq!(
-            volume_catch_up(25, true, Some(25), None),
+            volume_catch_up(25, true, Some(25), None, true),
             catch_up(Some(true), None)
         );
     }

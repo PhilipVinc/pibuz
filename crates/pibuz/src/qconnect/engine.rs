@@ -627,26 +627,14 @@ impl QconnectRendererEngine for DaemonRendererEngine {
             return Ok(());
         }
         // A level from the controller ends a mute, as one from the box does
-        // (`crate::mute`).
-        let mut unmuted = false;
+        // (`crate::mute`). Its echo carries the level and not the unmute, so
+        // the unmute is flagged for the volume publisher under the same lock
+        // (`DaemonShared::unmute_unreported`).
         crate::mute::change(
             &self.shared,
             |level| self.set_player_volume(level),
-            |mute| {
-                let was_muted = mute.is_muted();
-                let level = mute.take_level(fraction);
-                unmuted = was_muted && !mute.is_muted();
-                level
-            },
+            |s| crate::mute::take_controller_level(s, fraction),
         )?;
-        // The controller only asked for a level: its echo carries no unmute,
-        // so the app kept showing the mute over a playing box. Report it the
-        // way a box-side unmute is reported (`publish_local_volume_if_changed`).
-        if unmuted {
-            if let Ok(mut s) = self.shared.lock() {
-                s.volume_changed_here = true;
-            }
-        }
         self.events_edge.notify_one();
         Ok(())
     }
@@ -663,7 +651,7 @@ impl QconnectRendererEngine for DaemonRendererEngine {
         crate::mute::change(
             &self.shared,
             |level| self.set_player_volume(level),
-            |mute| mute.set(muted, live),
+            |s| s.mute.set(muted, live),
         )?;
         self.events_edge.notify_one();
         Ok(())

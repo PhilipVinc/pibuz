@@ -20,8 +20,18 @@ pub(crate) struct DaemonShared {
     pub(crate) queue_at_rest: bool,
     /// A volume or mute change was made on THIS side (the control API) and
     /// the Connect controller has not been told yet. The volume publisher
-    /// consumes it; a change the controller made itself never sets it.
+    /// consumes it; a change the controller made itself never sets it — the
+    /// one part of such a change the controller does not learn on its own is
+    /// `unmute_unreported`.
     pub(crate) volume_changed_here: bool,
+    /// A level from the Connect controller ended a mute, and the controller
+    /// has not been told. Its own echo carries the level and not the unmute,
+    /// so the app kept its mute icon on over a playing box. Set under the
+    /// lock that made the unmute (`crate::mute::take_controller_level`); the
+    /// volume publisher consumes it and reports the unmute ALONE — the level
+    /// is already on the controller's screen, and sending it back mid-drag
+    /// would move the slider under the listener's finger.
+    pub(crate) unmute_unreported: bool,
     pub(crate) started_at: std::time::Instant,
     pub(crate) startup_warnings: u32,
     pub qconnect: QconnectStatus,
@@ -151,6 +161,7 @@ mod tests {
             mute: crate::mute::Mute::default(),
             queue_at_rest: false,
             volume_changed_here: false,
+            unmute_unreported: false,
             started_at: std::time::Instant::now(),
             startup_warnings: 0,
             qconnect: QconnectStatus::default(),
@@ -168,6 +179,7 @@ mod tests {
             mute: crate::mute::Mute::default(),
             queue_at_rest: false,
             volume_changed_here: false,
+            unmute_unreported: false,
             started_at: std::time::Instant::now(),
             startup_warnings: 0,
             qconnect: QconnectStatus::default(),
@@ -197,6 +209,7 @@ mod tests {
             mute: crate::mute::Mute::default(),
             queue_at_rest: false,
             volume_changed_here: false,
+            unmute_unreported: false,
             started_at: std::time::Instant::now(),
             startup_warnings: 0,
             qconnect: QconnectStatus::default(),
