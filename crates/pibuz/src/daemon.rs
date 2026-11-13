@@ -405,6 +405,7 @@ fn new_shared(cfg: &PibuzConfig) -> Arc<Mutex<DaemonShared>> {
         mute: crate::mute::Mute::default(),
         queue_at_rest: false,
         volume_changed_here: false,
+        unmute_unreported: false,
         started_at: std::time::Instant::now(),
         startup_warnings: 0,
         qconnect: QconnectStatus::default(),

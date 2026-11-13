@@ -403,7 +403,7 @@ pub(crate) async fn deferred_renderer_join(
                         .set_volume(level)
                         .map_err(|err| err.to_string())
                 },
-                |mute| mute.set_level_quietly(fraction),
+                |s| s.mute.set_level_quietly(fraction),
             ) {
                 log::warn!("[QConnect] Could not apply the join-time volume: {err}");
             }
