@@ -1407,6 +1407,49 @@ enum StreamType {
     /// NOT bit-perfect (resampled to the graph rate).
     #[cfg(target_os = "linux")]
     Jack(Arc<qbz_audio::JackStream>),
+    /// A software DAC (`qbz_audio::VirtualAudioOut`) standing in for the
+    /// device, so a test can run the REAL audio thread — its command loop,
+    /// suspend, resume and end-of-track handling — on any platform. Opened
+    /// through [`virtual_device`]; drives the same ALSA-direct engine.
+    #[cfg(test)]
+    Virtual(Arc<qbz_audio::VirtualAudioOut>),
+}
+
+/// The devices a test registered, by name. `try_init_stream_with_backend`
+/// looks the configured `output_device` up here before touching any real
+/// backend, so the suite needs no sound card (CI has none).
+///
+/// A registry rather than a settable global: cases run in parallel in one
+/// process, and each one names its own device, so none can open another's.
+#[cfg(test)]
+mod virtual_device {
+    use qbz_audio::VirtualAudioOut;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    fn registry() -> &'static Mutex<HashMap<String, Arc<VirtualAudioOut>>> {
+        static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<VirtualAudioOut>>>> = OnceLock::new();
+        REGISTRY.get_or_init(Default::default)
+    }
+
+    /// Register `out` under a name unique to this test, and return the name
+    /// to put in `AudioSettings::output_device`.
+    pub(super) fn register(out: Arc<VirtualAudioOut>) -> String {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let name = format!(
+            "virtual:{}",
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        );
+        registry()
+            .lock()
+            .expect("registry")
+            .insert(name.clone(), out);
+        name
+    }
+
+    pub(super) fn lookup(name: &str) -> Option<Arc<VirtualAudioOut>> {
+        registry().lock().ok()?.get(name).cloned()
+    }
 }
 
 impl StreamType {
@@ -1452,6 +1495,8 @@ impl StreamType {
     fn output_sample_rate(&self) -> u32 {
         match self {
             StreamType::Rodio { sink, .. } => sink.config().sample_rate().get(),
+            #[cfg(test)]
+            StreamType::Virtual(out) => qbz_audio::AudioOut::sample_rate(out.as_ref()),
         }
     }
 }
@@ -1706,6 +1751,14 @@ fn try_init_stream_with_backend(
     channels: u16,
     state: &SharedState,
 ) -> Result<StreamType, String> {
+    #[cfg(test)]
+    if let Some(out) = audio_settings
+        .output_device
+        .as_deref()
+        .and_then(virtual_device::lookup)
+    {
+        return Ok(StreamType::Virtual(out));
+    }
     // A None backend_type means "Auto" / unset. Resolve it to SystemDefault on
     // every platform instead of returning None — returning None made the caller
     // fall through to the legacy CPAL path, which forced the track rate onto the
@@ -2675,7 +2728,9 @@ impl Player {
             let mut consecutive_sink_failures: u32 = 0;
             const MAX_SINK_FAILURES: u32 = 3;
             // Delay dropping the audio stream after pause to reduce CPU usage.
-            const PAUSE_SUSPEND_DELAY_MS: u64 = 2000;
+            // A tenth of that under test, so a "long" pause costs the suite
+            // 0.2 s rather than 2 s; nothing in the logic depends on the figure.
+            const PAUSE_SUSPEND_DELAY_MS: u64 = if cfg!(test) { 200 } else { 2000 };
             let mut pause_suspend_deadline: Option<Instant> = None;
             let mut last_empty_check = Instant::now();
             // When a device that stopped converting was last reopened. See
@@ -3129,6 +3184,20 @@ impl Player {
                                         }
                                     }
                                 }
+                                #[cfg(test)]
+                                StreamType::Virtual(alsa_stream) => {
+                                    *consecutive_sink_failures = 0;
+                                    thread_state.set_stream_error(false);
+                                    let hardware_volume = thread_settings
+                                        .lock()
+                                        .ok()
+                                        .map(|s| s.alsa_hardware_volume)
+                                        .unwrap_or(false);
+                                    PlaybackEngine::new_alsa_direct(
+                                        alsa_stream.clone(),
+                                        hardware_volume,
+                                    )
+                                }
                                 #[cfg(target_os = "linux")]
                                 StreamType::AlsaDirect(alsa_stream) => {
                                     *consecutive_sink_failures = 0;
@@ -3572,6 +3641,18 @@ impl Player {
                                         return;
                                     }
                                 },
+                                #[cfg(test)]
+                                StreamType::Virtual(alsa_stream) => {
+                                    let hardware_volume = thread_settings
+                                        .lock()
+                                        .ok()
+                                        .map(|s| s.alsa_hardware_volume)
+                                        .unwrap_or(false);
+                                    PlaybackEngine::new_alsa_direct(
+                                        alsa_stream.clone(),
+                                        hardware_volume,
+                                    )
+                                }
                                 #[cfg(target_os = "linux")]
                                 StreamType::AlsaDirect(alsa_stream) => {
                                     let hardware_volume = thread_settings
@@ -4150,6 +4231,18 @@ impl Player {
                                             return;
                                         }
                                     },
+                                    #[cfg(test)]
+                                    StreamType::Virtual(alsa_stream) => {
+                                        let hardware_volume = thread_settings
+                                            .lock()
+                                            .ok()
+                                            .map(|s| s.alsa_hardware_volume)
+                                            .unwrap_or(false);
+                                        PlaybackEngine::new_alsa_direct(
+                                            alsa_stream.clone(),
+                                            hardware_volume,
+                                        )
+                                    }
                                     #[cfg(target_os = "linux")]
                                     StreamType::AlsaDirect(alsa_stream) => {
                                         let hardware_volume = thread_settings
@@ -4610,6 +4703,18 @@ impl Player {
                                         return;
                                     }
                                 },
+                                #[cfg(test)]
+                                StreamType::Virtual(alsa_stream) => {
+                                    let hardware_volume = thread_settings
+                                        .lock()
+                                        .ok()
+                                        .map(|s| s.alsa_hardware_volume)
+                                        .unwrap_or(false);
+                                    PlaybackEngine::new_alsa_direct(
+                                        alsa_stream.clone(),
+                                        hardware_volume,
+                                    )
+                                }
                                 #[cfg(target_os = "linux")]
                                 StreamType::AlsaDirect(alsa_stream) => {
                                     let hardware_volume = thread_settings
@@ -8957,5 +9062,165 @@ mod cached_play_duration_tests {
             .expect("a readable file");
         assert_eq!(sent_duration(&rx), CATALOG_SECS);
         std::fs::remove_file(file.path()).ok();
+    }
+}
+
+/// The REAL audio thread — its command loop, the pause suspend, Resume's
+/// rebuild and the end-of-track handling — against a `VirtualAudioOut`
+/// opened through `virtual_device`, the way the daemon opens a DAC.
+///
+/// Everything above this module tests a helper or replaces the audio thread
+/// with a channel; a bug that lives in how the loop composes those helpers
+/// (which command runs, in which order, with which state left behind) is out
+/// of their reach. Same discipline as `engine_behaviour_tests`: assert what
+/// reaches the DAC.
+#[cfg(test)]
+mod audio_thread_tests {
+    use super::{virtual_device, AudioCommand, AudioSettings, Player, TrackAudio};
+    use qbz_audio::VirtualAudioOut;
+    use qbz_cache::TrackBytes;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    const RATE: u32 = 8_000;
+    /// Four times real time: a 4 s track plays in about a second.
+    const SPEED: f64 = 4.0;
+    const TRACK_SECS: u64 = 4;
+    const A: u64 = 1_001;
+    const B: u64 = 2_002;
+
+    /// A stereo 16-bit WAV holding `value` throughout, so the tape says which
+    /// track a frame came from by its sign.
+    fn constant_wav(secs: u64, value: i16) -> Vec<u8> {
+        let frames = RATE * secs as u32;
+        let data_len = frames * 4;
+        let mut w = Vec::with_capacity(44 + data_len as usize);
+        w.extend_from_slice(b"RIFF");
+        w.extend_from_slice(&(36 + data_len).to_le_bytes());
+        w.extend_from_slice(b"WAVEfmt ");
+        w.extend_from_slice(&16u32.to_le_bytes());
+        w.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        w.extend_from_slice(&2u16.to_le_bytes()); // stereo
+        w.extend_from_slice(&RATE.to_le_bytes());
+        w.extend_from_slice(&(RATE * 4).to_le_bytes()); // byte rate
+        w.extend_from_slice(&4u16.to_le_bytes()); // block align
+        w.extend_from_slice(&16u16.to_le_bytes());
+        w.extend_from_slice(b"data");
+        w.extend_from_slice(&data_len.to_le_bytes());
+        for _ in 0..frames * 2 {
+            w.extend_from_slice(&value.to_le_bytes());
+        }
+        w
+    }
+
+    fn track(value: i16) -> TrackAudio {
+        TrackAudio::Memory(TrackBytes::from(constant_wav(TRACK_SECS, value)))
+    }
+
+    fn player_on(out: Arc<VirtualAudioOut>) -> Player {
+        let name = virtual_device::register(out);
+        let settings = AudioSettings {
+            output_device: Some(name.clone()),
+            ..AudioSettings::default()
+        };
+        Player::new(Some(name), settings, None, None)
+    }
+
+    fn wait_until(timeout: Duration, mut done: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if done() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        done()
+    }
+
+    /// Samples of track B (negative) handed to the DAC so far.
+    fn samples_of_b(out: &VirtualAudioOut) -> usize {
+        out.recorded().iter().filter(|s| **s < -0.05).count()
+    }
+
+    /// A pause long enough to release the device drops the engine, and the
+    /// next track queued inside it goes too. Resume rebuilt the engine around
+    /// the current track alone while the player still counted the next one
+    /// as queued; at the end of the current track the player either switched
+    /// to the next one with no audio for it (and parked it at its full length,
+    /// which the driver reads as "finished" and skips) or dropped it. Either
+    /// way, the next track never reached the DAC.
+    #[test]
+    fn a_long_pause_does_not_lose_the_queued_next_track() {
+        let out = Arc::new(VirtualAudioOut::new(RATE, 2, 200, SPEED));
+        out.record();
+        let player = player_on(out.clone());
+        let state = player.state.clone();
+
+        player
+            .tx
+            .send(AudioCommand::Play {
+                audio: track(16_000),
+                track_id: A,
+                duration_secs: TRACK_SECS,
+                sample_rate: RATE,
+                channels: 2,
+                start_position_secs: 0,
+            })
+            .unwrap();
+        assert!(
+            wait_until(Duration::from_secs(5), || state.is_playing()
+                && state.current_track_id() == A),
+            "track A never started"
+        );
+
+        player
+            .tx
+            .send(AudioCommand::PlayNext {
+                audio: track(-16_000),
+                track_id: B,
+                sample_rate: RATE,
+                channels: 2,
+            })
+            .unwrap();
+        assert!(
+            wait_until(Duration::from_secs(5), || state.get_gapless_next_track_id()
+                == B),
+            "track B was never queued"
+        );
+
+        // Mid-track, a pause longer than the suspend delay: the engine and
+        // the device go.
+        player.tx.send(AudioCommand::Pause).unwrap();
+        std::thread::sleep(Duration::from_millis(700));
+        assert!(
+            state.current_track_id() == A && !state.is_playing(),
+            "the pause must land inside track A"
+        );
+        assert_eq!(samples_of_b(&out), 0, "B played before A had finished");
+
+        player
+            .tx
+            .send(AudioCommand::Resume { cached: None })
+            .unwrap();
+
+        let b_played = wait_until(Duration::from_secs(10), || {
+            samples_of_b(&out) > (RATE as usize) / 2
+        });
+        assert!(
+            b_played,
+            "track B never reached the DAC after the resume \
+             (player on track {}, playing {}, at {}s of {}s)",
+            state.current_track_id(),
+            state.is_playing(),
+            state.current_position(),
+            state.duration()
+        );
+        // Handed over is not yet played: the player names B once the device
+        // has played across the boundary, on its next tick.
+        assert!(
+            wait_until(Duration::from_secs(5), || state.current_track_id() == B
+                && state.is_playing()),
+            "B reached the DAC but the player never named it"
+        );
     }
 }
