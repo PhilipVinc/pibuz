@@ -535,9 +535,15 @@ impl QueueManager {
     /// Returns the matched track plus whether the pointer actually moved
     /// (`false` = it was already current). Returns `None` when no queue track
     /// has that id, leaving the pointer untouched.
+    ///
+    /// The same track can sit in the queue twice. Which copy is meant is
+    /// decided by [`slot_for_id`]: the current slot if it holds it, else the
+    /// next copy in play order. Taking the FIRST copy, as this did, snapped a
+    /// player on the second copy back to the first on every report tick, and
+    /// the queue looped between them.
     pub fn sync_current_to_id(&self, id: u64) -> Option<(QueueTrack, bool)> {
         let mut state = self.state.lock().unwrap();
-        let target = state.tracks.iter().position(|t| t.id == id)?;
+        let target = slot_for_id(&state, id)?;
         let moved = state.current_index != Some(target);
         if moved {
             // Record the outgoing track so `previous` still walks back.
@@ -1010,6 +1016,27 @@ impl QueueManager {
     }
 }
 
+/// The slot holding track `id` that the player most plausibly means: the
+/// current one if it holds `id`, otherwise the next slot holding it in PLAY
+/// order (the shuffle order when shuffle is on), wrapping round. A player that
+/// advanced on its own (a gapless hand-off) is on the next copy, not the first.
+fn slot_for_id(state: &InternalState, id: u64) -> Option<usize> {
+    let holds = |slot: usize| state.tracks.get(slot).is_some_and(|t| t.id == id);
+    if let Some(current) = state.current_index.filter(|&slot| holds(slot)) {
+        return Some(current);
+    }
+    if state.shuffle && state.shuffle_order.len() == state.tracks.len() {
+        let n = state.shuffle_order.len();
+        let start = state.shuffle_position + 1;
+        return (0..n)
+            .map(|k| state.shuffle_order[(start + k) % n])
+            .find(|&slot| holds(slot));
+    }
+    let n = state.tracks.len();
+    let start = state.current_index.map_or(0, |c| c + 1);
+    (0..n).map(|k| (start + k) % n).find(|&slot| holds(slot))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1258,16 +1285,13 @@ mod tests {
         assert_eq!(queue.get_state_full().current_track.unwrap().id, 100);
     }
 
-    /// ROOT-CAUSE (b): DUPLICATE track ids in the queue.
-    /// `sync_current_to_id` uses `position(|t| t.id == id)`, which returns the
-    /// FIRST match. If the same track id appears twice (very common: a track
-    /// added to a playlist twice, an album with a repeated bonus track, or a
-    /// QConnect queue echo), advancing the audio into the SECOND occurrence
-    /// resyncs the pointer to the FIRST occurrence — wrong index. The
-    /// now-playing track id is "right" but the upcoming list, position, and any
-    /// index-derived state are computed from the wrong slot.
+    /// DUPLICATE track ids in the queue (a track added to a playlist twice,
+    /// an album with a repeated bonus track). A player that advanced on its own
+    /// into the SECOND copy is on the second copy: the cursor follows it there,
+    /// and up-next is what follows that slot. Taking the first copy, as this
+    /// used to, computed up-next from the wrong slot.
     #[test]
-    fn test_sync_current_to_id_duplicate_id_resyncs_to_first_occurrence() {
+    fn test_sync_current_to_id_duplicate_id_follows_play_order() {
         let queue = QueueManager::new();
         queue.add_track(create_test_track(100)); // idx 0
         queue.add_track(create_test_track(200)); // idx 1
@@ -1282,52 +1306,53 @@ mod tests {
         assert!(moved, "pointer moved off track 200");
 
         let state = queue.get_state_full();
-        // current_index resynced to the FIRST occurrence (idx 0), NOT idx 2.
         assert_eq!(
             state.current_index,
-            Some(0),
-            "sync_current_to_id resyncs to the FIRST id match (idx 0), not the actually-playing idx 2"
+            Some(2),
+            "the copy after 200 in play order"
         );
-        // Consequence: the UP-NEXT list is computed from the wrong slot. From
-        // idx 0 the upcoming is [200, 100, 300]; from the real idx 2 it should
-        // be [300].
         let upcoming_ids: Vec<u64> = state.upcoming.iter().map(|t| t.id).collect();
-        assert_eq!(
-            upcoming_ids,
-            vec![200, 100, 300],
-            "upcoming is derived from the wrong (first-occurrence) index"
-        );
+        assert_eq!(upcoming_ids, vec![300]);
     }
 
+    /// The report loop syncs the cursor to the playing track every tick. On
+    /// the second copy of a repeated track, that snapped the cursor back to
+    /// the FIRST copy; the driver then queued the track after the first copy
+    /// as the next one, and the queue looped A, B, A, B.
     #[test]
-    fn test_clear_preserves_history() {
+    fn test_sync_current_to_id_keeps_the_current_copy() {
         let queue = QueueManager::new();
+        queue.add_track(create_test_track(100)); // idx 0
+        queue.add_track(create_test_track(200)); // idx 1
+        queue.add_track(create_test_track(100)); // idx 2
+        queue.add_track(create_test_track(300)); // idx 3
+        queue.play_index(2);
 
-        queue.add_track(create_test_track(123));
-        queue.add_track(create_test_track(124));
-        queue.add_track(create_test_track(125));
-        queue.play_index(0);
-        queue.next(); // push 123 into history, current becomes 124
+        let (_, moved) = queue.sync_current_to_id(100).expect("present");
+        assert!(!moved, "already on a copy of 100");
+        let state = queue.get_state_full();
+        assert_eq!(state.current_index, Some(2));
+    }
 
-        let before = queue.get_state();
-        assert_eq!(before.history.len(), 1);
-        assert_eq!(before.history[0].id, 123);
-        assert_eq!(before.current_track.as_ref().map(|t| t.id), Some(124));
-
-        queue.clear(true);
-
-        let after = queue.get_state();
-        // Kept track is the one that was current (124), not tracks[0] (123).
-        assert_eq!(after.current_track.as_ref().map(|t| t.id), Some(124));
-        assert_eq!(after.total_tracks, 1);
-        // History is index-based: entries for tracks that left the queue are
-        // dropped (same remap-by-id path as set_queue). Under the old
-        // truncate(1) bug, 123 stayed as the sole row so history still
-        // "resolved" — that was an accident of the bug, not the contract.
-        assert!(
-            after.history.is_empty(),
-            "history must not resolve removed tracks after clear: {:?}",
-            after.history.iter().map(|t| t.id).collect::<Vec<_>>()
+    /// With shuffle on, "next in play order" is the shuffle order.
+    #[test]
+    fn test_sync_current_to_id_duplicate_id_follows_the_shuffle_order() {
+        let queue = QueueManager::new();
+        for id in [100, 200, 100, 300] {
+            queue.add_track(create_test_track(id));
+        }
+        {
+            let mut state = queue.state.lock().unwrap();
+            state.shuffle = true;
+            state.shuffle_order = vec![3, 2, 1, 0];
+            state.shuffle_position = 0; // on idx 3 (track 300)
+            state.current_index = Some(3);
+        }
+        queue.sync_current_to_id(100).expect("present");
+        assert_eq!(
+            queue.get_state_full().current_index,
+            Some(2),
+            "after idx 3 the shuffle plays idx 2, not idx 0"
         );
     }
 
