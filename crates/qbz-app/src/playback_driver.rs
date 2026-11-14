@@ -128,9 +128,6 @@ pub(crate) struct QueueSnapshot {
     pub upcoming: Vec<(u64, bool)>,
     pub repeat: String,
     pub(crate) stop_after: Option<u64>,
-    /// True when autoplay mode is "infinite" — unsupported, logged and treated
-    /// as queue-finished. Nothing sets it yet.
-    pub(crate) autoplay_infinite: bool,
 }
 
 /// Whether a gapless successor that has finished downloading is still the one
@@ -649,12 +646,6 @@ pub async fn run_driver<A: FrontendAdapter + Send + Sync + 'static>(
                     (deps.on_edge)();
                 }
                 DriverAction::QueueFinished => {
-                    if queue.autoplay_infinite {
-                        log::info!(
-                            "[pibuz] driver: autoplay 'infinite' unsupported on pibuz v1, \
-                             treated as queue-finished"
-                        );
-                    }
                     log::info!("[pibuz] driver: queue finished");
                     finish_queue(core, &deps).await;
                 }
@@ -851,8 +842,6 @@ async fn queue_snapshot<A: FrontendAdapter + Send + Sync + 'static>(
         upcoming,
         repeat: repeat_to_str(state.repeat).to_string(),
         stop_after: state.stop_after_track_id,
-        // Nothing sets autoplay "infinite" yet.
-        autoplay_infinite: false,
     }
 }
 
@@ -948,7 +937,6 @@ mod tests {
             upcoming: upcoming.to_vec(),
             repeat: repeat.to_string(),
             stop_after,
-            autoplay_infinite: false,
         }
     }
 
@@ -1269,7 +1257,6 @@ mod residency_session_tests {
             upcoming,
             repeat: "off".to_string(),
             stop_after: None,
-            autoplay_infinite: false,
         }
     }
 

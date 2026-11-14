@@ -470,8 +470,7 @@ impl DaemonRendererEngine {
     /// must keep showing the level an unmute brings back.
     pub(crate) fn reported_volume_pct(&self) -> i32 {
         let live = self.core().get_playback_state().volume;
-        self.volume_mode
-            .reported_volume_pct(crate::mute::current(&self.shared).nominal(live))
+        crate::mute::current(&self.shared).reported_pct(self.volume_mode, live)
     }
 
     /// Whether the daemon is muted, box-side or by the controller.

@@ -426,9 +426,8 @@ pub(crate) async fn deferred_renderer_join(
     // the real percent, `Locked` reports 100 fixed (no software attenuation
     // on the bit-perfect path). The NOMINAL level: muted, the player is at 0
     // and the controller must keep showing the level an unmute restores.
-    let volume_pct = volume_mode.reported_volume_pct(
-        crate::mute::current(shared).nominal(runtime.core().get_playback_state().volume),
-    );
+    let volume_pct = crate::mute::current(shared)
+        .reported_pct(volume_mode, runtime.core().get_playback_state().volume);
     let volume_report = RendererReport::new(
         RendererReportType::RndrSrvrVolumeChanged,
         Uuid::new_v4().to_string(),
