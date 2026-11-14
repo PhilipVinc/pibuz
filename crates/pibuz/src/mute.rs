@@ -17,8 +17,9 @@ use std::sync::Mutex;
 use crate::state::{DaemonShared, VolumeNews};
 
 /// Restored by a mute taken at 0 when no level above 0 has been seen since the
-/// daemon started, so the unmute is still audible.
-const FALLBACK_LEVEL: f32 = 0.7;
+/// daemon started, so the unmute is still audible: the level the player starts
+/// at.
+const FALLBACK_LEVEL: f32 = qbz_player::STARTUP_VOLUME;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Mute {
@@ -235,6 +236,20 @@ mod tests {
         assert_eq!(mute.set(true, 0.0), Some(0.0));
         assert_eq!(mute.nominal(0.0), 0.36, "`muted (was 36%)`");
         assert_eq!(mute.set(false, 0.0), Some(0.36));
+    }
+
+    /// moOde's startup level is `qconnect.initial_volume` (20-30%), applied at
+    /// the join. The player's own 75% must not be what a mute at 0 restores.
+    #[test]
+    fn a_mute_at_zero_unmutes_to_the_join_time_level() {
+        let mut mute = Mute::default();
+        let started_at = qbz_player::STARTUP_VOLUME;
+        assert_eq!(mute.set_level_quietly(0.3), Some(0.3), "the join");
+        mute.take_level(0.0, 0.3);
+        mute.set(true, 0.0);
+        assert_eq!(mute.nominal(0.0), 0.3);
+        assert_eq!(mute.set(false, 0.0), Some(0.3));
+        assert_ne!(started_at, 0.3, "the case would prove nothing");
     }
 
     #[test]

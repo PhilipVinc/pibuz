@@ -40,6 +40,7 @@ pub use player::{
     release_finished_track_from, BufferWriter, BufferedMediaSource, CacheReport, CmafRefresher,
     DiskCacheReport, DiskTee, FetchPlan, IncrementalStreamingSource, PlanOrigin, PlaybackEvent,
     PlaybackState, Player, SharedState, StreamSeekMode, StreamingConfig, TrackAudio,
+    STARTUP_VOLUME,
 };
 pub use qbz_cache::{AudioCache, CachedFile, PlaybackCache, TrackBytes};
 pub use queue::QueueManager;
