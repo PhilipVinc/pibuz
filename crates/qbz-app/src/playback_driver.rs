@@ -636,11 +636,11 @@ pub async fn run_driver<A: FrontendAdapter + Send + Sync + 'static>(
                     } else {
                         // Marker cleared between the snapshot and the consume — fall
                         // through to the normal advance.
-                        advance_and_play_logged(&runtime, (deps.quality)()).await;
+                        advance_and_play_logged(&runtime, &deps).await;
                     }
                 }
                 DriverAction::AdvanceAndPlay => {
-                    advance_and_play_logged(&runtime, (deps.quality)()).await;
+                    advance_and_play_logged(&runtime, &deps).await;
                 }
                 DriverAction::LatchError(m) => {
                     (deps.on_latch)("stream", m.clone());
@@ -656,14 +656,7 @@ pub async fn run_driver<A: FrontendAdapter + Send + Sync + 'static>(
                         );
                     }
                     log::info!("[pibuz] driver: queue finished");
-                    if let Err(e) = core.stop() {
-                        log::warn!("[pibuz] driver: stop on queue-finished failed: {e}");
-                    }
-                    rewind_finished_queue(core).await;
-                    (deps.on_queue_finished)();
-                    // The stop's own edge may already have gone out naming the
-                    // track that just ended; tell the reporter the queue moved.
-                    (deps.on_edge)();
+                    finish_queue(core, &deps).await;
                 }
             }
         }
@@ -689,6 +682,25 @@ pub async fn run_driver<A: FrontendAdapter + Send + Sync + 'static>(
     log::info!("[pibuz] driver: shutting down");
 }
 
+/// The queue has played out: stop, come to rest on its first track, and say
+/// so. ONE function for both ways the driver finds that out — the decision's
+/// `QueueFinished` and an advance that found nothing playable. The second used
+/// to stop and rewind only, so `queue_at_rest` was never set there and the
+/// event hook heard a plain `stopped` (the #6 symptom).
+async fn finish_queue<A: FrontendAdapter + Send + Sync + 'static>(
+    core: &QbzCore<A>,
+    deps: &DriverDeps,
+) {
+    if let Err(e) = core.stop() {
+        log::warn!("[pibuz] driver: stop on queue-finished failed: {e}");
+    }
+    rewind_finished_queue(core).await;
+    (deps.on_queue_finished)();
+    // The stop's own edge may already have gone out naming the track that
+    // just ended; tell the reporter the queue moved.
+    (deps.on_edge)();
+}
+
 /// A queue that has played out comes to rest on its first track, paused —
 /// what the Qobuz apps do, so play starts the queue again instead of
 /// resuming the end of its last track. Only the cursor moves: nothing loads,
@@ -709,16 +721,13 @@ async fn rewind_finished_queue<A: FrontendAdapter + Send + Sync + 'static>(core:
 /// route's concern, wired directly through `advance_and_play(..., false)`).
 async fn advance_and_play_logged<A: FrontendAdapter + Send + Sync + 'static>(
     runtime: &Arc<AppRuntime<A>>,
-    quality: Quality,
+    deps: &DriverDeps,
 ) {
-    match advance_and_play(runtime, quality, true).await {
+    match advance_and_play(runtime, (deps.quality)(), true).await {
         Ok(Some(_)) => {}
         Ok(None) => {
             log::info!("[pibuz] driver: advance found nothing playable — queue finished");
-            if let Err(e) = runtime.core().stop() {
-                log::warn!("[pibuz] driver: stop after empty advance failed: {e}");
-            }
-            rewind_finished_queue(runtime.core()).await;
+            finish_queue(runtime.core(), deps).await;
         }
         Err(e) => log::warn!("[pibuz] driver: advance failed: {e}"),
     }
