@@ -100,6 +100,24 @@ against a real driver, RT scheduling, whether moOde's `_audioout` really passes
 through. Green here means the state machine is right, not that the Pi sounds
 right.
 
+### The audio-thread tests
+
+`crates/qbz-player/src/player/mod.rs` → `mod audio_thread_tests` goes one level
+up: a real `Player`, whose audio thread opens a `VirtualAudioOut` the way the
+daemon opens a DAC, driven by the same `AudioCommand`s. Use it for bugs in how
+the command loop composes the pieces — pause suspend, Resume's rebuild, seek,
+the end-of-track switch — which the engine suite cannot see.
+`cargo test -p qbz-player audio_thread_tests`, about 2 s.
+
+The seam is test-only: `StreamType::Virtual` and the `virtual_device` registry
+exist under `cfg(test)`, and `try_init_stream_with_backend` checks the registry
+before any real backend, so it needs no sound card. Each case registers its own
+device under its own name; do not replace that with a shared global.
+`PAUSE_SUSPEND_DELAY_MS` is 200 ms under test.
+
+Assert what reaches the DAC (`record()` / `recorded()`) and what the player
+then names, and give every wait a timeout: the audio thread runs on real time.
+
 ## The bytes-layer behaviour tests
 
 `crates/qbz-player/src/player/streaming_source.rs` → `mod buffer_behaviour_tests`
