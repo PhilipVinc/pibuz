@@ -105,10 +105,18 @@ impl<S> SourceQueue<S> {
     }
 }
 
+/// Every engine's identity, from [`PlaybackEngine::id`]. A counter rather than
+/// an address: an engine is moved into `current_engine` after it is built.
+static NEXT_ENGINE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_engine_id() -> u64 {
+    NEXT_ENGINE_ID.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Unified playback engine
 pub(crate) enum PlaybackEngine {
     /// Rodio-based (PipeWire, Pulse, ALSA via CPAL)
-    Rodio { sink: RodioPlayer },
+    Rodio { sink: RodioPlayer, id: u64 },
     /// Direct ALSA (hw: devices, bit-perfect) with gapless source queue
     #[cfg_attr(
         not(target_os = "linux"),
@@ -149,6 +157,7 @@ pub(crate) enum PlaybackEngine {
         /// use. Only read when `hardware_volume` is false; unity means the
         /// writer passes samples through untouched.
         volume: Arc<AtomicU32>,
+        id: u64,
     },
     /// Native JACK output (#263). Mirrors AlsaDirect (gapless source queue
     /// + a single long-lived feeder thread), but the feeder resamples each source
@@ -163,14 +172,30 @@ pub(crate) enum PlaybackEngine {
         feeder_thread: Option<thread::JoinHandle<()>>,
         source_transition: Arc<AtomicBool>,
         graph_rate: u32,
+        id: u64,
     },
 }
 
 impl PlaybackEngine {
+    /// This engine's identity, unique for the life of the process. A gapless
+    /// successor records the id of the engine it was appended to, so the
+    /// end-of-track switch can tell a successor THIS engine holds from one that
+    /// went with an engine since dropped (see `GaplessPending::engine_id`).
+    pub(crate) fn id(&self) -> u64 {
+        match self {
+            Self::Rodio { id, .. } | Self::AlsaDirect { id, .. } => *id,
+            #[cfg(target_os = "linux")]
+            Self::Jack { id, .. } => *id,
+        }
+    }
+
     /// Create Rodio engine
     pub(crate) fn new_rodio(mixer: &Mixer) -> Result<Self, String> {
         let sink = RodioPlayer::connect_new(mixer);
-        Ok(Self::Rodio { sink })
+        Ok(Self::Rodio {
+            sink,
+            id: next_engine_id(),
+        })
     }
 
     /// Create ALSA Direct engine with gapless source queue.
@@ -271,6 +296,7 @@ impl PlaybackEngine {
             device_failure,
             hardware_volume,
             volume,
+            id: next_engine_id(),
         }
     }
 
@@ -306,6 +332,7 @@ impl PlaybackEngine {
             feeder_thread: Some(handle),
             source_transition,
             graph_rate,
+            id: next_engine_id(),
         }
     }
 
@@ -327,7 +354,7 @@ impl PlaybackEngine {
         S: Source<Item = f32> + Send + 'static,
     {
         match self {
-            Self::Rodio { sink } => {
+            Self::Rodio { sink, .. } => {
                 sink.append(source);
             }
             Self::AlsaDirect {
@@ -406,7 +433,7 @@ impl PlaybackEngine {
     /// `append` can.
     pub(crate) fn play(&self) -> bool {
         match self {
-            Self::Rodio { sink } => {
+            Self::Rodio { sink, .. } => {
                 sink.play();
                 true
             }
@@ -437,7 +464,7 @@ impl PlaybackEngine {
     /// Pause
     pub(super) fn pause(&self) {
         match self {
-            Self::Rodio { sink } => sink.pause(),
+            Self::Rodio { sink, .. } => sink.pause(),
             Self::AlsaDirect { is_playing, .. } => {
                 log::info!("[ALSA Direct Engine] Pause requested");
                 is_playing.store(false, Ordering::SeqCst);
@@ -460,7 +487,7 @@ impl PlaybackEngine {
     /// Internal stop logic shared by stop() and Drop
     fn stop_inner(&mut self) {
         match self {
-            Self::Rodio { sink } => {
+            Self::Rodio { sink, .. } => {
                 sink.stop();
             }
             Self::AlsaDirect {
@@ -566,7 +593,7 @@ impl PlaybackEngine {
     pub(super) fn set_volume(&self, volume: f32) {
         let software_gain = qbz_audio::volume_curve::gain_for(volume);
         match self {
-            Self::Rodio { sink } => sink.set_volume(software_gain),
+            Self::Rodio { sink, .. } => sink.set_volume(software_gain),
             Self::AlsaDirect {
                 stream,
                 hardware_volume,
@@ -612,7 +639,7 @@ impl PlaybackEngine {
     /// under the integrator who owns it.
     pub(crate) fn set_unity_gain(&self) {
         match self {
-            Self::Rodio { sink } => sink.set_volume(1.0),
+            Self::Rodio { sink, .. } => sink.set_volume(1.0),
             Self::AlsaDirect {
                 volume: software_volume,
                 ..
@@ -625,7 +652,7 @@ impl PlaybackEngine {
     /// Check if playback queue is empty (all sources consumed, not playing)
     pub(crate) fn empty(&self) -> bool {
         match self {
-            Self::Rodio { sink } => sink.empty(),
+            Self::Rodio { sink, .. } => sink.empty(),
             Self::AlsaDirect {
                 is_playing,
                 source_queue,

@@ -208,6 +208,11 @@ struct GaplessPending {
     /// what it was checked against the first time.
     sample_rate: u32,
     channels: u16,
+    /// [`PlaybackEngine::id`] of the engine this track was appended to. The
+    /// end-of-track switch takes it only from that engine
+    /// ([`take_successor_for_transition`]): one dropped since took the audio
+    /// with it, and switching to a track nothing will play is the skip.
+    engine_id: u64,
 }
 
 struct CursorMediaSource {
@@ -972,6 +977,35 @@ fn take_successor_for_requeue(
     thread_state.set_gapless_ready(false);
     thread_state.set_gapless_next_track_id(0);
     requeue
+}
+
+/// The successor to switch to at the end of the current track, if the engine
+/// playing now is the one it was appended to.
+///
+/// A successor queued into an engine that has since been dropped (a pause
+/// suspend, a seek, a device reopen) went with that engine: nothing will play
+/// it. Every path that rebuilds the engine is meant to re-queue it
+/// (`take_successor_for_requeue`), and when one did not, the switch here named
+/// that track, the engine ran dry, and the driver read the parked position as
+/// the track having finished: a skip. With this check a forgotten re-queue is a
+/// gap instead — the track is dropped here, the engine runs empty, and the
+/// driver advances to it normally.
+fn take_successor_for_transition(
+    state: &SharedState,
+    gapless_pending: &mut Option<GaplessPending>,
+    engine_id: Option<u64>,
+) -> Option<GaplessPending> {
+    let pending = gapless_pending.take()?;
+    if Some(pending.engine_id) == engine_id {
+        return Some(pending);
+    }
+    log::warn!(
+        "Gapless: track {} was queued into an engine that is gone; not switching to it",
+        pending.track_id
+    );
+    state.set_gapless_ready(false);
+    state.set_gapless_next_track_id(0);
+    None
 }
 
 /// Would a successor at `next_rate` be refused by the engine for a rate change?
@@ -5173,6 +5207,7 @@ impl Player {
                                 normalization_gain: normalization,
                                 sample_rate,
                                 channels,
+                                engine_id: current_engine.as_ref().map_or(0, PlaybackEngine::id),
                             });
                             thread_state.set_gapless_next_track_id(track_id);
                             thread_state.set_gapless_ready(false); // Request fulfilled
@@ -5376,7 +5411,11 @@ impl Player {
                                 // silence with no recovery, and the guard buys
                                 // nothing the pattern match does not.
                                 let transition = if position_signalled || engine_signalled {
-                                    gapless_pending.take()
+                                    take_successor_for_transition(
+                                        &thread_state,
+                                        &mut gapless_pending,
+                                        current_engine.as_ref().map(PlaybackEngine::id),
+                                    )
                                 } else {
                                     None
                                 };
@@ -8266,8 +8305,8 @@ mod cached_quality_tests {
 #[cfg(test)]
 mod new_track_and_prefetch_tests {
     use super::{
-        begin_new_track, should_arm_prefetch, take_successor_for_requeue, GaplessPending,
-        SharedState, TrackAudio,
+        begin_new_track, should_arm_prefetch, take_successor_for_requeue,
+        take_successor_for_transition, GaplessPending, SharedState, TrackAudio,
     };
     use qbz_cache::TrackBytes;
 
@@ -8326,7 +8365,41 @@ mod new_track_and_prefetch_tests {
             normalization_gain: None,
             sample_rate: 44_100,
             channels: 2,
+            engine_id: ENGINE,
         }
+    }
+
+    const ENGINE: u64 = 7;
+
+    /// The end-of-track switch takes the successor the playing engine holds.
+    #[test]
+    fn the_switch_takes_the_successor_this_engine_holds() {
+        let state = SharedState::new();
+        let mut pending = Some(a_pending(2_944_914));
+        let taken = take_successor_for_transition(&state, &mut pending, Some(ENGINE));
+        assert_eq!(taken.map(|p| p.track_id), Some(2_944_914));
+        assert!(pending.is_none());
+    }
+
+    /// A successor appended to an engine since dropped is not switched to: the
+    /// audio went with that engine. Switching named a track nothing would
+    /// play, and the driver skipped it once the engine ran dry; dropping it
+    /// here leaves an ordinary end of track, and the driver plays it next.
+    #[test]
+    fn the_switch_refuses_a_successor_from_a_dropped_engine() {
+        let state = SharedState::new();
+        state.set_gapless_next_track_id(2_944_914);
+        let mut pending = Some(a_pending(2_944_914));
+        assert!(take_successor_for_transition(&state, &mut pending, Some(ENGINE + 1)).is_none());
+        assert!(pending.is_none(), "kept, it would fire at the next tick");
+        assert_eq!(state.get_gapless_next_track_id(), 0);
+        assert!(!state.is_gapless_ready());
+
+        let mut pending = Some(a_pending(2_944_914));
+        assert!(
+            take_successor_for_transition(&state, &mut pending, None).is_none(),
+            "no engine holds nothing"
+        );
     }
 
     /// THE regression. Starting a new track must leave nothing of the previous
