@@ -159,6 +159,20 @@ fn is_recent_load_attempt(state: &QconnectRemoteSyncState, track_id: u64) -> boo
     }
 }
 
+/// A load that failed is not one in flight, so it must not dedup the next
+/// attempt at the same track: that was a listener's retry dropped as an echo
+/// for 5 s. Cleared only while it still names THIS attempt, so a newer load
+/// recorded meanwhile keeps its window.
+async fn forget_failed_load_attempt(
+    sync_state: &Arc<Mutex<QconnectRemoteSyncState>>,
+    attempt: (u64, Instant),
+) {
+    let mut state = sync_state.lock().await;
+    if state.last_load_attempt == Some(attempt) {
+        state.last_load_attempt = None;
+    }
+}
+
 /// The position a `SetState` frame actually specifies, in milliseconds.
 ///
 /// The command's own `current_position_ms` is authoritative: it arrives in the
@@ -229,21 +243,22 @@ pub(crate) async fn ensure_remote_track_loaded(
         return Ok(false);
     }
 
-    {
-        let mut state = sync_state.lock().await;
-        state.last_load_attempt = Some((track_id, Instant::now()));
-    }
+    let attempt = (track_id, Instant::now());
+    sync_state.lock().await.last_load_attempt = Some(attempt);
 
     let quality = cap_quality(
         quality_from_max_audio_quality(max_audio_quality),
         engine.local_max_quality(),
     );
     let duration_secs = track_duration_secs(engine, sync_state, track_id).await;
-    engine
+    let started = engine
         .start_track_stream(track_id, quality, duration_secs, start_position_secs)
-        .await
-        .inspect_err(|err| engine.on_load_failed(track_id, err))
-        .map(|()| true)
+        .await;
+    if let Err(err) = &started {
+        engine.on_load_failed(track_id, err);
+        forget_failed_load_attempt(sync_state, attempt).await;
+    }
+    started.map(|()| true)
 }
 
 /// Force a (re)stream of `track_id` at `start_position_secs` when BECOMING the
@@ -284,21 +299,22 @@ pub(crate) async fn force_remote_track_stream(
             return Ok(false);
         }
     }
-    {
-        let mut state = sync_state.lock().await;
-        state.last_load_attempt = Some((track_id, Instant::now()));
-    }
+    let attempt = (track_id, Instant::now());
+    sync_state.lock().await.last_load_attempt = Some(attempt);
 
     let quality = cap_quality(
         quality_from_max_audio_quality(max_audio_quality),
         engine.local_max_quality(),
     );
     let duration_secs = track_duration_secs(engine, sync_state, track_id).await;
-    engine
+    let started = engine
         .start_track_stream(track_id, quality, duration_secs, start_position_secs)
-        .await
-        .inspect_err(|err| engine.on_load_failed(track_id, err))
-        .map(|()| true)
+        .await;
+    if let Err(err) = &started {
+        engine.on_load_failed(track_id, err);
+        forget_failed_load_attempt(sync_state, attempt).await;
+    }
+    started.map(|()| true)
 }
 
 pub async fn apply_remote_loop_mode(

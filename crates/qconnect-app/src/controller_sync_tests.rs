@@ -1520,6 +1520,48 @@ async fn a_load_that_cannot_open_the_device_is_paused_and_play_retries_it() {
     harness.assert_invariants();
 }
 
+/// A load that failed is not a load in flight. The dedup window exists so the
+/// cloud's echo of a SetState does not start the same track twice; it was
+/// recorded before the load and kept when the load failed, so for 5 s a
+/// listener's retry of that very track was taken for the echo and dropped:
+/// tapping it again after the error did nothing. (The box carries on with the
+/// track it had, so the retry is the same tap again, not play.)
+#[tokio::test]
+async fn a_retry_right_after_a_failed_load_loads_again() {
+    let harness = ControllerHarness::new().await;
+    harness.become_active_renderer().await;
+    harness.controller().push_queue_and_play(&TRACKS, 0).await;
+    harness.advance_playback(20_000);
+    harness.report_tick().await;
+
+    harness.let_the_load_windows_expire();
+    harness.the_next_stream_fails("resolve stream url: a network blip");
+    harness
+        .controller()
+        .tap_next_track(TRACKS[1], Some(TRACKS[2]))
+        .await;
+
+    // No `let_the_load_windows_expire` here: the retry is inside the window.
+    let before = harness.engine_calls().len();
+    harness
+        .controller()
+        .tap_next_track(TRACKS[1], Some(TRACKS[2]))
+        .await;
+    let after: Vec<_> = harness.engine_calls().into_iter().skip(before).collect();
+    assert!(
+        after.iter().any(|call| matches!(
+            call,
+            EngineCall::StartStream { track_id, .. } if *track_id == TRACKS[1]
+        )),
+        "a retry inside the dedup window must load the failed track again; \
+         it did {after:?}\ntimeline:\n{}",
+        harness.rendered_timeline()
+    );
+    harness.audio_thread_catches_up();
+    assert!(harness.engine().snapshot().is_playing);
+    harness.assert_invariants();
+}
+
 /// A load that fails before it opens — the stream URL would not resolve, say,
 /// because the track lost its rights — must be handed to the host by name, so
 /// the daemon can send the session a `PlaybackError` for THAT track the way
