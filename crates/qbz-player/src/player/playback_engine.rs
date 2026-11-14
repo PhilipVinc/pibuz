@@ -190,12 +190,17 @@ impl PlaybackEngine {
     }
 
     /// Create Rodio engine
-    pub(crate) fn new_rodio(mixer: &Mixer) -> Result<Self, String> {
+    ///
+    /// Infallible: rodio's `Player::connect_new` returns a player, not a
+    /// `Result`. This used to return one anyway, and every caller carried an
+    /// error arm, plus a failure counter and an auto-reinit behind it, that
+    /// could never run.
+    pub(crate) fn new_rodio(mixer: &Mixer) -> Self {
         let sink = RodioPlayer::connect_new(mixer);
-        Ok(Self::Rodio {
+        Self::Rodio {
             sink,
             id: next_engine_id(),
-        })
+        }
     }
 
     /// Create ALSA Direct engine with gapless source queue.
