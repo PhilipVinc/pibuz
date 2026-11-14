@@ -1579,6 +1579,7 @@ mod tests {
             config: base.join("config"),
             data: base.join("data"),
             cache: base.join("cache"),
+            state: base.join("state"),
         }
     }
 
@@ -1627,7 +1628,7 @@ mod tests {
         assert_eq!(
             get("logs"),
             roots
-                .data
+                .state
                 .join("logs")
                 .join("pibuz.log")
                 .display()

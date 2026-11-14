@@ -1,7 +1,7 @@
 //! The composite [`log::Log`] that fans every record to stderr and the file.
 
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::Write;
 use std::sync::Mutex;
 
 use log::{Log, Metadata, Record};
@@ -14,7 +14,10 @@ use crate::redact;
 /// write choke point. Both sinks receive the redacted text.
 pub(crate) struct TeeLogger {
     pub(crate) inner: env_logger::Logger,
-    pub file: Option<Mutex<BufWriter<File>>>,
+    /// Unbuffered on purpose: each line is one `write_all`, on disk when `log`
+    /// returns. Logging is a few lines a second, and the file is what is read
+    /// after a crash.
+    pub file: Option<Mutex<File>>,
 }
 
 fn now_epoch_ms() -> i64 {
@@ -54,7 +57,9 @@ impl Log for TeeLogger {
 
         if let Some(file) = &self.file {
             if let Ok(mut writer) = file.lock() {
-                let _ = writeln!(writer, "{}", format_line(&line));
+                let mut text = format_line(&line);
+                text.push('\n');
+                let _ = writer.write_all(text.as_bytes());
             }
         }
 
@@ -91,5 +96,38 @@ mod tests {
         let s = format_line(&line);
         assert!(s.contains("***REDACTED***"));
         assert!(!s.contains("SEKRET"));
+    }
+
+    /// A line is on disk when `log` returns. The file used to go through an
+    /// 8 KB buffer that nothing flushed, so on the Pi the log read 0 bytes for
+    /// the first stretch of every run while stderr already had it all, and a
+    /// crash lost whatever was still in the buffer: the lines that explain it.
+    #[test]
+    fn a_logged_line_is_in_the_file_at_once() {
+        let path = std::env::temp_dir().join(format!(
+            "qbz-log-tee-{}-{}.log",
+            std::process::id(),
+            now_epoch_ms()
+        ));
+        let file = File::create(&path).expect("create");
+        let logger = TeeLogger {
+            inner: env_logger::Builder::new()
+                .filter_level(log::LevelFilter::Info)
+                .build(),
+            file: Some(Mutex::new(file)),
+        };
+        logger.log(
+            &Record::builder()
+                .level(Level::Info)
+                .target("pibuz")
+                .args(format_args!("the daemon started"))
+                .build(),
+        );
+        let on_disk = std::fs::read_to_string(&path).expect("read");
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            on_disk.contains("the daemon started") && on_disk.ends_with('\n'),
+            "{on_disk:?}"
+        );
     }
 }
