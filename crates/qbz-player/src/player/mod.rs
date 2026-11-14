@@ -213,6 +213,11 @@ struct GaplessPending {
     /// ([`take_successor_for_transition`]): one dropped since took the audio
     /// with it, and switching to a track nothing will play is the skip.
     engine_id: u64,
+    /// The live loudness gain the analyzer writes for THIS track (`None` with
+    /// normalization off). Adopted as `current_gain_atomic` at the switch, so
+    /// a later seek or resume rebuilds with this track's gain; it kept the
+    /// previous track's, while the analyzer wrote to one nothing read.
+    gain_atomic: Option<Arc<AtomicU32>>,
 }
 
 struct CursorMediaSource {
@@ -5069,6 +5074,7 @@ impl Player {
                                         sample_rate,
                                         channels,
                                         engine_id: 0,
+                                        gain_atomic: None,
                                     });
                                     thread_state.set_gapless_ready(false);
                                     return;
@@ -5191,7 +5197,7 @@ impl Player {
                             let source = wrap_source(
                                 source,
                                 normalization,
-                                gain_atomic,
+                                gain_atomic.clone(),
                                 &analyzer_tx,
                                 &analyzer_enabled,
                             );
@@ -5232,6 +5238,7 @@ impl Player {
                                 sample_rate,
                                 channels,
                                 engine_id: current_engine.as_ref().map_or(0, PlaybackEngine::id),
+                                gain_atomic,
                             });
                             thread_state.set_gapless_next_track_id(track_id);
                             thread_state.set_gapless_ready(false); // Request fulfilled
@@ -5495,6 +5502,7 @@ impl Player {
                                         }
                                     }
                                     current_normalization_gain = pending.normalization_gain;
+                                    current_gain_atomic = pending.gain_atomic;
                                     thread_state.set_normalization_gain(pending.normalization_gain);
                                     gapless_request_armed = false;
                                     transition_consumed_pending = true;
@@ -8390,6 +8398,7 @@ mod new_track_and_prefetch_tests {
             sample_rate: 44_100,
             channels: 2,
             engine_id: ENGINE,
+            gain_atomic: None,
         }
     }
 
