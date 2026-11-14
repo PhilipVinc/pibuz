@@ -110,9 +110,6 @@ pub(crate) struct DaemonRendererEngine {
     /// Pulsed when buffering starts so the report scheduler tells the
     /// controller within milliseconds instead of at its next 2 s tick.
     report_notify: Arc<tokio::sync::Notify>,
-    /// Pulsed after a controller's volume or mute, so the events bridge
-    /// publishes `VolumeChanged` at once instead of at its next wake.
-    events_edge: Arc<tokio::sync::Notify>,
     /// Told when a load is refused with a 401, so the pairing heartbeat can
     /// check the credential (pairing.rs, `AuthSuspect`).
     auth_suspect: Arc<super::pairing::AuthSuspect>,
@@ -448,7 +445,6 @@ impl DaemonRendererEngine {
         volume_mode: VolumeMode,
         buffering: Arc<BufferingLatch>,
         report_notify: Arc<tokio::sync::Notify>,
-        events_edge: Arc<tokio::sync::Notify>,
         shared: Arc<std::sync::Mutex<crate::state::DaemonShared>>,
         auth_suspect: Arc<super::pairing::AuthSuspect>,
     ) -> Self {
@@ -459,7 +455,6 @@ impl DaemonRendererEngine {
             buffering,
             shared,
             report_notify,
-            events_edge,
             auth_suspect,
             load_started: std::sync::Mutex::new(None),
         }
@@ -628,14 +623,14 @@ impl QconnectRendererEngine for DaemonRendererEngine {
         }
         // A level from the controller ends a mute, as one from the box does
         // (`crate::mute`). Its echo carries the level and not the unmute, so
-        // the unmute is flagged for the volume publisher under the same lock
-        // (`DaemonShared::unmute_unreported`).
+        // `mute::change` records the unmute as news for the volume publisher
+        // (`VolumeNews::Unmute`).
         crate::mute::change(
             &self.shared,
+            crate::mute::Source::ControllerLevel,
             |level| self.set_player_volume(level),
-            |s| crate::mute::take_controller_level(s, fraction),
+            |mute| mute.take_level(fraction),
         )?;
-        self.events_edge.notify_one();
         Ok(())
     }
     fn set_muted(&self, muted: bool) -> Result<(), String> {
@@ -650,10 +645,10 @@ impl QconnectRendererEngine for DaemonRendererEngine {
         let live = self.core().get_playback_state().volume;
         crate::mute::change(
             &self.shared,
+            crate::mute::Source::ControllerMute,
             |level| self.set_player_volume(level),
-            |s| s.mute.set(muted, live),
+            |mute| mute.set(muted, live),
         )?;
-        self.events_edge.notify_one();
         Ok(())
     }
     fn get_playback_state(&self) -> PlaybackState {

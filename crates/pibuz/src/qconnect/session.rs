@@ -397,13 +397,14 @@ pub(crate) async fn deferred_renderer_join(
             // back: a cast must not unmute it.
             if let Err(err) = crate::mute::change(
                 shared,
+                crate::mute::Source::Join,
                 |level| {
                     runtime
                         .core()
                         .set_volume(level)
                         .map_err(|err| err.to_string())
                 },
-                |s| s.mute.set_level_quietly(fraction),
+                |mute| mute.set_level_quietly(fraction),
             ) {
                 log::warn!("[QConnect] Could not apply the join-time volume: {err}");
             }

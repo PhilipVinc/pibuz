@@ -243,8 +243,8 @@ pub(crate) fn spawn_queue_cloud_publish(
 /// the unmute brings back. Reporting a box-side mute as a level of 0 dragged
 /// the phone's slider to the bottom, and the unmute was then lost (issue #4).
 ///
-/// Only a change made HERE goes out (`DaemonShared::volume_changed_here`, set
-/// by the control API). Telling the two apart by comparing levels did not
+/// Only a change made HERE goes out (`VolumeNews::Local`, recorded by
+/// `crate::mute::change` for the control API). Telling the two apart by comparing levels did not
 /// hold: mid-drag the cloud's echoes arrive behind the slider, an old one
 /// overwrites the view, and the controller's own latest step then looked
 /// like a local change and went back to it a second time. The cloud's view
@@ -252,7 +252,7 @@ pub(crate) fn spawn_queue_cloud_publish(
 /// what it already shows is not sent again.
 ///
 /// The one exception is an unmute the controller's own level made
-/// (`DaemonShared::unmute_unreported`): its echo carries the level, not the
+/// (`VolumeNews::Unmute`): its echo carries the level, not the
 /// unmute. That goes out as the mute ALONE, for the same reason — the level is
 /// the controller's own, and a stale echo in the view would send it back.
 pub(crate) async fn publish_local_volume_if_changed(
@@ -262,18 +262,14 @@ pub(crate) async fn publish_local_volume_if_changed(
 ) {
     // Consumed first, so a change made with no session to tell is not left to
     // fire on the controller's next drag.
-    let (changed_here, unmute_unreported) = shared
+    let news = shared
         .lock()
-        .map(|mut s| {
-            (
-                std::mem::take(&mut s.volume_changed_here),
-                std::mem::take(&mut s.unmute_unreported),
-            )
-        })
-        .unwrap_or((false, false));
-    if !changed_here && !unmute_unreported {
+        .map(|mut s| std::mem::take(&mut s.volume_news))
+        .unwrap_or_default();
+    if news == crate::state::VolumeNews::None {
         return;
     }
+    let changed_here = news == crate::state::VolumeNews::Local;
     let (app, sync_state, volume_mode) = {
         let guard = inner.lock().await;
         match guard.runtime.as_ref() {
@@ -379,13 +375,23 @@ pub(crate) fn spawn_volume_cloud_publish(
     use tokio::sync::broadcast::error::RecvError;
     // Short: this is a slider the listener is watching, not a queue edit.
     const COALESCE: std::time::Duration = std::time::Duration::from_millis(150);
+    // Recorded news wakes it too: a change that leaves the player's level where
+    // it was (a mute at 0, a level set to the one it had) fires no
+    // `VolumeChanged`. See `DaemonShared::volume_news_wake`.
+    let news_wake = shared
+        .lock()
+        .map(|s| Arc::clone(&s.volume_news_wake))
+        .unwrap_or_default();
     tokio::spawn(async move {
         loop {
-            match rx.recv().await {
-                Ok(CoreEvent::VolumeChanged { .. }) => {}
-                Ok(_) => continue,
-                Err(RecvError::Lagged(_)) => continue,
-                Err(RecvError::Closed) => return,
+            tokio::select! {
+                r = rx.recv() => match r {
+                    Ok(CoreEvent::VolumeChanged { .. }) => {}
+                    Ok(_) => continue,
+                    Err(RecvError::Lagged(_)) => continue,
+                    Err(RecvError::Closed) => return,
+                },
+                () = news_wake.notified() => {}
             }
             let deadline = tokio::time::Instant::now() + COALESCE;
             loop {

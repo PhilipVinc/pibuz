@@ -18,20 +18,20 @@ pub(crate) struct DaemonShared {
     /// with nothing loaded. The Connect report names that track until
     /// something plays or loads (`qconnect::report`).
     pub(crate) queue_at_rest: bool,
-    /// A volume or mute change was made on THIS side (the control API) and
-    /// the Connect controller has not been told yet. The volume publisher
-    /// consumes it; a change the controller made itself never sets it — the
-    /// one part of such a change the controller does not learn on its own is
-    /// `unmute_unreported`.
-    pub(crate) volume_changed_here: bool,
-    /// A level from the Connect controller ended a mute, and the controller
-    /// has not been told. Its own echo carries the level and not the unmute,
-    /// so the app kept its mute icon on over a playing box. Set under the
-    /// lock that made the unmute (`crate::mute::take_controller_level`); the
-    /// volume publisher consumes it and reports the unmute ALONE — the level
-    /// is already on the controller's screen, and sending it back mid-drag
-    /// would move the slider under the listener's finger.
-    pub(crate) unmute_unreported: bool,
+    /// What the Connect controller has not been told about the volume yet.
+    /// Recorded by `crate::mute::change`, which every volume and mute change
+    /// goes through, and consumed by the volume publisher.
+    pub(crate) volume_news: VolumeNews,
+    /// Wakes the volume publisher when `volume_news` is recorded. It also runs
+    /// on the bus's `VolumeChanged`, but that fires only when the player's
+    /// LEVEL moves: a mute at level 0, or a level set to the one it had,
+    /// changes none, and the news waited for the controller's next drag.
+    pub(crate) volume_news_wake: std::sync::Arc<tokio::sync::Notify>,
+    /// The events bridge's wake-up (`daemon::run`, 10c½), pulsed by
+    /// `crate::mute::change` so `/api/events` and the hook see a volume or
+    /// mute change at once. It used to be pulsed by hand after each change,
+    /// and the one caller that forgot (the join-time volume) was late.
+    pub(crate) events_edge: std::sync::Arc<tokio::sync::Notify>,
     pub(crate) started_at: std::time::Instant,
     pub(crate) startup_warnings: u32,
     pub qconnect: QconnectStatus,
@@ -47,7 +47,47 @@ pub(crate) struct DaemonShared {
     pub(crate) bus: Option<tokio::sync::broadcast::Sender<qbz_models::CoreEvent>>,
 }
 
+/// What the controller has not been told about the volume, strongest last:
+/// news recorded on top of other news keeps the stronger (`merge`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum VolumeNews {
+    #[default]
+    None,
+    /// A level from the controller ended a mute. Its own echo carries the
+    /// level and not the unmute, so the app kept its mute icon over a playing
+    /// box. Reported ALONE: the level is already on the controller's screen,
+    /// and sending it back mid-drag would move the slider under the finger.
+    Unmute,
+    /// A change made on THIS side (the control API): level and mute both.
+    Local,
+}
+
+impl VolumeNews {
+    pub(crate) fn merge(self, other: Self) -> Self {
+        self.max(other)
+    }
+}
+
 impl DaemonShared {
+    /// Fresh state: nothing latched, unmuted, nothing to tell the controller,
+    /// network assumed up, no bus yet (`daemon::run` attaches it after boot).
+    pub(crate) fn new() -> Self {
+        Self {
+            last_errors: LatchedErrors::default(),
+            driver_last_tick: None,
+            mute: crate::mute::Mute::default(),
+            queue_at_rest: false,
+            volume_news: VolumeNews::None,
+            volume_news_wake: Default::default(),
+            events_edge: Default::default(),
+            started_at: std::time::Instant::now(),
+            startup_warnings: 0,
+            qconnect: QconnectStatus::default(),
+            network_online: std::sync::atomic::AtomicBool::new(true),
+            bus: None,
+        }
+    }
+
     /// Read the latched network-reachability signal. `Relaxed` is
     /// sufficient — this is a coarse status flag read under the same
     /// `Mutex<DaemonShared>` guard as every other field here, not a
@@ -160,8 +200,9 @@ mod tests {
             driver_last_tick: None,
             mute: crate::mute::Mute::default(),
             queue_at_rest: false,
-            volume_changed_here: false,
-            unmute_unreported: false,
+            volume_news: VolumeNews::None,
+            volume_news_wake: Default::default(),
+            events_edge: Default::default(),
             started_at: std::time::Instant::now(),
             startup_warnings: 0,
             qconnect: QconnectStatus::default(),
@@ -173,19 +214,7 @@ mod tests {
 
     #[test]
     fn a_session_going_down_clears_the_active_renderer_flag() {
-        let mut shared = DaemonShared {
-            last_errors: LatchedErrors::default(),
-            driver_last_tick: None,
-            mute: crate::mute::Mute::default(),
-            queue_at_rest: false,
-            volume_changed_here: false,
-            unmute_unreported: false,
-            started_at: std::time::Instant::now(),
-            startup_warnings: 0,
-            qconnect: QconnectStatus::default(),
-            network_online: std::sync::atomic::AtomicBool::new(true),
-            bus: None,
-        };
+        let mut shared = DaemonShared::new();
         shared.qconnect.state = "connected".to_string();
         shared.qconnect.session_active = true;
         shared.qconnect.is_active = true;
@@ -203,19 +232,7 @@ mod tests {
         // Pure latch semantics: a real network-class failure flips
         // it false, a real success flips it back true — the exact two
         // transitions every call site above drives. Defaults true.
-        let shared = DaemonShared {
-            last_errors: LatchedErrors::default(),
-            driver_last_tick: None,
-            mute: crate::mute::Mute::default(),
-            queue_at_rest: false,
-            volume_changed_here: false,
-            unmute_unreported: false,
-            started_at: std::time::Instant::now(),
-            startup_warnings: 0,
-            qconnect: QconnectStatus::default(),
-            network_online: std::sync::atomic::AtomicBool::new(true),
-            bus: None,
-        };
+        let shared = DaemonShared::new();
         assert!(shared.network_online(), "defaults true (optimistic)");
 
         shared.set_network_online(false);

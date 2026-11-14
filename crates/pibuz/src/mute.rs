@@ -14,7 +14,7 @@
 
 use std::sync::Mutex;
 
-use crate::state::DaemonShared;
+use crate::state::{DaemonShared, VolumeNews};
 
 /// Restored when the stashed level is 0, so a mute taken at 0 still unmutes to
 /// something audible.
@@ -95,44 +95,70 @@ impl Mute {
     }
 }
 
+/// Who is changing the volume, which decides what the controller has to be
+/// told ([`news_of`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Source {
+    /// The box: the control API.
+    Box,
+    /// A level from the Connect controller (`SetVolume`).
+    ControllerLevel,
+    /// A mute from the Connect controller (`MuteVolume`).
+    ControllerMute,
+    /// The level a controller hands over when the box joins a session.
+    Join,
+}
+
 /// Apply `change` to the daemon's mute and set the player to the level it asks
 /// for, holding the daemon lock across both: a mute from the box and an unmute
 /// from the controller racing each other must not leave the flag saying one
-/// thing and the player the other. `change` gets the whole daemon state so a
-/// flag that has to move with the mute (`DaemonShared::unmute_unreported`)
-/// moves under the same lock. Returns the mute as it now stands, and the level
-/// the player was set to, if `change` asked for one.
+/// thing and the player the other. Returns the mute as it now stands, and
+/// the level the player was set to, if `change` asked for one.
+///
+/// Every volume and mute change goes through here, so this is also where what
+/// the controller has not been told is recorded (`DaemonShared::volume_news`)
+/// and where the volume publisher and the events bridge are woken. Those were
+/// a flag and a `notify_one` each caller had to remember, and the callers that
+/// forgot are why a mute at level 0 never reached the phone, a level set to
+/// the one it had left news to misfire on the next drag, and the join-time
+/// volume reached `/api/events` late.
 ///
 /// On a failed `set_volume` the flag has still moved. That is the old
 /// behaviour of the box's mute, kept: the player's command channel is dead at
-/// that point, and nothing it reports means much.
+/// that point, and the error reaches the caller.
 pub(crate) fn change(
     shared: &Mutex<DaemonShared>,
+    source: Source,
     set_volume: impl FnOnce(f32) -> Result<(), String>,
-    change: impl FnOnce(&mut DaemonShared) -> Option<f32>,
+    change: impl FnOnce(&mut Mute) -> Option<f32>,
 ) -> Result<(Mute, Option<f32>), String> {
     let mut guard = shared
         .lock()
         .map_err(|_| "daemon state lock poisoned".to_string())?;
-    let level = change(&mut guard);
+    let before = guard.mute;
+    let level = change(&mut guard.mute);
     if let Some(level) = level {
         set_volume(level)?;
     }
+    let news = news_of(source, before, guard.mute, level);
+    if news != VolumeNews::None {
+        guard.volume_news = guard.volume_news.merge(news);
+        guard.volume_news_wake.notify_one();
+    }
+    guard.events_edge.notify_one();
     Ok((guard.mute, level))
 }
 
-/// A level from the Connect controller, for [`change`]: `Mute::take_level`,
-/// and an unmute it makes is flagged for the volume publisher
-/// (`DaemonShared::unmute_unreported`). The controller's echo of its own
-/// `SetVolume` carries the level but not the unmute, so without the flag the
-/// app keeps showing the mute over a box that plays again.
-pub(crate) fn take_controller_level(s: &mut DaemonShared, level: f32) -> Option<f32> {
-    let was_muted = s.mute.is_muted();
-    let set = s.mute.take_level(level);
-    if was_muted && !s.mute.is_muted() {
-        s.unmute_unreported = true;
+/// What a change tells the controller that it does not already know.
+fn news_of(source: Source, before: Mute, after: Mute, level: Option<f32>) -> VolumeNews {
+    let mute_moved = before.is_muted() != after.is_muted();
+    match source {
+        Source::Box if level.is_some() || mute_moved => VolumeNews::Local,
+        // Its own level and mute it knows; the one thing it does not learn
+        // from its echo is that its level ended a mute.
+        Source::ControllerLevel if before.is_muted() && !after.is_muted() => VolumeNews::Unmute,
+        _ => VolumeNews::None,
     }
-    set
 }
 
 /// The mute as it stands, or unmuted if the lock is poisoned.
@@ -182,19 +208,30 @@ mod tests {
     }
 
     fn shared() -> Mutex<DaemonShared> {
-        Mutex::new(DaemonShared {
-            last_errors: crate::state::LatchedErrors::default(),
-            driver_last_tick: None,
-            mute: Mute::default(),
-            queue_at_rest: false,
-            volume_changed_here: false,
-            unmute_unreported: false,
-            started_at: std::time::Instant::now(),
-            startup_warnings: 0,
-            qconnect: crate::state::QconnectStatus::default(),
-            network_online: std::sync::atomic::AtomicBool::new(true),
-            bus: None,
-        })
+        Mutex::new(DaemonShared::new())
+    }
+
+    const PLAYER: fn(f32) -> Result<(), String> = |_| Ok(());
+
+    fn news(shared: &Mutex<DaemonShared>) -> VolumeNews {
+        shared.lock().unwrap().volume_news
+    }
+
+    /// Whether `notify` holds a wake-up, consuming it.
+    fn woken(notify: &tokio::sync::Notify) -> bool {
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.enable()
+    }
+
+    fn publisher_woken(shared: &Mutex<DaemonShared>) -> bool {
+        let wake = std::sync::Arc::clone(&shared.lock().unwrap().volume_news_wake);
+        woken(&wake)
+    }
+
+    fn events_woken(shared: &Mutex<DaemonShared>) -> bool {
+        let edge = std::sync::Arc::clone(&shared.lock().unwrap().events_edge);
+        woken(&edge)
     }
 
     /// The player is set to exactly the level the change asked for, and the
@@ -209,16 +246,16 @@ mod tests {
             Ok(())
         };
 
-        let (mute, level) = change(&shared, player, |s| s.mute.set(true, 0.26)).unwrap();
+        let (mute, level) = change(&shared, Source::Box, player, |m| m.set(true, 0.26)).unwrap();
         assert!(mute.is_muted());
         assert_eq!((level, set.get()), (Some(0.0), Some(0.0)));
 
-        let (mute, level) = change(&shared, player, |s| s.mute.set(false, 0.0)).unwrap();
+        let (mute, level) = change(&shared, Source::Box, player, |m| m.set(false, 0.0)).unwrap();
         assert!(!mute.is_muted());
         assert_eq!((level, set.get()), (Some(0.26), Some(0.26)));
 
         set.set(None);
-        let (_, level) = change(&shared, player, |s| s.mute.set(false, 0.26)).unwrap();
+        let (_, level) = change(&shared, Source::Box, player, |m| m.set(false, 0.26)).unwrap();
         assert_eq!(
             (level, set.get()),
             (None, None),
@@ -226,29 +263,97 @@ mod tests {
         );
     }
 
-    /// A controller's level that ends a mute flags the unmute for the
-    /// publisher; one that does not end one leaves the flag alone.
+    /// A controller's level that ends a mute is news to it, the unmute alone;
+    /// one that does not end one is not news at all: it echoes its own level.
     #[test]
-    fn a_controllers_level_flags_only_the_unmute_it_makes() {
+    fn a_controllers_level_reports_only_the_unmute_it_makes() {
         let shared = shared();
-        let player = |_| Ok(());
-        let flagged = || shared.lock().unwrap().unmute_unreported;
+        change(&shared, Source::ControllerMute, PLAYER, |m| {
+            m.set(true, 0.4)
+        })
+        .unwrap();
+        assert_eq!(news(&shared), VolumeNews::None, "its own mute it knows");
 
-        change(&shared, player, |s| s.mute.set(true, 0.4)).unwrap();
-        change(&shared, player, |s| take_controller_level(s, 0.0)).unwrap();
-        assert!(!flagged(), "a level of 0 leaves the mute on");
+        change(&shared, Source::ControllerLevel, PLAYER, |m| {
+            m.take_level(0.0)
+        })
+        .unwrap();
+        assert_eq!(
+            news(&shared),
+            VolumeNews::None,
+            "a level of 0 leaves the mute on"
+        );
 
-        let (mute, level) = change(&shared, player, |s| take_controller_level(s, 0.6)).unwrap();
+        let (mute, level) = change(&shared, Source::ControllerLevel, PLAYER, |m| {
+            m.take_level(0.6)
+        })
+        .unwrap();
         assert!(!mute.is_muted());
         assert_eq!(level, Some(0.6));
-        assert!(flagged(), "the unmute is news to the controller");
+        assert_eq!(news(&shared), VolumeNews::Unmute);
+        assert!(publisher_woken(&shared));
 
-        shared.lock().unwrap().unmute_unreported = false;
-        change(&shared, player, |s| take_controller_level(s, 0.5)).unwrap();
-        assert!(
-            !flagged(),
-            "unmuted already: only the level, which it echoes"
+        shared.lock().unwrap().volume_news = VolumeNews::None;
+        change(&shared, Source::ControllerLevel, PLAYER, |m| {
+            m.take_level(0.5)
+        })
+        .unwrap();
+        assert_eq!(news(&shared), VolumeNews::None, "unmuted already");
+    }
+
+    /// A mute on the box while the player is at 0 leaves the level where it
+    /// was, so the bus's `VolumeChanged` — the only thing that used to run the
+    /// publisher — never fired, and the phone never learned of the mute.
+    #[test]
+    fn a_box_mute_at_level_zero_wakes_the_publisher() {
+        let shared = shared();
+        change(&shared, Source::Box, PLAYER, |m| m.set(true, 0.0)).unwrap();
+        assert_eq!(news(&shared), VolumeNews::Local);
+        assert!(publisher_woken(&shared), "nothing else will run it");
+    }
+
+    /// A level set to the one it had moves nothing either. The news it left
+    /// waited for the controller's next drag, which the publisher then took
+    /// for a local change and sent back: the slider jumped under the finger.
+    /// Woken at once, the publisher finds the controller already shows it and
+    /// sends nothing, and the news is gone before any drag.
+    #[test]
+    fn a_level_set_to_the_one_it_had_is_not_left_waiting() {
+        let shared = shared();
+        change(&shared, Source::Box, PLAYER, |m| m.take_level(0.5)).unwrap();
+        assert!(publisher_woken(&shared));
+    }
+
+    /// Every change wakes the events bridge, the join-time level included,
+    /// which was the one caller that did not.
+    #[test]
+    fn every_change_wakes_the_events_bridge() {
+        let shared = shared();
+        change(&shared, Source::Join, PLAYER, |m| m.set_level_quietly(0.3)).unwrap();
+        assert!(events_woken(&shared));
+        assert_eq!(
+            news(&shared),
+            VolumeNews::None,
+            "the controller handed it over"
         );
+        assert!(!publisher_woken(&shared));
+
+        change(&shared, Source::ControllerMute, PLAYER, |m| {
+            m.set(true, 0.3)
+        })
+        .unwrap();
+        assert!(events_woken(&shared));
+    }
+
+    /// News on top of news keeps the stronger: a box change after a
+    /// controller's unmute is reported in full, and an unmute after a box
+    /// change does not narrow it.
+    #[test]
+    fn news_keeps_the_stronger() {
+        use VolumeNews::{Local, None, Unmute};
+        assert_eq!(Unmute.merge(Local), Local);
+        assert_eq!(Local.merge(Unmute), Local);
+        assert_eq!(None.merge(Unmute), Unmute);
     }
 
     #[test]
