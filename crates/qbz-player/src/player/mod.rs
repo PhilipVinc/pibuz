@@ -25,6 +25,9 @@ pub use streaming_source::{
     StreamingConfig,
 };
 
+/// The level a new player starts at, before anyone sets one.
+pub const STARTUP_VOLUME: f32 = 0.75;
+
 use rodio::buffer::SamplesBuffer;
 use rodio::cpal::traits::{DeviceTrait, HostTrait};
 use rodio::cpal::{
@@ -2220,7 +2223,7 @@ impl SharedState {
             duration: Arc::new(AtomicU64::new(0)),
             current_track_id: Arc::new(AtomicU64::new(0)),
             has_loaded_audio: Arc::new(AtomicBool::new(false)),
-            volume: Arc::new(AtomicU32::new(0.75f32.to_bits())),
+            volume: Arc::new(AtomicU32::new(STARTUP_VOLUME.to_bits())),
             playback_start_millis: Arc::new(AtomicU64::new(0)),
             position_at_start: Arc::new(AtomicU64::new(0)),
             current_device: Arc::new(std::sync::RwLock::new(None)),

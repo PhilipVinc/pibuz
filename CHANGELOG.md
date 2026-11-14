@@ -37,7 +37,9 @@ tags on `main`.
   of every run, and a crash lost the lines that explained it.
 - **Muting at volume 0 and unmuting goes back to the level you had.** It went
   to a fixed 70%: at 36%, `pibuz volume 0`, `pibuz mute`, `pibuz mute` came
-  back almost twice as loud. It now restores the last level above 0.
+  back almost twice as loud. It now restores the last level above 0, which is
+  at worst the startup level (`qconnect.initial_volume`, the "initial volume"
+  on moOde's renderer page) a session set when it joined.
 - **`pibuz unmute`** is the same as `pibuz mute off`.
 
 ## 2.8.1 — 2026-11-14
