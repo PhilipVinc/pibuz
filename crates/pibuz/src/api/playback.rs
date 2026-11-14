@@ -208,7 +208,7 @@ pub(crate) fn volume(state: &ApiState, body: &Value) -> Response<Cursor<Vec<u8>>
         &state.shared,
         crate::mute::Source::Box,
         |level| set_player_volume(state, level),
-        |mute| mute.take_level(target),
+        |mute| mute.take_level(target, live),
     ) {
         Ok((mute, _)) => mute,
         Err(e) => return runtime_error(&e),

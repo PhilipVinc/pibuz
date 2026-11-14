@@ -624,11 +624,12 @@ impl QconnectRendererEngine for DaemonRendererEngine {
         // (`crate::mute`). Its echo carries the level and not the unmute, so
         // `mute::change` records the unmute as news for the volume publisher
         // (`VolumeNews::Unmute`).
+        let live = self.core().get_playback_state().volume;
         crate::mute::change(
             &self.shared,
             crate::mute::Source::ControllerLevel,
             |level| self.set_player_volume(level),
-            |mute| mute.take_level(fraction),
+            |mute| mute.take_level(fraction, live),
         )?;
         Ok(())
     }

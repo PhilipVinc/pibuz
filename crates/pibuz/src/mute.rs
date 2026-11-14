@@ -16,8 +16,8 @@ use std::sync::Mutex;
 
 use crate::state::{DaemonShared, VolumeNews};
 
-/// Restored when the stashed level is 0, so a mute taken at 0 still unmutes to
-/// something audible.
+/// Restored by a mute taken at 0 when no level above 0 has been seen since the
+/// daemon started, so the unmute is still audible.
 const FALLBACK_LEVEL: f32 = 0.7;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -25,6 +25,11 @@ pub(crate) struct Mute {
     muted: bool,
     /// The level an unmute restores. Meaningful only while `muted`.
     premute: f32,
+    /// The last level above 0 the player was at. A mute taken at 0 stashes
+    /// THIS: `volume 0` then `mute` then `mute` again goes back to where the
+    /// listener was before turning it down, not to a constant (it once came
+    /// back at 70% from 36%).
+    last_audible: f32,
 }
 
 impl Default for Mute {
@@ -32,6 +37,7 @@ impl Default for Mute {
         Self {
             muted: false,
             premute: 1.0,
+            last_audible: FALLBACK_LEVEL,
         }
     }
 }
@@ -56,7 +62,8 @@ impl Mute {
     pub(crate) fn set(&mut self, on: bool, live: f32) -> Option<f32> {
         match (on, self.muted) {
             (true, false) => {
-                self.premute = if live > 0.0 { live } else { FALLBACK_LEVEL };
+                self.heard(live);
+                self.premute = self.last_audible;
                 self.muted = true;
                 Some(0.0)
             }
@@ -74,12 +81,23 @@ impl Mute {
 
     /// A listener setting a level, on the box or on the controller. A non-zero
     /// one ends a mute — the same rule both sides had before — and the player
-    /// goes to that level either way.
-    pub(crate) fn take_level(&mut self, level: f32) -> Option<f32> {
+    /// goes to that level either way. `live` is the player's level before it,
+    /// which may never have passed through here (the level the daemon started
+    /// at), so turning it down to 0 still remembers it.
+    pub(crate) fn take_level(&mut self, level: f32, live: f32) -> Option<f32> {
+        self.heard(live);
+        self.heard(level);
         if level > 0.0 {
             self.muted = false;
         }
         Some(level)
+    }
+
+    /// Note a level the player is, or was, at.
+    fn heard(&mut self, level: f32) {
+        if level > 0.0 {
+            self.last_audible = level;
+        }
     }
 
     /// A level nobody chose just now: `qconnect.initial_volume` at a join.
@@ -95,6 +113,7 @@ impl Mute {
     }
 
     pub(crate) fn set_level_quietly(&mut self, level: f32) -> Option<f32> {
+        self.heard(level);
         if self.muted {
             self.premute = level;
             None
@@ -206,13 +225,34 @@ mod tests {
         assert_eq!(mute.set(false, 0.0), Some(FALLBACK_LEVEL));
     }
 
+    /// Seen on the Pi: at 36%, `volume 0`, `mute` said `muted (was 70%)` and
+    /// the unmute came back at 70%, twice as loud as the listener had it.
+    #[test]
+    fn a_mute_at_zero_unmutes_to_the_level_before_it_was_turned_down() {
+        let mut mute = Mute::default();
+        // 36% is the level the daemon started at: nothing set it through here.
+        assert_eq!(mute.take_level(0.0, 0.36), Some(0.0));
+        assert_eq!(mute.set(true, 0.0), Some(0.0));
+        assert_eq!(mute.nominal(0.0), 0.36, "`muted (was 36%)`");
+        assert_eq!(mute.set(false, 0.0), Some(0.36));
+    }
+
+    #[test]
+    fn a_mute_at_zero_remembers_a_level_set_on_the_controller() {
+        let mut mute = Mute::default();
+        mute.take_level(0.5, 0.36);
+        mute.take_level(0.0, 0.5);
+        mute.set(true, 0.0);
+        assert_eq!(mute.set(false, 0.0), Some(0.5));
+    }
+
     #[test]
     fn a_listeners_level_ends_a_mute_and_zero_does_not() {
         let mut mute = Mute::default();
         mute.set(true, 0.4);
-        assert_eq!(mute.take_level(0.0), Some(0.0));
+        assert_eq!(mute.take_level(0.0, 0.0), Some(0.0));
         assert!(mute.is_muted());
-        assert_eq!(mute.take_level(0.6), Some(0.6));
+        assert_eq!(mute.take_level(0.6, 0.0), Some(0.6));
         assert!(!mute.is_muted());
     }
 
@@ -284,7 +324,7 @@ mod tests {
         assert_eq!(news(&shared), VolumeNews::None, "its own mute it knows");
 
         change(&shared, Source::ControllerLevel, PLAYER, |m| {
-            m.take_level(0.0)
+            m.take_level(0.0, 0.0)
         })
         .unwrap();
         assert_eq!(
@@ -294,7 +334,7 @@ mod tests {
         );
 
         let (mute, level) = change(&shared, Source::ControllerLevel, PLAYER, |m| {
-            m.take_level(0.6)
+            m.take_level(0.6, 0.0)
         })
         .unwrap();
         assert!(!mute.is_muted());
@@ -304,7 +344,7 @@ mod tests {
 
         shared.lock().unwrap().volume_news = VolumeNews::None;
         change(&shared, Source::ControllerLevel, PLAYER, |m| {
-            m.take_level(0.5)
+            m.take_level(0.5, 0.0)
         })
         .unwrap();
         assert_eq!(news(&shared), VolumeNews::None, "unmuted already");
@@ -329,7 +369,7 @@ mod tests {
     #[test]
     fn a_level_set_to_the_one_it_had_is_not_left_waiting() {
         let shared = shared();
-        change(&shared, Source::Box, PLAYER, |m| m.take_level(0.5)).unwrap();
+        change(&shared, Source::Box, PLAYER, |m| m.take_level(0.5, 0.0)).unwrap();
         assert!(publisher_woken(&shared));
     }
 

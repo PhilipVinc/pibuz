@@ -35,6 +35,10 @@ tags on `main`.
 - **The log file has each line as soon as it is logged.** It went through an
   8 KB buffer that nothing flushed, so it read 0 bytes for the first minutes
   of every run, and a crash lost the lines that explained it.
+- **Muting at volume 0 and unmuting goes back to the level you had.** It went
+  to a fixed 70%: at 36%, `pibuz volume 0`, `pibuz mute`, `pibuz mute` came
+  back almost twice as loud. It now restores the last level above 0.
+- **`pibuz unmute`** is the same as `pibuz mute off`.
 
 ## 2.8.1 — 2026-11-14
 
