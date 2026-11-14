@@ -1447,6 +1447,16 @@ mod virtual_device {
         name
     }
 
+    /// What the NEXT open of `name` gets: a device that came back. A killed
+    /// `VirtualAudioOut` stays dead, while on the Pi closing and reopening the
+    /// PCM is what revived the DAC, so a reopen test swaps in a fresh one.
+    pub(super) fn replace(name: &str, out: Arc<VirtualAudioOut>) {
+        registry()
+            .lock()
+            .expect("registry")
+            .insert(name.to_string(), out);
+    }
+
     pub(super) fn lookup(name: &str) -> Option<Arc<VirtualAudioOut>> {
         registry().lock().ok()?.get(name).cloned()
     }
@@ -5560,26 +5570,16 @@ impl Player {
                                     }
                                     // The queued next track went with the engine,
                                     // but which track comes next has not changed and
-                                    // its bytes are still in hand: carried across
-                                    // the reopen and re-queued once the new engine
-                                    // exists, exactly as a seek does (see Seek for
-                                    // why ARMED stays set while that is in flight).
-                                    let requeue_gapless = gapless_pending.take().map(|pending| {
-                                        (
-                                            pending.audio,
-                                            pending.track_id,
-                                            pending.sample_rate,
-                                            pending.channels,
-                                        )
-                                    });
-                                    thread_state.set_gapless_ready(false);
-                                    thread_state.set_gapless_next_track_id(0);
-                                    gapless_request_armed = false;
+                                    // its bytes are still in hand. It stays in
+                                    // `gapless_pending`: the Resume below rebuilds
+                                    // the engine and re-queues it, as it does after
+                                    // a long pause (`take_successor_for_requeue`).
+                                    // This path used to keep its own copy of that
+                                    // re-queue, and the two fought over ARMED.
 
                                     let reopen = last_device_reopen
                                         .is_none_or(|at| at.elapsed() >= DEVICE_REOPEN_COOLDOWN);
                                     if reopen {
-                                        gapless_request_armed = requeue_gapless.is_some();
                                         last_device_reopen = Some(Instant::now());
                                         log::warn!(
                                             "Audio thread: {failure}; reopening it and resuming at {}s",
@@ -5602,33 +5602,6 @@ impl Player {
                                             &mut gapless_pending,
                                             &mut gapless_request_armed,
                                         );
-                                        match requeue_gapless {
-                                            Some((audio, track_id, sample_rate, channels))
-                                                if current_engine.is_some() =>
-                                            {
-                                                log::info!(
-                                                    "Gapless: re-queueing track {track_id} after the device was reopened"
-                                                );
-                                                if let Err(e) =
-                                                    self_tx.send(AudioCommand::PlayNext {
-                                                        audio,
-                                                        track_id,
-                                                        sample_rate,
-                                                        channels,
-                                                    })
-                                                {
-                                                    // Not fatal: the driver re-arms the
-                                                    // prefetch on its own.
-                                                    log::warn!(
-                                                        "Gapless: could not re-queue after the reopen: {e}"
-                                                    );
-                                                    gapless_request_armed = false;
-                                                }
-                                            }
-                                            // The resume failed and said why; nothing
-                                            // to hand the successor to.
-                                            _ => gapless_request_armed = false,
-                                        }
                                     } else {
                                         log::error!(
                                             "Audio thread: {failure}, again within {}s of reopening it; stopping",
@@ -5637,6 +5610,12 @@ impl Player {
                                         thread_state.record_stream_error(format!(
                                             "The audio device stopped playing: {failure}"
                                         ));
+                                        // Nothing will rebuild an engine to queue
+                                        // it into: playback stops here.
+                                        gapless_pending = None;
+                                        gapless_request_armed = false;
+                                        thread_state.set_gapless_ready(false);
+                                        thread_state.set_gapless_next_track_id(0);
                                     }
                                     continue;
                                 }
@@ -9117,13 +9096,14 @@ mod audio_thread_tests {
         TrackAudio::Memory(TrackBytes::from(constant_wav(TRACK_SECS, value)))
     }
 
-    fn player_on(out: Arc<VirtualAudioOut>) -> Player {
+    /// A player whose audio thread opens `out`, and the device name it uses.
+    fn player_on(out: Arc<VirtualAudioOut>) -> (Player, String) {
         let name = virtual_device::register(out);
         let settings = AudioSettings {
             output_device: Some(name.clone()),
             ..AudioSettings::default()
         };
-        Player::new(Some(name), settings, None, None)
+        (Player::new(Some(name.clone()), settings, None, None), name)
     }
 
     fn wait_until(timeout: Duration, mut done: impl FnMut() -> bool) -> bool {
@@ -9142,20 +9122,9 @@ mod audio_thread_tests {
         out.recorded().iter().filter(|s| **s < -0.05).count()
     }
 
-    /// A pause long enough to release the device drops the engine, and the
-    /// next track queued inside it goes too. Resume rebuilt the engine around
-    /// the current track alone while the player still counted the next one
-    /// as queued; at the end of the current track the player either switched
-    /// to the next one with no audio for it (and parked it at its full length,
-    /// which the driver reads as "finished" and skips) or dropped it. Either
-    /// way, the next track never reached the DAC.
-    #[test]
-    fn a_long_pause_does_not_lose_the_queued_next_track() {
-        let out = Arc::new(VirtualAudioOut::new(RATE, 2, 200, SPEED));
-        out.record();
-        let player = player_on(out.clone());
-        let state = player.state.clone();
-
+    /// Play A, and queue B behind it for a gapless hand-off.
+    fn play_a_and_queue_b(player: &Player) {
+        let state = &player.state;
         player
             .tx
             .send(AudioCommand::Play {
@@ -9172,7 +9141,6 @@ mod audio_thread_tests {
                 && state.current_track_id() == A),
             "track A never started"
         );
-
         player
             .tx
             .send(AudioCommand::PlayNext {
@@ -9187,6 +9155,46 @@ mod audio_thread_tests {
                 == B),
             "track B was never queued"
         );
+    }
+
+    /// B reaches `out` and the player then names it, playing.
+    fn assert_b_follows_on(player: &Player, out: &VirtualAudioOut, after: &str) {
+        let state = &player.state;
+        let b_played = wait_until(Duration::from_secs(10), || {
+            samples_of_b(out) > (RATE as usize) / 2
+        });
+        assert!(
+            b_played,
+            "track B never reached the DAC after {after} \
+             (player on track {}, playing {}, at {}s of {}s)",
+            state.current_track_id(),
+            state.is_playing(),
+            state.current_position(),
+            state.duration()
+        );
+        // Handed over is not yet played: the player names B once the device
+        // has played across the boundary, on its next tick.
+        assert!(
+            wait_until(Duration::from_secs(5), || state.current_track_id() == B
+                && state.is_playing()),
+            "B reached the DAC but the player never named it"
+        );
+    }
+
+    /// A pause long enough to release the device drops the engine, and the
+    /// next track queued inside it goes too. Resume rebuilt the engine around
+    /// the current track alone while the player still counted the next one
+    /// as queued; at the end of the current track the player either switched
+    /// to the next one with no audio for it (and parked it at its full length,
+    /// which the driver reads as "finished" and skips) or dropped it. Either
+    /// way, the next track never reached the DAC.
+    #[test]
+    fn a_long_pause_does_not_lose_the_queued_next_track() {
+        let out = Arc::new(VirtualAudioOut::new(RATE, 2, 200, SPEED));
+        out.record();
+        let (player, _) = player_on(out.clone());
+        let state = player.state.clone();
+        play_a_and_queue_b(&player);
 
         // Mid-track, a pause longer than the suspend delay: the engine and
         // the device go.
@@ -9202,25 +9210,45 @@ mod audio_thread_tests {
             .tx
             .send(AudioCommand::Resume { cached: None })
             .unwrap();
+        assert_b_follows_on(&player, &out, "the resume");
+    }
 
-        let b_played = wait_until(Duration::from_secs(10), || {
-            samples_of_b(&out) > (RATE as usize) / 2
-        });
+    /// A DAC that stops converting mid-track is closed and reopened, and the
+    /// engine rebuilt there by Resume. The queued next track has to survive
+    /// that too. The reopen path used to carry its own copy of the re-queue,
+    /// which fought Resume's over ARMED; now Resume's is the only one, and
+    /// this is what says it covers the reopen.
+    ///
+    /// The reopen gets a FRESH device under the same name: a killed
+    /// `VirtualAudioOut` stays dead, while on the Pi reopening the PCM is what
+    /// brought the DAC back. B's samples on the new device can only have got
+    /// there through the rebuilt engine.
+    #[test]
+    fn a_reopened_device_still_plays_the_queued_next_track() {
+        let dead = Arc::new(VirtualAudioOut::new(RATE, 2, 200, SPEED));
+        let (player, name) = player_on(dead.clone());
+        let state = player.state.clone();
+        play_a_and_queue_b(&player);
+
+        let revived = Arc::new(VirtualAudioOut::new(RATE, 2, 200, SPEED));
+        revived.record();
+        virtual_device::replace(&name, revived.clone());
+        dead.kill();
+
         assert!(
-            b_played,
-            "track B never reached the DAC after the resume \
-             (player on track {}, playing {}, at {}s of {}s)",
-            state.current_track_id(),
-            state.is_playing(),
-            state.current_position(),
-            state.duration()
+            wait_until(Duration::from_secs(5), || state
+                .device_failures
+                .load(std::sync::atomic::Ordering::SeqCst)
+                > 0),
+            "the dead device was never noticed"
         );
-        // Handed over is not yet played: the player names B once the device
-        // has played across the boundary, on its next tick.
-        assert!(
-            wait_until(Duration::from_secs(5), || state.current_track_id() == B
-                && state.is_playing()),
-            "B reached the DAC but the player never named it"
+        assert_b_follows_on(&player, &revived, "the device was reopened");
+        assert_eq!(
+            state
+                .device_failures
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one death, one reopen"
         );
     }
 }
