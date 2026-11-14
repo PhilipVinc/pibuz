@@ -3,6 +3,24 @@
 Notable changes per release. Versions are plain semver; releases are `vX.Y.Z`
 tags on `main`.
 
+## Unreleased
+
+### Changed
+
+- **The log is in the XDG state folder.** It moves from `<data>/logs/pibuz.log`
+  (`~/.local/share/pibuz/logs/`) to `$XDG_STATE_HOME/pibuz/logs/pibuz.log`
+  (`~/.local/state/pibuz/logs/`), which is where the XDG spec puts logs.
+  Where there is no state folder (macOS), and under a `data_root` override,
+  it stays in the data folder, so a container keeps everything in one place.
+  `pibuz config path` shows where it is. The first start removes the old
+  `<data>/logs` folder, with the log of the last run before the upgrade.
+
+### Fixed
+
+- **The log file has each line as soon as it is logged.** It went through an
+  8 KB buffer that nothing flushed, so it read 0 bytes for the first minutes
+  of every run, and a crash lost the lines that explained it.
+
 ## 2.8.1 — 2026-11-14
 
 ### Fixed

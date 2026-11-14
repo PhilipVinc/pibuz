@@ -47,11 +47,12 @@ pub(crate) async fn run(
     //    why the watchdog had fired. The refusal prints to stderr, which is all
     //    it ever needed.
     let _lock = InstanceLock::acquire(&roots.data).map_err(diagnose_lock)?;
-    // 3. logging, into the data root like everything else the daemon keeps:
+    // 3. logging, into the XDG state folder (see `paths::log_file`):
     qbz_log::install(&cfg.log.level, Some(crate::paths::log_file(&roots)));
     // The folders pibuz used before it kept everything in its own; see
     // `paths::clear_legacy_folders`. After the logger, so it can say so.
     crate::paths::clear_legacy_folders();
+    crate::paths::clear_stale_data_logs(&roots);
     // …including libasound's, which otherwise writes straight to stderr. It
     // used to be installed only by `BackendManager::create_backend`, i.e. not
     // until something played — so every libasound message before the first

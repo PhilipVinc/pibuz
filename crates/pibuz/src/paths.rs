@@ -24,6 +24,10 @@ pub(crate) struct ProfileRoots {
     pub(crate) config: PathBuf,
     pub data: PathBuf,
     pub(crate) cache: PathBuf,
+    /// XDG state (`$XDG_STATE_HOME/pibuz`, `~/.local/state/pibuz`): the logs.
+    /// The data root where the platform has no state folder (macOS), and
+    /// under a `data_root` override, so a container keeps everything.
+    pub(crate) state: PathBuf,
 }
 
 impl ProfileRoots {
@@ -62,11 +66,18 @@ impl ProfileRoots {
             Some(_) => data.join("cache"),
             None => default_cache_dir(),
         };
+        let state = match data_root_override {
+            Some(_) => data.clone(),
+            None => dirs::state_dir()
+                .map(|base| base.join(APP_DIR))
+                .unwrap_or_else(|| data.clone()),
+        };
 
         Self {
             config,
             data,
             cache,
+            state,
         }
     }
 
@@ -120,9 +131,24 @@ pub(crate) fn config_file_in(config_dir: &Path) -> PathBuf {
     current
 }
 
-/// The daemon's log, rotated to `pibuz.log.prev` at each start.
+/// The daemon's log, rotated to `pibuz.log.prev` at each start. In the XDG
+/// state folder: a log is state, not data.
 pub(crate) fn log_file(roots: &ProfileRoots) -> PathBuf {
-    roots.data.join("logs").join("pibuz.log")
+    roots.state.join("logs").join("pibuz.log")
+}
+
+/// 2.8.0 kept the log in `<data>/logs`. Where the log has moved to the state
+/// folder, that copy is stale; it is in pibuz's own folder, so it is removed,
+/// and the folder too once empty. Only `pibuz run` calls this.
+pub(crate) fn clear_stale_data_logs(roots: &ProfileRoots) {
+    if roots.state == roots.data {
+        return;
+    }
+    let old = roots.data.join("logs");
+    for name in ["pibuz.log", "pibuz.log.prev"] {
+        let _ = std::fs::remove_file(old.join(name));
+    }
+    let _ = std::fs::remove_dir(&old);
 }
 
 /// Where the logs, the disk cache and the Qobuz token cache lived before the
@@ -249,11 +275,43 @@ mod tests {
     /// moves all of it: settings and logs in the data root, the disk cache and
     /// the token cache in the cache root under it.
     #[test]
-    fn logs_live_in_the_data_root() {
+    fn a_data_root_override_keeps_the_logs_under_it() {
         let data_dir = scratch_dir("logs");
         let roots = ProfileRoots::resolve(None, Some(&data_dir));
         assert_eq!(log_file(&roots), data_dir.join("logs").join("pibuz.log"));
         assert!(roots.cache.starts_with(&data_dir));
+    }
+
+    /// 2.8.0 wrote its log to `<data>/logs`. Once the log lives in the state
+    /// folder that one is stale, and it is in pibuz's own folder, so it goes,
+    /// and the folder with it when nothing else is there.
+    #[test]
+    fn the_log_from_the_data_folder_is_cleared_once_it_lives_elsewhere() {
+        let base = scratch_dir("stale-logs");
+        let roots = ProfileRoots {
+            config: base.join("config"),
+            data: base.join("data"),
+            cache: base.join("cache"),
+            state: base.join("state"),
+        };
+        let old = roots.data.join("logs");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("pibuz.log"), "old\n").unwrap();
+        std::fs::write(old.join("pibuz.log.prev"), "older\n").unwrap();
+
+        clear_stale_data_logs(&roots);
+        assert!(!old.exists(), "the 2.8.0 log folder is still there");
+
+        // With a data_root override the log never moved: nothing to clear.
+        let same = ProfileRoots {
+            state: roots.data.clone(),
+            ..roots.clone()
+        };
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("pibuz.log"), "live\n").unwrap();
+        clear_stale_data_logs(&same);
+        assert!(old.join("pibuz.log").exists(), "the live log was removed");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -283,15 +341,18 @@ mod tests {
         let xdg_config = base.join("config");
         let xdg_data = base.join("data");
         let xdg_cache = base.join("cache");
+        let xdg_state = base.join("state");
 
         let saved = [
             ("XDG_CONFIG_HOME", std::env::var("XDG_CONFIG_HOME").ok()),
             ("XDG_DATA_HOME", std::env::var("XDG_DATA_HOME").ok()),
             ("XDG_CACHE_HOME", std::env::var("XDG_CACHE_HOME").ok()),
+            ("XDG_STATE_HOME", std::env::var("XDG_STATE_HOME").ok()),
         ];
         std::env::set_var("XDG_CONFIG_HOME", &xdg_config);
         std::env::set_var("XDG_DATA_HOME", &xdg_data);
         std::env::set_var("XDG_CACHE_HOME", &xdg_cache);
+        std::env::set_var("XDG_STATE_HOME", &xdg_state);
 
         let roots = ProfileRoots::resolve(None, None);
 
@@ -305,6 +366,12 @@ mod tests {
         assert_eq!(roots.config, xdg_config.join("pibuz"));
         assert_eq!(roots.data, xdg_data.join("pibuz"));
         assert_eq!(roots.cache, xdg_cache.join("pibuz"));
+        // Logs are state in XDG terms (`~/.local/state`), not data.
+        assert_eq!(roots.state, xdg_state.join("pibuz"));
+        assert_eq!(
+            log_file(&roots),
+            xdg_state.join("pibuz").join("logs").join("pibuz.log")
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 }
