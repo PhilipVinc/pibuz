@@ -103,6 +103,8 @@ enum Cmd {
     },
     /// Mute: on | off (bare = toggle)
     Mute { state: Option<String> },
+    /// Same as `mute off`
+    Unmute,
     /// Show and edit the play queue
     Queue {
         #[command(subcommand)]
@@ -168,6 +170,7 @@ const HELP_SECTIONS: &[(&str, &[&str])] = &[
         "Music control",
         &[
             "now", "play", "pause", "toggle", "stop", "next", "prev", "seek", "volume", "mute",
+            "unmute",
         ],
     ),
 ];
@@ -510,6 +513,10 @@ async fn main() {
         Cmd::Mute { state } => {
             let roots = paths::ProfileRoots::resolve(None, None);
             cli::transport::mute(cli.host, &roots, state).await
+        }
+        Cmd::Unmute => {
+            let roots = paths::ProfileRoots::resolve(None, None);
+            cli::transport::mute(cli.host, &roots, Some("off".to_string())).await
         }
         Cmd::Queue { cmd } => {
             let roots = paths::ProfileRoots::resolve(None, None);
