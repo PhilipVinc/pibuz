@@ -85,6 +85,15 @@ impl Mute {
     /// A level nobody chose just now: `qconnect.initial_volume` at a join.
     /// While muted it becomes what the unmute restores and the player stays
     /// silent — a cast must not unmute the box.
+    /// The 0-100 level the controller is told: the NOMINAL level (muted, the
+    /// player sits at 0 and the controller keeps showing what an unmute brings
+    /// back), through the volume mode (`Locked` always says 100). The join
+    /// report, the join-time re-assertion and the volume publisher all ask
+    /// here, so they cannot disagree.
+    pub(crate) fn reported_pct(&self, mode: crate::qconnect::engine::VolumeMode, live: f32) -> i32 {
+        mode.reported_volume_pct(self.nominal(live))
+    }
+
     pub(crate) fn set_level_quietly(&mut self, level: f32) -> Option<f32> {
         if self.muted {
             self.premute = level;

@@ -943,6 +943,29 @@ struct Requeue {
     channels: u16,
 }
 
+/// Queue `requeue` into the engine just rebuilt, by sending the audio thread
+/// the `PlayNext` it would get from a prefetch, so the format check and the
+/// append stay in one handler.
+///
+/// The receiver is the audio thread's own channel, and this runs ON the audio
+/// thread while it handles a command, so the send cannot fail; the error arms
+/// the callers used to carry were unreachable.
+fn send_requeue(self_tx: &mpsc::Sender<AudioCommand>, requeue: Requeue, after: &str) {
+    let Requeue {
+        audio,
+        track_id,
+        sample_rate,
+        channels,
+    } = requeue;
+    log::info!("Gapless: re-queueing track {track_id} after {after}");
+    let _ = self_tx.send(AudioCommand::PlayNext {
+        audio,
+        track_id,
+        sample_rate,
+        channels,
+    });
+}
+
 /// Take the prepared successor back from an engine that is going away while
 /// the CURRENT track carries on, so it can be queued into the new one.
 ///
@@ -4502,30 +4525,16 @@ impl Player {
                                 // the next track was skipped. Hand it back, as a
                                 // seek does. Only here, on success, so a resume
                                 // that fails above leaves nothing armed.
-                                if let Some(Requeue {
-                                    audio,
-                                    track_id,
-                                    sample_rate,
-                                    channels,
-                                }) = take_successor_for_requeue(
+                                if let Some(requeue) = take_successor_for_requeue(
                                     &thread_state,
                                     gapless_pending,
                                     gapless_request_armed,
                                 ) {
-                                    log::info!(
-                                        "Gapless: re-queueing track {track_id} after the engine was rebuilt on resume"
+                                    send_requeue(
+                                        &self_tx,
+                                        requeue,
+                                        "the engine was rebuilt on resume",
                                     );
-                                    if let Err(e) = self_tx.send(AudioCommand::PlayNext {
-                                        audio,
-                                        track_id,
-                                        sample_rate,
-                                        channels,
-                                    }) {
-                                        // Not fatal: with nothing armed, the
-                                        // prefetch check can ask for it again.
-                                        log::warn!("Gapless: could not re-queue after resume: {e}");
-                                        *gapless_request_armed = false;
-                                    }
                                 }
                                 return;
                             }
@@ -4982,27 +4991,8 @@ impl Player {
                             // re-validates everything, so a re-queue that is no
                             // longer appropriate is refused exactly as a fresh
                             // one would be.
-                            if let Some(Requeue {
-                                audio,
-                                track_id,
-                                sample_rate,
-                                channels,
-                            }) = requeue_gapless
-                            {
-                                log::info!(
-                                    "Gapless: re-queueing track {track_id} after the seek rebuilt the engine"
-                                );
-                                if let Err(e) = self_tx.send(AudioCommand::PlayNext {
-                                    audio,
-                                    track_id,
-                                    sample_rate,
-                                    channels,
-                                }) {
-                                    // Not fatal: the driver re-arms the prefetch
-                                    // on its own, which is what used to happen
-                                    // every time.
-                                    log::warn!("Gapless: could not re-queue after seek: {e}");
-                                }
+                            if let Some(requeue) = requeue_gapless {
+                                send_requeue(&self_tx, requeue, "the seek rebuilt the engine");
                             }
                         }
                         AudioCommand::ReinitDevice {

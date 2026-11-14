@@ -283,7 +283,7 @@ pub(crate) async fn publish_local_volume_if_changed(
     };
     let mute = crate::mute::current(shared);
     let live = runtime.core().get_playback_state().volume;
-    let ours = volume_mode.reported_volume_pct(mute.nominal(live));
+    let ours = mute.reported_pct(volume_mode, live);
     let catch_up = {
         let state = sync_state.lock().await;
         if !is_local_renderer_active(&state.session) {
