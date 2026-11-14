@@ -220,6 +220,51 @@ struct GaplessPending {
     gain_atomic: Option<Arc<AtomicU32>>,
 }
 
+/// The gapless successor, and the two shared slots that describe it to the
+/// driver (`gapless_next_track_id`, and `gapless_ready`, which a held
+/// successor always leaves false: its request has been answered).
+///
+/// They used to be kept in step by hand at nine places, each pairing the
+/// `Option` with its own two stores, in its own order. Every change of the
+/// successor goes through here now, and the slots move with it.
+#[derive(Default)]
+struct Successor(Option<GaplessPending>);
+
+impl Successor {
+    /// Appended to the engine: the driver now sees it as the next track.
+    fn queue(&mut self, state: &SharedState, pending: GaplessPending) {
+        state.set_gapless_next_track_id(pending.track_id);
+        state.set_gapless_ready(false);
+        self.0 = Some(pending);
+    }
+
+    /// Held with NO engine to append it to (a long pause released the
+    /// device). Not queued, so the driver is not told of it; Resume re-queues
+    /// it (`take_successor_for_requeue`).
+    fn park(&mut self, state: &SharedState, pending: GaplessPending) {
+        state.set_gapless_ready(false);
+        self.0 = Some(pending);
+    }
+
+    /// Take it out, whether or not one was held, clearing both slots FIRST.
+    /// The order matters at the end-of-track switch, which changes
+    /// `current_track_id` straight after: see the ORDERING NOTE there.
+    fn take(&mut self, state: &SharedState) -> Option<GaplessPending> {
+        state.set_gapless_next_track_id(0);
+        state.set_gapless_ready(false);
+        self.0.take()
+    }
+
+    /// Drop it, and clear both slots.
+    fn clear(&mut self, state: &SharedState) {
+        let _ = self.take(state);
+    }
+
+    fn is_held(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
 struct CursorMediaSource {
     inner: Cursor<TrackBytes>,
     len: u64,
@@ -923,15 +968,13 @@ fn fail_play(
 /// quietly forget half of it.
 fn begin_new_track(
     thread_state: &SharedState,
-    gapless_pending: &mut Option<GaplessPending>,
+    gapless_pending: &mut Successor,
     gapless_request_armed: &mut bool,
     pause_suspend_deadline: &mut Option<Instant>,
 ) {
     *pause_suspend_deadline = None;
-    *gapless_pending = None;
+    gapless_pending.clear(thread_state);
     *gapless_request_armed = false;
-    thread_state.set_gapless_ready(false);
-    thread_state.set_gapless_next_track_id(0);
 }
 
 /// A prepared successor taken out of an engine that is being replaced, to be
@@ -992,18 +1035,16 @@ fn send_requeue(self_tx: &mpsc::Sender<AudioCommand>, requeue: Requeue, after: &
 /// clears the flag, as it does for any normal arm.
 fn take_successor_for_requeue(
     thread_state: &SharedState,
-    gapless_pending: &mut Option<GaplessPending>,
+    gapless_pending: &mut Successor,
     gapless_request_armed: &mut bool,
 ) -> Option<Requeue> {
-    let requeue = gapless_pending.take().map(|pending| Requeue {
+    let requeue = gapless_pending.take(thread_state).map(|pending| Requeue {
         audio: pending.audio,
         track_id: pending.track_id,
         sample_rate: pending.sample_rate,
         channels: pending.channels,
     });
     *gapless_request_armed = requeue.is_some();
-    thread_state.set_gapless_ready(false);
-    thread_state.set_gapless_next_track_id(0);
     requeue
 }
 
@@ -1018,12 +1059,19 @@ fn take_successor_for_requeue(
 /// the track having finished: a skip. With this check a forgotten re-queue is a
 /// gap instead — the track is dropped here, the engine runs empty, and the
 /// driver advances to it normally.
+///
+/// The slots are cleared only when a successor was held: with none, a
+/// prefetch may still be asked for (`gapless_ready`), and the end of a track
+/// whose successor has not arrived must not withdraw the request.
 fn take_successor_for_transition(
     state: &SharedState,
-    gapless_pending: &mut Option<GaplessPending>,
+    gapless_pending: &mut Successor,
     engine_id: Option<u64>,
 ) -> Option<GaplessPending> {
-    let pending = gapless_pending.take()?;
+    if !gapless_pending.is_held() {
+        return None;
+    }
+    let pending = gapless_pending.take(state)?;
     if Some(pending.engine_id) == engine_id {
         return Some(pending);
     }
@@ -1031,8 +1079,6 @@ fn take_successor_for_transition(
         "Gapless: track {} was queued into an engine that is gone; not switching to it",
         pending.track_id
     );
-    state.set_gapless_ready(false);
-    state.set_gapless_next_track_id(0);
     None
 }
 
@@ -2813,7 +2859,7 @@ impl Player {
             // Current track's dynamic gain atomic (shared with DynamicAmplify + LoudnessAnalyzer)
             let mut current_gain_atomic: Option<Arc<AtomicU32>> = None;
             // Gapless: pending next track that has been appended to the engine
-            let mut gapless_pending: Option<GaplessPending> = None;
+            let mut gapless_pending = Successor::default();
             // Gapless request guard: once we request "next" for a track, do not re-arm
             // until track changes or playback state is reset.
             let mut gapless_request_armed = false;
@@ -2834,7 +2880,7 @@ impl Player {
                  current_track_channels: &mut Option<u16>,
                  current_normalization_gain: &mut Option<f32>,
                  current_gain_atomic: &mut Option<Arc<AtomicU32>>,
-                 gapless_pending: &mut Option<GaplessPending>,
+                 gapless_pending: &mut Successor,
                  gapless_request_armed: &mut bool| {
                     let _busy = AudioThreadBusy::new(&thread_state, &command);
                     match command {
@@ -4565,10 +4611,8 @@ impl Player {
                             release_streaming_source(current_streaming_source);
                             *current_normalization_gain = None;
                             *current_gain_atomic = None;
-                            *gapless_pending = None;
+                            gapless_pending.clear(&thread_state);
                             *gapless_request_armed = false;
-                            thread_state.set_gapless_ready(false);
-                            thread_state.set_gapless_next_track_id(0);
                             analyzer_enabled.store(false, Ordering::SeqCst);
                             thread_state.set_normalization_gain(None);
                             thread_state.is_playing.store(false, Ordering::SeqCst);
@@ -5056,17 +5100,19 @@ impl Player {
                                     log::info!(
                                         "Gapless: no engine (paused), holding track {track_id} for the resume"
                                     );
-                                    *gapless_pending = Some(GaplessPending {
-                                        track_id,
-                                        duration_secs: 0,
-                                        audio,
-                                        normalization_gain: None,
-                                        sample_rate,
-                                        channels,
-                                        engine_id: 0,
-                                        gain_atomic: None,
-                                    });
-                                    thread_state.set_gapless_ready(false);
+                                    gapless_pending.park(
+                                        &thread_state,
+                                        GaplessPending {
+                                            track_id,
+                                            duration_secs: 0,
+                                            audio,
+                                            normalization_gain: None,
+                                            sample_rate,
+                                            channels,
+                                            engine_id: 0,
+                                            gain_atomic: None,
+                                        },
+                                    );
                                     return;
                                 }
                                 None => {
@@ -5220,18 +5266,21 @@ impl Player {
                                 "Gapless: track {track_id} queued from {}",
                                 audio.describe()
                             );
-                            *gapless_pending = Some(GaplessPending {
-                                track_id,
-                                duration_secs: actual_duration,
-                                audio,
-                                normalization_gain: normalization,
-                                sample_rate,
-                                channels,
-                                engine_id: current_engine.as_ref().map_or(0, PlaybackEngine::id),
-                                gain_atomic,
-                            });
-                            thread_state.set_gapless_next_track_id(track_id);
-                            thread_state.set_gapless_ready(false); // Request fulfilled
+                            gapless_pending.queue(
+                                &thread_state,
+                                GaplessPending {
+                                    track_id,
+                                    duration_secs: actual_duration,
+                                    audio,
+                                    normalization_gain: normalization,
+                                    sample_rate,
+                                    channels,
+                                    engine_id: current_engine
+                                        .as_ref()
+                                        .map_or(0, PlaybackEngine::id),
+                                    gain_atomic,
+                                },
+                            );
 
                             log::info!(
                                 "Gapless: queued track {} (duration: {}s) for seamless transition",
@@ -5465,13 +5514,12 @@ impl Player {
                                     // `gapless_next_track_id` pre-reset is a mix no real state
                                     // ever had.
                                     //
-                                    // So clear the "transition complete" markers BEFORE
-                                    // mutating `track_id`. A racing reader then sees either the
-                                    // old id with cleared slots (catches up next tick) or the
-                                    // new id with cleared slots (a clean transition), never the
-                                    // mid-swap mix.
-                                    thread_state.set_gapless_next_track_id(0);
-                                    thread_state.set_gapless_ready(false);
+                                    // So the "transition complete" markers are cleared BEFORE
+                                    // `track_id` changes: `Successor::take`, inside
+                                    // `take_successor_for_transition`, cleared them above. A
+                                    // racing reader then sees either the old id with cleared
+                                    // slots (catches up next tick) or the new id with cleared
+                                    // slots (a clean transition), never the mid-swap mix.
                                     thread_state
                                         .current_track_id
                                         .store(pending.track_id, Ordering::SeqCst);
@@ -5559,7 +5607,7 @@ impl Player {
                                     gapless_enabled,
                                     transition_consumed_pending,
                                     dur,
-                                    gapless_pending.is_some(),
+                                    gapless_pending.is_held(),
                                     gapless_request_armed,
                                     thread_state.is_gapless_ready(),
                                     thread_state.get_gapless_next_track_id(),
@@ -5673,10 +5721,8 @@ impl Player {
                                         ));
                                         // Nothing will rebuild an engine to queue
                                         // it into: playback stops here.
-                                        gapless_pending = None;
+                                        gapless_pending.clear(&thread_state);
                                         gapless_request_armed = false;
-                                        thread_state.set_gapless_ready(false);
-                                        thread_state.set_gapless_next_track_id(0);
                                     }
                                     continue;
                                 }
@@ -5694,9 +5740,7 @@ impl Player {
                                             .playback_start_millis
                                             .store(0, Ordering::SeqCst);
                                         // Clear gapless state on track end
-                                        thread_state.set_gapless_ready(false);
-                                        thread_state.set_gapless_next_track_id(0);
-                                        gapless_pending = None;
+                                        gapless_pending.clear(&thread_state);
                                         gapless_request_armed = false;
                                     }
                                 }
@@ -8328,7 +8372,7 @@ mod cached_quality_tests {
 mod new_track_and_prefetch_tests {
     use super::{
         begin_new_track, should_arm_prefetch, take_successor_for_requeue,
-        take_successor_for_transition, GaplessPending, SharedState, TrackAudio,
+        take_successor_for_transition, GaplessPending, SharedState, Successor, TrackAudio,
     };
     use qbz_cache::TrackBytes;
 
@@ -8346,7 +8390,7 @@ mod new_track_and_prefetch_tests {
     #[test]
     fn a_rebuilt_engine_gets_the_successor_back() {
         let state = SharedState::new();
-        let mut pending = Some(a_pending(2_944_914));
+        let mut pending = Successor(Some(a_pending(2_944_914)));
         let mut armed = false;
         state.set_gapless_ready(true);
         state.set_gapless_next_track_id(2_944_914);
@@ -8357,7 +8401,7 @@ mod new_track_and_prefetch_tests {
         assert_eq!(requeue.track_id, 2_944_914);
         assert_eq!((requeue.sample_rate, requeue.channels), (44_100, 2));
         assert!(
-            pending.is_none(),
+            !pending.is_held(),
             "left in place, it names a track the new engine does not have"
         );
         assert!(
@@ -8373,7 +8417,7 @@ mod new_track_and_prefetch_tests {
     #[test]
     fn a_rebuild_with_no_successor_arms_nothing() {
         let state = SharedState::new();
-        let mut pending: Option<GaplessPending> = None;
+        let mut pending = Successor::default();
         let mut armed = true;
         assert!(take_successor_for_requeue(&state, &mut pending, &mut armed).is_none());
         assert!(!armed);
@@ -8398,10 +8442,10 @@ mod new_track_and_prefetch_tests {
     #[test]
     fn the_switch_takes_the_successor_this_engine_holds() {
         let state = SharedState::new();
-        let mut pending = Some(a_pending(2_944_914));
+        let mut pending = Successor(Some(a_pending(2_944_914)));
         let taken = take_successor_for_transition(&state, &mut pending, Some(ENGINE));
         assert_eq!(taken.map(|p| p.track_id), Some(2_944_914));
-        assert!(pending.is_none());
+        assert!(!pending.is_held());
     }
 
     /// A successor appended to an engine since dropped is not switched to: the
@@ -8412,13 +8456,13 @@ mod new_track_and_prefetch_tests {
     fn the_switch_refuses_a_successor_from_a_dropped_engine() {
         let state = SharedState::new();
         state.set_gapless_next_track_id(2_944_914);
-        let mut pending = Some(a_pending(2_944_914));
+        let mut pending = Successor(Some(a_pending(2_944_914)));
         assert!(take_successor_for_transition(&state, &mut pending, Some(ENGINE + 1)).is_none());
-        assert!(pending.is_none(), "kept, it would fire at the next tick");
+        assert!(!pending.is_held(), "kept, it would fire at the next tick");
         assert_eq!(state.get_gapless_next_track_id(), 0);
         assert!(!state.is_gapless_ready());
 
-        let mut pending = Some(a_pending(2_944_914));
+        let mut pending = Successor(Some(a_pending(2_944_914)));
         assert!(
             take_successor_for_transition(&state, &mut pending, None).is_none(),
             "no engine holds nothing"
@@ -8436,7 +8480,7 @@ mod new_track_and_prefetch_tests {
     #[test]
     fn starting_a_track_clears_every_gapless_slot() {
         let state = SharedState::new();
-        let mut pending = Some(a_pending(2_944_914));
+        let mut pending = Successor(Some(a_pending(2_944_914)));
         let mut armed = true;
         let mut deadline = Some(std::time::Instant::now());
         state.set_gapless_ready(true);
@@ -8445,7 +8489,7 @@ mod new_track_and_prefetch_tests {
         begin_new_track(&state, &mut pending, &mut armed, &mut deadline);
 
         assert!(
-            pending.is_none(),
+            !pending.is_held(),
             "a successor from the previous track must not survive"
         );
         assert!(
@@ -8462,13 +8506,13 @@ mod new_track_and_prefetch_tests {
     #[test]
     fn starting_a_track_from_clean_state_changes_nothing() {
         let state = SharedState::new();
-        let mut pending: Option<GaplessPending> = None;
+        let mut pending = Successor::default();
         let mut armed = false;
         let mut deadline = None;
 
         begin_new_track(&state, &mut pending, &mut armed, &mut deadline);
 
-        assert!(pending.is_none());
+        assert!(!pending.is_held());
         assert!(!armed);
         assert!(!state.is_gapless_ready());
         assert_eq!(state.get_gapless_next_track_id(), 0);
@@ -8564,7 +8608,7 @@ mod new_track_and_prefetch_tests {
     #[test]
     fn a_track_change_unblocks_the_next_prefetch() {
         let state = SharedState::new();
-        let mut pending = Some(a_pending(2_944_914));
+        let mut pending = Successor(Some(a_pending(2_944_914)));
         let mut armed = true;
         let mut deadline = None;
 
@@ -8573,7 +8617,7 @@ mod new_track_and_prefetch_tests {
             true,
             false,
             774,
-            pending.is_some(),
+            pending.is_held(),
             armed,
             state.is_gapless_ready(),
             state.get_gapless_next_track_id(),
@@ -8586,7 +8630,7 @@ mod new_track_and_prefetch_tests {
             true,
             false,
             774,
-            pending.is_some(),
+            pending.is_held(),
             armed,
             state.is_gapless_ready(),
             state.get_gapless_next_track_id(),
