@@ -1570,6 +1570,50 @@ mod virtual_device {
     }
 }
 
+/// The engine for an open output stream. ONE function for the four places
+/// that build one (Play, PlayStreaming, Resume, Seek), which used to carry a
+/// near-identical `match` each and had drifted: which of them reset the
+/// stream-error flag, and for which kinds of stream, differed.
+#[cfg_attr(
+    not(any(target_os = "linux", test)),
+    allow(
+        unused_variables,
+        reason = "`settings` is read by the ALSA-direct arms, which a macOS build does not compile"
+    )
+)]
+fn build_engine(stream: &StreamType, settings: &Mutex<AudioSettings>) -> PlaybackEngine {
+    match stream {
+        StreamType::Rodio {
+            sink: mixer_sink, ..
+        } => PlaybackEngine::new_rodio(mixer_sink.mixer()),
+        #[cfg(target_os = "linux")]
+        StreamType::AlsaDirect(alsa_stream) => {
+            PlaybackEngine::new_alsa_direct(alsa_stream.clone(), alsa_hardware_volume(settings))
+        }
+        #[cfg(target_os = "linux")]
+        StreamType::Jack(jack_stream) => PlaybackEngine::new_jack(jack_stream.clone()),
+        #[cfg(test)]
+        StreamType::Virtual(out) => {
+            PlaybackEngine::new_alsa_direct(out.clone(), alsa_hardware_volume(settings))
+        }
+    }
+}
+
+#[cfg_attr(
+    not(any(target_os = "linux", test)),
+    allow(
+        dead_code,
+        reason = "only the ALSA-direct engine takes a hardware volume"
+    )
+)]
+fn alsa_hardware_volume(settings: &Mutex<AudioSettings>) -> bool {
+    settings
+        .lock()
+        .ok()
+        .map(|s| s.alsa_hardware_volume)
+        .unwrap_or(false)
+}
+
 impl StreamType {
     /// Construct a shared-mode Rodio stream (no exclusive guard).
     fn rodio(sink: MixerDeviceSink) -> Self {
@@ -2842,9 +2886,6 @@ impl Player {
             let mut current_audio_file: Option<qbz_cache::CachedFile> = None;
             // Store streaming source for resume (when download completes, we can get the data)
             let mut current_streaming_source: Option<Arc<BufferedMediaSource>> = None;
-            // Track consecutive sink creation failures to detect broken streams
-            let mut consecutive_sink_failures: u32 = 0;
-            const MAX_SINK_FAILURES: u32 = 3;
             // Delay dropping the audio stream after pause to reduce CPU usage.
             // A tenth of that under test, so a "long" pause costs the suite
             // 0.2 s rather than 2 s; nothing in the logic depends on the figure.
@@ -2874,7 +2915,6 @@ impl Player {
                  current_streaming_source: &mut Option<Arc<BufferedMediaSource>>,
                  stream_opt: &mut Option<StreamType>,
                  current_device_name: &mut Option<String>,
-                 consecutive_sink_failures: &mut u32,
                  pause_suspend_deadline: &mut Option<Instant>,
                  current_track_sample_rate: &mut Option<u32>,
                  current_track_channels: &mut Option<u16>,
@@ -3242,101 +3282,8 @@ impl Player {
                             thread_state.set_loaded_audio(true);
 
                             // Create PlaybackEngine from StreamType
-                            let mut engine = match stream {
-                                StreamType::Rodio {
-                                    sink: mixer_sink, ..
-                                } => {
-                                    match PlaybackEngine::new_rodio(mixer_sink.mixer()) {
-                                        Ok(e) => {
-                                            *consecutive_sink_failures = 0;
-                                            thread_state.set_stream_error(false);
-                                            e
-                                        }
-                                        Err(e) => {
-                                            *consecutive_sink_failures += 1;
-                                            log::error!(
-                                                "Failed to create engine (attempt {}): {}",
-                                                *consecutive_sink_failures,
-                                                e
-                                            );
-
-                                            if *consecutive_sink_failures >= MAX_SINK_FAILURES {
-                                                log::warn!(
-                                                "Audio stream appears broken after {} failures. Auto-reinitializing...",
-                                                *consecutive_sink_failures
-                                            );
-                                                thread_state.set_stream_error(true);
-
-                                                drop(stream_opt.take());
-                                                std::thread::sleep(Duration::from_millis(200));
-
-                                                // Use last known sample rate/channels to maintain DAC passthrough
-                                                let sr = current_track_sample_rate.unwrap_or(48000);
-                                                let ch = current_track_channels.unwrap_or(2);
-                                                *stream_opt = init_device(
-                                                    current_device_name,
-                                                    &thread_state,
-                                                    sr,
-                                                    ch,
-                                                );
-                                                if stream_opt.is_some() {
-                                                    log::info!("Audio stream auto-reinitialized successfully at {}Hz", sr);
-                                                    *consecutive_sink_failures = 0;
-                                                    thread_state.set_stream_error(false);
-                                                } else {
-                                                    log::error!("Auto-reinit failed. Audio device unavailable.");
-                                                    thread_state.set_current_device(None);
-                                                }
-                                            }
-                                            // This track did not start either way:
-                                            // a reinit only readies the NEXT play.
-                                            fail_play(
-                                                &thread_state,
-                                                current_audio_data,
-                                                current_audio_file,
-                                                current_streaming_source,
-                                                (track_id, start_position_secs, duration_secs),
-                                                format!("Failed to create engine: {e}"),
-                                            );
-                                            return;
-                                        }
-                                    }
-                                }
-                                #[cfg(test)]
-                                StreamType::Virtual(alsa_stream) => {
-                                    *consecutive_sink_failures = 0;
-                                    thread_state.set_stream_error(false);
-                                    let hardware_volume = thread_settings
-                                        .lock()
-                                        .ok()
-                                        .map(|s| s.alsa_hardware_volume)
-                                        .unwrap_or(false);
-                                    PlaybackEngine::new_alsa_direct(
-                                        alsa_stream.clone(),
-                                        hardware_volume,
-                                    )
-                                }
-                                #[cfg(target_os = "linux")]
-                                StreamType::AlsaDirect(alsa_stream) => {
-                                    *consecutive_sink_failures = 0;
-                                    thread_state.set_stream_error(false);
-                                    let hardware_volume = thread_settings
-                                        .lock()
-                                        .ok()
-                                        .map(|s| s.alsa_hardware_volume)
-                                        .unwrap_or(false);
-                                    PlaybackEngine::new_alsa_direct(
-                                        alsa_stream.clone(),
-                                        hardware_volume,
-                                    )
-                                }
-                                #[cfg(target_os = "linux")]
-                                StreamType::Jack(jack_stream) => {
-                                    *consecutive_sink_failures = 0;
-                                    thread_state.set_stream_error(false);
-                                    PlaybackEngine::new_jack(jack_stream.clone())
-                                }
-                            };
+                            let mut engine = build_engine(stream, &thread_settings);
+                            thread_state.set_stream_error(false);
 
                             let volume = f32::from_bits(thread_state.volume.load(Ordering::SeqCst));
                             apply_engine_volume(
@@ -3737,57 +3684,8 @@ impl Player {
                             }
 
                             // Create PlaybackEngine
-                            let mut engine = match stream {
-                                StreamType::Rodio {
-                                    sink: mixer_sink, ..
-                                } => match PlaybackEngine::new_rodio(mixer_sink.mixer()) {
-                                    Ok(e) => {
-                                        *consecutive_sink_failures = 0;
-                                        thread_state.set_stream_error(false);
-                                        e
-                                    }
-                                    Err(e) => {
-                                        log::error!("Failed to create engine for streaming: {}", e);
-                                        fail_play(
-                                            &thread_state,
-                                            current_audio_data,
-                                            current_audio_file,
-                                            current_streaming_source,
-                                            (track_id, start_position_secs, duration_secs),
-                                            "Failed to create the playback engine for streaming",
-                                        );
-                                        return;
-                                    }
-                                },
-                                #[cfg(test)]
-                                StreamType::Virtual(alsa_stream) => {
-                                    let hardware_volume = thread_settings
-                                        .lock()
-                                        .ok()
-                                        .map(|s| s.alsa_hardware_volume)
-                                        .unwrap_or(false);
-                                    PlaybackEngine::new_alsa_direct(
-                                        alsa_stream.clone(),
-                                        hardware_volume,
-                                    )
-                                }
-                                #[cfg(target_os = "linux")]
-                                StreamType::AlsaDirect(alsa_stream) => {
-                                    let hardware_volume = thread_settings
-                                        .lock()
-                                        .ok()
-                                        .map(|s| s.alsa_hardware_volume)
-                                        .unwrap_or(false);
-                                    PlaybackEngine::new_alsa_direct(
-                                        alsa_stream.clone(),
-                                        hardware_volume,
-                                    )
-                                }
-                                #[cfg(target_os = "linux")]
-                                StreamType::Jack(jack_stream) => {
-                                    PlaybackEngine::new_jack(jack_stream.clone())
-                                }
-                            };
+                            let mut engine = build_engine(stream, &thread_settings);
+                            thread_state.set_stream_error(false);
 
                             let volume = f32::from_bits(thread_state.volume.load(Ordering::SeqCst));
                             apply_engine_volume(
@@ -4339,45 +4237,7 @@ impl Player {
                                     return;
                                 };
 
-                                let mut engine = match stream {
-                                    StreamType::Rodio {
-                                        sink: mixer_sink, ..
-                                    } => match PlaybackEngine::new_rodio(mixer_sink.mixer()) {
-                                        Ok(e) => e,
-                                        Err(e) => {
-                                            fail(format!("failed to create the engine: {e}"));
-                                            return;
-                                        }
-                                    },
-                                    #[cfg(test)]
-                                    StreamType::Virtual(alsa_stream) => {
-                                        let hardware_volume = thread_settings
-                                            .lock()
-                                            .ok()
-                                            .map(|s| s.alsa_hardware_volume)
-                                            .unwrap_or(false);
-                                        PlaybackEngine::new_alsa_direct(
-                                            alsa_stream.clone(),
-                                            hardware_volume,
-                                        )
-                                    }
-                                    #[cfg(target_os = "linux")]
-                                    StreamType::AlsaDirect(alsa_stream) => {
-                                        let hardware_volume = thread_settings
-                                            .lock()
-                                            .ok()
-                                            .map(|s| s.alsa_hardware_volume)
-                                            .unwrap_or(false);
-                                        PlaybackEngine::new_alsa_direct(
-                                            alsa_stream.clone(),
-                                            hardware_volume,
-                                        )
-                                    }
-                                    #[cfg(target_os = "linux")]
-                                    StreamType::Jack(jack_stream) => {
-                                        PlaybackEngine::new_jack(jack_stream.clone())
-                                    }
-                                };
+                                let mut engine = build_engine(stream, &thread_settings);
 
                                 let volume =
                                     f32::from_bits(thread_state.volume.load(Ordering::SeqCst));
@@ -4792,48 +4652,7 @@ impl Player {
                                 thread_state.record_stream_error(format!("Seek aborted: {why}"));
                             };
 
-                            let mut engine = match stream {
-                                StreamType::Rodio {
-                                    sink: mixer_sink, ..
-                                } => match PlaybackEngine::new_rodio(mixer_sink.mixer()) {
-                                    Ok(e) => e,
-                                    Err(e) => {
-                                        seek_abort(
-                                            &thread_state,
-                                            &format!("rodio engine create failed: {e}"),
-                                        );
-                                        return;
-                                    }
-                                },
-                                #[cfg(test)]
-                                StreamType::Virtual(alsa_stream) => {
-                                    let hardware_volume = thread_settings
-                                        .lock()
-                                        .ok()
-                                        .map(|s| s.alsa_hardware_volume)
-                                        .unwrap_or(false);
-                                    PlaybackEngine::new_alsa_direct(
-                                        alsa_stream.clone(),
-                                        hardware_volume,
-                                    )
-                                }
-                                #[cfg(target_os = "linux")]
-                                StreamType::AlsaDirect(alsa_stream) => {
-                                    let hardware_volume = thread_settings
-                                        .lock()
-                                        .ok()
-                                        .map(|s| s.alsa_hardware_volume)
-                                        .unwrap_or(false);
-                                    PlaybackEngine::new_alsa_direct(
-                                        alsa_stream.clone(),
-                                        hardware_volume,
-                                    )
-                                }
-                                #[cfg(target_os = "linux")]
-                                StreamType::Jack(jack_stream) => {
-                                    PlaybackEngine::new_jack(jack_stream.clone())
-                                }
-                            };
+                            let mut engine = build_engine(stream, &thread_settings);
 
                             let volume = f32::from_bits(thread_state.volume.load(Ordering::SeqCst));
                             apply_engine_volume(
@@ -5066,7 +4885,6 @@ impl Player {
 
                             if stream_opt.is_some() {
                                 log::info!("Audio thread: device reinitialized successfully");
-                                *consecutive_sink_failures = 0;
                             } else {
                                 log::error!("Audio thread: failed to reinitialize device");
                             }
@@ -5302,7 +5120,6 @@ impl Player {
                             &mut current_streaming_source,
                             &mut stream_opt,
                             &mut current_device_name,
-                            &mut consecutive_sink_failures,
                             &mut pause_suspend_deadline,
                             &mut current_track_sample_rate,
                             &mut current_track_channels,
@@ -5702,7 +5519,6 @@ impl Player {
                                             &mut current_streaming_source,
                                             &mut stream_opt,
                                             &mut current_device_name,
-                                            &mut consecutive_sink_failures,
                                             &mut pause_suspend_deadline,
                                             &mut current_track_sample_rate,
                                             &mut current_track_channels,
@@ -5777,7 +5593,6 @@ impl Player {
                                     &mut current_streaming_source,
                                     &mut stream_opt,
                                     &mut current_device_name,
-                                    &mut consecutive_sink_failures,
                                     &mut pause_suspend_deadline,
                                     &mut current_track_sample_rate,
                                     &mut current_track_channels,
@@ -5806,7 +5621,6 @@ impl Player {
                             &mut current_streaming_source,
                             &mut stream_opt,
                             &mut current_device_name,
-                            &mut consecutive_sink_failures,
                             &mut pause_suspend_deadline,
                             &mut current_track_sample_rate,
                             &mut current_track_channels,
