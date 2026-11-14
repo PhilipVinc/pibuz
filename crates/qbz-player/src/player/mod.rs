@@ -5049,6 +5049,30 @@ impl Player {
                             // Gapless: append next track to the existing engine
                             let engine = match current_engine.as_mut() {
                                 Some(e) => e,
+                                // No engine, but a track to resume: a long pause
+                                // released the device. Hold the next track for
+                                // the Resume, whose re-queue appends it to the
+                                // rebuilt engine (`take_successor_for_requeue`)
+                                // and re-checks it there. Dropping it cost the
+                                // hand-off: the prefetch was already spent on it.
+                                // Engine id 0 names no engine, so the transition
+                                // can never take it from here.
+                                None if thread_state.has_loaded_audio() => {
+                                    log::info!(
+                                        "Gapless: no engine (paused), holding track {track_id} for the resume"
+                                    );
+                                    *gapless_pending = Some(GaplessPending {
+                                        track_id,
+                                        duration_secs: 0,
+                                        audio,
+                                        normalization_gain: None,
+                                        sample_rate,
+                                        channels,
+                                        engine_id: 0,
+                                    });
+                                    thread_state.set_gapless_ready(false);
+                                    return;
+                                }
                                 None => {
                                     log::warn!(
                                         "Gapless: no engine, ignoring PlayNext for track {}",
@@ -9284,6 +9308,51 @@ mod audio_thread_tests {
             .send(AudioCommand::Resume { cached: None })
             .unwrap();
         assert_b_follows_on(&player, &out, "the resume");
+    }
+
+    /// The next track can finish downloading WHILE a long pause has the
+    /// device released: there is no engine to append it to. It used to be
+    /// dropped, and with the prefetch already spent on it, the change of track
+    /// was a gap. Held for the Resume to queue, it plays gaplessly.
+    #[test]
+    fn a_next_track_that_arrives_during_a_long_pause_still_plays() {
+        let out = Arc::new(VirtualAudioOut::new(RATE, 2, 200, SPEED));
+        out.record();
+        let (player, _) = player_on(out.clone());
+        let state = player.state.clone();
+        player
+            .tx
+            .send(AudioCommand::Play {
+                audio: track(16_000),
+                track_id: A,
+                duration_secs: TRACK_SECS,
+                sample_rate: RATE,
+                channels: 2,
+                start_position_secs: 0,
+            })
+            .unwrap();
+        assert!(
+            wait_until(Duration::from_secs(5), || state.is_playing()
+                && state.current_track_id() == A),
+            "track A never started"
+        );
+
+        player.tx.send(AudioCommand::Pause).unwrap();
+        std::thread::sleep(Duration::from_millis(700)); // past the suspend
+        player
+            .tx
+            .send(AudioCommand::PlayNext {
+                audio: track(-16_000),
+                track_id: B,
+                sample_rate: RATE,
+                channels: 2,
+            })
+            .unwrap();
+        player
+            .tx
+            .send(AudioCommand::Resume { cached: None })
+            .unwrap();
+        assert_b_follows_on(&player, &out, "a resume, B having arrived mid-pause");
     }
 
     /// A DAC that stops converting mid-track is closed and reopened, and the
