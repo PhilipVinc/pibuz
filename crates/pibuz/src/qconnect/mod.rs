@@ -207,9 +207,6 @@ pub(crate) struct DaemonQconnectService {
     buffering: Arc<engine::BufferingLatch>,
     /// Report-tick wakeup, shared with the engine so a load reports at once.
     report_notify: Arc<tokio::sync::Notify>,
-    /// Events-bridge wakeup, shared with the engine so a controller's volume
-    /// reaches `/api/events` and the hook at once.
-    events_edge: Arc<tokio::sync::Notify>,
     /// A load refused with a 401: written by each session's renderer engine,
     /// answered by the pairing refresh heartbeat (pairing.rs). Service-level,
     /// like `report_notify`, so it outlives the sessions that report into it.
@@ -292,7 +289,6 @@ impl DaemonQconnectService {
             volume_mode,
             Arc::clone(&self.buffering),
             Arc::clone(&self.report_notify),
-            Arc::clone(&self.events_edge),
             Arc::clone(&self.shared),
             Arc::clone(&self.auth_suspect),
         );
@@ -791,7 +787,6 @@ pub(crate) fn start(
     shared: SharedState,
     roots: &ProfileRoots,
     report_notify: Arc<tokio::sync::Notify>,
-    events_edge: Arc<tokio::sync::Notify>,
     core_events: broadcast::Receiver<CoreEvent>,
 ) -> QconnectHandle {
     // Point device identity, the Connect settings and the quality cap (the cast
@@ -840,7 +835,6 @@ pub(crate) fn start(
         handoff_join_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         buffering: Arc::new(engine::BufferingLatch::default()),
         report_notify: Arc::clone(&report_notify),
-        events_edge,
         auth_suspect: Arc::new(pairing::AuthSuspect::default()),
         teardown: Mutex::new(None),
         shutting_down: std::sync::atomic::AtomicBool::new(false),

@@ -12,7 +12,7 @@ use crate::adapter::DaemonAdapter;
 use crate::config::PibuzConfig;
 use crate::lock::{InstanceLock, LockError};
 use crate::paths::ProfileRoots;
-use crate::state::{DaemonShared, LatchedErrors, QconnectStatus};
+use crate::state::DaemonShared;
 
 /// The composed runtime handoff produced by [`boot`]: [`run`] spawns the
 /// playback driver on `runtime` + `shared`, serves `bus` over HTTP/SSE and
@@ -122,7 +122,13 @@ pub(crate) async fn run(
     let report_notify = Arc::new(tokio::sync::Notify::new());
     // The same edge, pulsed onto a SECOND Notify for the events bridge:
     // two subscribers on one Notify would race for the single stored permit.
-    let edge_notify = Arc::new(tokio::sync::Notify::new());
+    // It lives in `DaemonShared` so `crate::mute::change` can pulse it after
+    // every volume or mute change, whoever made it.
+    let edge_notify = booted
+        .shared
+        .lock()
+        .map(|s| Arc::clone(&s.events_edge))
+        .map_err(|_| "daemon state lock poisoned".to_string())?;
     let deps = build_driver_deps(
         quality_cell.clone(),
         booted.shared.clone(),
@@ -142,9 +148,8 @@ pub(crate) async fn run(
     //       PositionUpdated / VolumeChanged. Holds only a Weak<AppRuntime>
     //       upgraded per wake, but is still aborted+joined ahead of
     //       `drop(booted)` so a mid-wake strong Arc can't outlive the ordering.
-    // The API and the Connect engine pulse the same edge after a volume change
-    // (`ApiState::events_edge`).
-    let events_edge = edge_notify.clone();
+    // `crate::mute::change` pulses the same edge after a volume change
+    // (`DaemonShared::events_edge`).
     let events_bridge = crate::events_bridge::spawn(
         &booted.runtime,
         booted.shared.clone(),
@@ -199,7 +204,6 @@ pub(crate) async fn run(
             audio_snapshot: std::sync::Mutex::new(initial_audio_settings),
             quality: quality_cell.clone(),
             qconnect_control: qconnect_control.clone(),
-            events_edge: events_edge.clone(),
         },
     );
     log::info!("control API listening on {bind_addr}");
@@ -216,7 +220,6 @@ pub(crate) async fn run(
         booted.shared.clone(),
         &roots,
         report_notify,
-        events_edge,
         booted.bus.subscribe(),
     );
     // Publish the reload route's handle onto the running service now that
@@ -400,20 +403,7 @@ fn build_driver_deps(
 /// Fresh shared state.
 fn new_shared(cfg: &PibuzConfig) -> Arc<Mutex<DaemonShared>> {
     let _ = cfg; // reserved: nothing in the config seeds shared state yet.
-    Arc::new(Mutex::new(DaemonShared {
-        last_errors: LatchedErrors::default(),
-        driver_last_tick: None,
-        mute: crate::mute::Mute::default(),
-        queue_at_rest: false,
-        volume_changed_here: false,
-        unmute_unreported: false,
-        started_at: std::time::Instant::now(),
-        startup_warnings: 0,
-        qconnect: QconnectStatus::default(),
-        network_online: std::sync::atomic::AtomicBool::new(true),
-        // Attached by daemon::run right after boot (the bus outlives boot).
-        bus: None,
-    }))
+    Arc::new(Mutex::new(DaemonShared::new()))
 }
 
 /// Resolve `[server] bind:port` to a `SocketAddr`. A malformed value
